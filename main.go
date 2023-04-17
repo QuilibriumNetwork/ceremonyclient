@@ -41,6 +41,7 @@ func WaitForSequencerToBeReady() {
 		state = GetSequencerState()
 	}
 
+	fmt.Println()
 	fmt.Println("Sequencer is ready for contributions!")
 }
 
