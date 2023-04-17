@@ -15,7 +15,7 @@ func main() {
 	state := GetSequencerState()
 	for state != SEQUENCER_ACCEPTING {
 		fmt.Println("Sequencer currently not accepting new contributions, waiting...")
-		time.Sleep(1 * time.Second)
+		time.Sleep(30 * time.Second)
 		state = GetSequencerState()
 	}
 
