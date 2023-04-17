@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	bls48581 "source.quilibrium.com/quilibrium/ceremonyclient/ec/bls48581"
@@ -112,100 +113,98 @@ func GetSequencerState() string {
 	return string(sequencerState)
 }
 
-func Bootstrap(batch uint, batchSize uint) {
-	if batch == 65536/batchSize {
-		return
+func Bootstrap() {
+	secretBytes := make([]byte, (8 * int(bls48581.MODBYTES)))
+	rand.Read(secretBytes)
+	secret = bls48581.FromBytes(secretBytes)
+	secret.Mod(bls48581.NewBIGints(bls48581.CURVE_Order))
+
+	bcjRes, err := http.DefaultClient.Post(HOST+"current_state", "application/json", bytes.NewBufferString("{}"))
+	if err != nil {
+		panic(err)
 	}
 
-	if batch == 0 {
-		secretBytes := make([]byte, (8 * int(bls48581.MODBYTES)))
-		rand.Read(secretBytes)
-		secret = bls48581.FromBytes(secretBytes)
+	defer bcjRes.Body.Close()
 
-		bcjRes, err := http.DefaultClient.Post(HOST+"current_state", "application/json", bytes.NewBufferString("{}"))
-		if err != nil {
-			panic(err)
-		}
-
-		defer bcjRes.Body.Close()
-
-		bcjBytes, err := io.ReadAll(bcjRes.Body)
-		if err != nil {
-			panic(err)
-		}
-
-		if err := json.Unmarshal(bcjBytes, bcj); err != nil {
-			// message is not conformant, we are in validating phase
-			panic(err)
-		}
+	bcjBytes, err := io.ReadAll(bcjRes.Body)
+	if err != nil {
+		panic(err)
 	}
 
-	contributeWithSecrets(batch, batchSize, secret)
+	if err := json.Unmarshal(bcjBytes, bcj); err != nil {
+		// message is not conformant, we are in validating phase
+		panic(err)
+	}
 
-	fmt.Printf("Participating... %f%% Complete\n", float32(batch*batchSize)/655.36)
+	contributeWithSecrets(secret)
 }
 
-func contributeWithSecrets(batch uint, batchSize uint, secret *bls48581.BIG) error {
-	updatePowersOfTau(batch, batchSize, secret)
-
-	if batch == 0 {
-		updateWitness(secret)
-	}
+func contributeWithSecrets(secret *bls48581.BIG) error {
+	updatePowersOfTau(secret)
+	updateWitness(secret)
 
 	return nil
 }
 
-var xi *bls48581.BIG
-var xi2 *bls48581.BIG
+var xi []*bls48581.BIG
 
-func updatePowersOfTau(batch uint, batchSize uint, secret *bls48581.BIG) {
-	if batch == 0 {
-		xi = bls48581.NewBIGint(1)
-		xi2 = bls48581.NewBIGint(1)
+func updatePowersOfTau(secret *bls48581.BIG) {
+	xi = append(xi, bls48581.NewBIGint(1))
+
+	for i := 0; i < 65536; i++ {
+		xi = append(xi, bls48581.Modmul(xi[i], secret, bls48581.NewBIGints(bls48581.CURVE_Order)))
 	}
 
-	for i := batchSize * batch; i < batchSize*(batch+1); i++ {
-		g1PowersString := strings.TrimPrefix(bcj.PowersOfTau.G1Affines[i], "0x")
-		g1PowersHex, _ := hex.DecodeString(g1PowersString)
-		g1Power := bls48581.ECP_fromBytes(g1PowersHex)
+	wg := sync.WaitGroup{}
+	wg.Add(65536)
 
-		if g1Power.Equals(bls48581.NewECP()) {
-			panic("invalid g1Power")
-		}
+	for i := 0; i < 65536; i++ {
+		i := i
+		go func() {
+			g1PowersString := strings.TrimPrefix(bcj.PowersOfTau.G1Affines[i], "0x")
+			g1PowersHex, _ := hex.DecodeString(g1PowersString)
+			g1Power := bls48581.ECP_fromBytes(g1PowersHex)
 
-		g1Power = g1Power.Mul(xi)
-		g1Power.ToBytes(g1PowersHex, true)
-		bcj.PowersOfTau.G1Affines[i] = "0x" + hex.EncodeToString(g1PowersHex)
-
-		if (i%batchSize == 0) && i < uint(257*batchSize) {
-			g2PowersString := strings.TrimPrefix(bcj.PowersOfTau.G2Affines[i/batchSize], "0x")
-			g2PowersHex, _ := hex.DecodeString(g2PowersString)
-			g2Power := bls48581.ECP8_fromBytes(g2PowersHex)
-
-			if g2Power.Equals(bls48581.NewECP8()) {
+			if g1Power.Equals(bls48581.NewECP()) {
 				panic("invalid g1Power")
 			}
 
-			g2Power = g2Power.Mul(xi2)
-			g2Power.ToBytes(g2PowersHex, true)
-			bcj.PowersOfTau.G2Affines[i/batchSize] = "0x" + hex.EncodeToString(g2PowersHex)
-			xi2 = bls48581.Modmul(xi2, secret, bls48581.NewBIGints(bls48581.Modulus))
-		}
-		xi = bls48581.Modmul(xi, secret, bls48581.NewBIGints(bls48581.Modulus))
+			g1Power = g1Power.Mul(xi[i])
+			g1Power.ToBytes(g1PowersHex, true)
+			bcj.PowersOfTau.G1Affines[i] = "0x" + hex.EncodeToString(g1PowersHex)
+
+			if i < 257 {
+				g2PowersString := strings.TrimPrefix(bcj.PowersOfTau.G2Affines[i], "0x")
+				g2PowersHex, _ := hex.DecodeString(g2PowersString)
+				g2Power := bls48581.ECP8_fromBytes(g2PowersHex)
+
+				if g2Power.Equals(bls48581.NewECP8()) {
+					panic("invalid g2Power")
+				}
+
+				g2Power = g2Power.Mul(xi[i])
+				g2Power.ToBytes(g2PowersHex, true)
+				bcj.PowersOfTau.G2Affines[i] = "0x" + hex.EncodeToString(g2PowersHex)
+			}
+			wg.Done()
+		}()
 	}
+
+	wg.Wait()
 }
 
 func updateWitness(secret *bls48581.BIG) {
 	g2PowersString := strings.TrimPrefix(bcj.PotPubKey, "0x")
 	g2PowersHex, _ := hex.DecodeString(g2PowersString)
 	g2Power := bls48581.ECP8_fromBytes(g2PowersHex)
+	x := bls48581.Modmul(bls48581.NewBIGint(1), secret, bls48581.NewBIGints(bls48581.CURVE_Order))
 
 	if g2Power.Equals(bls48581.NewECP8()) {
 		panic("invalid g2Power")
 	}
 
-	newPotPubKey := g2Power.Mul(secret)
-	newPotPubKey.ToBytes(g2PowersHex, true)
+	g2Power = g2Power.Mul(x)
+	g2Power.ToBytes(g2PowersHex, true)
 	bcj.PotPubKey = "0x" + hex.EncodeToString(g2PowersHex)
 	bcj.VoucherPubKey = "0x" + hex.EncodeToString(voucherPubKey)
 }

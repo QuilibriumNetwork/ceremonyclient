@@ -15,16 +15,12 @@ func main() {
 	state := GetSequencerState()
 	for state != SEQUENCER_ACCEPTING {
 		fmt.Println("Sequencer currently not accepting new contributions, waiting...")
-		time.Sleep(30 * time.Second)
+		time.Sleep(1 * time.Second)
 		state = GetSequencerState()
 	}
 
 	JoinLobby()
-	batchSize := uint(32)
-	for batch := uint(0); batch < 65536/batchSize; batch++ {
-		Bootstrap(batch, batchSize)
-		fmt.Printf("batch: %d\n", batch)
-	}
+	Bootstrap()
 	fmt.Println("New Pubkey: ")
 	fmt.Println(bcj.PotPubKey)
 	ContributeAndGetVoucher()
@@ -67,5 +63,5 @@ func PrintLogo() {
 
 func PrintVersion() {
 	fmt.Println(" ")
-	fmt.Println("                    Quilibrium Ceremony Client - CLI - v1.0.0")
+	fmt.Println("                    Quilibrium Ceremony Client - CLI - v1.0.1")
 }
