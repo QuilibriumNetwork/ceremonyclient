@@ -21,7 +21,7 @@ func main() {
 }
 
 func WaitForSequencerToBeReady() {
-	spinnerChars := []string{"🌕", "🌖", "🌗", "🌘", "🌑", "🌒", "🌓", "🌔"}
+	spinnerChars := []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
 	spinnerIndex := 0
 	attempts := 0
 	removeLine := "\u001B[A\u001B[2K"
@@ -37,7 +37,7 @@ func WaitForSequencerToBeReady() {
 		spinnerIndex = (spinnerIndex + 1) % len(spinnerChars)
 		attempts += 1
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(5 * time.Second)
 		state = GetSequencerState()
 	}
 
@@ -46,6 +46,7 @@ func WaitForSequencerToBeReady() {
 }
 
 func PrintLogo() {
+	fmt.Println()
 	fmt.Println("                                   %#########")
 	fmt.Println("                          #############################")
 	fmt.Println("                    ########################################&")
