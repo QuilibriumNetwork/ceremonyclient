@@ -78,7 +78,8 @@ func JoinLobby() {
 
 	client := http.DefaultClient
 	resp, err := client.Do(req)
-	fmt.Println("connected")
+
+	fmt.Println("Connected to sequencer!")
 
 	if err != nil {
 		panic(err)
