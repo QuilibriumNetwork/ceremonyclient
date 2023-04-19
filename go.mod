@@ -4,4 +4,7 @@ go 1.18
 
 require github.com/cloudflare/circl v1.3.2
 
-require golang.org/x/sys v0.6.0 // indirect
+require (
+	golang.org/x/sync v0.1.0 // indirect
+	golang.org/x/sys v0.6.0 // indirect
+)

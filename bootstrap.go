@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/cloudflare/circl/sign/ed448"
+	"golang.org/x/sync/errgroup"
 	bls48581 "source.quilibrium.com/quilibrium/ceremonyclient/ec/bls48581"
 )
 
@@ -37,6 +39,18 @@ type BatchContribution struct {
 type PowersOfTau struct {
 	G1Affines []*bls48581.ECP
 	G2Affines []*bls48581.ECP8
+}
+
+type CeremonyState struct {
+	PowersOfTau    PowersOfTauJson `json:"powersOfTau"`
+	PotPubKey      string          `json:"potPubKey"`
+	Witness        Witness         `json:"witness"`
+	VoucherPubKeys []string        `json:"voucherPubKeys"`
+}
+
+type Witness struct {
+	RunningProducts []string `json:"runningProducts"`
+	PotPubKeys      []string `json:"potPubKeys"`
 }
 
 type Contribution struct {
@@ -248,4 +262,266 @@ func ContributeAndGetVoucher() {
 		fmt.Println("Could not write voucher to file, voucher hex string below:")
 		fmt.Println(hex.EncodeToString(voucher))
 	}
+}
+
+func VerifyState() {
+	csjRes, err := http.DefaultClient.Post(HOST+"current_state", "application/json", bytes.NewBufferString("{}"))
+	if err != nil {
+		panic(err)
+	}
+
+	defer csjRes.Body.Close()
+
+	csjBytes, err := io.ReadAll(csjRes.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	currentStateJson := &CeremonyState{}
+
+	if err := json.Unmarshal(csjBytes, currentStateJson); err != nil {
+		// message is not conformant, we are in validating phase
+		panic(err)
+	}
+
+	verifyState(currentStateJson)
+}
+
+func CheckVoucherInclusion(path string) {
+	csjRes, err := http.DefaultClient.Post(HOST+"current_state", "application/json", bytes.NewBufferString("{}"))
+	if err != nil {
+		panic(err)
+	}
+
+	defer csjRes.Body.Close()
+
+	csjBytes, err := io.ReadAll(csjRes.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	currentStateJson := &CeremonyState{}
+
+	if err := json.Unmarshal(csjBytes, currentStateJson); err != nil {
+		// message is not conformant, we are in validating phase
+		panic(err)
+	}
+
+	voucherHex, err := os.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+
+	decodedVoucher, err := hex.DecodeString(string(voucherHex))
+	if err != nil {
+		panic(err)
+	}
+
+	privKey := ed448.PrivateKey(decodedVoucher)
+
+	verifyPubKey := "0x" + hex.EncodeToString(privKey.Public().(ed448.PublicKey))
+
+	for i, v := range currentStateJson.VoucherPubKeys {
+		if v == verifyPubKey {
+			fmt.Printf("Voucher pubkey found at index %d\n", i)
+			os.Exit(0)
+		}
+	}
+
+	panic(errors.New("voucher not found"))
+}
+
+func verifyState(currentState *CeremonyState) {
+	wg := &errgroup.Group{}
+	// This limit needs to be low – this check is a very painfully CPU intensive operation
+	wg.SetLimit(8)
+
+	fmt.Println("Checking running products of witnesses...")
+
+	// check the pairings
+	for j := 0; j < len(currentState.Witness.RunningProducts)-1; j++ {
+		j := j
+		wg.Go(func() error {
+			fmt.Printf("Checking witness at %d\n", j)
+
+			currRunningProductHex := strings.TrimPrefix(currentState.Witness.RunningProducts[j], "0x")
+			currRunningProductBytes, err := hex.DecodeString(currRunningProductHex)
+			if err != nil {
+				return fmt.Errorf("could not decode G1 at %d", j)
+			}
+
+			currRunningProduct := bls48581.ECP_fromBytes(currRunningProductBytes)
+			if currRunningProduct == nil {
+				return fmt.Errorf("could not convert G1 at %d", j)
+			}
+
+			nextRunningProductHex := strings.TrimPrefix(currentState.Witness.RunningProducts[j+1], "0x")
+			nextRunningProductBytes, err := hex.DecodeString(nextRunningProductHex)
+			if err != nil {
+				return fmt.Errorf("could not decode next G1 at %d", j)
+			}
+
+			nextRunningProduct := bls48581.ECP_fromBytes(nextRunningProductBytes)
+			if nextRunningProduct == nil {
+				return fmt.Errorf("could not convert next G1 at %d", j)
+			}
+
+			potPubKeyHex := strings.TrimPrefix(currentState.Witness.PotPubKeys[j+1], "0x")
+			potPubKeyBytes, err := hex.DecodeString(potPubKeyHex)
+			if err != nil {
+				return fmt.Errorf("could not decode POT pubkey at %d", j)
+			}
+
+			potPubKey := bls48581.ECP8_fromBytes(potPubKeyBytes)
+			if potPubKey == nil {
+				return fmt.Errorf("could not convert POT pubkey at %d", j)
+			}
+
+			prevPotPubKeyHex := strings.TrimPrefix(currentState.Witness.PotPubKeys[j], "0x")
+			prevPotPubKeyBytes, err := hex.DecodeString(prevPotPubKeyHex)
+			if err != nil {
+				return fmt.Errorf("could not decode POT pubkey at %d", j)
+			}
+
+			prevPotPubKey := bls48581.ECP8_fromBytes(prevPotPubKeyBytes)
+			if prevPotPubKey == nil {
+				return fmt.Errorf("could not convert POT pubkey at %d", j)
+			}
+
+			if !pairCheck(potPubKey, currRunningProduct, prevPotPubKey, nextRunningProduct) {
+				return fmt.Errorf("pairing check failed")
+			}
+
+			return nil
+		})
+	}
+
+	fmt.Println("Checking latest witness parity...")
+
+	// Check that the last running product is equal to G1 first power.
+	lastRunningProductIdx := len(currentState.Witness.RunningProducts) - 1
+	lastRunningProduct := currentState.Witness.RunningProducts[lastRunningProductIdx]
+	if lastRunningProduct != currentState.PowersOfTau.G1Affines[1] {
+		panic("mismatched running products for G1")
+	}
+
+	// Check that the first running product is the tau^0 power.
+	firstRunningProduct := currentState.Witness.RunningProducts[0]
+	if firstRunningProduct != currentState.PowersOfTau.G1Affines[0] {
+		panic("mismatched first product for G1")
+	}
+
+	fmt.Println("Checking coherency of G1 powers...")
+	// Check coherency of powers
+	for j := 0; j < 65535; j++ {
+		j := j
+		wg.Go(func() error {
+			fmt.Printf("Checking coherency of G1 at %d\n", j)
+			baseTauG2Hex := strings.TrimPrefix(currentState.PowersOfTau.G2Affines[1], "0x")
+			baseTauG2Bytes, err := hex.DecodeString(baseTauG2Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G2 at %d", j)
+			}
+
+			baseTauG2 := bls48581.ECP8_fromBytes(baseTauG2Bytes)
+			if baseTauG2 == nil {
+				return fmt.Errorf("failed to convert for G2 at %d", j)
+			}
+
+			currG1Hex := strings.TrimPrefix(currentState.PowersOfTau.G1Affines[j], "0x")
+			currG1Bytes, err := hex.DecodeString(currG1Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G1 at %d", j)
+			}
+
+			currG1 := bls48581.ECP_fromBytes(currG1Bytes)
+			if currG1 == nil {
+				return fmt.Errorf("failed to convert for G1 at %d", j)
+			}
+
+			nextG1Hex := strings.TrimPrefix(currentState.PowersOfTau.G1Affines[j+1], "0x")
+			nextG1Bytes, err := hex.DecodeString(nextG1Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G1 at %d", j+1)
+			}
+
+			nextG1 := bls48581.ECP_fromBytes(nextG1Bytes)
+			if nextG1 == nil {
+				return fmt.Errorf("failed to convert for G1 at %d", j+1)
+			}
+
+			if !pairCheck(baseTauG2, currG1, bls48581.ECP8_generator(), nextG1) {
+				return fmt.Errorf("pairing check failed")
+			}
+
+			return nil
+		})
+	}
+
+	fmt.Println("Checking coherency of G2 powers...")
+
+	// Check G2 powers are coherent
+	for j := 0; j < 256; j++ {
+		j := j
+		wg.Go(func() error {
+			fmt.Printf("Checking coherency of G2 at %d\n", j)
+			baseTauG1Hex := strings.TrimPrefix(currentState.PowersOfTau.G1Affines[1], "0x")
+			baseTauG1Bytes, err := hex.DecodeString(baseTauG1Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G1 at %d", j)
+			}
+
+			baseTauG1 := bls48581.ECP_fromBytes(baseTauG1Bytes)
+			if baseTauG1 == nil {
+				return fmt.Errorf("failed to convert for G1 at %d", j)
+			}
+
+			currG2Hex := strings.TrimPrefix(currentState.PowersOfTau.G2Affines[j], "0x")
+			currG2Bytes, err := hex.DecodeString(currG2Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G2 at %d", j)
+			}
+
+			currG2 := bls48581.ECP8_fromBytes(currG2Bytes)
+			if currG2 == nil {
+				return fmt.Errorf("failed to convert for G1 at %d", j)
+			}
+
+			nextG2Hex := strings.TrimPrefix(currentState.PowersOfTau.G2Affines[j+1], "0x")
+			nextG2Bytes, err := hex.DecodeString(nextG2Hex)
+			if err != nil {
+				return fmt.Errorf("failed to decode for G2 at %d", j+1)
+			}
+
+			nextG2 := bls48581.ECP8_fromBytes(nextG2Bytes)
+			if nextG2 == nil {
+				return fmt.Errorf("failed to convert for G2 at %d", j+1)
+			}
+
+			if !pairCheck(currG2, baseTauG1, nextG2, bls48581.ECP_generator()) {
+				return fmt.Errorf("pairing check failed")
+			}
+
+			return nil
+		})
+	}
+
+	if err := wg.Wait(); err != nil {
+		panic(fmt.Errorf("error validating transcript: %w", err))
+	}
+
+	fmt.Println("Current state is valid Powers of Tau!")
+}
+
+func pairCheck(G21 *bls48581.ECP8, G11 *bls48581.ECP, G22 *bls48581.ECP8, G12 *bls48581.ECP) bool {
+	G12.Neg()
+	v := bls48581.Ate2(G21, G11, G22, G12)
+	v = bls48581.Fexp(v)
+
+	if !v.Isunity() {
+		fmt.Println("pairing check failed")
+		return false
+	}
+
+	return true
 }

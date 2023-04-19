@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -11,12 +12,32 @@ func main() {
 	PrintLogo()
 	PrintVersion()
 
+	ParseArgs()
+}
+
+func ParseArgs() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "verify-transcript":
+			VerifyState()
+			os.Exit(0)
+		case "check-voucher":
+			CheckVoucherInclusion(os.Args[2])
+			os.Exit(0)
+		default:
+			break
+		}
+	}
+
 	WaitForSequencerToBeReady()
 
 	JoinLobby()
 	Bootstrap()
-	fmt.Println("New Pubkey: ")
+	fmt.Println("New PoT Pubkey: ")
 	fmt.Println(bcj.PotPubKey)
+	fmt.Println()
+	fmt.Println("Voucher Pubkey: ")
+	fmt.Println(bcj.VoucherPubKey)
 	ContributeAndGetVoucher()
 }
 
