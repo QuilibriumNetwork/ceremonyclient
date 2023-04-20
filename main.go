@@ -104,7 +104,7 @@ func PrintLogo() {
 
 func PrintVersion() {
 	fmt.Println(" ")
-	fmt.Println("                    Quilibrium Ceremony Client - CLI - v1.0.1")
+	fmt.Println("                    Quilibrium Ceremony Client - CLI - v1.0.2")
 	fmt.Println()
 	fmt.Println()
 }

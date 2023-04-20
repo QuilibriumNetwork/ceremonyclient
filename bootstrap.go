@@ -98,10 +98,14 @@ func JoinLobby() {
 	if err != nil {
 		panic(err)
 	} else {
-		_, err := io.ReadAll(resp.Body)
+		responseData, err := io.ReadAll(resp.Body)
 		if err != nil {
 			panic(err)
 		} else {
+			if resp.StatusCode != 200 {
+				fmt.Printf("Status code %d given by sequencer: \n", resp.StatusCode)
+				panic(string(responseData))
+			}
 			return
 		}
 	}
@@ -125,6 +129,12 @@ func GetSequencerState() string {
 	if err != nil {
 		panic(err)
 	}
+
+	if resp.StatusCode != 200 {
+		fmt.Printf("Status code %d given by sequencer: \n", resp.StatusCode)
+		panic(string(sequencerState))
+	}
+
 	return string(sequencerState)
 }
 
@@ -144,6 +154,11 @@ func Bootstrap() {
 	bcjBytes, err := io.ReadAll(bcjRes.Body)
 	if err != nil {
 		panic(err)
+	} else {
+		if bcjRes.StatusCode != 200 {
+			fmt.Printf("Status code %d given by sequencer: \n", bcjRes.StatusCode)
+			panic(string(bcjBytes))
+		}
 	}
 
 	if err := json.Unmarshal(bcjBytes, bcj); err != nil {
