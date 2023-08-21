@@ -81,7 +81,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 		}
 	}()
 
-	newMockGS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
 			if sub.GetSubscribe() {
@@ -185,7 +185,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 		iWantCount += i
 	}
 
-	newMockGS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
 			if sub.GetSubscribe() {
@@ -319,7 +319,7 @@ func TestBlossomSubAttackGRAFTNonExistentBitmask(t *testing.T) {
 		}
 	}
 
-	newMockGS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
 			if sub.GetSubscribe() {
@@ -419,7 +419,7 @@ func TestBlossomSubAttackGRAFTDuringBackoff(t *testing.T) {
 		pruneCount += i
 	}
 
-	newMockGS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
 			if sub.GetSubscribe() {
@@ -599,11 +599,11 @@ func TestBlossomSubAttackGRAFTDuringBackoff(t *testing.T) {
 	<-ctx.Done()
 }
 
-type gsAttackInvalidMsgTracer struct {
+type bsAttackInvalidMsgTracer struct {
 	rejectCount int
 }
 
-func (t *gsAttackInvalidMsgTracer) Trace(evt *pb.TraceEvent) {
+func (t *bsAttackInvalidMsgTracer) Trace(evt *pb.TraceEvent) {
 	// fmt.Printf("    %s %s\n", evt.Type, evt)
 	if evt.GetType() == pb.TraceEvent_REJECT_MESSAGE {
 		t.rejectCount++
@@ -660,7 +660,7 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	}
 
 	// Set up BlossomSub on the legit host
-	tracer := &gsAttackInvalidMsgTracer{}
+	tracer := &bsAttackInvalidMsgTracer{}
 	ps, err := NewBlossomSub(ctx, legit,
 		WithEventTracer(tracer),
 		WithPeerScore(params, thresholds),
@@ -692,7 +692,7 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 		pruneCount += i
 	}
 
-	newMockGS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
 			if sub.GetSubscribe() {
@@ -762,9 +762,9 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	<-ctx.Done()
 }
 
-type mockGSOnRead func(writeMsg func(*pb.RPC), irpc *pb.RPC)
+type MockBSOnRead func(writeMsg func(*pb.RPC), irpc *pb.RPC)
 
-func newMockGS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg mockGSOnRead) {
+func newMockBS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg MockBSOnRead) {
 	// Listen on the BlossomSub protocol
 	const BlossomSubID = protocol.ID("/meshsub/1.0.0")
 	const maxMessageSize = 1024 * 1024

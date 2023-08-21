@@ -1,0 +1,22 @@
+name: Interoperability Testing
+on:
+  pull_request:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  run-multidim-interop:
+    name: Run multidimensional interoperability tests
+    runs-on: ${{ fromJSON(vars['INTEROP_TEST_RUNNER_UBUNTU'] || '"ubuntu-22.04"') }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build image
+        run: docker build -t go-libp2p-head -f test-plans/PingDockerfile .
+      - uses: libp2p/test-plans/.github/actions/run-interop-ping-test@master
+        with:
+          test-filter: go-libp2p-head
+          extra-versions: ${{ github.workspace }}/test-plans/ping-version.json
+          s3-cache-bucket: libp2p-by-tf-aws-bootstrap
+          s3-access-key-id: ${{ vars.TEST_PLANS_BUILD_CACHE_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.TEST_PLANS_BUILD_CACHE_KEY }}

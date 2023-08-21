@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -200,8 +201,6 @@ type BlossomSubParams struct {
 }
 
 // NewBlossomSub returns a new PubSub object using the default BlossomSubRouter as the router.
-// BlossomSub is not intended to be used directly in V1 – you will need to employ a bloom filter
-// mapping per message corresponding to your own namespacing strategy.
 func NewBlossomSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
 	rt := DefaultBlossomSubRouter(h)
 	opts = append(opts, WithRawTracer(rt.tagTracer))
@@ -296,7 +295,7 @@ func DefaultBlossomSubParams() BlossomSubParams {
 // WithPeerScore is a BlossomSub router option that enables peer scoring.
 func WithPeerScore(params *PeerScoreParams, thresholds *PeerScoreThresholds) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
@@ -313,21 +312,21 @@ func WithPeerScore(params *PeerScoreParams, thresholds *PeerScoreThresholds) Opt
 			return err
 		}
 
-		gs.score = newPeerScore(params)
-		gs.gossipThreshold = thresholds.GossipThreshold
-		gs.publishThreshold = thresholds.PublishThreshold
-		gs.graylistThreshold = thresholds.GraylistThreshold
-		gs.acceptPXThreshold = thresholds.AcceptPXThreshold
-		gs.opportunisticGraftThreshold = thresholds.OpportunisticGraftThreshold
+		bs.score = newPeerScore(params)
+		bs.gossipThreshold = thresholds.GossipThreshold
+		bs.publishThreshold = thresholds.PublishThreshold
+		bs.graylistThreshold = thresholds.GraylistThreshold
+		bs.acceptPXThreshold = thresholds.AcceptPXThreshold
+		bs.opportunisticGraftThreshold = thresholds.OpportunisticGraftThreshold
 
-		gs.gossipTracer = newGossipTracer()
+		bs.gossipTracer = newGossipTracer()
 
 		// hook the tracer
 		if ps.tracer != nil {
-			ps.tracer.raw = append(ps.tracer.raw, gs.score, gs.gossipTracer)
+			ps.tracer.raw = append(ps.tracer.raw, bs.score, bs.gossipTracer)
 		} else {
 			ps.tracer = &pubsubTracer{
-				raw:   []RawTracer{gs.score, gs.gossipTracer},
+				raw:   []RawTracer{bs.score, bs.gossipTracer},
 				pid:   ps.host.ID(),
 				idGen: ps.idGen,
 			}
@@ -342,12 +341,12 @@ func WithPeerScore(params *PeerScoreParams, thresholds *PeerScoreThresholds) Opt
 // to publishThreshold
 func WithFloodPublish(floodPublish bool) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
 
-		gs.floodPublish = floodPublish
+		bs.floodPublish = floodPublish
 
 		return nil
 	}
@@ -358,12 +357,12 @@ func WithFloodPublish(floodPublish bool) Option {
 // used for bootstrapping.
 func WithPeerExchange(doPX bool) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
 
-		gs.doPX = doPX
+		bs.doPX = doPX
 
 		return nil
 	}
@@ -376,7 +375,7 @@ func WithPeerExchange(doPX bool) Option {
 // symmetrically configured at both ends.
 func WithDirectPeers(pis []peer.AddrInfo) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
@@ -387,10 +386,10 @@ func WithDirectPeers(pis []peer.AddrInfo) Option {
 			ps.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.PermanentAddrTTL)
 		}
 
-		gs.direct = direct
+		bs.direct = direct
 
-		if gs.tagTracer != nil {
-			gs.tagTracer.direct = direct
+		if bs.tagTracer != nil {
+			bs.tagTracer.direct = direct
 		}
 
 		return nil
@@ -403,11 +402,11 @@ func WithDirectPeers(pis []peer.AddrInfo) Option {
 // 1s by default. The default value for direct connect ticks is 300.
 func WithDirectConnectTicks(t uint64) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
-		gs.params.DirectConnectTicks = t
+		bs.params.DirectConnectTicks = t
 		return nil
 	}
 }
@@ -416,14 +415,14 @@ func WithDirectConnectTicks(t uint64) Option {
 // config to be set when instantiating the BlossomSub router.
 func WithBlossomSubParams(cfg BlossomSubParams) Option {
 	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*BlossomSubRouter)
+		bs, ok := ps.rt.(*BlossomSubRouter)
 		if !ok {
 			return fmt.Errorf("pubsub router is not BlossomSub")
 		}
 		// Overwrite current config and associated variables in the router.
-		gs.params = cfg
-		gs.connect = make(chan connectInfo, cfg.MaxPendingConnections)
-		gs.mcache = NewMessageCache(cfg.HistoryGossip, cfg.HistoryLength)
+		bs.params = cfg
+		bs.connect = make(chan connectInfo, cfg.MaxPendingConnections)
+		bs.mcache = NewMessageCache(cfg.HistoryGossip, cfg.HistoryLength)
 
 		return nil
 	}
@@ -453,6 +452,12 @@ type BlossomSubRouter struct {
 
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
+
+	fanoutMx   sync.Mutex
+	lastpubMx  sync.Mutex
+	meshMx     sync.Mutex
+	peerhaveMx sync.Mutex
+	iaskedMx   sync.Mutex
 
 	mcache       *MessageCache
 	tracer       *pubsubTracer
@@ -500,55 +505,55 @@ type connectInfo struct {
 	spr *record.Envelope
 }
 
-func (gs *BlossomSubRouter) Protocols() []protocol.ID {
-	return gs.protos
+func (bs *BlossomSubRouter) Protocols() []protocol.ID {
+	return bs.protos
 }
 
-func (gs *BlossomSubRouter) Attach(p *PubSub) {
-	gs.p = p
-	gs.tracer = p.tracer
+func (bs *BlossomSubRouter) Attach(p *PubSub) {
+	bs.p = p
+	bs.tracer = p.tracer
 
 	// start the scoring
-	gs.score.Start(gs)
+	bs.score.Start(bs)
 
 	// and the gossip tracing
-	gs.gossipTracer.Start(gs)
+	bs.gossipTracer.Start(bs)
 
 	// and the tracer for connmgr tags
-	gs.tagTracer.Start(gs)
+	bs.tagTracer.Start(bs)
 
 	// start using the same msg ID function as PubSub for caching messages.
-	gs.mcache.SetMsgIdFn(p.idGen.ID)
+	bs.mcache.SetMsgIdFn(p.idGen.ID)
 
 	// start the heartbeat
-	go gs.heartbeatTimer()
+	go bs.heartbeatTimer()
 
 	// start the PX connectors
-	for i := 0; i < gs.params.Connectors; i++ {
-		go gs.connector()
+	for i := 0; i < bs.params.Connectors; i++ {
+		go bs.connector()
 	}
 
 	// connect to direct peers
-	if len(gs.direct) > 0 {
+	if len(bs.direct) > 0 {
 		go func() {
-			if gs.params.DirectConnectInitialDelay > 0 {
-				time.Sleep(gs.params.DirectConnectInitialDelay)
+			if bs.params.DirectConnectInitialDelay > 0 {
+				time.Sleep(bs.params.DirectConnectInitialDelay)
 			}
-			for p := range gs.direct {
-				gs.connect <- connectInfo{p: p}
+			for p := range bs.direct {
+				bs.connect <- connectInfo{p: p}
 			}
 		}()
 	}
 }
 
-func (gs *BlossomSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
+func (bs *BlossomSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
 	log.Debugf("PEERUP: Add new peer %s using %s", p, proto)
-	gs.tracer.AddPeer(p, proto)
-	gs.peers[p] = proto
+	bs.tracer.AddPeer(p, proto)
+	bs.peers[p] = proto
 
 	// track the connection direction
 	outbound := false
-	conns := gs.p.host.Network().ConnsToPeer(p)
+	conns := bs.p.host.Network().ConnsToPeer(p)
 loop:
 	for _, c := range conns {
 		stat := c.Stat()
@@ -567,27 +572,27 @@ loop:
 			}
 		}
 	}
-	gs.outbound[p] = outbound
+	bs.outbound[p] = outbound
 }
 
-func (gs *BlossomSubRouter) RemovePeer(p peer.ID) {
+func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
-	gs.tracer.RemovePeer(p)
-	delete(gs.peers, p)
-	for _, peers := range gs.mesh {
+	bs.tracer.RemovePeer(p)
+	delete(bs.peers, p)
+	for _, peers := range bs.mesh {
 		delete(peers, p)
 	}
-	for _, peers := range gs.fanout {
+	for _, peers := range bs.fanout {
 		delete(peers, p)
 	}
-	delete(gs.gossip, p)
-	delete(gs.control, p)
-	delete(gs.outbound, p)
+	delete(bs.gossip, p)
+	delete(bs.control, p)
+	delete(bs.outbound, p)
 }
 
-func (gs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
+func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 	// check all peers in the bitmask
-	tmap, ok := gs.p.bitmasks[string(bitmask)]
+	tmap, ok := bs.p.bitmasks[string(bitmask)]
 	if !ok {
 		return false
 	}
@@ -595,91 +600,93 @@ func (gs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 	fsPeers, gsPeers := 0, 0
 	// floodsub peers
 	for p := range tmap {
-		if !gs.feature(BlossomSubFeatureMesh, gs.peers[p]) {
+		if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) {
 			fsPeers++
 		}
 	}
 
 	// BlossomSub peers
-	gsPeers = len(gs.mesh[string(bitmask)])
+	gsPeers = len(bs.mesh[string(bitmask)])
 
 	if suggested == 0 {
-		suggested = gs.params.Dlo
+		suggested = bs.params.Dlo
 	}
 
-	if fsPeers+gsPeers >= suggested || gsPeers >= gs.params.Dhi {
+	if fsPeers+gsPeers >= suggested || gsPeers >= bs.params.Dhi {
 		return true
 	}
 
 	return false
 }
 
-func (gs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
-	_, direct := gs.direct[p]
+func (bs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
+	_, direct := bs.direct[p]
 	if direct {
 		return AcceptAll
 	}
 
-	if gs.score.Score(p) < gs.graylistThreshold {
+	if bs.score.Score(p) < bs.graylistThreshold {
 		return AcceptNone
 	}
 
-	return gs.gate.AcceptFrom(p)
+	return bs.gate.AcceptFrom(p)
 }
 
-func (gs *BlossomSubRouter) HandleRPC(rpc *RPC) {
+func (bs *BlossomSubRouter) HandleRPC(rpc *RPC) {
 	ctl := rpc.GetControl()
 	if ctl == nil {
 		return
 	}
 
-	iwant := gs.handleIHave(rpc.from, ctl)
-	ihave := gs.handleIWant(rpc.from, ctl)
-	prune := gs.handleGraft(rpc.from, ctl)
-	gs.handlePrune(rpc.from, ctl)
+	iwant := bs.handleIHave(rpc.from, ctl)
+	ihave := bs.handleIWant(rpc.from, ctl)
+	prune := bs.handleGraft(rpc.from, ctl)
+	bs.handlePrune(rpc.from, ctl)
 
 	if len(iwant) == 0 && len(ihave) == 0 && len(prune) == 0 {
 		return
 	}
 
 	out := rpcWithControl(ihave, nil, iwant, nil, prune)
-	gs.sendRPC(rpc.from, out)
+	bs.sendRPC(rpc.from, out)
 }
 
-func (gs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
+func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
 	// we ignore IHAVE gossip from any peer whose score is below the gossip threshold
-	score := gs.score.Score(p)
-	if score < gs.gossipThreshold {
+	score := bs.score.Score(p)
+	if score < bs.gossipThreshold {
 		log.Debugf("IHAVE: ignoring peer %s with score below threshold [score = %f]", p, score)
 		return nil
 	}
 
 	// IHAVE flood protection
-	gs.peerhave[p]++
-	if gs.peerhave[p] > gs.params.MaxIHaveMessages {
-		log.Debugf("IHAVE: peer %s has advertised too many times (%d) within this heartbeat interval; ignoring", p, gs.peerhave[p])
+	bs.peerhaveMx.Lock()
+	bs.peerhave[p]++
+	bs.peerhaveMx.Unlock()
+	if bs.peerhave[p] > bs.params.MaxIHaveMessages {
+		log.Debugf("IHAVE: peer %s has advertised too many times (%d) within this heartbeat interval; ignoring", p, bs.peerhave[p])
 		return nil
 	}
 
-	if gs.iasked[p] >= gs.params.MaxIHaveLength {
-		log.Debugf("IHAVE: peer %s has already advertised too many messages (%d); ignoring", p, gs.iasked[p])
+	if bs.iasked[p] >= bs.params.MaxIHaveLength {
+		log.Debugf("IHAVE: peer %s has already advertised too many messages (%d); ignoring", p, bs.iasked[p])
 		return nil
 	}
 
 	iwant := make(map[string]struct{})
 	for _, ihave := range ctl.GetIhave() {
 		bitmask := ihave.GetBitmask()
-		_, ok := gs.mesh[string(bitmask)]
+		_, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			continue
 		}
 
-		if !gs.p.peerFilter(p, bitmask) {
+		if !bs.p.peerFilter(p, bitmask) {
 			continue
 		}
 
 		for _, mid := range ihave.GetMessageIDs() {
-			if gs.p.seenMessage(mid) {
+			if bs.p.seenMessage(mid) {
 				continue
 			}
 			iwant[mid] = struct{}{}
@@ -691,8 +698,8 @@ func (gs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 	}
 
 	iask := len(iwant)
-	if iask+gs.iasked[p] > gs.params.MaxIHaveLength {
-		iask = gs.params.MaxIHaveLength - gs.iasked[p]
+	if iask+bs.iasked[p] > bs.params.MaxIHaveLength {
+		iask = bs.params.MaxIHaveLength - bs.iasked[p]
 	}
 
 	log.Debugf("IHAVE: Asking for %d out of %d messages from %s", iask, len(iwant), p)
@@ -707,17 +714,19 @@ func (gs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 
 	// truncate to the messages we are actually asking for and update the iasked counter
 	iwantlst = iwantlst[:iask]
-	gs.iasked[p] += iask
+	bs.iaskedMx.Lock()
+	bs.iasked[p] += iask
+	bs.iaskedMx.Unlock()
 
-	gs.gossipTracer.AddPromise(p, iwantlst)
+	bs.gossipTracer.AddPromise(p, iwantlst)
 
 	return []*pb.ControlIWant{{MessageIDs: iwantlst}}
 }
 
-func (gs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {
+func (bs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {
 	// we don't respond to IWANT requests from any peer whose score is below the gossip threshold
-	score := gs.score.Score(p)
-	if score < gs.gossipThreshold {
+	score := bs.score.Score(p)
+	if score < bs.gossipThreshold {
 		log.Debugf("IWANT: ignoring peer %s with score below threshold [score = %f]", p, score)
 		return nil
 	}
@@ -725,16 +734,16 @@ func (gs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb
 	ihave := make(map[string]*pb.Message)
 	for _, iwant := range ctl.GetIwant() {
 		for _, mid := range iwant.GetMessageIDs() {
-			msg, count, ok := gs.mcache.GetForPeer(mid, p)
+			msg, count, ok := bs.mcache.GetForPeer(mid, p)
 			if !ok {
 				continue
 			}
 
-			if !gs.p.peerFilter(p, msg.GetBitmask()) {
+			if !bs.p.peerFilter(p, msg.GetBitmask()) {
 				continue
 			}
 
-			if count > gs.params.GossipRetransmission {
+			if count > bs.params.GossipRetransmission {
 				log.Debugf("IWANT: Peer %s has asked for message %s too many times; ignoring request", p, mid)
 				continue
 			}
@@ -757,21 +766,21 @@ func (gs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb
 	return msgs
 }
 
-func (gs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlPrune {
+func (bs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlPrune {
 	var prune [][]byte
 
-	doPX := gs.doPX
-	score := gs.score.Score(p)
+	doPX := bs.doPX
+	score := bs.score.Score(p)
 	now := time.Now()
 
 	for _, graft := range ctl.GetGraft() {
 		bitmask := graft.GetBitmask()
 
-		if !gs.p.peerFilter(p, bitmask) {
+		if !bs.p.peerFilter(p, bitmask) {
 			continue
 		}
 
-		peers, ok := gs.mesh[string(bitmask)]
+		peers, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			// don't do PX when there is an unknown bitmask to avoid leaking our peers
 			doPX = false
@@ -786,7 +795,7 @@ func (gs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 		}
 
 		// we don't GRAFT to/from direct peers; complain loudly if this happens
-		_, direct := gs.direct[p]
+		_, direct := bs.direct[p]
 		if direct {
 			log.Warnf("GRAFT: ignoring request from direct peer %s", p)
 			// this is possibly a bug from non-reciprocal configuration; send a PRUNE
@@ -797,21 +806,21 @@ func (gs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 		}
 
 		// make sure we are not backing off that peer
-		expire, backoff := gs.backoff[string(bitmask)][p]
+		expire, backoff := bs.backoff[string(bitmask)][p]
 		if backoff && now.Before(expire) {
 			log.Debugf("GRAFT: ignoring backed off peer %s", p)
 			// add behavioural penalty
-			gs.score.AddPenalty(p, 1)
+			bs.score.AddPenalty(p, 1)
 			// no PX
 			doPX = false
 			// check the flood cutoff -- is the GRAFT coming too fast?
-			floodCutoff := expire.Add(gs.params.GraftFloodThreshold - gs.params.PruneBackoff)
+			floodCutoff := expire.Add(bs.params.GraftFloodThreshold - bs.params.PruneBackoff)
 			if now.Before(floodCutoff) {
 				// extra penalty
-				gs.score.AddPenalty(p, 1)
+				bs.score.AddPenalty(p, 1)
 			}
 			// refresh the backoff
-			gs.addBackoff(p, bitmask, false)
+			bs.addBackoff(p, bitmask, false)
 			prune = append(prune, bitmask)
 			continue
 		}
@@ -825,21 +834,21 @@ func (gs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 			// but we won't PX to them
 			doPX = false
 			// add/refresh backoff so that we don't reGRAFT too early even if the score decays back up
-			gs.addBackoff(p, bitmask, false)
+			bs.addBackoff(p, bitmask, false)
 			continue
 		}
 
 		// check the number of mesh peers; if it is at (or over) Dhi, we only accept grafts
 		// from peers with outbound connections; this is a defensive check to restrict potential
 		// mesh takeover attacks combined with love bombing
-		if len(peers) >= gs.params.Dhi && !gs.outbound[p] {
+		if len(peers) >= bs.params.Dhi && !bs.outbound[p] {
 			prune = append(prune, bitmask)
-			gs.addBackoff(p, bitmask, false)
+			bs.addBackoff(p, bitmask, false)
 			continue
 		}
 
 		log.Debugf("GRAFT: add mesh link from %s in %s", p, bitmask)
-		gs.tracer.Graft(p, bitmask)
+		bs.tracer.Graft(p, bitmask)
 		peers[p] = struct{}{}
 	}
 
@@ -849,59 +858,59 @@ func (gs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 
 	cprune := make([]*pb.ControlPrune, 0, len(prune))
 	for _, bitmask := range prune {
-		cprune = append(cprune, gs.makePrune(p, bitmask, doPX, false))
+		cprune = append(cprune, bs.makePrune(p, bitmask, doPX, false))
 	}
 
 	return cprune
 }
 
-func (gs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
-	score := gs.score.Score(p)
+func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
+	score := bs.score.Score(p)
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
-		peers, ok := gs.mesh[string(bitmask)]
+		peers, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			continue
 		}
 
 		log.Debugf("PRUNE: Remove mesh link to %s in %s", p, bitmask)
-		gs.tracer.Prune(p, bitmask)
+		bs.tracer.Prune(p, bitmask)
 		delete(peers, p)
 		// is there a backoff specified by the peer? if so obey it.
 		backoff := prune.GetBackoff()
 		if backoff > 0 {
-			gs.doAddBackoff(p, bitmask, time.Duration(backoff)*time.Second)
+			bs.doAddBackoff(p, bitmask, time.Duration(backoff)*time.Second)
 		} else {
-			gs.addBackoff(p, bitmask, false)
+			bs.addBackoff(p, bitmask, false)
 		}
 
 		px := prune.GetPeers()
 		if len(px) > 0 {
 			// we ignore PX from peers with insufficient score
-			if score < gs.acceptPXThreshold {
+			if score < bs.acceptPXThreshold {
 				log.Debugf("PRUNE: ignoring PX from peer %s with insufficient score [score = %f, bitmask = %s]", p, score, bitmask)
 				continue
 			}
 
-			gs.pxConnect(px)
+			bs.pxConnect(px)
 		}
 	}
 }
 
-func (gs *BlossomSubRouter) addBackoff(p peer.ID, bitmask []byte, isUnsubscribe bool) {
-	backoff := gs.params.PruneBackoff
+func (bs *BlossomSubRouter) addBackoff(p peer.ID, bitmask []byte, isUnsubscribe bool) {
+	backoff := bs.params.PruneBackoff
 	if isUnsubscribe {
-		backoff = gs.params.UnsubscribeBackoff
+		backoff = bs.params.UnsubscribeBackoff
 	}
-	gs.doAddBackoff(p, bitmask, backoff)
+	bs.doAddBackoff(p, bitmask, backoff)
 }
 
-func (gs *BlossomSubRouter) doAddBackoff(p peer.ID, bitmask []byte, interval time.Duration) {
-	backoff, ok := gs.backoff[string(bitmask)]
+func (bs *BlossomSubRouter) doAddBackoff(p peer.ID, bitmask []byte, interval time.Duration) {
+	backoff, ok := bs.backoff[string(bitmask)]
 	if !ok {
 		backoff = make(map[peer.ID]time.Time)
-		gs.backoff[string(bitmask)] = backoff
+		bs.backoff[string(bitmask)] = backoff
 	}
 	expire := time.Now().Add(interval)
 	if backoff[p].Before(expire) {
@@ -909,10 +918,10 @@ func (gs *BlossomSubRouter) doAddBackoff(p peer.ID, bitmask []byte, interval tim
 	}
 }
 
-func (gs *BlossomSubRouter) pxConnect(peers []*pb.PeerInfo) {
-	if len(peers) > gs.params.PrunePeers {
+func (bs *BlossomSubRouter) pxConnect(peers []*pb.PeerInfo) {
+	if len(peers) > bs.params.PrunePeers {
 		shufflePeerInfo(peers)
-		peers = peers[:gs.params.PrunePeers]
+		peers = peers[:bs.params.PrunePeers]
 	}
 
 	toconnect := make([]connectInfo, 0, len(peers))
@@ -920,7 +929,7 @@ func (gs *BlossomSubRouter) pxConnect(peers []*pb.PeerInfo) {
 	for _, pi := range peers {
 		p := peer.ID(pi.PeerID)
 
-		_, connected := gs.peers[p]
+		_, connected := bs.peers[p]
 		if connected {
 			continue
 		}
@@ -954,23 +963,23 @@ func (gs *BlossomSubRouter) pxConnect(peers []*pb.PeerInfo) {
 
 	for _, ci := range toconnect {
 		select {
-		case gs.connect <- ci:
+		case bs.connect <- ci:
 		default:
 			log.Debugf("ignoring peer connection attempt; too many pending connections")
 		}
 	}
 }
 
-func (gs *BlossomSubRouter) connector() {
+func (bs *BlossomSubRouter) connector() {
 	for {
 		select {
-		case ci := <-gs.connect:
-			if gs.p.host.Network().Connectedness(ci.p) == network.Connected {
+		case ci := <-bs.connect:
+			if bs.p.host.Network().Connectedness(ci.p) == network.Connected {
 				continue
 			}
 
 			log.Debugf("connecting to %s", ci.p)
-			cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
+			cab, ok := peerstore.GetCertifiedAddrBook(bs.p.host.Peerstore())
 			if ok && ci.spr != nil {
 				_, err := cab.ConsumePeerRecord(ci.spr, peerstore.TempAddrTTL)
 				if err != nil {
@@ -978,21 +987,21 @@ func (gs *BlossomSubRouter) connector() {
 				}
 			}
 
-			ctx, cancel := context.WithTimeout(gs.p.ctx, gs.params.ConnectionTimeout)
-			err := gs.p.host.Connect(ctx, peer.AddrInfo{ID: ci.p})
+			ctx, cancel := context.WithTimeout(bs.p.ctx, bs.params.ConnectionTimeout)
+			err := bs.p.host.Connect(ctx, peer.AddrInfo{ID: ci.p})
 			cancel()
 			if err != nil {
 				log.Debugf("error connecting to %s: %s", ci.p, err)
 			}
 
-		case <-gs.p.ctx.Done():
+		case <-bs.p.ctx.Done():
 			return
 		}
 	}
 }
 
-func (gs *BlossomSubRouter) Publish(msg *Message) {
-	gs.mcache.Put(msg)
+func (bs *BlossomSubRouter) Publish(msg *Message) {
+	bs.mcache.Put(msg)
 
 	from := msg.ReceivedFrom
 	bitmask := msg.GetBitmask()
@@ -1000,21 +1009,21 @@ func (gs *BlossomSubRouter) Publish(msg *Message) {
 	tosend := make(map[peer.ID]struct{})
 
 	// any peers in the bitmask?
-	tmap, ok := gs.p.bitmasks[string(bitmask)]
+	tmap, ok := bs.p.bitmasks[string(bitmask)]
 	if !ok {
 		return
 	}
 
-	if gs.floodPublish && from == gs.p.host.ID() {
+	if bs.floodPublish && from == bs.p.host.ID() {
 		for p := range tmap {
-			_, direct := gs.direct[p]
-			if direct || gs.score.Score(p) >= gs.publishThreshold {
+			_, direct := bs.direct[p]
+			if direct || bs.score.Score(p) >= bs.publishThreshold {
 				tosend[p] = struct{}{}
 			}
 		}
 	} else {
 		// direct peers
-		for p := range gs.direct {
+		for p := range bs.direct {
 			_, inBitmask := tmap[p]
 			if inBitmask {
 				tosend[p] = struct{}{}
@@ -1023,29 +1032,31 @@ func (gs *BlossomSubRouter) Publish(msg *Message) {
 
 		// floodsub peers
 		for p := range tmap {
-			if !gs.feature(BlossomSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.publishThreshold {
+			if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && bs.score.Score(p) >= bs.publishThreshold {
 				tosend[p] = struct{}{}
 			}
 		}
 
 		// BlossomSub peers
-		gmap, ok := gs.mesh[string(bitmask)]
+		gmap, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			// we are not in the mesh for bitmask, use fanout peers
-			gmap, ok = gs.fanout[string(bitmask)]
+			gmap, ok = bs.fanout[string(bitmask)]
 			if !ok || len(gmap) == 0 {
 				// we don't have any, pick some with score above the publish threshold
-				peers := gs.getPeers(bitmask, gs.params.D, func(p peer.ID) bool {
-					_, direct := gs.direct[p]
-					return !direct && gs.score.Score(p) >= gs.publishThreshold
+				peers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
+					_, direct := bs.direct[p]
+					return !direct && bs.score.Score(p) >= bs.publishThreshold
 				})
 
 				if len(peers) > 0 {
 					gmap = peerListToMap(peers)
-					gs.fanout[string(bitmask)] = gmap
+					bs.fanoutMx.Lock()
+					bs.fanout[string(bitmask)] = gmap
+					bs.fanoutMx.Unlock()
 				}
 			}
-			gs.lastpub[string(bitmask)] = time.Now().UnixNano()
+			bs.lastpub[string(bitmask)] = time.Now().UnixNano()
 		}
 
 		for p := range gmap {
@@ -1059,164 +1070,173 @@ func (gs *BlossomSubRouter) Publish(msg *Message) {
 			continue
 		}
 
-		gs.sendRPC(pid, out)
+		bs.sendRPC(pid, out)
 	}
 }
 
-func (gs *BlossomSubRouter) Join(bitmask []byte) {
-	gmap, ok := gs.mesh[string(bitmask)]
+func (bs *BlossomSubRouter) Join(bitmask []byte) {
+	gmap, ok := bs.mesh[string(bitmask)]
 	if ok {
 		return
 	}
 
 	log.Debugf("JOIN %s", bitmask)
-	gs.tracer.Join(bitmask)
+	bs.tracer.Join(bitmask)
 
-	gmap, ok = gs.fanout[string(bitmask)]
+	gmap, ok = bs.fanout[string(bitmask)]
 	if ok {
-		backoff := gs.backoff[string(bitmask)]
+		backoff := bs.backoff[string(bitmask)]
 		// these peers have a score above the publish threshold, which may be negative
 		// so drop the ones with a negative score
 		for p := range gmap {
 			_, doBackOff := backoff[p]
-			if gs.score.Score(p) < 0 || doBackOff {
+			if bs.score.Score(p) < 0 || doBackOff {
 				delete(gmap, p)
 			}
 		}
 
-		if len(gmap) < gs.params.D {
+		if len(gmap) < bs.params.D {
 			// we need more peers; eager, as this would get fixed in the next heartbeat
-			more := gs.getPeers(bitmask, gs.params.D-len(gmap), func(p peer.ID) bool {
+			more := bs.getPeers(bitmask, bs.params.D-len(gmap), func(p peer.ID) bool {
 				// filter our current peers, direct peers, peers we are backing off, and
 				// peers with negative scores
 				_, inMesh := gmap[p]
-				_, direct := gs.direct[p]
+				_, direct := bs.direct[p]
 				_, doBackOff := backoff[p]
-				return !inMesh && !direct && !doBackOff && gs.score.Score(p) >= 0
+				return !inMesh && !direct && !doBackOff && bs.score.Score(p) >= 0
 			})
 			for _, p := range more {
 				gmap[p] = struct{}{}
 			}
 		}
-		gs.mesh[string(bitmask)] = gmap
-		delete(gs.fanout, string(bitmask))
-		delete(gs.lastpub, string(bitmask))
+
+		bs.meshMx.Lock()
+		bs.mesh[string(bitmask)] = gmap
+		bs.meshMx.Unlock()
+		bs.fanoutMx.Lock()
+		delete(bs.fanout, string(bitmask))
+		bs.fanoutMx.Unlock()
+		bs.lastpubMx.Lock()
+		delete(bs.lastpub, string(bitmask))
+		bs.lastpubMx.Unlock()
 	} else {
-		backoff := gs.backoff[string(bitmask)]
-		peers := gs.getPeers(bitmask, gs.params.D, func(p peer.ID) bool {
+		backoff := bs.backoff[string(bitmask)]
+		peers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
 			// filter direct peers, peers we are backing off and peers with negative score
-			_, direct := gs.direct[p]
+			_, direct := bs.direct[p]
 			_, doBackOff := backoff[p]
-			return !direct && !doBackOff && gs.score.Score(p) >= 0
+			return !direct && !doBackOff && bs.score.Score(p) >= 0
 		})
 		gmap = peerListToMap(peers)
-		gs.mesh[string(bitmask)] = gmap
+		bs.mesh[string(bitmask)] = gmap
 	}
 
 	for p := range gmap {
 		log.Debugf("JOIN: Add mesh link to %s in %s", p, bitmask)
-		gs.tracer.Graft(p, bitmask)
-		gs.sendGraft(p, bitmask)
+		bs.tracer.Graft(p, bitmask)
+		bs.sendGraft(p, bitmask)
 	}
 }
 
-func (gs *BlossomSubRouter) Leave(bitmask []byte) {
-	gmap, ok := gs.mesh[string(bitmask)]
+func (bs *BlossomSubRouter) Leave(bitmask []byte) {
+	gmap, ok := bs.mesh[string(bitmask)]
 	if !ok {
 		return
 	}
 
 	log.Debugf("LEAVE %s", bitmask)
-	gs.tracer.Leave(bitmask)
+	bs.tracer.Leave(bitmask)
 
-	delete(gs.mesh, string(bitmask))
+	bs.meshMx.Lock()
+	delete(bs.mesh, string(bitmask))
+	bs.meshMx.Unlock()
 
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, bitmask)
-		gs.tracer.Prune(p, bitmask)
-		gs.sendPrune(p, bitmask, true)
+		bs.tracer.Prune(p, bitmask)
+		bs.sendPrune(p, bitmask, true)
 		// Add a backoff to this peer to prevent us from eagerly
 		// re-grafting this peer into our mesh if we rejoin this
 		// bitmask before the backoff period ends.
-		gs.addBackoff(p, bitmask, true)
+		bs.addBackoff(p, bitmask, true)
 	}
 }
 
-func (gs *BlossomSubRouter) sendGraft(p peer.ID, bitmask []byte) {
+func (bs *BlossomSubRouter) sendGraft(p peer.ID, bitmask []byte) {
 	graft := []*pb.ControlGraft{{Bitmask: bitmask}}
 	out := rpcWithControl(nil, nil, nil, graft, nil)
-	gs.sendRPC(p, out)
+	bs.sendRPC(p, out)
 }
 
-func (gs *BlossomSubRouter) sendPrune(p peer.ID, bitmask []byte, isUnsubscribe bool) {
-	prune := []*pb.ControlPrune{gs.makePrune(p, bitmask, gs.doPX, isUnsubscribe)}
+func (bs *BlossomSubRouter) sendPrune(p peer.ID, bitmask []byte, isUnsubscribe bool) {
+	prune := []*pb.ControlPrune{bs.makePrune(p, bitmask, bs.doPX, isUnsubscribe)}
 	out := rpcWithControl(nil, nil, nil, nil, prune)
-	gs.sendRPC(p, out)
+	bs.sendRPC(p, out)
 }
 
-func (gs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
+func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 	// do we own the RPC?
 	own := false
 
 	// piggyback control message retries
-	ctl, ok := gs.control[p]
+	ctl, ok := bs.control[p]
 	if ok {
 		out = copyRPC(out)
 		own = true
-		gs.piggybackControl(p, out, ctl)
-		delete(gs.control, p)
+		bs.piggybackControl(p, out, ctl)
+		delete(bs.control, p)
 	}
 
 	// piggyback gossip
-	ihave, ok := gs.gossip[p]
+	ihave, ok := bs.gossip[p]
 	if ok {
 		if !own {
 			out = copyRPC(out)
 			own = true
 		}
-		gs.piggybackGossip(p, out, ihave)
-		delete(gs.gossip, p)
+		bs.piggybackGossip(p, out, ihave)
+		delete(bs.gossip, p)
 	}
 
-	mch, ok := gs.p.peers[p]
+	mch, ok := bs.p.peers[p]
 	if !ok {
 		return
 	}
 
 	// If we're below the max message size, go ahead and send
-	if out.Size() < gs.p.maxMessageSize {
-		gs.doSendRPC(out, p, mch)
+	if out.Size() < bs.p.maxMessageSize {
+		bs.doSendRPC(out, p, mch)
 		return
 	}
 
 	// If we're too big, fragment into multiple RPCs and send each sequentially
-	outRPCs, err := fragmentRPC(out, gs.p.maxMessageSize)
+	outRPCs, err := fragmentRPC(out, bs.p.maxMessageSize)
 	if err != nil {
-		gs.doDropRPC(out, p, fmt.Sprintf("unable to fragment RPC: %s", err))
+		bs.doDropRPC(out, p, fmt.Sprintf("unable to fragment RPC: %s", err))
 		return
 	}
 
 	for _, rpc := range outRPCs {
-		gs.doSendRPC(rpc, p, mch)
+		bs.doSendRPC(rpc, p, mch)
 	}
 }
 
-func (gs *BlossomSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
+func (bs *BlossomSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	log.Debugf("dropping message to peer %s: %s", p.Pretty(), reason)
-	gs.tracer.DropRPC(rpc, p)
+	bs.tracer.DropRPC(rpc, p)
 	// push control messages that need to be retried
 	ctl := rpc.GetControl()
 	if ctl != nil {
-		gs.pushControl(p, ctl)
+		bs.pushControl(p, ctl)
 	}
 }
 
-func (gs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
+func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
 	select {
 	case mch <- rpc:
-		gs.tracer.SendRPC(rpc, p)
+		bs.tracer.SendRPC(rpc, p)
 	default:
-		gs.doDropRPC(rpc, p, "queue full")
+		bs.doDropRPC(rpc, p, "queue full")
 	}
 }
 
@@ -1336,85 +1356,85 @@ func fragmentMessageIds(msgIds []string, limit int) [][]string {
 	return out
 }
 
-func (gs *BlossomSubRouter) heartbeatTimer() {
-	time.Sleep(gs.params.HeartbeatInitialDelay)
+func (bs *BlossomSubRouter) heartbeatTimer() {
+	time.Sleep(bs.params.HeartbeatInitialDelay)
 	select {
-	case gs.p.eval <- gs.heartbeat:
-	case <-gs.p.ctx.Done():
+	case bs.p.eval <- bs.heartbeat:
+	case <-bs.p.ctx.Done():
 		return
 	}
 
-	ticker := time.NewTicker(gs.params.HeartbeatInterval)
+	ticker := time.NewTicker(bs.params.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			select {
-			case gs.p.eval <- gs.heartbeat:
-			case <-gs.p.ctx.Done():
+			case bs.p.eval <- bs.heartbeat:
+			case <-bs.p.ctx.Done():
 				return
 			}
-		case <-gs.p.ctx.Done():
+		case <-bs.p.ctx.Done():
 			return
 		}
 	}
 }
 
-func (gs *BlossomSubRouter) heartbeat() {
+func (bs *BlossomSubRouter) heartbeat() {
 	start := time.Now()
 	defer func() {
-		if gs.params.SlowHeartbeatWarning > 0 {
-			slowWarning := time.Duration(gs.params.SlowHeartbeatWarning * float64(gs.params.HeartbeatInterval))
+		if bs.params.SlowHeartbeatWarning > 0 {
+			slowWarning := time.Duration(bs.params.SlowHeartbeatWarning * float64(bs.params.HeartbeatInterval))
 			if dt := time.Since(start); dt > slowWarning {
 				log.Warnw("slow heartbeat", "took", dt)
 			}
 		}
 	}()
 
-	gs.heartbeatTicks++
+	bs.heartbeatTicks++
 
 	tograft := make(map[peer.ID][][]byte)
 	toprune := make(map[peer.ID][][]byte)
 	noPX := make(map[peer.ID]bool)
 
 	// clean up expired backoffs
-	gs.clearBackoff()
+	bs.clearBackoff()
 
 	// clean up iasked counters
-	gs.clearIHaveCounters()
+	bs.clearIHaveCounters()
 
 	// apply IWANT request penalties
-	gs.applyIwantPenalties()
+	bs.applyIwantPenalties()
 
 	// ensure direct peers are connected
-	gs.directConnect()
+	bs.directConnect()
 
 	// cache scores throughout the heartbeat
 	scores := make(map[peer.ID]float64)
 	score := func(p peer.ID) float64 {
 		s, ok := scores[p]
 		if !ok {
-			s = gs.score.Score(p)
+			s = bs.score.Score(p)
 			scores[p] = s
 		}
 		return s
 	}
 
 	// maintain the mesh for bitmasks we have joined
-	for bitmask, peers := range gs.mesh {
+	for bitmask, peers := range bs.mesh {
 		bitmask := []byte(bitmask)
 		prunePeer := func(p peer.ID) {
-			gs.tracer.Prune(p, bitmask)
+			bs.tracer.Prune(p, bitmask)
 			delete(peers, p)
-			gs.addBackoff(p, bitmask, false)
+			bs.addBackoff(p, bitmask, false)
 			bitmasks := toprune[p]
 			toprune[p] = append(bitmasks, bitmask)
 		}
 
 		graftPeer := func(p peer.ID) {
 			log.Debugf("HEARTBEAT: Add mesh link to %s in %s", p, bitmask)
-			gs.tracer.Graft(p, bitmask)
+			bs.tracer.Graft(p, bitmask)
 			peers[p] = struct{}{}
 			bitmasks := tograft[p]
 			tograft[p] = append(bitmasks, bitmask)
@@ -1430,14 +1450,14 @@ func (gs *BlossomSubRouter) heartbeat() {
 		}
 
 		// do we have enough peers?
-		if l := len(peers); l < gs.params.Dlo {
-			backoff := gs.backoff[string(bitmask)]
-			ineed := gs.params.D - l
-			plst := gs.getPeers(bitmask, ineed, func(p peer.ID) bool {
+		if l := len(peers); l < bs.params.Dlo {
+			backoff := bs.backoff[string(bitmask)]
+			ineed := bs.params.D - l
+			plst := bs.getPeers(bitmask, ineed, func(p peer.ID) bool {
 				// filter our current and direct peers, peers we are backing off, and peers with negative score
 				_, inMesh := peers[p]
 				_, doBackoff := backoff[p]
-				_, direct := gs.direct[p]
+				_, direct := bs.direct[p]
 				return !inMesh && !doBackoff && !direct && score(p) >= 0
 			})
 
@@ -1447,7 +1467,7 @@ func (gs *BlossomSubRouter) heartbeat() {
 		}
 
 		// do we have too many peers?
-		if len(peers) > gs.params.Dhi {
+		if len(peers) > bs.params.Dhi {
 			plst := peerMapToList(peers)
 
 			// sort by score (but shuffle first for the case we don't use the score)
@@ -1458,18 +1478,18 @@ func (gs *BlossomSubRouter) heartbeat() {
 
 			// We keep the first D_score peers by score and the remaining up to D randomly
 			// under the constraint that we keep D_out peers in the mesh (if we have that many)
-			shufflePeers(plst[gs.params.Dscore:])
+			shufflePeers(plst[bs.params.Dscore:])
 
 			// count the outbound peers we are keeping
 			outbound := 0
-			for _, p := range plst[:gs.params.D] {
-				if gs.outbound[p] {
+			for _, p := range plst[:bs.params.D] {
+				if bs.outbound[p] {
 					outbound++
 				}
 			}
 
 			// if it's less than D_out, bubble up some outbound peers from the random selection
-			if outbound < gs.params.Dout {
+			if outbound < bs.params.Dout {
 				rotate := func(i int) {
 					// rotate the plst to the right and put the ith peer in the front
 					p := plst[i]
@@ -1482,9 +1502,9 @@ func (gs *BlossomSubRouter) heartbeat() {
 				// first bubble up all outbound peers already in the selection to the front
 				if outbound > 0 {
 					ihave := outbound
-					for i := 1; i < gs.params.D && ihave > 0; i++ {
+					for i := 1; i < bs.params.D && ihave > 0; i++ {
 						p := plst[i]
-						if gs.outbound[p] {
+						if bs.outbound[p] {
 							rotate(i)
 							ihave--
 						}
@@ -1492,10 +1512,10 @@ func (gs *BlossomSubRouter) heartbeat() {
 				}
 
 				// now bubble up enough outbound peers outside the selection to the front
-				ineed := gs.params.Dout - outbound
-				for i := gs.params.D; i < len(plst) && ineed > 0; i++ {
+				ineed := bs.params.Dout - outbound
+				for i := bs.params.D; i < len(plst) && ineed > 0; i++ {
 					p := plst[i]
-					if gs.outbound[p] {
+					if bs.outbound[p] {
 						rotate(i)
 						ineed--
 					}
@@ -1503,32 +1523,32 @@ func (gs *BlossomSubRouter) heartbeat() {
 			}
 
 			// prune the excess peers
-			for _, p := range plst[gs.params.D:] {
+			for _, p := range plst[bs.params.D:] {
 				log.Debugf("HEARTBEAT: Remove mesh link to %s in %s", p, bitmask)
 				prunePeer(p)
 			}
 		}
 
 		// do we have enough outboud peers?
-		if len(peers) >= gs.params.Dlo {
+		if len(peers) >= bs.params.Dlo {
 			// count the outbound peers we have
 			outbound := 0
 			for p := range peers {
-				if gs.outbound[p] {
+				if bs.outbound[p] {
 					outbound++
 				}
 			}
 
 			// if it's less than D_out, select some peers with outbound connections and graft them
-			if outbound < gs.params.Dout {
-				ineed := gs.params.Dout - outbound
-				backoff := gs.backoff[string(bitmask)]
-				plst := gs.getPeers(bitmask, ineed, func(p peer.ID) bool {
+			if outbound < bs.params.Dout {
+				ineed := bs.params.Dout - outbound
+				backoff := bs.backoff[string(bitmask)]
+				plst := bs.getPeers(bitmask, ineed, func(p peer.ID) bool {
 					// filter our current and direct peers, peers we are backing off, and peers with negative score
 					_, inMesh := peers[p]
 					_, doBackoff := backoff[p]
-					_, direct := gs.direct[p]
-					return !inMesh && !doBackoff && !direct && gs.outbound[p] && score(p) >= 0
+					_, direct := bs.direct[p]
+					return !inMesh && !doBackoff && !direct && bs.outbound[p] && score(p) >= 0
 				})
 
 				for _, p := range plst {
@@ -1538,7 +1558,7 @@ func (gs *BlossomSubRouter) heartbeat() {
 		}
 
 		// should we try to improve the mesh with opportunistic grafting?
-		if gs.heartbeatTicks%gs.params.OpportunisticGraftTicks == 0 && len(peers) > 1 {
+		if bs.heartbeatTicks%bs.params.OpportunisticGraftTicks == 0 && len(peers) > 1 {
 			// Opportunistic grafting works as follows: we check the median score of peers in the
 			// mesh; if this score is below the opportunisticGraftThreshold, we select a few peers at
 			// random with score over the median.
@@ -1555,12 +1575,12 @@ func (gs *BlossomSubRouter) heartbeat() {
 			medianScore := scores[plst[medianIndex]]
 
 			// if the median score is below the threshold, select a better peer (if any) and GRAFT
-			if medianScore < gs.opportunisticGraftThreshold {
-				backoff := gs.backoff[string(bitmask)]
-				plst = gs.getPeers(bitmask, gs.params.OpportunisticGraftPeers, func(p peer.ID) bool {
+			if medianScore < bs.opportunisticGraftThreshold {
+				backoff := bs.backoff[string(bitmask)]
+				plst = bs.getPeers(bitmask, bs.params.OpportunisticGraftPeers, func(p peer.ID) bool {
 					_, inMesh := peers[p]
 					_, doBackoff := backoff[p]
-					_, direct := gs.direct[p]
+					_, direct := bs.direct[p]
 					return !inMesh && !doBackoff && !direct && score(p) > medianScore
 				})
 
@@ -1573,37 +1593,41 @@ func (gs *BlossomSubRouter) heartbeat() {
 
 		// 2nd arg are mesh peers excluded from gossip. We already push
 		// messages to them, so its redundant to gossip IHAVEs.
-		gs.emitGossip(bitmask, peers)
+		bs.emitGossip(bitmask, peers)
 	}
 
 	// expire fanout for bitmasks we haven't published to in a while
 	now := time.Now().UnixNano()
-	for bitmask, lastpub := range gs.lastpub {
-		if lastpub+int64(gs.params.FanoutTTL) < now {
-			delete(gs.fanout, bitmask)
-			delete(gs.lastpub, bitmask)
+	for bitmask, lastpub := range bs.lastpub {
+		if lastpub+int64(bs.params.FanoutTTL) < now {
+			bs.fanoutMx.Lock()
+			delete(bs.fanout, bitmask)
+			bs.fanoutMx.Unlock()
+			bs.lastpubMx.Lock()
+			delete(bs.lastpub, bitmask)
+			bs.lastpubMx.Unlock()
 		}
 	}
 
 	// maintain our fanout for bitmasks we are publishing but we have not joined
-	for bitmask, peers := range gs.fanout {
+	for bitmask, peers := range bs.fanout {
 		bitmask := []byte(bitmask)
 		// check whether our peers are still in the bitmask and have a score above the publish threshold
 		for p := range peers {
-			_, ok := gs.p.bitmasks[string(bitmask)][p]
-			if !ok || score(p) < gs.publishThreshold {
+			_, ok := bs.p.bitmasks[string(bitmask)][p]
+			if !ok || score(p) < bs.publishThreshold {
 				delete(peers, p)
 			}
 		}
 
 		// do we need more peers?
-		if len(peers) < gs.params.D {
-			ineed := gs.params.D - len(peers)
-			plst := gs.getPeers(bitmask, ineed, func(p peer.ID) bool {
+		if len(peers) < bs.params.D {
+			ineed := bs.params.D - len(peers)
+			plst := bs.getPeers(bitmask, ineed, func(p peer.ID) bool {
 				// filter our current and direct peers and peers with score above the publish threshold
 				_, inFanout := peers[p]
-				_, direct := gs.direct[p]
-				return !inFanout && !direct && score(p) >= gs.publishThreshold
+				_, direct := bs.direct[p]
+				return !inFanout && !direct && score(p) >= bs.publishThreshold
 			})
 
 			for _, p := range plst {
@@ -1613,46 +1637,50 @@ func (gs *BlossomSubRouter) heartbeat() {
 
 		// 2nd arg are fanout peers excluded from gossip. We already push
 		// messages to them, so its redundant to gossip IHAVEs.
-		gs.emitGossip(bitmask, peers)
+		bs.emitGossip(bitmask, peers)
 	}
 
 	// send coalesced GRAFT/PRUNE messages (will piggyback gossip)
-	gs.sendGraftPrune(tograft, toprune, noPX)
+	bs.sendGraftPrune(tograft, toprune, noPX)
 
 	// flush all pending gossip that wasn't piggybacked above
-	gs.flush()
+	bs.flush()
 
 	// advance the message history window
-	gs.mcache.Shift()
+	bs.mcache.Shift()
 }
 
-func (gs *BlossomSubRouter) clearIHaveCounters() {
-	if len(gs.peerhave) > 0 {
+func (bs *BlossomSubRouter) clearIHaveCounters() {
+	if len(bs.peerhave) > 0 {
 		// throw away the old map and make a new one
-		gs.peerhave = make(map[peer.ID]int)
+		bs.peerhaveMx.Lock()
+		bs.peerhave = make(map[peer.ID]int)
+		bs.peerhaveMx.Unlock()
 	}
 
-	if len(gs.iasked) > 0 {
+	if len(bs.iasked) > 0 {
 		// throw away the old map and make a new one
-		gs.iasked = make(map[peer.ID]int)
+		bs.iaskedMx.Lock()
+		bs.iasked = make(map[peer.ID]int)
+		bs.iaskedMx.Unlock()
 	}
 }
 
-func (gs *BlossomSubRouter) applyIwantPenalties() {
-	for p, count := range gs.gossipTracer.GetBrokenPromises() {
+func (bs *BlossomSubRouter) applyIwantPenalties() {
+	for p, count := range bs.gossipTracer.GetBrokenPromises() {
 		log.Infof("peer %s didn't follow up in %d IWANT requests; adding penalty", p, count)
-		gs.score.AddPenalty(p, count)
+		bs.score.AddPenalty(p, count)
 	}
 }
 
-func (gs *BlossomSubRouter) clearBackoff() {
+func (bs *BlossomSubRouter) clearBackoff() {
 	// we only clear once every 15 ticks to avoid iterating over the map(s) too much
-	if gs.heartbeatTicks%15 != 0 {
+	if bs.heartbeatTicks%15 != 0 {
 		return
 	}
 
 	now := time.Now()
-	for bitmask, backoff := range gs.backoff {
+	for bitmask, backoff := range bs.backoff {
 		for p, expire := range backoff {
 			// add some slack time to the expiration
 			// https://github.com/libp2p/specs/pull/289
@@ -1661,21 +1689,21 @@ func (gs *BlossomSubRouter) clearBackoff() {
 			}
 		}
 		if len(backoff) == 0 {
-			delete(gs.backoff, bitmask)
+			delete(bs.backoff, bitmask)
 		}
 	}
 }
 
-func (gs *BlossomSubRouter) directConnect() {
+func (bs *BlossomSubRouter) directConnect() {
 	// we donly do this every some ticks to allow pending connections to complete and account
 	// for restarts/downtime
-	if gs.heartbeatTicks%gs.params.DirectConnectTicks != 0 {
+	if bs.heartbeatTicks%bs.params.DirectConnectTicks != 0 {
 		return
 	}
 
 	var toconnect []peer.ID
-	for p := range gs.direct {
-		_, connected := gs.peers[p]
+	for p := range bs.direct {
+		_, connected := bs.peers[p]
 		if !connected {
 			toconnect = append(toconnect, p)
 		}
@@ -1684,13 +1712,13 @@ func (gs *BlossomSubRouter) directConnect() {
 	if len(toconnect) > 0 {
 		go func() {
 			for _, p := range toconnect {
-				gs.connect <- connectInfo{p: p}
+				bs.connect <- connectInfo{p: p}
 			}
 		}()
 	}
 }
 
-func (gs *BlossomSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][][]byte, noPX map[peer.ID]bool) {
+func (bs *BlossomSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][][]byte, noPX map[peer.ID]bool) {
 	for p, bitmasks := range tograft {
 		graft := make([]*pb.ControlGraft, 0, len(bitmasks))
 		for _, bitmask := range bitmasks {
@@ -1708,29 +1736,29 @@ func (gs *BlossomSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][][]byte
 			delete(toprune, p)
 			prune = make([]*pb.ControlPrune, 0, len(pruning))
 			for _, bitmask := range pruning {
-				prune = append(prune, gs.makePrune(p, bitmask, gs.doPX && !noPX[p], false))
+				prune = append(prune, bs.makePrune(p, bitmask, bs.doPX && !noPX[p], false))
 			}
 		}
 
 		out := rpcWithControl(nil, nil, nil, graft, prune)
-		gs.sendRPC(p, out)
+		bs.sendRPC(p, out)
 	}
 
 	for p, bitmasks := range toprune {
 		prune := make([]*pb.ControlPrune, 0, len(bitmasks))
 		for _, bitmask := range bitmasks {
-			prune = append(prune, gs.makePrune(p, bitmask, gs.doPX && !noPX[p], false))
+			prune = append(prune, bs.makePrune(p, bitmask, bs.doPX && !noPX[p], false))
 		}
 
 		out := rpcWithControl(nil, nil, nil, nil, prune)
-		gs.sendRPC(p, out)
+		bs.sendRPC(p, out)
 	}
 }
 
 // emitGossip emits IHAVE gossip advertising items in the message cache window
 // of this bitmask.
-func (gs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struct{}) {
-	mids := gs.mcache.GetGossipIDs(bitmask)
+func (bs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struct{}) {
+	mids := bs.mcache.GetGossipIDs(bitmask)
 	if len(mids) == 0 {
 		return
 	}
@@ -1739,7 +1767,7 @@ func (gs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	shuffleStrings(mids)
 
 	// if we are emitting more than BlossomSubMaxIHaveLength mids, truncate the list
-	if len(mids) > gs.params.MaxIHaveLength {
+	if len(mids) > bs.params.MaxIHaveLength {
 		// we do the truncation (with shuffling) per peer below
 		log.Debugf("too many messages for gossip; will truncate IHAVE list (%d messages)", len(mids))
 	}
@@ -1748,17 +1776,17 @@ func (gs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	// First we collect the peers above gossipThreshold that are not in the exclude set
 	// and then randomly select from that set.
 	// We also exclude direct peers, as there is no reason to emit gossip to them.
-	peers := make([]peer.ID, 0, len(gs.p.bitmasks[string(bitmask)]))
-	for p := range gs.p.bitmasks[string(bitmask)] {
+	peers := make([]peer.ID, 0, len(bs.p.bitmasks[string(bitmask)]))
+	for p := range bs.p.bitmasks[string(bitmask)] {
 		_, inExclude := exclude[p]
-		_, direct := gs.direct[p]
-		if !inExclude && !direct && gs.feature(BlossomSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.gossipThreshold {
+		_, direct := bs.direct[p]
+		if !inExclude && !direct && bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && bs.score.Score(p) >= bs.gossipThreshold {
 			peers = append(peers, p)
 		}
 	}
 
-	target := gs.params.Dlazy
-	factor := int(gs.params.GossipFactor * float64(len(peers)))
+	target := bs.params.Dlazy
+	factor := int(bs.params.GossipFactor * float64(len(peers)))
 	if factor > target {
 		target = factor
 	}
@@ -1773,41 +1801,41 @@ func (gs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	// Emit the IHAVE gossip to the selected peers.
 	for _, p := range peers {
 		peerMids := mids
-		if len(mids) > gs.params.MaxIHaveLength {
+		if len(mids) > bs.params.MaxIHaveLength {
 			// we do this per peer so that we emit a different set for each peer.
 			// we have enough redundancy in the system that this will significantly increase the message
 			// coverage when we do truncate.
-			peerMids = make([]string, gs.params.MaxIHaveLength)
+			peerMids = make([]string, bs.params.MaxIHaveLength)
 			shuffleStrings(mids)
 			copy(peerMids, mids)
 		}
-		gs.enqueueGossip(p, &pb.ControlIHave{Bitmask: bitmask, MessageIDs: peerMids})
+		bs.enqueueGossip(p, &pb.ControlIHave{Bitmask: bitmask, MessageIDs: peerMids})
 	}
 }
 
-func (gs *BlossomSubRouter) flush() {
+func (bs *BlossomSubRouter) flush() {
 	// send gossip first, which will also piggyback pending control
-	for p, ihave := range gs.gossip {
-		delete(gs.gossip, p)
+	for p, ihave := range bs.gossip {
+		delete(bs.gossip, p)
 		out := rpcWithControl(nil, ihave, nil, nil, nil)
-		gs.sendRPC(p, out)
+		bs.sendRPC(p, out)
 	}
 
 	// send the remaining control messages that wasn't merged with gossip
-	for p, ctl := range gs.control {
-		delete(gs.control, p)
+	for p, ctl := range bs.control {
+		delete(bs.control, p)
 		out := rpcWithControl(nil, nil, nil, ctl.Graft, ctl.Prune)
-		gs.sendRPC(p, out)
+		bs.sendRPC(p, out)
 	}
 }
 
-func (gs *BlossomSubRouter) enqueueGossip(p peer.ID, ihave *pb.ControlIHave) {
-	gossip := gs.gossip[p]
+func (bs *BlossomSubRouter) enqueueGossip(p peer.ID, ihave *pb.ControlIHave) {
+	gossip := bs.gossip[p]
 	gossip = append(gossip, ihave)
-	gs.gossip[p] = gossip
+	bs.gossip[p] = gossip
 }
 
-func (gs *BlossomSubRouter) piggybackGossip(p peer.ID, out *RPC, ihave []*pb.ControlIHave) {
+func (bs *BlossomSubRouter) piggybackGossip(p peer.ID, out *RPC, ihave []*pb.ControlIHave) {
 	ctl := out.GetControl()
 	if ctl == nil {
 		ctl = &pb.ControlMessage{}
@@ -1817,23 +1845,23 @@ func (gs *BlossomSubRouter) piggybackGossip(p peer.ID, out *RPC, ihave []*pb.Con
 	ctl.Ihave = ihave
 }
 
-func (gs *BlossomSubRouter) pushControl(p peer.ID, ctl *pb.ControlMessage) {
+func (bs *BlossomSubRouter) pushControl(p peer.ID, ctl *pb.ControlMessage) {
 	// remove IHAVE/IWANT from control message, gossip is not retried
 	ctl.Ihave = nil
 	ctl.Iwant = nil
 	if ctl.Graft != nil || ctl.Prune != nil {
-		gs.control[p] = ctl
+		bs.control[p] = ctl
 	}
 }
 
-func (gs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.ControlMessage) {
+func (bs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.ControlMessage) {
 	// check control message for staleness first
 	var tograft []*pb.ControlGraft
 	var toprune []*pb.ControlPrune
 
 	for _, graft := range ctl.GetGraft() {
 		bitmask := graft.GetBitmask()
-		peers, ok := gs.mesh[string(bitmask)]
+		peers, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			continue
 		}
@@ -1845,7 +1873,7 @@ func (gs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
-		peers, ok := gs.mesh[string(bitmask)]
+		peers, ok := bs.mesh[string(bitmask)]
 		if !ok {
 			toprune = append(toprune, prune)
 			continue
@@ -1874,25 +1902,25 @@ func (gs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 	}
 }
 
-func (gs *BlossomSubRouter) makePrune(p peer.ID, bitmask []byte, doPX bool, isUnsubscribe bool) *pb.ControlPrune {
-	if !gs.feature(BlossomSubFeaturePX, gs.peers[p]) {
+func (bs *BlossomSubRouter) makePrune(p peer.ID, bitmask []byte, doPX bool, isUnsubscribe bool) *pb.ControlPrune {
+	if !bs.feature(BlossomSubFeaturePX, bs.peers[p]) {
 		// BlossomSub v1.0 -- no peer exchange, the peer won't be able to parse it anyway
 		return &pb.ControlPrune{Bitmask: bitmask}
 	}
 
-	backoff := uint64(gs.params.PruneBackoff / time.Second)
+	backoff := uint64(bs.params.PruneBackoff / time.Second)
 	if isUnsubscribe {
-		backoff = uint64(gs.params.UnsubscribeBackoff / time.Second)
+		backoff = uint64(bs.params.UnsubscribeBackoff / time.Second)
 	}
 
 	var px []*pb.PeerInfo
 	if doPX {
 		// select peers for Peer eXchange
-		peers := gs.getPeers(bitmask, gs.params.PrunePeers, func(xp peer.ID) bool {
-			return p != xp && gs.score.Score(xp) >= 0
+		peers := bs.getPeers(bitmask, bs.params.PrunePeers, func(xp peer.ID) bool {
+			return p != xp && bs.score.Score(xp) >= 0
 		})
 
-		cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
+		cab, ok := peerstore.GetCertifiedAddrBook(bs.p.host.Peerstore())
 		px = make([]*pb.PeerInfo, 0, len(peers))
 		for _, p := range peers {
 			// see if we have a signed peer record to send back; if we don't, just send
@@ -1916,15 +1944,15 @@ func (gs *BlossomSubRouter) makePrune(p peer.ID, bitmask []byte, doPX bool, isUn
 	return &pb.ControlPrune{Bitmask: bitmask, Peers: px, Backoff: backoff}
 }
 
-func (gs *BlossomSubRouter) getPeers(bitmask []byte, count int, filter func(peer.ID) bool) []peer.ID {
-	tmap, ok := gs.p.bitmasks[string(bitmask)]
+func (bs *BlossomSubRouter) getPeers(bitmask []byte, count int, filter func(peer.ID) bool) []peer.ID {
+	tmap, ok := bs.p.bitmasks[string(bitmask)]
 	if !ok {
 		return nil
 	}
 
 	peers := make([]peer.ID, 0, len(tmap))
 	for p := range tmap {
-		if gs.feature(BlossomSubFeatureMesh, gs.peers[p]) && filter(p) && gs.p.peerFilter(p, bitmask) {
+		if bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && filter(p) && bs.p.peerFilter(p, bitmask) {
 			peers = append(peers, p)
 		}
 	}
@@ -1942,8 +1970,8 @@ func (gs *BlossomSubRouter) getPeers(bitmask []byte, count int, filter func(peer
 // This is useful for cases where the BlossomSubRouter is instantiated externally, and is
 // injected into the BlossomSub constructor as a dependency. This allows the tag tracer to be
 // also injected into the BlossomSub constructor as a PubSub option dependency.
-func (gs *BlossomSubRouter) WithDefaultTagTracer() Option {
-	return WithRawTracer(gs.tagTracer)
+func (bs *BlossomSubRouter) WithDefaultTagTracer() Option {
+	return WithRawTracer(bs.tagTracer)
 }
 
 func peerListToMap(peers []peer.ID) map[peer.ID]struct{} {

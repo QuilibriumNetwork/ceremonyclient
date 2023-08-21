@@ -38,9 +38,9 @@ func TestBlossomSubCustomProtocols(t *testing.T) {
 	defer cancel()
 	hosts := getNetHosts(t, ctx, 3)
 
-	gsubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubProtocols(protos, features))
+	bsubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubProtocols(protos, features))
 	fsub := getPubsub(ctx, hosts[2])
-	psubs := append(gsubs, fsub)
+	psubs := append(bsubs, fsub)
 
 	connectAll(t, hosts)
 
@@ -58,33 +58,33 @@ func TestBlossomSubCustomProtocols(t *testing.T) {
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
-	// check the meshes of the gsubs, the BlossomSub meshes should include each other but not the
+	// check the meshes of the bsubs, the BlossomSub meshes should include each other but not the
 	// floddsub peer
-	gsubs[0].eval <- func() {
-		gs := gsubs[0].rt.(*BlossomSubRouter)
+	bsubs[0].eval <- func() {
+		bs := bsubs[0].rt.(*BlossomSubRouter)
 
-		_, ok := gs.mesh[string(bitmask)][hosts[1].ID()]
+		_, ok := bs.mesh[string(bitmask)][hosts[1].ID()]
 		if !ok {
-			t.Fatal("expected gs0 to have gs1 in its mesh")
+			t.Fatal("expected bs0 to have bs1 in its mesh")
 		}
 
-		_, ok = gs.mesh[string(bitmask)][hosts[2].ID()]
+		_, ok = bs.mesh[string(bitmask)][hosts[2].ID()]
 		if ok {
-			t.Fatal("expected gs0 to not have fs in its mesh")
+			t.Fatal("expected bs0 to not have fs in its mesh")
 		}
 	}
 
-	gsubs[1].eval <- func() {
-		gs := gsubs[1].rt.(*BlossomSubRouter)
+	bsubs[1].eval <- func() {
+		bs := bsubs[1].rt.(*BlossomSubRouter)
 
-		_, ok := gs.mesh[string(bitmask)][hosts[0].ID()]
+		_, ok := bs.mesh[string(bitmask)][hosts[0].ID()]
 		if !ok {
-			t.Fatal("expected gs1 to have gs0 in its mesh")
+			t.Fatal("expected bs1 to have bs0 in its mesh")
 		}
 
-		_, ok = gs.mesh[string(bitmask)][hosts[2].ID()]
+		_, ok = bs.mesh[string(bitmask)][hosts[2].ID()]
 		if ok {
-			t.Fatal("expected gs1 to not have fs in its mesh")
+			t.Fatal("expected bs1 to not have fs in its mesh")
 		}
 	}
 

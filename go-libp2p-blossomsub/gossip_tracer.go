@@ -35,13 +35,13 @@ func newGossipTracer() *gossipTracer {
 	}
 }
 
-func (gt *gossipTracer) Start(gs *BlossomSubRouter) {
+func (gt *gossipTracer) Start(bs *BlossomSubRouter) {
 	if gt == nil {
 		return
 	}
 
-	gt.idGen = gs.p.idGen
-	gt.followUpTime = gs.params.IWantFollowupTime
+	gt.idGen = bs.p.idGen
+	gt.followUpTime = bs.params.IWantFollowupTime
 }
 
 // track a promise to deliver a message from a list of msgIDs we are requesting

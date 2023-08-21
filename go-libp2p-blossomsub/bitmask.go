@@ -56,18 +56,18 @@ func (t *Bitmask) SetScoreParams(p *BitmaskScoreParams) error {
 
 	result := make(chan error, 1)
 	update := func() {
-		gs, ok := t.p.rt.(*BlossomSubRouter)
+		bs, ok := t.p.rt.(*BlossomSubRouter)
 		if !ok {
 			result <- fmt.Errorf("pubsub router is not BlossomSub")
 			return
 		}
 
-		if gs.score == nil {
+		if bs.score == nil {
 			result <- fmt.Errorf("peer scoring is not enabled in router")
 			return
 		}
 
-		err := gs.score.SetBitmaskScoreParams(t.bitmask, p)
+		err := bs.score.SetBitmaskScoreParams(t.bitmask, p)
 		result <- err
 	}
 
