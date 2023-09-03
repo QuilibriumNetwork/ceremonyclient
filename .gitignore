@@ -1,3 +1,5 @@
 .idea/
 vouchers/
 ceremony-client
+.config*
+.DS_Store

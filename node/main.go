@@ -11,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/node/app"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -32,7 +33,6 @@ func main() {
 		fmt.Println("Import completed, you are ready for the launch.")
 		return
 	}
-
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 
@@ -40,7 +40,19 @@ func main() {
 	printVersion()
 	fmt.Println(" ")
 
-	flag.Usage()
+	nodeConfig, err := config.LoadConfig(*configDirectory, "")
+	if err != nil {
+		panic(err)
+	}
+
+	node, err := app.NewNode(nodeConfig)
+	if err != nil {
+		panic(err)
+	}
+	node.Start()
+
+	<-done
+	node.Stop()
 }
 
 func printPeerID(p2pConfig *config.P2PConfig) {
@@ -100,5 +112,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                   Quilibrium Node - v1.0.0 – Import-only Utility")
+	fmt.Println("                  Quilibrium Node - v1.0.0 – DHT Verification")
 }

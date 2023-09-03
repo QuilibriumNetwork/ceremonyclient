@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package quilibrium.node.ceremony.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "keys.proto";
+
+// Describes the transcript of KZG ceremony execution
+message CeremonyTranscript {
+  // The active collection of powers over G1
+  repeated quilibrium.node.keys.pb.BLS48581G1PublicKey g1_powers = 1;
+  // The active collection of powers over G2
+  repeated quilibrium.node.keys.pb.BLS48581G2PublicKey g2_powers = 2;
+  // The running s^256 G1 witnesses – the choice of the 256th power is to ensure
+  // combinatorial birthday paradox-based attacks are not possible. In common
+  // KZG ceremonies, the collection of witnesses to PoT pubkeys produce the
+  // relationship of e(w*G1, s*G2) == (s'*G1, G2), where w*s == s'. The problem
+  // with this is that there are n powers under G2 (excl. the case where PoT
+  // ceremonies _only_ have the first G2 power), and so the chance of collision
+  // by combination to a target value for s' is feasible such that a sum of a
+  // permutation of valid G2 powers could forge witness values to reach a
+  // a desired outcome, as there are matching pairs of the G1 and G2 powers to
+  // permute. When the number of G2 powers is low, or one, this reduces to the
+  // discrete log assumption and so the only viable attack is of
+  // O(sqrt(<bit size>)) per Pollard's Rho (barring any advancements), but in
+  // many cases the number of G2 powers is high enough such that n! naive
+  // combinations of additions are greater (and cheap, since the additions are
+  // first tested in G1) than the required time of testing the discrete log,
+  // and combined with many generated target values, significantly reduces the
+  // amount of time required to complete the attack. This means that in
+  // traditional KZG ceremonies, the last contributor to a ceremony can
+  // potentially control the secret. Or, we can just track the witnesses to the
+  // highest power in the ceremony and avoid the whole problem. :)
+  repeated quilibrium.node.keys.pb.BLS48581G1PublicKey running_g1_256_witnesses = 3;
+  // The running s^256 G2 powers – see notes on running_g1_256_witnesses for why
+  // we do this.
+  repeated quilibrium.node.keys.pb.BLS48581G2PublicKey running_g2_256_powers = 4;
+}
