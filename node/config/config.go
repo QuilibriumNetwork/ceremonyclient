@@ -81,7 +81,10 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		},
 		P2P: &P2PConfig{
 			ListenMultiaddr: "/ip4/0.0.0.0/udp/8336/quic",
-			PeerPrivKey:     "",
+			BootstrapPeers: []string{
+				"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/QmUhm9iZVruSxyavjoPLCfuoRG94SGQEkfxEEoukEZmD5B",
+			},
+			PeerPrivKey: "",
 		},
 		Engine: &EngineConfig{
 			ProvingKeyId:         "default-proving-key",
