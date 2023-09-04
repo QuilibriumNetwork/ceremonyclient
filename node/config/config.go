@@ -87,6 +87,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 				"/ip4/13.237.250.230/udp/8317/quic/p2p/QmazMeSUA9HPLuj53w56k6GUq3xVny3pHtosUZndejJeai",
 				"/ip4/13.236.219.103/udp/8317/quic/p2p/QmcJqNsJLNfxkAxeJijfLppiNQERaeFuwsbg3BGScKqrfh",
 				"/ip4/204.186.74.46/udp/8316/quic/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
+				"/ip4/186.233.184.181/udp/8336/quic/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
 			},
 			PeerPrivKey: "",
 		},
