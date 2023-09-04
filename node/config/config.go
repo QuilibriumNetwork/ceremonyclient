@@ -83,6 +83,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			ListenMultiaddr: "/ip4/0.0.0.0/udp/8336/quic",
 			BootstrapPeers: []string{
 				"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/QmUhm9iZVruSxyavjoPLCfuoRG94SGQEkfxEEoukEZmD5B",
+				"/ip4/204.186.74.47/udp/8317/quic/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
 			},
 			PeerPrivKey: "",
 		},
