@@ -84,6 +84,8 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			BootstrapPeers: []string{
 				"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/QmUhm9iZVruSxyavjoPLCfuoRG94SGQEkfxEEoukEZmD5B",
 				"/ip4/204.186.74.47/udp/8317/quic/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
+				"/ip4/13.237.250.230/udp/8317/quic/p2p/QmazMeSUA9HPLuj53w56k6GUq3xVny3pHtosUZndejJeai",
+				"/ip4/13.236.219.103/udp/8317/quic/p2p/QmcJqNsJLNfxkAxeJijfLppiNQERaeFuwsbg3BGScKqrfh",
 			},
 			PeerPrivKey: "",
 		},
