@@ -93,6 +93,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 				"/ip4/144.76.104.93/udp/8336/quic/p2p/QmZejZ8DBGQ6foX9recW73GA6TqL6hCMX9ETWWW1Fb8xtx",
 				"/ip4/86.106.89.131/udp/8336/quic/p2p/QmU6kHqghuZbLGDivFh2TQw73vQzsNtYoegwhKTRw77R5p",
 				"/ip4/103.79.113.68/udp/8336/quic/p2p/QmSheQ43HuLhVYxdAByUV5pskihWRFpADnivuPf4cShZKq",
+				"/dns/abyssia.fr/udp/8336/quic/p2p/QmS7C1UhN8nvzLJgFFf1uspMRrXjJqThHNN6AyEXp6oVUB",
 			},
 			PeerPrivKey: "",
 		},
