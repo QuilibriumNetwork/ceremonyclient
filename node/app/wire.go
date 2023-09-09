@@ -12,6 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/nop"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 func logger() *zap.Logger {
@@ -33,6 +34,13 @@ var keyManagerSet = wire.NewSet(
 	wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)),
 )
 
+var storeSet = wire.NewSet(
+	wire.FieldsOf(new(*config.Config), "DB"),
+	store.NewPebbleDB,
+	store.NewPebbleClockStore,
+	wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)),
+)
+
 var pubSubSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "P2P"),
 	p2p.NewBlossomSub,
@@ -46,9 +54,24 @@ var engineSet = wire.NewSet(
 var consensusSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "Engine"),
 	master.NewMasterClockConsensusEngine,
-	wire.Bind(new(consensus.ConsensusEngine), new(*master.MasterClockConsensusEngine)),
+	wire.Bind(
+		new(consensus.ConsensusEngine),
+		new(*master.MasterClockConsensusEngine),
+	),
 )
 
 func NewNode(*config.Config) (*Node, error) {
-	panic(wire.Build(loggerSet, keyManagerSet, pubSubSet, engineSet, consensusSet, newNode))
+	panic(wire.Build(
+		loggerSet,
+		keyManagerSet,
+		storeSet,
+		pubSubSet,
+		engineSet,
+		consensusSet,
+		newNode,
+	))
+}
+
+func NewDBConsole(*config.Config) (*DBConsole, error) {
+	panic(wire.Build(loggerSet, storeSet, newDBConsole))
 }

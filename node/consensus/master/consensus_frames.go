@@ -238,8 +238,33 @@ func (
 		}
 	}
 
+	txn, err := e.clockStore.NewTransaction()
+	if err != nil {
+		e.logger.Error("error while creating transaction", zap.Error(err))
+		return nil, errors.Wrap(err, "confirm latest frame")
+	}
+
+	for _, frame := range committedSet {
+		if err = e.clockStore.PutMasterClockFrame(frame, txn); err != nil {
+			e.logger.Error("error while committing frame", zap.Error(err))
+			return nil, errors.Wrap(err, "confirm latest frame")
+		}
+	}
+
+	if err = txn.Commit(); err != nil {
+		e.logger.Error("error while committing transaction", zap.Error(err))
+		return nil, errors.Wrap(err, "confirm latest frame")
+	}
+
+	e.logger.Info("stored frames", zap.Int("frame_count", len(committedSet)))
+
 	e.historicFramesMx.Lock()
+
 	e.historicFrames = append(e.historicFrames, committedSet...)
+	if len(e.historicFrames) > 256 {
+		e.historicFrames = e.historicFrames[len(e.historicFrames)-256:]
+	}
+
 	e.historicFramesMx.Unlock()
 
 	e.setFrame(prev)

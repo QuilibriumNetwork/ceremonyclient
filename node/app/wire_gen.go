@@ -15,6 +15,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/nop"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 // Injectors from wire.go:
@@ -23,16 +24,31 @@ func NewNode(configConfig *config.Config) (*Node, error) {
 	zapLogger := logger()
 	nopExecutionEngine := nop.NewNopExecutionEngine(zapLogger)
 	engineConfig := configConfig.Engine
+	dbConfig := configConfig.DB
+	db := store.NewPebbleDB(dbConfig)
+	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
-	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, fileKeyManager, blossomSub)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub)
 	node, err := newNode(nopExecutionEngine, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
 	}
 	return node, nil
+}
+
+func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
+	dbConfig := configConfig.DB
+	db := store.NewPebbleDB(dbConfig)
+	zapLogger := logger()
+	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
+	dbConsole, err := newDBConsole(pebbleClockStore)
+	if err != nil {
+		return nil, err
+	}
+	return dbConsole, nil
 }
 
 // wire.go:
@@ -52,8 +68,14 @@ var loggerSet = wire.NewSet(
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))
 
+var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, store.NewPebbleClockStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)))
+
 var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)))
 
 var engineSet = wire.NewSet(nop.NewNopExecutionEngine)
 
-var consensusSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), master.NewMasterClockConsensusEngine, wire.Bind(new(consensus.ConsensusEngine), new(*master.MasterClockConsensusEngine)))
+var consensusSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), master.NewMasterClockConsensusEngine, wire.Bind(
+	new(consensus.ConsensusEngine),
+	new(*master.MasterClockConsensusEngine),
+),
+)

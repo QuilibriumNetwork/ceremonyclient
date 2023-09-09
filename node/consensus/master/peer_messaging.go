@@ -225,11 +225,35 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 		zap.Uint64("total_frames", uint64(to-from+1)),
 	)
 
+	iter, err := e.clockStore.RangeMasterClockFrames(
+		request.Filter,
+		from,
+		to,
+	)
+	if err != nil {
+		return errors.Wrap(err, "handle clock frame request")
+	}
+
+	response := []*protobufs.ClockFrame{}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		frame, err := iter.Value()
+		if err != nil {
+			return errors.Wrap(err, "handle clock frame request")
+		}
+
+		response = append(response, frame)
+	}
+
+	if err = iter.Close(); err != nil {
+		return errors.Wrap(err, "handle clock frame request")
+	}
+
 	if err := e.publishMessage(channel, &protobufs.ClockFramesResponse{
 		Filter:          request.Filter,
 		FromFrameNumber: request.FromFrameNumber,
 		ToFrameNumber:   to,
-		ClockFrames:     e.historicFrames[from:to],
+		ClockFrames:     response,
 	}); err != nil {
 		return errors.Wrap(err, "handle clock frame request")
 	}

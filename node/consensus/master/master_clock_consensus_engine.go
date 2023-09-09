@@ -13,6 +13,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type SyncStatusType int
@@ -42,9 +43,9 @@ type MasterClockConsensusEngine struct {
 	engineMx         sync.Mutex
 	seenFramesMx     sync.Mutex
 	historicFramesMx sync.Mutex
-	// for DHT testing, we're only using in memory stores
-	seenFrames     []*protobufs.ClockFrame
-	historicFrames []*protobufs.ClockFrame
+	seenFrames       []*protobufs.ClockFrame
+	historicFrames   []*protobufs.ClockFrame
+	clockStore       store.ClockStore
 }
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
@@ -52,6 +53,7 @@ var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
 func NewMasterClockConsensusEngine(
 	engineConfig *config.EngineConfig,
 	logger *zap.Logger,
+	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
 ) *MasterClockConsensusEngine {
@@ -88,6 +90,7 @@ func NewMasterClockConsensusEngine(
 		input:               seed,
 		lastFrameReceivedAt: time.Time{},
 		syncingStatus:       SyncStatusNotSyncing,
+		clockStore:          clockStore,
 	}
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
@@ -107,8 +110,59 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateLoading
 	e.logger.Info("syncing last seen state")
 
-	latestFrame := e.createGenesisFrame()
-	e.historicFrames = []*protobufs.ClockFrame{latestFrame}
+	latestFrame, err := e.clockStore.GetLatestMasterClockFrame(e.filter)
+	if err != nil && errors.Is(err, store.ErrNotFound) {
+		latestFrame = e.createGenesisFrame()
+		txn, err := e.clockStore.NewTransaction()
+		if err != nil {
+			panic(err)
+		}
+
+		if err = e.clockStore.PutMasterClockFrame(latestFrame, txn); err != nil {
+			panic(err)
+		}
+
+		if err = txn.Commit(); err != nil {
+			panic(err)
+		}
+	} else if err != nil {
+		panic(err)
+	} else {
+		e.setFrame(latestFrame)
+	}
+
+	e.historicFrames = []*protobufs.ClockFrame{}
+
+	if latestFrame.FrameNumber != 0 {
+		min := uint64(0)
+		if latestFrame.FrameNumber-255 > min {
+			min = latestFrame.FrameNumber - 255
+		}
+
+		iter, err := e.clockStore.RangeMasterClockFrames(
+			e.filter,
+			min,
+			latestFrame.FrameNumber-1,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		for iter.First(); iter.Valid(); iter.Next() {
+			frame, err := iter.Value()
+			if err != nil {
+				panic(err)
+			}
+
+			e.historicFrames = append(e.historicFrames, frame)
+		}
+
+		if err = iter.Close(); err != nil {
+			panic(err)
+		}
+	}
+
+	e.historicFrames = append(e.historicFrames, latestFrame)
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)

@@ -16,8 +16,21 @@ import (
 )
 
 var (
-	configDirectory = flag.String("config", "./.config/", "the configuration directory")
-	importPrivKey   = flag.String("import-priv-key", "", "creates a new config using a specific key from the phase one ceremony")
+	configDirectory = flag.String(
+		"config",
+		"./.config/",
+		"the configuration directory",
+	)
+	importPrivKey = flag.String(
+		"import-priv-key",
+		"",
+		"creates a new config using a specific key from the phase one ceremony",
+	)
+	dbConsole = flag.Bool(
+		"db-console",
+		false,
+		"starts the node in database console mode",
+	)
 )
 
 func main() {
@@ -43,6 +56,16 @@ func main() {
 	nodeConfig, err := config.LoadConfig(*configDirectory, "")
 	if err != nil {
 		panic(err)
+	}
+
+	if *dbConsole {
+		console, err := app.NewDBConsole(nodeConfig)
+		if err != nil {
+			panic(err)
+		}
+
+		console.Run()
+		return
 	}
 
 	node, err := app.NewNode(nodeConfig)
