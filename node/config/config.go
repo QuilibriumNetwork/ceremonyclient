@@ -90,6 +90,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 				"/ip4/186.233.184.181/udp/8336/quic/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
 				"/dns/quil.zanshindojo.org/udp/8336/quic/p2p/QmXbbmtS5D12rEc4HWiHWr6e83SCE4jeThPP4VJpAQPvXq",
                                 "/ip4/195.15.213.171/udp/8336/quic/p2p/Qme5PeqPSNRAvgWYbKoW9yy8S9tUwx1RBGaJ4ByE1a4rnu",
+				"/ip4/144.76.104.93/udp/8336/quic/p2p/QmZejZ8DBGQ6foX9recW73GA6TqL6hCMX9ETWWW1Fb8xtx",
 			},
 			PeerPrivKey: "",
 		},
