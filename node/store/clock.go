@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -130,6 +131,16 @@ func (p *PebbleMasterClockIterator) Value() (*protobufs.ClockFrame, error) {
 	frame.Difficulty = binary.BigEndian.Uint32(value[:4])
 	frame.Input = value[4 : len(value)-516]
 	frame.Output = value[len(value)-516:]
+
+	previousSelectorBytes := [516]byte{}
+	copy(previousSelectorBytes[:], frame.Input[:516])
+
+	parent, err := poseidon.HashBytes(previousSelectorBytes[:])
+	if err != nil {
+		return nil, errors.Wrap(err, "get master clock frame iterator value")
+	}
+
+	frame.ParentSelector = parent.Bytes()
 
 	return frame, nil
 }
@@ -414,6 +425,16 @@ func (p *PebbleClockStore) GetMasterClockFrame(
 	frame.Difficulty = binary.BigEndian.Uint32(value[:4])
 	frame.Input = value[4 : len(value)-516]
 	frame.Output = value[len(value)-516:]
+
+	previousSelectorBytes := [516]byte{}
+	copy(previousSelectorBytes[:], frame.Input[:516])
+
+	parent, err := poseidon.HashBytes(previousSelectorBytes[:])
+	if err != nil {
+		return nil, errors.Wrap(err, "get master clock frame")
+	}
+
+	frame.ParentSelector = parent.Bytes()
 
 	return frame, nil
 }

@@ -10,5 +10,7 @@ type PubSub interface {
 	Subscribe(bitmask []byte, handler func(message *pb.Message) error, raw bool)
 	Unsubscribe(bitmask []byte, raw bool)
 	GetPeerID() []byte
+	GetPeerstoreCount() int
+	GetNetworkPeersCount() int
 	GetRandomPeer(bitmask []byte) ([]byte, error)
 }

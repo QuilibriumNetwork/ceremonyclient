@@ -28,6 +28,7 @@ type BlossomSub struct {
 	logger     *zap.Logger
 	peerID     peer.ID
 	bitmaskMap map[string]*blossomsub.Bitmask
+	h          host.Host
 }
 
 var _ PubSub = (*BlossomSub)(nil)
@@ -107,6 +108,7 @@ func NewBlossomSub(
 		logger,
 		peerID,
 		make(map[string]*blossomsub.Bitmask),
+		h,
 	}
 }
 
@@ -258,6 +260,14 @@ func initDHT(
 	return kademliaDHT
 }
 
+func (b *BlossomSub) GetPeerstoreCount() int {
+	return len(b.h.Peerstore().Peers())
+}
+
+func (b *BlossomSub) GetNetworkPeersCount() int {
+	return len(b.h.Network().Peers())
+}
+
 func discoverPeers(
 	p2pConfig *config.P2PConfig,
 	ctx context.Context,
@@ -276,6 +286,7 @@ func discoverPeers(
 		if err != nil {
 			panic(err)
 		}
+
 		for peer := range peerChan {
 			if peer.ID == h.ID() {
 				continue

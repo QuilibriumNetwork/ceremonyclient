@@ -171,6 +171,17 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateCollecting
 
 	go func() {
+		for {
+			e.logger.Info(
+				"peers in store",
+				zap.Int("peer_store_count", e.pubSub.GetPeerstoreCount()),
+				zap.Int("network_peer_count", e.pubSub.GetNetworkPeersCount()),
+			)
+			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	go func() {
 		for e.state < consensus.EngineStateStopping {
 			var err error
 			switch e.state {
