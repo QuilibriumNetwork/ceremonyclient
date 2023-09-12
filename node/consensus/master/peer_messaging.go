@@ -213,8 +213,8 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 		to = request.FromFrameNumber + 127
 	}
 
-	if int(to) > len(e.historicFrames)-1 {
-		to = uint64(len(e.historicFrames) - 1)
+	if int(to) > int(e.latestFrame.FrameNumber) {
+		to = e.latestFrame.FrameNumber
 	}
 
 	e.logger.Info(
