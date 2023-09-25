@@ -422,13 +422,16 @@ func (p *PebbleClockStore) GetMasterClockFrame(
 		return nil, errors.Wrap(err, "get master clock frame")
 	}
 
+	copied := make([]byte, len(value))
+	copy(copied[:], value[:])
+
 	defer closer.Close()
 	frame := &protobufs.ClockFrame{}
 	frame.FrameNumber = frameNumber
 	frame.Filter = filter
-	frame.Difficulty = binary.BigEndian.Uint32(value[:4])
-	frame.Input = value[4 : len(value)-516]
-	frame.Output = value[len(value)-516:]
+	frame.Difficulty = binary.BigEndian.Uint32(copied[:4])
+	frame.Input = copied[4 : len(copied)-516]
+	frame.Output = copied[len(copied)-516:]
 
 	previousSelectorBytes := [516]byte{}
 	copy(previousSelectorBytes[:], frame.Input[:516])
