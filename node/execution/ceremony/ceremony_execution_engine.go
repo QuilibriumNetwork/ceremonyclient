@@ -485,11 +485,32 @@ func (e *CeremonyExecutionEngine) announceJoin(
 ) error {
 	idk, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
 	if err != nil {
-		return errors.Wrap(err, "announce join")
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			idk, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-idk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "announce key bundle")
+			}
+		} else {
+			return errors.Wrap(err, "announce key bundle")
+		}
 	}
+
 	spk, err := e.keyManager.GetAgreementKey("q-ratchet-spk")
 	if err != nil {
-		return errors.Wrap(err, "announce join")
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			spk, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-spk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "announce key bundle")
+			}
+		} else {
+			return errors.Wrap(err, "announce key bundle")
+		}
 	}
 
 	g := curves.ED448().Point.Generator()
