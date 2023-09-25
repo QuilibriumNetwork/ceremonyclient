@@ -45,6 +45,8 @@ type CeremonyExecutionEngine struct {
 	activeClockFrame           *protobufs.ClockFrame
 	alreadyPublishedShare      bool
 	alreadyPublishedTranscript bool
+	seenMessageMap             map[string]bool
+	seenMessageMx              sync.Mutex
 }
 
 func NewCeremonyExecutionEngine(
@@ -71,6 +73,8 @@ func NewCeremonyExecutionEngine(
 		participantMx:         sync.Mutex{},
 		peerChannels:          map[string]*p2p.PublicP2PChannel{},
 		alreadyPublishedShare: false,
+		seenMessageMx:         sync.Mutex{},
+		seenMessageMap:        map[string]bool{},
 	}
 
 	provingKey, _, publicKeyBytes, provingKeyAddress := e.clock.GetProvingKey(
@@ -329,7 +333,17 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 				zap.Uint64("current_round", app.RoundCount),
 			)
 
-			e.ensureSecrets(app)
+			if len(e.activeSecrets) == 0 {
+				// If we ended up in the scenario where we do not have any secrets
+				// available but we're in the round, we should politely leave.
+				for _, p := range app.ActiveParticipants {
+					if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+						e.publishDroppedParticipant(e.proverPublicKey)
+						break
+					}
+				}
+				continue
+			}
 
 			shouldConnect := false
 			position := 0
@@ -339,6 +353,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 					if bytes.Equal(p.KeyValue, e.proverPublicKey) {
 						shouldConnect = true
 						position = i
+						break
 					}
 				}
 			}
@@ -378,6 +393,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 					err := e.participateRound(app)
 					if err != nil {
 						e.logger.Error("error while participating in round", zap.Error(err))
+						e.publishDroppedParticipant(e.proverPublicKey)
 					}
 				}
 			} else if len(app.ActiveParticipants) == 1 &&
@@ -411,7 +427,19 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 				}
 			}
 
-			if !e.alreadyPublishedShare {
+			shouldPublish := false
+			for _, p := range app.ActiveParticipants {
+				if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+					shouldPublish = true
+					break
+				}
+			}
+
+			if !e.alreadyPublishedShare && shouldPublish {
+				if len(e.activeSecrets) == 0 {
+					e.publishDroppedParticipant(e.proverPublicKey)
+					continue
+				}
 				err := e.publishTranscriptShare(app)
 				if err != nil {
 					e.logger.Error(
@@ -620,8 +648,14 @@ func (e *CeremonyExecutionEngine) participateRound(
 		return errors.Wrap(err, "participate round")
 	}
 
+	spk, err := e.keyManager.GetAgreementKey("q-ratchet-spk")
+	if err != nil {
+		return errors.Wrap(err, "participate round")
+	}
+
 	idkPoint := curves.ED448().Point.Generator().Mul(idk)
 	idks := []curves.Point{}
+	initiator := false
 	for _, p := range app.ActiveParticipants {
 		if !bytes.Equal(p.KeyValue, e.proverPublicKey) {
 			ic, err := e.keyStore.GetLatestKeyBundle(p.KeyValue)
@@ -647,8 +681,35 @@ func (e *CeremonyExecutionEngine) participateRound(
 			if err != nil {
 				return errors.Wrap(err, "participate round")
 			}
+
+			receiverSpk, err := curves.ED448().Point.FromAffineCompressed(
+				kba.SignedPreKey.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+			)
+			if err != nil {
+				return errors.Wrap(err, "participate round")
+			}
+
+			if _, ok := e.peerChannels[string(p.KeyValue)]; !ok {
+				e.peerChannels[string(p.KeyValue)], err = p2p.NewPublicP2PChannel(
+					e.proverPublicKey,
+					p.KeyValue,
+					initiator,
+					idk,
+					spk,
+					receiverIdk,
+					receiverSpk,
+					curves.ED448(),
+					e.keyManager,
+					e.pubSub,
+				)
+				if err != nil {
+					return errors.Wrap(err, "participate round")
+				}
+			}
+
 			idks = append(idks, receiverIdk)
 		} else {
+			initiator = true
 			idks = append(idks, idkPoint)
 		}
 	}
@@ -666,19 +727,19 @@ func (e *CeremonyExecutionEngine) participateRound(
 		idks,
 		e.activeSecrets,
 		curves.BLS48581G1(),
-		func(i int, filter, msg []byte) error {
-			return e.peerChannels[string(filter[len(e.proverPublicKey):])].Send(msg)
+		func(i int, receiver []byte, msg []byte) error {
+			return e.peerChannels[string(receiver)].Send(msg)
 		},
-		func(i int, filter []byte) ([]byte, error) {
+		func(i int, sender []byte) ([]byte, error) {
 			msg, err := e.peerChannels[string(
-				filter[:len(e.proverPublicKey)],
+				sender,
 			)].Receive()
 			if err != nil {
-				e.publishDroppedParticipant(filter[:len(e.proverPublicKey)])
+				e.publishDroppedParticipant(sender)
 				return nil, err
 			} else {
 				if i == 0 {
-					e.publishLastSeenParticipant(filter[:len(e.proverPublicKey)])
+					e.publishLastSeenParticipant(sender)
 				}
 				return msg, nil
 			}

@@ -196,36 +196,39 @@ func TestProcessRound(t *testing.T) {
 
 		peerSecrets = append(peerSecrets, secrets)
 		originalPeerSecrets = append(originalPeerSecrets, originalSecrets)
-
 	}
 
 	messages := syncmap.Map{}
-	send := func(seq int, dst, msg []byte) error {
-		fmt.Printf("send %d bytes for seq %d to %+x\n", len(msg), seq, dst)
+	send := func(peer []byte) func(seq int, dst, msg []byte) error {
+		return func(seq int, dst, msg []byte) error {
+			fmt.Printf("send %d bytes for seq %d to %+x\n", len(msg), seq, dst)
 
-		b := byte(seq)
-		dst = append(append([]byte{}, b), dst...)
-		if msg == nil {
-			msg = []byte{0x01}
+			b := byte(seq)
+			dst = append(append(append([]byte{}, b), peer...), dst...)
+			if msg == nil {
+				msg = []byte{0x01}
+			}
+			messages.Store(string(dst), string(msg))
+			return nil
 		}
-		messages.Store(string(dst), string(msg))
-		return nil
 	}
-	recv := func(seq int, src []byte) ([]byte, error) {
-		fmt.Printf("recv %d from %+x\n", seq, src)
+	recv := func(peer []byte) func(seq int, src []byte) ([]byte, error) {
+		return func(seq int, src []byte) ([]byte, error) {
+			fmt.Printf("recv %d from %+x\n", seq, src)
 
-		b := byte(seq)
-		bsrc := append(append([]byte{}, b), src...)
+			b := byte(seq)
+			bsrc := append(append(append([]byte{}, b), src...), peer...)
 
-		msg, ok := messages.LoadAndDelete(string(bsrc))
-		for !ok {
-			fmt.Printf("no message yet, waiting for recv %d from %+x\n", seq, src)
+			msg, ok := messages.LoadAndDelete(string(bsrc))
+			for !ok {
+				fmt.Printf("no message yet, waiting for recv %d from %+x\n", seq, src)
 
-			time.Sleep(100 * time.Millisecond)
-			msg, ok = messages.LoadAndDelete(string(bsrc))
+				time.Sleep(100 * time.Millisecond)
+				msg, ok = messages.LoadAndDelete(string(bsrc))
+			}
+
+			return []byte(msg.(string)), nil
 		}
-
-		return []byte(msg.(string)), nil
 	}
 
 	for j := 1; j < 4; j++ {
@@ -244,8 +247,8 @@ func TestProcessRound(t *testing.T) {
 					idkPoints,
 					peerSecrets[i],
 					curves.BLS48581G1(),
-					send,
-					recv,
+					send(peerPoints[i]),
+					recv(peerPoints[i]),
 					[]byte{0x01},
 				)
 				require.NoError(t, err)

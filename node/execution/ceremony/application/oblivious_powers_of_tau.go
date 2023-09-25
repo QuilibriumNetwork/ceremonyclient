@@ -70,7 +70,7 @@ func ProcessRound(
 			for !participants[j].IsDone() {
 				var err error
 				if isReceiver {
-					msg, err = recv(seq, append(append([]byte{}, roundPeers[j]...), i...))
+					msg, err = recv(seq, roundPeers[j])
 					if err != nil {
 						return err
 					}
@@ -81,13 +81,13 @@ func ProcessRound(
 					return err
 				}
 
-				err = send(seq, append(append([]byte{}, i...), roundPeers[j]...), next)
+				err = send(seq, roundPeers[j], next)
 				if err != nil {
 					return err
 				}
 
 				if !isReceiver {
-					msg, err = recv(seq, append(append([]byte{}, roundPeers[j]...), i...))
+					msg, err = recv(seq, roundPeers[j])
 					if err != nil {
 						return err
 					}

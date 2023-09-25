@@ -4,6 +4,7 @@ import (
 	"bytes"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -36,42 +37,59 @@ func (a *CeremonyApplication) applyTranscript(
 		)
 	}
 
-	g1s := []*curves.PointBls48581G1{}
+	g1s := make([]*curves.PointBls48581G1, len(a.UpdatedTranscript.G1Powers))
+	eg := errgroup.Group{}
+	eg.SetLimit(100)
+
 	for i := range a.UpdatedTranscript.G1Powers {
-		if !bytes.Equal(
-			a.UpdatedTranscript.G1Powers[i].KeyValue,
-			transcript.G1Powers[i].KeyValue,
-		) {
-			return errors.Wrap(errors.New("invalid g1s"), "apply transcript")
-		}
+		i := i
+		eg.Go(func() error {
+			if !bytes.Equal(
+				a.UpdatedTranscript.G1Powers[i].KeyValue,
+				transcript.G1Powers[i].KeyValue,
+			) {
+				return errors.Wrap(errors.New("invalid g1s"), "apply transcript")
+			}
 
-		g1 := &curves.PointBls48581G1{}
-		x, err := g1.FromAffineCompressed(a.UpdatedTranscript.G1Powers[i].KeyValue)
-		if err != nil {
-			return errors.Wrap(err, "apply transcript")
-		}
-		g1, _ = x.(*curves.PointBls48581G1)
+			g1 := &curves.PointBls48581G1{}
+			x, err := g1.FromAffineCompressed(a.UpdatedTranscript.G1Powers[i].KeyValue)
+			if err != nil {
+				return errors.Wrap(err, "apply transcript")
+			}
+			g1, _ = x.(*curves.PointBls48581G1)
 
-		g1s = append(g1s, g1)
+			g1s[i] = g1
+
+			return nil
+		})
 	}
 
-	g2s := []*curves.PointBls48581G2{}
+	g2s := make([]*curves.PointBls48581G2, len(a.UpdatedTranscript.G2Powers))
 	for i := range a.UpdatedTranscript.G2Powers {
-		if !bytes.Equal(
-			a.UpdatedTranscript.G2Powers[i].KeyValue,
-			transcript.G2Powers[i].KeyValue,
-		) {
-			return errors.Wrap(errors.New("invalid g2s"), "apply transcript")
-		}
+		i := i
+		eg.Go(func() error {
+			if !bytes.Equal(
+				a.UpdatedTranscript.G2Powers[i].KeyValue,
+				transcript.G2Powers[i].KeyValue,
+			) {
+				return errors.Wrap(errors.New("invalid g2s"), "apply transcript")
+			}
 
-		g2 := &curves.PointBls48581G2{}
-		x, err := g2.FromAffineCompressed(a.UpdatedTranscript.G2Powers[i].KeyValue)
-		if err != nil {
-			return errors.Wrap(err, "apply transcript")
-		}
-		g2, _ = x.(*curves.PointBls48581G2)
+			g2 := &curves.PointBls48581G2{}
+			x, err := g2.FromAffineCompressed(a.UpdatedTranscript.G2Powers[i].KeyValue)
+			if err != nil {
+				return errors.Wrap(err, "apply transcript")
+			}
+			g2, _ = x.(*curves.PointBls48581G2)
 
-		g2s = append(g2s, g2)
+			g2s[i] = g2
+
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
 	g1Witnesses := []*curves.PointBls48581G1{}
