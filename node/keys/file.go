@@ -24,7 +24,7 @@ type FileKeyManager struct {
 }
 
 var UnsupportedKeyTypeErr = errors.New("unsupported key type")
-var KeyNotFoundErr = errors.New("unsupported key type")
+var KeyNotFoundErr = errors.New("key not found")
 
 func NewFileKeyManager(
 	keyStoreConfig *config.KeyConfig,

@@ -40,32 +40,27 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	for name := range e.executionEngines {
 		name := name
 		eg.Go(func() error {
-			applications := e.executionEngines[name].GetSupportedApplications()
-			for _, application := range applications {
-				if bytes.Equal(msg.Address, application.Address) {
-					messages, err := e.executionEngines[name].ProcessMessage(
-						msg.Address,
-						msg,
-					)
-					if err != nil {
-						e.logger.Error(
-							"could not process message for engine",
-							zap.Error(err),
-							zap.String("engine_name", name),
-						)
-						return errors.Wrap(err, "handle message")
-					}
+			messages, err := e.executionEngines[name].ProcessMessage(
+				msg.Address,
+				msg,
+			)
+			if err != nil {
+				e.logger.Error(
+					"could not process message for engine",
+					zap.Error(err),
+					zap.String("engine_name", name),
+				)
+				return errors.Wrap(err, "handle message")
+			}
 
-					for _, m := range messages {
-						if err := e.publishMessage(e.filter, m); err != nil {
-							e.logger.Error(
-								"could not publish message for engine",
-								zap.Error(err),
-								zap.String("engine_name", name),
-							)
-							return errors.Wrap(err, "handle message")
-						}
-					}
+			for _, m := range messages {
+				if err := e.publishMessage(m.Address, m); err != nil {
+					e.logger.Error(
+						"could not publish message for engine",
+						zap.Error(err),
+						zap.String("engine_name", name),
+					)
+					return errors.Wrap(err, "handle message")
 				}
 			}
 
@@ -87,6 +82,7 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 			return errors.Wrap(err, "handle message")
 		}
 	}
+
 	return nil
 }
 
@@ -115,7 +111,10 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 			"frame difficulty mismatched",
 			zap.Uint32("difficulty", frame.Difficulty),
 		)
-		return nil
+		return errors.Wrap(
+			errors.New("frame difficulty"),
+			"handle clock frame data",
+		)
 	}
 
 	e.logger.Info(

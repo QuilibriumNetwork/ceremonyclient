@@ -1,7 +1,12 @@
 package consensus
 
 import (
+	"crypto"
+
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/keys"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 type EngineState int
@@ -26,4 +31,20 @@ type ConsensusEngine interface {
 	GetDifficulty() uint32
 	GetState() EngineState
 	GetFrameChannel() <-chan uint64
+}
+
+type DataConsensusEngine interface {
+	Start(filter []byte, seed []byte) <-chan error
+	Stop(force bool) <-chan error
+	RegisterExecutor(exec execution.ExecutionEngine, frame uint64) <-chan error
+	UnregisterExecutor(name string, frame uint64, force bool) <-chan error
+	GetFrame() uint64
+	GetDifficulty() uint32
+	GetState() EngineState
+	GetFrameChannel() <-chan *protobufs.ClockFrame
+	GetActiveFrame() *protobufs.ClockFrame
+	GetProvingKey(
+		engineConfig *config.EngineConfig,
+	) (crypto.Signer, keys.KeyType, []byte, []byte)
+	IsInProverTrie(key []byte) bool
 }

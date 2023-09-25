@@ -16,8 +16,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-const PROTOCOL_VERSION = 1
-const PROTOCOL = 1<<8 + PROTOCOL_VERSION
+const DOUBLE_RATCHET_PROTOCOL_VERSION = 1
+const DOUBLE_RATCHET_PROTOCOL = 1<<8 + DOUBLE_RATCHET_PROTOCOL_VERSION
 
 const CHAIN_KEY = 0x01
 const MESSAGE_KEY = 0x02
@@ -29,7 +29,7 @@ const AEAD_KEY = 0x03
 type DoubleRatchetParticipant struct {
 	sendingEphemeralPrivateKey   curves.Scalar
 	receivingEphemeralKey        curves.Point
-	curve                        curves.Curve
+	curve                        *curves.Curve
 	keyManager                   keys.KeyManager
 	rootKey                      []byte
 	sendingChainKey              []byte
@@ -52,7 +52,7 @@ func NewDoubleRatchetParticipant(
 	isSender bool,
 	sendingEphemeralPrivateKey curves.Scalar,
 	receivingEphemeralKey curves.Point,
-	curve curves.Curve,
+	curve *curves.Curve,
 	keyManager keys.KeyManager,
 ) (*DoubleRatchetParticipant, error) {
 	participant := &DoubleRatchetParticipant{}
@@ -106,7 +106,7 @@ func (r *DoubleRatchetParticipant) RatchetEncrypt(
 	message []byte,
 ) (*protobufs.P2PChannelEnvelope, error) {
 	envelope := &protobufs.P2PChannelEnvelope{
-		ProtocolIdentifier: PROTOCOL,
+		ProtocolIdentifier: DOUBLE_RATCHET_PROTOCOL,
 		MessageHeader:      &protobufs.MessageCiphertext{},
 		MessageBody:        &protobufs.MessageCiphertext{},
 	}
@@ -181,8 +181,6 @@ func (r *DoubleRatchetParticipant) RatchetDecrypt(
 	}
 
 	newChainKey, messageKey, aeadKey := ratchetKeys(r.receivingChainKey)
-	r.receivingChainKey = newChainKey
-	r.currentReceivingChainLength++
 
 	plaintext, err = r.decrypt(
 		envelope.MessageBody,
@@ -192,6 +190,9 @@ func (r *DoubleRatchetParticipant) RatchetDecrypt(
 			envelope.MessageHeader.Ciphertext...,
 		),
 	)
+
+	r.receivingChainKey = newChainKey
+	r.currentReceivingChainLength++
 
 	return plaintext, errors.Wrap(err, "could not decrypt message")
 }

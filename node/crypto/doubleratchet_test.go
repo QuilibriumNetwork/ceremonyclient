@@ -43,7 +43,7 @@ func TestRatchetEncrypt(t *testing.T) {
 		true,
 		x448SendingEphemeralPrivateKey,
 		x448ReceivingSignedPreKey,
-		*curves.ED448(),
+		curves.ED448(),
 		nil,
 	)
 	require.NoError(t, err)
@@ -55,7 +55,7 @@ func TestRatchetEncrypt(t *testing.T) {
 		false,
 		x448ReceivingSignedPrePrivateKey,
 		x448SendingEphemeralKey,
-		*curves.ED448(),
+		curves.ED448(),
 		nil,
 	)
 	require.NoError(t, err)

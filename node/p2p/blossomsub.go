@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -76,12 +78,14 @@ func NewBlossomSub(
 
 	go discoverPeers(p2pConfig, ctx, logger, h)
 
+	// TODO: turn into an option flag for console logging, this is too noisy for
+	// default logging behavior
 	var tracer *blossomsub.JSONTracer
 	if p2pConfig.TraceLogFile == "" {
-		tracer, err = blossomsub.NewStdoutJSONTracer()
-		if err != nil {
-			panic(errors.Wrap(err, "error building stdout tracer"))
-		}
+		// tracer, err = blossomsub.NewStdoutJSONTracer()
+		// if err != nil {
+		// 	panic(errors.Wrap(err, "error building stdout tracer"))
+		// }
 	} else {
 		tracer, err = blossomsub.NewJSONTracer(p2pConfig.TraceLogFile)
 		if err != nil {
@@ -89,8 +93,9 @@ func NewBlossomSub(
 		}
 	}
 
-	blossomOpts := []blossomsub.Option{
-		blossomsub.WithEventTracer(tracer),
+	blossomOpts := []blossomsub.Option{}
+	if tracer != nil {
+		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
 
 	params := mergeDefaults(p2pConfig)
@@ -236,28 +241,60 @@ func initDHT(
 	if err = kademliaDHT.Bootstrap(ctx); err != nil {
 		panic(err)
 	}
-	var wg sync.WaitGroup
 
-	logger.Info("connecting to bootstrap", zap.String("peer_id", h.ID().String()))
+	reconnect := func() {
+		var wg sync.WaitGroup
 
-	defaultBootstrapPeers := p2pConfig.BootstrapPeers
+		logger.Info("connecting to bootstrap", zap.String("peer_id", h.ID().String()))
 
-	for _, peerAddr := range defaultBootstrapPeers {
-		peerinfo, err := peer.AddrInfoFromString(peerAddr)
-		if err != nil {
-			panic(err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-				logger.Warn("error while connecting to dht peer", zap.Error(err))
+		defaultBootstrapPeers := p2pConfig.BootstrapPeers
+
+		for _, peerAddr := range defaultBootstrapPeers {
+			peerinfo, err := peer.AddrInfoFromString(peerAddr)
+			if err != nil {
+				panic(err)
 			}
-		}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := h.Connect(ctx, *peerinfo); err != nil {
+					logger.Warn("error while connecting to dht peer", zap.Error(err))
+				}
+			}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
+
+	reconnect()
+
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			if len(h.Network().Peers()) == 0 {
+				logger.Info("reconnecting to peers")
+				reconnect()
+			}
+		}
+	}()
 
 	return kademliaDHT
+}
+
+func (b *BlossomSub) GetBitmaskPeers() map[string][]string {
+	peers := map[string][]string{}
+
+	for _, k := range b.bitmaskMap {
+		peers[fmt.Sprintf("%+x", k.Bitmask())] = []string{}
+
+		for _, p := range k.ListPeers() {
+			peers[fmt.Sprintf("%+x", k.Bitmask())] = append(
+				peers[fmt.Sprintf("%+x", k.Bitmask())],
+				p.String(),
+			)
+		}
+	}
+
+	return peers
 }
 
 func (b *BlossomSub) GetPeerstoreCount() int {

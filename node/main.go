@@ -4,8 +4,10 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -13,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/app"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 )
 
 var (
@@ -58,6 +61,8 @@ func main() {
 		panic(err)
 	}
 
+	clearIfTestData(*configDirectory, nodeConfig)
+
 	if *dbConsole {
 		console, err := app.NewDBConsole(nodeConfig)
 		if err != nil {
@@ -68,6 +73,9 @@ func main() {
 		return
 	}
 
+	fmt.Println("Loading ceremony state and starting node...")
+	qcrypto.Init()
+
 	node, err := app.NewNode(nodeConfig)
 	if err != nil {
 		panic(err)
@@ -76,6 +84,36 @@ func main() {
 
 	<-done
 	node.Stop()
+}
+
+func clearIfTestData(configDir string, nodeConfig *config.Config) {
+	_, err := os.Stat(filepath.Join(configDir, "RELEASE_VERSION"))
+	if os.IsNotExist(err) {
+		fmt.Println("Clearing test data...")
+		err := os.RemoveAll(nodeConfig.DB.Path)
+		if err != nil {
+			panic(err)
+		}
+
+		versionFile, err := os.OpenFile(
+			filepath.Join(configDir, "RELEASE_VERSION"),
+			os.O_CREATE|os.O_RDWR,
+			fs.FileMode(0700),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = versionFile.Write([]byte{0x01, 0x00, 0x00})
+		if err != nil {
+			panic(err)
+		}
+
+		err = versionFile.Close()
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 func printPeerID(p2pConfig *config.P2PConfig) {
@@ -135,5 +173,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                  Quilibrium Node - v1.0.0 – DHT Verification")
+	fmt.Println("                         Quilibrium Node - v1.0.0 – Dawn")
 }

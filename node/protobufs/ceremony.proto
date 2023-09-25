@@ -37,3 +37,90 @@ message CeremonyTranscript {
   // we do this.
   repeated quilibrium.node.keys.pb.BLS48581G2PublicKey running_g2_256_powers = 4;
 }
+
+message CeremonyLobbyState {
+  int32 lobby_state = 1;
+  oneof ceremony_state {
+    CeremonyOpenState ceremony_open_state = 2;
+    CeremonyInProgressState ceremony_in_progress_state = 3;
+    CeremonyFinalizingState ceremony_finalizing_state = 4;
+    CeremonyValidatingState ceremony_validating_state = 5;
+  }
+  CeremonyTranscript latest_transcript = 6;
+  bytes reward_trie = 7;
+}
+
+message CeremonySeenProverAttestation {
+  quilibrium.node.keys.pb.Ed448PublicKey seen_prover_key = 1;
+  uint64 last_seen_frame = 2;
+  quilibrium.node.keys.pb.Ed448Signature prover_signature = 3;
+}
+
+message CeremonyDroppedProverAttestation {
+  quilibrium.node.keys.pb.Ed448PublicKey dropped_prover_key = 1;
+  uint64 last_seen_frame = 2;
+  quilibrium.node.keys.pb.Ed448Signature prover_signature = 3;
+}
+
+message CeremonyTranscriptShare {
+  repeated quilibrium.node.keys.pb.BLS48581G1PublicKey additive_g1_powers = 1;
+  repeated quilibrium.node.keys.pb.BLS48581G2PublicKey additive_g2_powers = 2;
+  quilibrium.node.keys.pb.BLS48581G1PublicKey additive_g1_256_witness = 3;
+  quilibrium.node.keys.pb.BLS48581G2PublicKey additive_g2_256_witness = 4;
+  quilibrium.node.keys.pb.Ed448Signature prover_signature = 5;
+}
+
+// Describes the required proof to commit to a transcript to advance a round,
+// and as a proof to move to the verification state
+message CeremonyTranscriptCommit {
+  // Prover key signature over the G1 point of the additive share of the first
+  // power.
+  quilibrium.node.keys.pb.Ed448Signature prover_signature = 1;
+  // BLS short signature over the Ed448 prover public key, using the additive
+  // share of the first power.
+  quilibrium.node.keys.pb.BLS48581Signature contribution_signature = 2;
+}
+
+message CeremonyAdvanceRound {
+  repeated CeremonyTranscriptCommit commits = 1;
+}
+
+message CeremonyLobbyJoin {
+  uint64 frame_number = 1;
+  quilibrium.node.keys.pb.X448PublicKey identity_key = 2;
+  quilibrium.node.keys.pb.X448PublicKey signed_pre_key = 3;
+  quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 4;
+}
+
+message CeremonyLobbyStateTransition {
+  repeated string type_urls = 1;
+  repeated bytes transition_inputs = 2;
+}
+
+message CeremonyOpenState { 
+  repeated CeremonyLobbyJoin joined_participants = 1;
+  repeated quilibrium.node.keys.pb.Ed448PublicKey preferred_participants = 2;
+}
+
+message CeremonyInProgressState { 
+  repeated quilibrium.node.keys.pb.Ed448PublicKey active_participants = 1;
+  repeated CeremonySeenProverAttestation latest_seen_prover_attestations = 2;
+  repeated CeremonyDroppedProverAttestation dropped_participant_attestations = 3;
+  repeated CeremonyAdvanceRound transcript_round_advance_commits = 4;
+  repeated quilibrium.node.keys.pb.Ed448PublicKey next_round_participants = 5;
+}
+
+message CeremonyFinalizingState {
+  repeated quilibrium.node.keys.pb.Ed448PublicKey active_participants = 1;
+  repeated CeremonySeenProverAttestation latest_seen_prover_attestations = 2;
+  repeated CeremonyDroppedProverAttestation dropped_participant_attestations = 3;
+  repeated CeremonyTranscriptCommit commits = 4;
+  repeated CeremonyTranscriptShare shares = 5;
+  repeated quilibrium.node.keys.pb.Ed448PublicKey next_round_participants = 6;
+}
+
+message CeremonyValidatingState {
+  repeated CeremonyTranscriptCommit commits = 1;
+  CeremonyTranscript updated_transcript = 2;
+  repeated quilibrium.node.keys.pb.Ed448PublicKey next_round_participants = 3;
+}

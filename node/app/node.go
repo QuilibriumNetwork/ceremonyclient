@@ -5,7 +5,7 @@ import (
 
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/nop"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
 )
 
 type Node struct {
@@ -14,7 +14,7 @@ type Node struct {
 }
 
 func newNode(
-	nopExecutionEngine *nop.NopExecutionEngine,
+	ceremonyExecutionEngine *ceremony.CeremonyExecutionEngine,
 	engine consensus.ConsensusEngine,
 ) (*Node, error) {
 	if engine == nil {
@@ -22,8 +22,8 @@ func newNode(
 	}
 
 	execEngines := make(map[string]execution.ExecutionEngine)
-	if nopExecutionEngine != nil {
-		execEngines[nopExecutionEngine.GetName()] = nopExecutionEngine
+	if ceremonyExecutionEngine != nil {
+		execEngines[ceremonyExecutionEngine.GetName()] = ceremonyExecutionEngine
 	}
 
 	return &Node{

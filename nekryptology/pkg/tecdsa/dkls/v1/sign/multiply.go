@@ -31,7 +31,7 @@ import (
 // MultiplySender is the party that plays the role of Sender in the multiplication protocol (protocol 5 of the paper).
 type MultiplySender struct {
 	cOtSender           *kos.Sender   // underlying cOT sender struct, used by mult.
-	outputAdditiveShare curves.Scalar // ultimate output share of mult.
+	OutputAdditiveShare curves.Scalar // ultimate output share of mult.
 	gadget              []curves.Scalar
 	curve               *curves.Curve
 	transcript          *merlin.Transcript
@@ -41,7 +41,7 @@ type MultiplySender struct {
 // MultiplyReceiver is the party that plays the role of Sender in the multiplication protocol (protocol 5 of the paper).
 type MultiplyReceiver struct {
 	cOtReceiver         *kos.Receiver // underlying cOT receiver struct, used by mult.
-	outputAdditiveShare curves.Scalar // ultimate output share of mult.
+	OutputAdditiveShare curves.Scalar // ultimate output share of mult.
 	omega               []byte        // this is used as an intermediate result during the course of mult.
 	gadget              []curves.Scalar
 	curve               *curves.Curve
@@ -212,13 +212,13 @@ func (sender *MultiplySender) Round2Multiply(alpha curves.Scalar, round1Output *
 			return nil, errors.Wrap(err, "setting chi scalar from bytes")
 		}
 	}
-	sender.outputAdditiveShare = sender.curve.Scalar.Zero()
+	sender.OutputAdditiveShare = sender.curve.Scalar.Zero()
 	for j := uint(0); j < sender.cOtSender.L; j++ {
 		round2Output.R[j] = sender.curve.Scalar.Zero()
 		for k := 0; k < chiWidth; k++ {
 			round2Output.R[j] = round2Output.R[j].Add(chi[k].Mul(sender.cOtSender.OutputAdditiveShares[j][k]))
 		}
-		sender.outputAdditiveShare = sender.outputAdditiveShare.Add(sender.gadget[j].Mul(sender.cOtSender.OutputAdditiveShares[j][0]))
+		sender.OutputAdditiveShare = sender.OutputAdditiveShare.Add(sender.gadget[j].Mul(sender.cOtSender.OutputAdditiveShares[j][0]))
 	}
 	round2Output.U = chi[0].Mul(alpha).Add(chi[1].Mul(alphaHat))
 	return round2Output, nil
@@ -250,7 +250,7 @@ func (receiver *MultiplyReceiver) Round3Multiply(round2Output *MultiplyRound2Out
 		}
 	}
 
-	receiver.outputAdditiveShare = receiver.curve.Scalar.Zero()
+	receiver.OutputAdditiveShare = receiver.curve.Scalar.Zero()
 	for j := uint(0); j < receiver.cOtReceiver.L; j++ {
 		// compute the LHS of bob's step 6) for j. note that we're "adding r_j" to both sides"; so this LHS includes r_j.
 		// the reason to do this is so that the constant-time (i.e., independent of w_j) calculation of w_j * u can proceed more cleanly.
@@ -265,7 +265,7 @@ func (receiver *MultiplyReceiver) Round3Multiply(round2Output *MultiplyRound2Out
 		if subtle.ConstantTimeCompare(rightHandSideOfCheck[:], leftHandSideOfCheck.Bytes()) != 1 {
 			return fmt.Errorf("alice's values R and U failed to check in round 3 multiply")
 		}
-		receiver.outputAdditiveShare = receiver.outputAdditiveShare.Add(receiver.gadget[j].Mul(receiver.cOtReceiver.OutputAdditiveShares[j][0]))
+		receiver.OutputAdditiveShare = receiver.OutputAdditiveShare.Add(receiver.gadget[j].Mul(receiver.cOtReceiver.OutputAdditiveShares[j][0]))
 	}
 	return nil
 }

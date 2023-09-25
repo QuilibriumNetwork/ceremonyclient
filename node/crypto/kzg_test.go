@@ -328,16 +328,7 @@ func TestKZGProof(t *testing.T) {
 		commitment,
 		proof,
 	)
+	require.False(t, proof.IsIdentity())
 	require.NoError(t, err)
 	require.True(t, valid)
-}
-
-func ReverseScalarBytes(inBytes []byte) []byte {
-	outBytes := make([]byte, len(inBytes))
-
-	for i, j := 0, len(inBytes)-1; j >= 0; i, j = i+1, j-1 {
-		outBytes[i] = inBytes[j]
-	}
-
-	return outBytes
 }

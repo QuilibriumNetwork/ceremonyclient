@@ -82,6 +82,8 @@ func Init() {
 		panic(err)
 	}
 
+	bls48581.Init()
+
 	cs := &CeremonyState{}
 	if err := json.Unmarshal(csBytes, cs); err != nil {
 		panic(err)
@@ -607,7 +609,7 @@ func (p *KZGProver) CommitAggregate(
 		var err error
 		commitments[i], err = p.Commit(poly)
 		if err != nil {
-			return nil, errors.Wrap(err, "prove aggregate")
+			return nil, errors.Wrap(err, "commit aggregate")
 		}
 	}
 

@@ -66,3 +66,9 @@ message BLS48581G2PrivateKey {
   bytes key_value = 1; // 73 byte value
   BLS48581G2PublicKey public_key = 2;
 }
+
+// Describes a raw BLS48-581 signature, minimal signature size variant
+message BLS48581Signature {
+  bytes signature = 1; // 74 byte value
+  BLS48581G2PublicKey public_key = 2;
+}

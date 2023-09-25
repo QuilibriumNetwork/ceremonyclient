@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -56,10 +55,6 @@ func (
 	e *MasterClockConsensusEngine,
 ) createGenesisFrame() *protobufs.ClockFrame {
 	e.logger.Info("creating genesis frame")
-	for _, l := range strings.Split(string(e.input), "\n") {
-		e.logger.Info(l)
-	}
-
 	b := sha3.Sum256(e.input)
 	v := vdf.New(e.difficulty, b)
 

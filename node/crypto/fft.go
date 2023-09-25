@@ -86,7 +86,7 @@ func FFT(
 	}
 
 	// We make a copy so we can mutate it during the work.
-	workingValues := make([]curves.PairingScalar, width, width)
+	workingValues := make([]curves.PairingScalar, width)
 	for i := 0; i < len(values); i++ {
 		workingValue := values[i].Clone()
 		workingValues[i] = workingValue.(curves.PairingScalar)
@@ -101,7 +101,7 @@ func FFT(
 		workingValues[i] = workingValue.(curves.PairingScalar)
 	}
 
-	out := make([]curves.PairingScalar, width, width)
+	out := make([]curves.PairingScalar, width)
 	stride := fftWidth / width
 
 	for i := 0; i < len(out); i++ {
@@ -210,7 +210,7 @@ func FFTG1(
 		width = nearestPowerOfTwo(width)
 	}
 
-	workingValues := make([]curves.PairingPoint, width, width)
+	workingValues := make([]curves.PairingPoint, width)
 	for i := 0; i < len(values); i++ {
 		workingValue, err := curve.NewG1GeneratorPoint().FromAffineCompressed(
 			values[i].ToAffineCompressed(),
@@ -224,7 +224,7 @@ func FFTG1(
 		workingValues[i] = curve.NewG1IdentityPoint()
 	}
 
-	out := make([]curves.PairingPoint, width, width)
+	out := make([]curves.PairingPoint, width)
 	stride := fftWidth / width
 
 	for i := 0; i < len(out); i++ {

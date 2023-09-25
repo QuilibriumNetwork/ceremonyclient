@@ -44,7 +44,7 @@ func TestMultiply(t *testing.T) {
 	require.Nil(t, err)
 
 	product := alpha.Mul(beta)
-	sum := sender.outputAdditiveShare.Add(receiver.outputAdditiveShare)
+	sum := sender.OutputAdditiveShare.Add(receiver.OutputAdditiveShare)
 	require.Equal(t, product, sum)
 }
 
@@ -88,14 +88,14 @@ func TestMultiplyBLS48(t *testing.T) {
 
 	generator := alpha.Point().Generator()
 	product := generator.Mul(alpha).Mul(beta)
-	sum := generator.Mul(sender.outputAdditiveShare).Add(generator.Mul(receiver.outputAdditiveShare))
+	sum := generator.Mul(sender.OutputAdditiveShare).Add(generator.Mul(receiver.OutputAdditiveShare))
 
 	g2generator := curves.BLS48581G2().NewGeneratorPoint()
 	g2product := g2generator.Mul(alpha).Mul(beta)
-	g2sum := g2generator.Mul(sender.outputAdditiveShare).Add(g2generator.Mul(receiver.outputAdditiveShare))
+	g2sum := g2generator.Mul(sender.OutputAdditiveShare).Add(g2generator.Mul(receiver.OutputAdditiveShare))
 
 	product2 := generator.Mul(alpha2).Mul(beta2)
-	sum2 := generator.Mul(sender2.outputAdditiveShare).Add(generator.Mul(receiver2.outputAdditiveShare))
+	sum2 := generator.Mul(sender2.OutputAdditiveShare).Add(generator.Mul(receiver2.OutputAdditiveShare))
 	sum2Neg := sum2.Neg()
 
 	result := product.(*curves.PointBls48581G1).MultiPairing(

@@ -234,7 +234,7 @@ func (alice *Alice) Round3Sign(message []byte, round2Output *SignRound2Output) (
 
 	one := alice.curve.Scalar.One()
 	gamma1 := alice.curve.ScalarBaseMult(kA.Mul(phi).Add(one))
-	other := r.Mul(multiplySenders[0].outputAdditiveShare.Neg())
+	other := r.Mul(multiplySenders[0].OutputAdditiveShare.Neg())
 	gamma1 = gamma1.Add(other)
 	hashGamma1Bytes := sha3.Sum256(gamma1.ToAffineCompressed())
 	hashGamma1, err := alice.curve.Scalar.SetBytes(hashGamma1Bytes[:])
@@ -260,9 +260,9 @@ func (alice *Alice) Round3Sign(message []byte, round2Output *SignRound2Output) (
 		return nil, errors.Wrap(err, "setting rX scalar from bytes")
 	}
 
-	sigA := hOfMAsInteger.Mul(multiplySenders[0].outputAdditiveShare).Add(rX.Mul(multiplySenders[1].outputAdditiveShare))
-	gamma2 := alice.publicKey.Mul(multiplySenders[0].outputAdditiveShare)
-	other = alice.curve.ScalarBaseMult(multiplySenders[1].outputAdditiveShare.Neg())
+	sigA := hOfMAsInteger.Mul(multiplySenders[0].OutputAdditiveShare).Add(rX.Mul(multiplySenders[1].OutputAdditiveShare))
+	gamma2 := alice.publicKey.Mul(multiplySenders[0].OutputAdditiveShare)
+	other = alice.curve.ScalarBaseMult(multiplySenders[1].OutputAdditiveShare.Neg())
 	gamma2 = gamma2.Add(other)
 	hashGamma2Bytes := sha3.Sum256(gamma2.ToAffineCompressed())
 	hashGamma2, err := alice.curve.Scalar.SetBytes(hashGamma2Bytes[:])
@@ -314,14 +314,14 @@ func (bob *Bob) Round4Final(message []byte, round3Output *SignRound3Output) erro
 		R: rX.Add(zero).BigInt(), // slight trick here; add it to 0 just to mod it by q (now it's mod p!)
 		V: int(rY),
 	}
-	gamma1 := r.Mul(bob.multiplyReceivers[0].outputAdditiveShare)
+	gamma1 := r.Mul(bob.multiplyReceivers[0].OutputAdditiveShare)
 	gamma1HashedBytes := sha3.Sum256(gamma1.ToAffineCompressed())
 	gamma1Hashed, err := bob.curve.Scalar.SetBytes(gamma1HashedBytes[:])
 	if err != nil {
 		return errors.Wrap(err, "setting gamma1Hashed scalar from bytes")
 	}
 	phi := round3Output.EtaPhi.Sub(gamma1Hashed)
-	theta := bob.multiplyReceivers[0].outputAdditiveShare.Sub(phi.Div(bob.kB))
+	theta := bob.multiplyReceivers[0].OutputAdditiveShare.Sub(phi.Div(bob.kB))
 	if _, err = bob.hash.Write(message); err != nil {
 		return errors.Wrap(err, "writing message to hash in Bob sign round 5 final")
 	}
@@ -334,8 +334,8 @@ func (bob *Bob) Round4Final(message []byte, round3Output *SignRound3Output) erro
 	if err != nil {
 		return errors.Wrap(err, "setting capitalR scalar from big int")
 	}
-	sigB := digest.Mul(theta).Add(capitalR.Mul(bob.multiplyReceivers[1].outputAdditiveShare))
-	gamma2 := bob.curve.ScalarBaseMult(bob.multiplyReceivers[1].outputAdditiveShare)
+	sigB := digest.Mul(theta).Add(capitalR.Mul(bob.multiplyReceivers[1].OutputAdditiveShare))
+	gamma2 := bob.curve.ScalarBaseMult(bob.multiplyReceivers[1].OutputAdditiveShare)
 	other := bob.publicKey.Mul(theta.Neg())
 	gamma2 = gamma2.Add(other)
 	gamma2HashedBytes := sha3.Sum256(gamma2.ToAffineCompressed())

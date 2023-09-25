@@ -14,7 +14,6 @@ import (
 
 	"golang.org/x/crypto/sha3"
 
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/internal"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581/ext"
 )
@@ -240,7 +239,11 @@ func (s *ScalarBls48581) SetBigInt(v *big.Int) (Scalar, error) {
 	if v == nil {
 		return nil, fmt.Errorf("invalid value")
 	}
-	i := bls48581.FromBytes(internal.ReverseScalarBytes(v.Bytes()))
+	t := make([]byte, bls48581.MODBYTES)
+	b := v.Bytes()
+	copy(t[bls48581.MODBYTES-uint(len(b)):], b)
+
+	i := bls48581.FromBytes(t)
 	i.Mod(bls48581.NewBIGints(bls48581.CURVE_Order))
 	return &ScalarBls48581{
 		Value: i,
@@ -251,19 +254,22 @@ func (s *ScalarBls48581) SetBigInt(v *big.Int) (Scalar, error) {
 func (s *ScalarBls48581) BigInt() *big.Int {
 	bytes := make([]byte, bls48581.MODBYTES)
 	s.Value.ToBytes(bytes)
-	return new(big.Int).SetBytes(internal.ReverseScalarBytes(bytes))
+
+	return new(big.Int).SetBytes(bytes)
 }
 
 func (s *ScalarBls48581) Bytes() []byte {
 	t := make([]byte, bls48581.MODBYTES)
 	s.Value.ToBytes(t)
-	return internal.ReverseScalarBytes(t)
+
+	return t
 }
 
 func (s *ScalarBls48581) SetBytes(bytes []byte) (Scalar, error) {
 	var seq [bls48581.MODBYTES]byte
-	copy(seq[:], internal.ReverseScalarBytes(bytes))
+	copy(seq[bls48581.MODBYTES-uint(len(bytes)):], bytes)
 	value := bls48581.FromBytes(seq[:])
+
 	if value == nil {
 		return nil, errors.New("could not deserialize")
 	}
@@ -277,7 +283,7 @@ func (s *ScalarBls48581) SetBytesWide(bytes []byte) (Scalar, error) {
 		return nil, fmt.Errorf("invalid length")
 	}
 	var seq [bls48581.MODBYTES]byte
-	copy(seq[:], internal.ReverseScalarBytes(bytes))
+	copy(seq[:], bytes)
 	value := bls48581.FromBytes(seq[:])
 	if value == nil {
 		return nil, errors.New("could not deserialize")

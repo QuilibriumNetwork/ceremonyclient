@@ -13,9 +13,10 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.7.0
 	golang.org/x/crypto v0.9.0
-	golang.org/x/sys v0.8.0
 	golang.org/x/tools v0.1.5
 )
+
+require golang.org/x/sys v0.8.0 // indirect
 
 require (
 	github.com/cloudflare/circl v1.3.3
