@@ -491,10 +491,10 @@ func (e *CeremonyExecutionEngine) announceJoin(
 				keys.KeyTypeX448,
 			)
 			if err != nil {
-				return errors.Wrap(err, "announce key bundle")
+				return errors.Wrap(err, "announce join")
 			}
 		} else {
-			return errors.Wrap(err, "announce key bundle")
+			return errors.Wrap(err, "announce join")
 		}
 	}
 
@@ -506,10 +506,10 @@ func (e *CeremonyExecutionEngine) announceJoin(
 				keys.KeyTypeX448,
 			)
 			if err != nil {
-				return errors.Wrap(err, "announce key bundle")
+				return errors.Wrap(err, "announce join")
 			}
 		} else {
-			return errors.Wrap(err, "announce key bundle")
+			return errors.Wrap(err, "announce join")
 		}
 	}
 
