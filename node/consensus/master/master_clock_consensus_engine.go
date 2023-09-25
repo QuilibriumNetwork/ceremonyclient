@@ -177,10 +177,6 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				zap.Int("peer_store_count", e.pubSub.GetPeerstoreCount()),
 				zap.Int("network_peer_count", e.pubSub.GetNetworkPeersCount()),
 			)
-			e.logger.Info(
-				"peers by bitmask",
-				zap.Any("peers", e.pubSub.GetBitmaskPeers()),
-			)
 			time.Sleep(10 * time.Second)
 		}
 	}()
