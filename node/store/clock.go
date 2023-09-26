@@ -275,7 +275,9 @@ func extractFrameNumberAndFilterFromMasterFrameKey(
 		)
 	}
 
-	return binary.BigEndian.Uint64(key[2:10]), key[10:], nil
+	copied := make([]byte, len(key))
+	copy(copied, key)
+	return binary.BigEndian.Uint64(copied[2:10]), copied[10:], nil
 }
 
 func clockDataFrameKey(
