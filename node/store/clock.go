@@ -123,7 +123,8 @@ func (p *PebbleMasterClockIterator) Value() (*protobufs.ClockFrame, error) {
 	}
 
 	frame.FrameNumber = frameNumber
-	frame.Filter = filter
+	frame.Filter = make([]byte, len(filter))
+	copy(frame.Filter, filter)
 
 	if len(value) < 521 {
 		return nil, errors.Wrap(
@@ -132,9 +133,12 @@ func (p *PebbleMasterClockIterator) Value() (*protobufs.ClockFrame, error) {
 		)
 	}
 
-	frame.Difficulty = binary.BigEndian.Uint32(value[:4])
-	frame.Input = value[4 : len(value)-516]
-	frame.Output = value[len(value)-516:]
+	copied := make([]byte, len(value))
+	copy(copied, value)
+
+	frame.Difficulty = binary.BigEndian.Uint32(copied[:4])
+	frame.Input = copied[4 : len(copied)-516]
+	frame.Output = copied[len(copied)-516:]
 
 	previousSelectorBytes := [516]byte{}
 	copy(previousSelectorBytes[:], frame.Input[:516])
