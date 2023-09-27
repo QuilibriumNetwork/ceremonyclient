@@ -47,11 +47,20 @@ func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
 	db := store.NewPebbleDB(dbConfig)
 	zapLogger := logger()
 	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
-	dbConsole, err := newDBConsole(pebbleClockStore)
+	pebbleDataProofStore := store.NewPebbleDataProofStore(db, zapLogger)
+	dbConsole, err := newDBConsole(pebbleClockStore, pebbleDataProofStore)
 	if err != nil {
 		return nil, err
 	}
 	return dbConsole, nil
+}
+
+func NewClockStore(configConfig *config.Config) (store.ClockStore, error) {
+	dbConfig := configConfig.DB
+	db := store.NewPebbleDB(dbConfig)
+	zapLogger := logger()
+	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
+	return pebbleClockStore, nil
 }
 
 // wire.go:
@@ -71,7 +80,7 @@ var loggerSet = wire.NewSet(
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))
 
-var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, store.NewPebbleClockStore, store.NewPebbleKeyStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)))
+var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)))
 
 var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)))
 

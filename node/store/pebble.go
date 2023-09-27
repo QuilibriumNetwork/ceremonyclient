@@ -18,6 +18,7 @@ type Transaction interface {
 	Set(key []byte, value []byte) error
 	Commit() error
 	Delete(key []byte) error
+	Abort() error
 }
 
 type PebbleTransaction struct {
@@ -34,6 +35,10 @@ func (t *PebbleTransaction) Commit() error {
 
 func (t *PebbleTransaction) Delete(key []byte) error {
 	return t.b.Delete(key, &pebble.WriteOptions{Sync: true})
+}
+
+func (t *PebbleTransaction) Abort() error {
+	return t.b.Close()
 }
 
 var _ Transaction = (*PebbleTransaction)(nil)
