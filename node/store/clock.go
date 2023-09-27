@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -71,6 +72,7 @@ type ClockStore interface {
 		parent []byte,
 		frameNumber uint64,
 	) (*protobufs.ClockFrame, error)
+	Deduplicate(filter []byte) error
 }
 
 type PebbleClockStore struct {
@@ -85,11 +87,13 @@ type PebbleMasterClockIterator struct {
 }
 
 type PebbleClockIterator struct {
-	i *pebble.Iterator
+	i  *pebble.Iterator
+	db *PebbleClockStore
 }
 
 type PebbleCandidateClockIterator struct {
-	i *pebble.Iterator
+	i  *pebble.Iterator
+	db *PebbleClockStore
 }
 
 var _ Iterator[*protobufs.ClockFrame] = (*PebbleMasterClockIterator)(nil)
@@ -183,6 +187,13 @@ func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 		)
 	}
 
+	if err := p.db.fillAggregateProofs(frame); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get clock frame iterator value",
+		)
+	}
+
 	return frame, nil
 }
 
@@ -213,6 +224,13 @@ func (p *PebbleCandidateClockIterator) Value() (*protobufs.ClockFrame, error) {
 		return nil, errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
 			"get candidate clock frame iterator value",
+		)
+	}
+
+	if err := p.db.fillAggregateProofs(frame); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get clock frame iterator value",
 		)
 	}
 
@@ -542,6 +560,13 @@ func (p *PebbleClockStore) GetDataClockFrame(
 		)
 	}
 
+	if err = p.fillAggregateProofs(frame); err != nil {
+		return nil, nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get data clock frame",
+		)
+	}
+
 	proverTrie := &tries.RollingFrecencyCritbitTrie{}
 
 	trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
@@ -556,6 +581,98 @@ func (p *PebbleClockStore) GetDataClockFrame(
 	}
 
 	return frame, proverTrie, nil
+}
+
+func (p *PebbleClockStore) fillAggregateProofs(
+	frame *protobufs.ClockFrame,
+) error {
+	if frame.FrameNumber == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(frame.Input[516:])/74; i++ {
+		commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
+		ap, err := internalGetAggregateProof(
+			p.db,
+			frame.Filter,
+			commit,
+			frame.FrameNumber,
+			func(typeUrl string, data [][]byte) ([]byte, error) {
+				if typeUrl == protobufs.IntrinsicExecutionOutputType {
+					o := &protobufs.IntrinsicExecutionOutput{}
+					copiedLeft := make([]byte, len(data[0]))
+					copiedRight := make([]byte, len(data[1]))
+					copy(copiedLeft, data[0])
+					copy(copiedRight, data[1])
+
+					o.Address = copiedLeft[:32]
+					o.Output = copiedLeft[32:]
+					o.Proof = copiedRight
+					return proto.Marshal(o)
+				}
+
+				copied := make([]byte, len(data[0]))
+				copy(copied, data[0])
+				return copied, nil
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		frame.AggregateProofs = append(frame.AggregateProofs, ap)
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) saveAggregateProofs(
+	txn Transaction,
+	frame *protobufs.ClockFrame,
+) error {
+	shouldClose := false
+	if txn == nil {
+		var err error
+		txn, err = p.NewTransaction()
+		if err != nil {
+			return err
+		}
+
+		shouldClose = true
+	}
+
+	for i := 0; i < len(frame.Input[516:])/74; i++ {
+		commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
+		err := internalPutAggregateProof(
+			p.db,
+			txn,
+			frame.AggregateProofs[i],
+			commit, func(typeUrl string, data []byte) ([][]byte, error) {
+				if typeUrl == protobufs.IntrinsicExecutionOutputType {
+					o := &protobufs.IntrinsicExecutionOutput{}
+					if err := proto.Unmarshal(data, o); err != nil {
+						return nil, err
+					}
+					leftBits := append([]byte{}, o.Address...)
+					leftBits = append(leftBits, o.Output...)
+					rightBits := o.Proof
+					return [][]byte{leftBits, rightBits}, nil
+				}
+
+				return [][]byte{data}, nil
+			})
+		if err != nil {
+			if err = txn.Abort(); err != nil {
+				return err
+			}
+		}
+	}
+
+	if shouldClose {
+		txn.Commit()
+	}
+
+	return nil
 }
 
 // GetEarliestDataClockFrame implements ClockStore.
@@ -656,6 +773,13 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 		return nil, errors.Wrap(err, "get parent data clock frame")
 	}
 
+	if err := p.fillAggregateProofs(parent); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get clock frame iterator value",
+		)
+	}
+
 	if closer != nil {
 		closer.Close()
 	}
@@ -671,6 +795,19 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 	frame *protobufs.ClockFrame,
 	txn Transaction,
 ) error {
+	if err := p.saveAggregateProofs(nil, frame); err != nil {
+		return errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"put candidate data clock frame",
+		)
+	}
+
+	temp := append(
+		[]*protobufs.InclusionAggregateProof{},
+		frame.AggregateProofs...,
+	)
+	frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
+
 	data, err := proto.Marshal(frame)
 	if err != nil {
 		return errors.Wrap(
@@ -678,6 +815,8 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 			"put candidate data clock frame",
 		)
 	}
+
+	frame.AggregateProofs = temp
 
 	if err = txn.Set(
 		clockDataCandidateFrameKey(
@@ -711,6 +850,22 @@ func (p *PebbleClockStore) PutDataClockFrame(
 	proverTrie *tries.RollingFrecencyCritbitTrie,
 	txn Transaction,
 ) error {
+	if frame.FrameNumber != 0 {
+		if err := p.saveAggregateProofs(nil, frame); err != nil {
+			return errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"put candidate data clock frame",
+			)
+		}
+	}
+
+	temp := append(
+		[]*protobufs.InclusionAggregateProof{},
+		frame.AggregateProofs...,
+	)
+	if frame.FrameNumber != 0 {
+		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
+	}
 	data, err := proto.Marshal(frame)
 	if err != nil {
 		return errors.Wrap(
@@ -719,6 +874,9 @@ func (p *PebbleClockStore) PutDataClockFrame(
 		)
 	}
 
+	if frame.FrameNumber != 0 {
+		frame.AggregateProofs = temp
+	}
 	frameNumberBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(frameNumberBytes, frame.FrameNumber)
 
@@ -811,7 +969,7 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 	})
 
 	frames := []*protobufs.ClockFrame{}
-	i := &PebbleCandidateClockIterator{i: iter}
+	i := &PebbleCandidateClockIterator{i: iter, db: p}
 
 	for i.First(); i.Valid(); i.Next() {
 		value, err := i.Value()
@@ -861,7 +1019,7 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 		),
 	})
 
-	return &PebbleCandidateClockIterator{i: iter}, nil
+	return &PebbleCandidateClockIterator{i: iter, db: p}, nil
 }
 
 // RangeDataClockFrames implements ClockStore.
@@ -881,5 +1039,184 @@ func (p *PebbleClockStore) RangeDataClockFrames(
 		UpperBound: clockDataFrameKey(filter, endFrameNumber),
 	})
 
-	return &PebbleClockIterator{i: iter}, nil
+	return &PebbleClockIterator{i: iter, db: p}, nil
+}
+
+// Should only need be run once, before starting
+func (p *PebbleClockStore) Deduplicate(filter []byte) error {
+	from := clockDataParentIndexKey(
+		filter,
+		1,
+		[]byte{
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		},
+	)
+	to := clockDataParentIndexKey(
+		filter,
+		20000,
+		[]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+	)
+
+	iter := p.db.NewIter(&pebble.IterOptions{
+		LowerBound: from,
+		UpperBound: to,
+	})
+
+	i := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		value := iter.Value()
+		frame := &protobufs.ClockFrame{}
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return err
+		}
+
+		if err := p.saveAggregateProofs(nil, frame); err != nil {
+			return err
+		}
+
+		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
+		newValue, err := proto.Marshal(frame)
+		if err != nil {
+			return err
+		}
+
+		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		if err != nil {
+			return err
+		}
+		i++
+		if i%100 == 0 {
+			fmt.Println("Deduplicated 100 parent frames")
+		}
+	}
+
+	iter.Close()
+	if err := p.db.Compact(from, to, true); err != nil {
+		return err
+	}
+
+	from = clockDataFrameKey(filter, 1)
+	to = clockDataFrameKey(filter, 20000)
+
+	iter = p.db.NewIter(&pebble.IterOptions{
+		LowerBound: from,
+		UpperBound: to,
+	})
+
+	i = 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		value := iter.Value()
+		frame := &protobufs.ClockFrame{}
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return err
+		}
+
+		if err := p.saveAggregateProofs(nil, frame); err != nil {
+			return err
+		}
+
+		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
+		newValue, err := proto.Marshal(frame)
+		if err != nil {
+			return err
+		}
+
+		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		if err != nil {
+			return err
+		}
+		i++
+		if i%100 == 0 {
+			fmt.Println("Deduplicated 100 data frames")
+		}
+	}
+
+	iter.Close()
+	if err := p.db.Compact(from, to, true); err != nil {
+		return err
+	}
+
+	from = clockDataCandidateFrameKey(
+		filter,
+		1,
+		[]byte{
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		},
+		[]byte{
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		},
+	)
+	to = clockDataCandidateFrameKey(
+		filter,
+		20000,
+		[]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+		[]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+	)
+
+	iter = p.db.NewIter(&pebble.IterOptions{
+		LowerBound: from,
+		UpperBound: to,
+	})
+
+	i = 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		value := iter.Value()
+		frame := &protobufs.ClockFrame{}
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return err
+		}
+
+		if err := p.saveAggregateProofs(nil, frame); err != nil {
+			return err
+		}
+
+		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
+		newValue, err := proto.Marshal(frame)
+		if err != nil {
+			return err
+		}
+
+		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		if err != nil {
+			return err
+		}
+
+		i++
+		if i%100 == 0 {
+			fmt.Println("Deduplicated 100 candidate frames")
+		}
+	}
+
+	iter.Close()
+	if err := p.db.Compact(from, to, true); err != nil {
+		return err
+	}
+
+	p.db.Close()
+
+	return nil
 }

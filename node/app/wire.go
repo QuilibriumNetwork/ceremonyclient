@@ -40,8 +40,10 @@ var storeSet = wire.NewSet(
 	store.NewPebbleDB,
 	store.NewPebbleClockStore,
 	store.NewPebbleKeyStore,
+	store.NewPebbleDataProofStore,
 	wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)),
 	wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)),
+	wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)),
 )
 
 var pubSubSet = wire.NewSet(
@@ -86,4 +88,8 @@ func NewNode(*config.Config) (*Node, error) {
 
 func NewDBConsole(*config.Config) (*DBConsole, error) {
 	panic(wire.Build(loggerSet, storeSet, newDBConsole))
+}
+
+func NewClockStore(*config.Config) (store.ClockStore, error) {
+	panic(wire.Build(loggerSet, storeSet))
 }
