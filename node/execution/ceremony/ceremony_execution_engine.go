@@ -282,12 +282,6 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 
 		switch app.LobbyState {
 		case application.CEREMONY_APPLICATION_STATE_OPEN:
-			e.logger.Info(
-				"lobby open for joins",
-				zap.Any("lobby_joins", app.LobbyJoins),
-				zap.Any("preferred_participants", app.NextRoundPreferredParticipants),
-				zap.Uint64("state_count", app.StateCount),
-			)
 			e.alreadyPublishedShare = false
 			e.alreadyPublishedTranscript = false
 			alreadyJoined := false
@@ -300,6 +294,14 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 					break
 				}
 			}
+
+			e.logger.Info(
+				"lobby open for joins",
+				zap.Int("joined_participants", len(app.LobbyJoins)),
+				zap.Int("preferred_participants", len(app.NextRoundPreferredParticipants)),
+				zap.Bool("in_lobby", alreadyJoined),
+				zap.Uint64("state_count", app.StateCount),
+			)
 
 			if !alreadyJoined {
 				e.logger.Info(
@@ -318,32 +320,36 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 				e.ensureSecrets(app)
 			}
 		case application.CEREMONY_APPLICATION_STATE_IN_PROGRESS:
+			inRound := false
+			for _, p := range app.ActiveParticipants {
+				if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+					inRound = true
+					break
+				}
+			}
+
+			if len(e.activeSecrets) == 0 && inRound {
+				// If we ended up in the scenario where we do not have any secrets
+				// available but we're in the round, we should politely leave.
+				e.publishDroppedParticipant(e.proverPublicKey)
+				continue
+			}
+
 			e.logger.Info(
 				"round in progress",
 				zap.Any("participants", app.ActiveParticipants),
-				zap.Any("current_seen_attestations", app.LatestSeenProverAttestations),
+				zap.Any("current_seen_attestations", len(app.LatestSeenProverAttestations)),
 				zap.Any(
 					"current_dropped_attestations",
-					app.DroppedParticipantAttestations,
+					len(app.DroppedParticipantAttestations),
 				),
 				zap.Any(
 					"preferred_participants_for_next_round",
-					app.NextRoundPreferredParticipants,
+					len(app.NextRoundPreferredParticipants),
 				),
-				zap.Uint64("current_round", app.RoundCount),
+				zap.Bool("in_round", inRound),
+				zap.Uint64("current_sub_round", app.RoundCount),
 			)
-
-			if len(e.activeSecrets) == 0 {
-				// If we ended up in the scenario where we do not have any secrets
-				// available but we're in the round, we should politely leave.
-				for _, p := range app.ActiveParticipants {
-					if bytes.Equal(p.KeyValue, e.proverPublicKey) {
-						e.publishDroppedParticipant(e.proverPublicKey)
-						break
-					}
-				}
-				continue
-			}
 
 			shouldConnect := false
 			position := 0
@@ -405,15 +411,15 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 		case application.CEREMONY_APPLICATION_STATE_FINALIZING:
 			e.logger.Info(
 				"round contribution finalizing",
-				zap.Any("participants", app.ActiveParticipants),
-				zap.Any("current_seen_attestations", app.LatestSeenProverAttestations),
+				zap.Any("participants", len(app.ActiveParticipants)),
+				zap.Any("current_seen_attestations", len(app.LatestSeenProverAttestations)),
 				zap.Any(
 					"current_dropped_attestations",
-					app.DroppedParticipantAttestations,
+					len(app.DroppedParticipantAttestations),
 				),
 				zap.Any(
 					"preferred_participants_for_next_round",
-					app.NextRoundPreferredParticipants,
+					len(app.NextRoundPreferredParticipants),
 				),
 				zap.Int("finalized_shares", len(app.TranscriptShares)),
 			)

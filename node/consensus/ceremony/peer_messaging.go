@@ -7,7 +7,6 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -27,6 +26,10 @@ func (e *CeremonyDataClockConsensusEngine) handleSync(
 		zap.Binary("from", message.From),
 		zap.Binary("signature", message.Signature),
 	)
+	if bytes.Equal(message.From, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
 	msg := &protobufs.Message{}
 
 	if err := proto.Unmarshal(message.Data, msg); err != nil {
@@ -38,35 +41,15 @@ func (e *CeremonyDataClockConsensusEngine) handleSync(
 		return errors.Wrap(err, "handle sync")
 	}
 
-	eg := errgroup.Group{}
-	eg.SetLimit(len(e.executionEngines))
-
-	for name := range e.executionEngines {
-		name := name
-		eg.Go(func() error {
-			// if message,err := e.executionEngines[name].ProcessMessage(
-			if _, err := e.executionEngines[name].ProcessMessage(
-				msg.Address,
-				msg,
-			); err != nil {
-				e.logger.Error(
-					"could not process message for engine",
-					zap.Error(err),
-					zap.String("engine_name", name),
-				)
-				return err
-			}
-
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		e.logger.Error("rejecting invalid message", zap.Error(err))
-		return errors.Wrap(err, "handle sync")
-	}
-
 	switch any.TypeUrl {
+	case protobufs.ClockFrameType:
+		if err := e.handleClockFrameData(
+			message.From,
+			msg.Address,
+			any,
+		); err != nil {
+			return errors.Wrap(err, "handle sync")
+		}
 	case protobufs.ClockFramesResponseType:
 		if err := e.handleClockFramesResponse(
 			message.From,
@@ -127,7 +110,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if bytes.Equal(address, e.provingKeyAddress) {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		return nil
 	}
 
@@ -208,7 +191,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
 			for _, commit := range proof.GetInclusionCommitments() {
 				switch commit.TypeUrl {
 				case protobufs.IntrinsicExecutionOutputType:
-					e.logger.Info("confirming inclusion in aggregate")
+					e.logger.Debug("confirming inclusion in aggregate")
 					digest := sha3.NewShake256()
 					_, err := digest.Write(commit.Data)
 					if err != nil {
@@ -253,7 +236,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
 						)
 						return errors.Wrap(err, "handle clock frame response")
 					}
-					e.logger.Info(
+					e.logger.Debug(
 						"created fft of polynomial",
 						zap.Int("poly_size", len(evalPoly)),
 					)
@@ -355,7 +338,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
 		if err != nil {
 			return errors.Wrap(err, "handle clock frame data")
 		}
-		e.logger.Info(
+		e.logger.Debug(
 			"difference between selector/discriminator",
 			zap.Binary("difference", distance.Bytes()),
 		)
@@ -398,31 +381,28 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if bytes.Equal(address, e.provingKeyAddress) {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		return nil
 	}
 
 	request := &protobufs.ProvingKeyRequest{}
 	if err := any.UnmarshalTo(request); err != nil {
-		return errors.Wrap(err, "handle proving key request")
+		return nil
 	}
 
 	if len(request.ProvingKeyBytes) == 0 {
-		e.logger.Warn(
+		e.logger.Debug(
 			"received proving key request for empty key",
 			zap.Binary("peer_id", peerID),
 			zap.Binary("address", address),
 		)
-		return errors.Wrap(
-			errors.New("empty proving key"),
-			"handle proving key request",
-		)
+		return nil
 	}
 
 	channel := e.createPeerSendChannel(peerID)
 	e.pubSub.Subscribe(channel, e.handleSync, true)
 
-	e.logger.Info(
+	e.logger.Debug(
 		"received proving key request",
 		zap.Binary("peer_id", peerID),
 		zap.Binary("address", address),
@@ -433,26 +413,26 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
 	inclusion, err := e.keyStore.GetProvingKey(request.ProvingKeyBytes)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
-			e.logger.Error(
+			e.logger.Debug(
 				"peer asked for proving key that returned error",
 				zap.Binary("peer_id", peerID),
 				zap.Binary("address", address),
 				zap.Binary("proving_key", request.ProvingKeyBytes),
 			)
-			return errors.Wrap(err, "handle proving key request")
+			return nil
 		}
 
 		provingKey, err = e.keyStore.GetStagedProvingKey(request.ProvingKeyBytes)
 		if !errors.Is(err, store.ErrNotFound) {
-			e.logger.Error(
+			e.logger.Debug(
 				"peer asked for proving key that returned error",
 				zap.Binary("peer_id", peerID),
 				zap.Binary("address", address),
 				zap.Binary("proving_key", request.ProvingKeyBytes),
 			)
-			return errors.Wrap(err, "handle proving key request")
+			return nil
 		} else if err != nil {
-			e.logger.Warn(
+			e.logger.Debug(
 				"peer asked for unknown proving key",
 				zap.Binary("peer_id", peerID),
 				zap.Binary("address", address),
@@ -463,13 +443,13 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
 	} else {
 		err := proto.Unmarshal(inclusion.Data, provingKey)
 		if err != nil {
-			e.logger.Error(
+			e.logger.Debug(
 				"inclusion commitment could not be deserialized",
 				zap.Binary("peer_id", peerID),
 				zap.Binary("address", address),
 				zap.Binary("proving_key", request.ProvingKeyBytes),
 			)
-			return errors.Wrap(err, "handle proving key request")
+			return nil
 		}
 	}
 
@@ -485,7 +465,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if bytes.Equal(address, e.provingKeyAddress) {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		return nil
 	}
 
@@ -543,8 +523,8 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 	}
 
 	to := request.ToFrameNumber
-	if to == 0 || to-request.FromFrameNumber > 128 {
-		to = request.FromFrameNumber + 127
+	if to == 0 || to-request.FromFrameNumber > 32 {
+		to = request.FromFrameNumber + 31
 	}
 
 	set := []*protobufs.ClockFrame{base}
@@ -586,6 +566,12 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 						return errors.Wrap(err, "handle clock frame request")
 					}
 				} else {
+					if err = e.publishMessage(
+						append(append([]byte{}, e.filter...), peerID...),
+						frame,
+					); err != nil {
+						return errors.Wrap(err, "handle clock frame request")
+					}
 					nextSpan = append(nextSpan, frame)
 					set = append(set, frame)
 				}
@@ -622,6 +608,12 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 						return errors.Wrap(err, "handle clock frame request")
 					}
 
+					if err = e.publishMessage(
+						append(append([]byte{}, e.filter...), peerID...),
+						frame,
+					); err != nil {
+						return errors.Wrap(err, "handle clock frame request")
+					}
 					nextSpan = append(nextSpan, frame)
 					set = append(set, frame)
 				}

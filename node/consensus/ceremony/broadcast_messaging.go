@@ -173,7 +173,7 @@ func (e *CeremonyDataClockConsensusEngine) handleKeyBundle(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	e.logger.Info("received key bundle")
+	e.logger.Debug("received key bundle")
 	keyBundleAnnouncement := &protobufs.KeyBundleAnnouncement{}
 	if err := any.UnmarshalTo(keyBundleAnnouncement); err != nil {
 		return errors.Wrap(err, "handle key bundle")
@@ -243,24 +243,24 @@ func (e *CeremonyDataClockConsensusEngine) handleKeyBundle(
 
 	// We have a matching proving key, we can set this up to be committed.
 	if provingKey != nil {
-		e.logger.Info("verifying key bundle announcement")
+		e.logger.Debug("verifying key bundle announcement")
 		if err := keyBundleAnnouncement.Verify(provingKey); err != nil {
-			e.logger.Error(
+			e.logger.Debug(
 				"could not verify key bundle announcement",
 				zap.Error(err),
 			)
-			return errors.Wrap(err, "handle key bundle")
+			return nil
 		}
 
 		go func() {
-			e.logger.Info("adding key bundle announcement to pending commits")
+			e.logger.Debug("adding key bundle announcement to pending commits")
 
 			e.pendingCommits <- any
 		}()
 
 		return nil
 	} else {
-		e.logger.Info("proving key not found, requesting from peers")
+		e.logger.Debug("proving key not found, requesting from peers")
 
 		if err = e.publishMessage(e.filter, &protobufs.ProvingKeyRequest{
 			ProvingKeyBytes: keyBundleAnnouncement.ProvingKeyBytes,
@@ -281,7 +281,7 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	e.logger.Info("received proving key")
+	e.logger.Debug("received proving key")
 
 	provingKeyAnnouncement := &protobufs.ProvingKeyAnnouncement{}
 	if err := any.UnmarshalTo(provingKeyAnnouncement); err != nil {
@@ -298,7 +298,7 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 
 	provingKey := provingKeyAnnouncement.PublicKey()
 
-	e.logger.Info(
+	e.logger.Debug(
 		"proving key staged",
 		zap.Binary("proving_key", provingKey),
 	)
@@ -345,8 +345,15 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	earliestFrame, _, count := e.frameProverTrie.Get(address)
-	_, latestFrame, _ := e.frameSeenProverTrie.Get(address)
+	addr, err := poseidon.HashBytes(
+		frame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+	)
+	if err != nil {
+		return errors.Wrap(err, "handle clock frame data")
+	}
+
+	earliestFrame, _, count := e.frameProverTrie.Get(addr.Bytes())
+	_, latestFrame, _ := e.frameSeenProverTrie.Get(addr.Bytes())
 	if frame.FrameNumber == latestFrame {
 		e.logger.Info(
 			"already received frame from address",
@@ -397,7 +404,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		for _, commit := range proof.GetInclusionCommitments() {
 			switch commit.TypeUrl {
 			case protobufs.IntrinsicExecutionOutputType:
-				e.logger.Info("confirming inclusion in aggregate")
+				e.logger.Debug("confirming inclusion in aggregate")
 				digest := sha3.NewShake256()
 				_, err := digest.Write(commit.Data)
 				if err != nil {
@@ -442,7 +449,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 					)
 					return errors.Wrap(err, "handle clock frame data")
 				}
-				e.logger.Info(
+				e.logger.Debug(
 					"created fft of polynomial",
 					zap.Int("poly_size", len(evalPoly)),
 				)
@@ -458,7 +465,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 				}
 				commitments = append(commitments, c.(curves.PairingPoint))
 			default:
-				e.logger.Info("confirming inclusion in aggregate")
+				e.logger.Debug("confirming inclusion in aggregate")
 				poly, err := e.prover.BytesToPolynomial(commit.Data)
 				if err != nil {
 					e.logger.Error(
@@ -490,7 +497,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 					)
 					return errors.Wrap(err, "handle clock frame data")
 				}
-				e.logger.Info(
+				e.logger.Debug(
 					"created fft of polynomial",
 					zap.Int("poly_size", len(evalPoly)),
 				)
@@ -548,7 +555,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 	if err != nil {
 		return errors.Wrap(err, "handle clock frame data")
 	}
-	e.logger.Info(
+	e.logger.Debug(
 		"difference between selector/discriminator",
 		zap.Binary("difference", distance.Bytes()),
 	)
@@ -612,7 +619,7 @@ func (e *CeremonyDataClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
 	if e.state == consensus.EngineStatePublishing {
-		e.logger.Info(
+		e.logger.Debug(
 			"publishing frame and aggregations",
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
@@ -668,7 +675,7 @@ func (e *CeremonyDataClockConsensusEngine) publishMessage(
 }
 
 func (e *CeremonyDataClockConsensusEngine) announceKeyBundle() error {
-	e.logger.Info("announcing key bundle")
+	e.logger.Debug("announcing key bundle")
 	idk, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
 	if err != nil {
 		if errors.Is(err, keys.KeyNotFoundErr) {

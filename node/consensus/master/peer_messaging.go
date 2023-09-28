@@ -128,7 +128,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 	}
 
 	for _, frame := range response.ClockFrames {
-		e.logger.Info(
+		e.logger.Debug(
 			"processing clock frame",
 			zap.Binary("sender", peerID),
 			zap.Binary("filter", frame.Filter),
@@ -140,7 +140,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 			return errors.Wrap(err, "handle clock frame response")
 		}
 
-		e.logger.Info(
+		e.logger.Debug(
 			"clock frame was valid",
 			zap.Binary("sender", peerID),
 			zap.Binary("filter", frame.Filter),
@@ -175,7 +175,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 
 	e.pubSub.Subscribe(channel, e.handleSync, true)
 
-	e.logger.Info(
+	e.logger.Debug(
 		"received clock frame request",
 		zap.Binary("peer_id", peerID),
 		zap.Uint64("from_frame_number", request.FromFrameNumber),
@@ -185,7 +185,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 	from := request.FromFrameNumber
 
 	if e.frame < from || len(e.historicFrames) == 0 {
-		e.logger.Info(
+		e.logger.Debug(
 			"peer asked for undiscovered frame",
 			zap.Binary("peer_id", peerID),
 			zap.Uint64("frame_number", request.FromFrameNumber),
@@ -212,7 +212,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 		to = e.latestFrame.FrameNumber
 	}
 
-	e.logger.Info(
+	e.logger.Debug(
 		"sending response",
 		zap.Binary("peer_id", peerID),
 		zap.Uint64("from", from),

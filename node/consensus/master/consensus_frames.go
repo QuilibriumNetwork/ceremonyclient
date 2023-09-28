@@ -20,7 +20,7 @@ func (e *MasterClockConsensusEngine) prove(
 	previousFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
 	if e.state == consensus.EngineStateProving {
-		e.logger.Info("proving new frame")
+		e.logger.Debug("proving new frame")
 
 		frame, err := protobufs.ProveMasterClockFrame(
 			previousFrame,
@@ -31,7 +31,7 @@ func (e *MasterClockConsensusEngine) prove(
 		}
 
 		e.state = consensus.EngineStatePublishing
-		e.logger.Info("returning new proven frame")
+		e.logger.Debug("returning new proven frame")
 		return frame, nil
 	}
 
@@ -42,7 +42,7 @@ func (e *MasterClockConsensusEngine) setFrame(frame *protobufs.ClockFrame) {
 	previousSelectorBytes := [516]byte{}
 	copy(previousSelectorBytes[:], frame.Output[:516])
 
-	e.logger.Info("set frame", zap.Uint64("frame_number", frame.FrameNumber))
+	e.logger.Debug("set frame", zap.Uint64("frame_number", frame.FrameNumber))
 	e.frame = frame.FrameNumber
 	e.latestFrame = frame
 
@@ -54,7 +54,7 @@ func (e *MasterClockConsensusEngine) setFrame(frame *protobufs.ClockFrame) {
 func (
 	e *MasterClockConsensusEngine,
 ) createGenesisFrame() *protobufs.ClockFrame {
-	e.logger.Info("creating genesis frame")
+	e.logger.Debug("creating genesis frame")
 	b := sha3.Sum256(e.input)
 	v := vdf.New(e.difficulty, b)
 
@@ -62,7 +62,7 @@ func (
 	o := v.GetOutput()
 	inputMessage := o[:]
 
-	e.logger.Info("proving genesis frame")
+	e.logger.Debug("proving genesis frame")
 	input := []byte{}
 	input = append(input, e.filter...)
 	input = binary.BigEndian.AppendUint64(input, e.frame)
@@ -105,7 +105,7 @@ func (e *MasterClockConsensusEngine) collect(
 	currentFramePublished *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
 	if e.state == consensus.EngineStateCollecting {
-		e.logger.Info("collecting vdf proofs")
+		e.logger.Debug("collecting vdf proofs")
 
 		latest := e.latestFrame
 
@@ -119,11 +119,11 @@ func (e *MasterClockConsensusEngine) collect(
 				}
 			} else {
 				e.syncingStatus = SyncStatusAwaitingResponse
-				e.logger.Info("setting syncing target", zap.Binary("peer_id", peer))
+				e.logger.Debug("setting syncing target", zap.Binary("peer_id", peer))
 				e.syncingTarget = peer
 
 				channel := e.createPeerReceiveChannel(peer)
-				e.logger.Info(
+				e.logger.Debug(
 					"listening on peer receive channel",
 					zap.Binary("channel", channel),
 				)
@@ -151,7 +151,7 @@ func (e *MasterClockConsensusEngine) collect(
 
 		waitDecay := time.Duration(2000)
 		for e.syncingStatus != SyncStatusNotSyncing {
-			e.logger.Info(
+			e.logger.Debug(
 				"waiting for sync to complete...",
 				zap.Duration("wait_decay", waitDecay),
 			)
@@ -161,7 +161,7 @@ func (e *MasterClockConsensusEngine) collect(
 			waitDecay = waitDecay * 2
 			if waitDecay >= (100 * (2 << 6)) {
 				if e.syncingStatus == SyncStatusAwaitingResponse {
-					e.logger.Info("maximum wait for sync response, skipping sync")
+					e.logger.Debug("maximum wait for sync response, skipping sync")
 					e.syncingStatus = SyncStatusNotSyncing
 					break
 				} else {
@@ -170,14 +170,14 @@ func (e *MasterClockConsensusEngine) collect(
 			}
 		}
 
-		e.logger.Info("selecting leader")
+		e.logger.Debug("selecting leader")
 		latestFrame, err := e.confirmLatestFrame()
 		if err != nil {
 			e.logger.Error("could not confirm latest frame", zap.Error(err))
 			return nil, errors.Wrap(err, "collect")
 		}
 
-		e.logger.Info(
+		e.logger.Debug(
 			"returning leader frame",
 			zap.Uint64("frame_number", latestFrame.FrameNumber),
 		)
@@ -210,14 +210,14 @@ func (
 		curr := e.seenFrames[0]
 		e.seenFrames = e.seenFrames[1:]
 
-		e.logger.Info(
+		e.logger.Debug(
 			"checking continuity for frame",
 			zap.Uint64("frame_number", curr.FrameNumber),
 		)
 
 		if prev.FrameNumber+1 < curr.FrameNumber ||
 			prev.FrameNumber > curr.FrameNumber {
-			e.logger.Info(
+			e.logger.Debug(
 				"continuity break found",
 				zap.Uint64("prev_frame_number", prev.FrameNumber),
 				zap.Uint64("curr_frame_number", curr.FrameNumber),
@@ -229,7 +229,7 @@ func (
 			prev = curr
 			committedSet = append(committedSet, prev)
 		} else {
-			e.logger.Info("frame mismatch on input/output")
+			e.logger.Debug("frame mismatch on input/output")
 		}
 	}
 
@@ -251,7 +251,7 @@ func (
 		return nil, errors.Wrap(err, "confirm latest frame")
 	}
 
-	e.logger.Info("stored frames", zap.Int("frame_count", len(committedSet)))
+	e.logger.Debug("stored frames", zap.Int("frame_count", len(committedSet)))
 
 	e.historicFramesMx.Lock()
 

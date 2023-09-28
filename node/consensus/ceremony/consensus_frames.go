@@ -11,6 +11,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/ff"
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
@@ -31,18 +32,18 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 	previousFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
 	if e.state == consensus.EngineStateProving {
-		e.logger.Info("proving new frame")
 		if !e.frameProverTrie.Contains(e.provingKeyAddress) {
 			e.state = consensus.EngineStateCollecting
 			return previousFrame, nil
 		}
+		e.logger.Info("proving new frame")
 
 		commitments := [][]byte{}
 		aggregations := []*protobufs.InclusionAggregateProof{}
 
 		e.stagedKeyCommitsMx.Lock()
 		if len(e.stagedKeyCommits) > 0 && len(e.stagedKeyPolynomials) > 0 {
-			e.logger.Info(
+			e.logger.Debug(
 				"adding staged key commits to frame",
 				zap.Uint64("frame_number", previousFrame.FrameNumber+1),
 			)
@@ -52,7 +53,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			i := uint32(0)
 
 			for commit, inclusion := range e.stagedKeyCommits {
-				e.logger.Info(
+				e.logger.Debug(
 					"adding staged key commit to aggregate proof",
 					zap.Uint64("frame_number", previousFrame.FrameNumber+1),
 					zap.Uint32("position", i),
@@ -148,7 +149,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			return nil, errors.Wrap(err, "prove")
 		}
 
-		e.logger.Info("encoded execution output")
+		e.logger.Debug("encoded execution output")
 
 		// Execution data in the ceremony is plaintext, we do not need to leverage
 		// full encoding for commit/proof reference.
@@ -178,7 +179,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			return nil, errors.Wrap(err, "prove")
 		}
 
-		e.logger.Info("proving execution output for inclusion")
+		e.logger.Debug("proving execution output for inclusion")
 		polys, err := qcrypto.FFT(
 			poly,
 			*curves.BLS48581(
@@ -193,9 +194,9 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			return nil, errors.Wrap(err, "prove")
 		}
 
-		e.logger.Info("converted execution output chunk to evaluation form")
+		e.logger.Debug("converted execution output chunk to evaluation form")
 
-		e.logger.Info("creating kzg commitment")
+		e.logger.Debug("creating kzg commitment")
 		commitment, err := e.prover.Commit(polys)
 		if err != nil {
 			e.stagedLobbyStateTransitions = &protobufs.CeremonyLobbyStateTransition{}
@@ -203,7 +204,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			return nil, errors.Wrap(err, "prove")
 		}
 
-		e.logger.Info("creating kzg proof")
+		e.logger.Debug("creating kzg proof")
 		proof, aggregate, err := e.prover.ProveAggregate(
 			[][]curves.PairingScalar{polys},
 			[]curves.PairingPoint{commitment},
@@ -219,7 +220,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 
 		commitments = append(commitments, aggregate.ToAffineCompressed())
 
-		e.logger.Info("finalizing execution proof")
+		e.logger.Debug("finalizing execution proof")
 
 		e.stagedLobbyStateTransitions = &protobufs.CeremonyLobbyStateTransition{}
 		e.stagedLobbyStateTransitionsMx.Unlock()
@@ -254,7 +255,7 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 			return nil, errors.Wrap(err, "prove")
 		}
 		e.state = consensus.EngineStatePublishing
-		e.logger.Info(
+		e.logger.Debug(
 			"returning new proven frame",
 			zap.Int("proof_count", len(aggregations)),
 			zap.Int("commitment_count", len(commitments)),
@@ -306,7 +307,7 @@ func (e *CeremonyDataClockConsensusEngine) setFrame(
 	if err != nil {
 		panic(errors.Wrap(err, "set frame"))
 	}
-	e.logger.Info("set frame", zap.Uint64("frame_number", frame.FrameNumber))
+	e.logger.Debug("set frame", zap.Uint64("frame_number", frame.FrameNumber))
 	e.currentDistance = distance
 	e.frame = frame.FrameNumber
 	e.parentSelector = parent.Bytes()
@@ -666,7 +667,6 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 				e.logger.Info(
 					"adding candidate",
 					zap.Uint64("frame_number", value.FrameNumber),
-					zap.Binary("output", value.Output),
 				)
 
 				nextRunningFrames = append(
@@ -697,7 +697,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 				e.logger.Info(
 					"committing candidate",
 					zap.Uint64("frame_number", s.FrameNumber),
-					zap.Binary("output", s.Output),
+					zap.Binary("prover", s.GetPublicKeySignatureEd448().PublicKey.KeyValue),
 				)
 
 				addr, err := s.GetAddress()
@@ -720,13 +720,13 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 					return nil, errors.Wrap(err, "commit longest path")
 				}
 
-				e.logger.Info(
+				e.logger.Debug(
 					"committing aggregate proofs",
 					zap.Int("proof_count", len(s.AggregateProofs)),
 				)
 
 				for _, p := range s.AggregateProofs {
-					e.logger.Info(
+					e.logger.Debug(
 						"committing inclusions",
 						zap.Int("inclusions_count", len(p.InclusionCommitments)),
 					)
@@ -745,7 +745,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 								return nil, errors.Wrap(err, "commit longest path")
 							}
 
-							e.logger.Info(
+							e.logger.Debug(
 								"committing proving key",
 								zap.Uint64("frame_number", s.FrameNumber),
 								zap.Binary("commitment", c.Commitment),
@@ -772,7 +772,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 								return nil, errors.Wrap(err, "commit longest path")
 							}
 
-							e.logger.Info(
+							e.logger.Debug(
 								"committing key bundle",
 								zap.Uint64("frame_number", s.FrameNumber),
 								zap.Binary("commitment", c.Commitment),
@@ -842,7 +842,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 		}
 
 		if e.syncingStatus == SyncStatusNotSyncing {
-			peer, err := e.pubSub.GetRandomPeer(e.filter)
+			peerId, err := e.pubSub.GetRandomPeer(e.filter)
 			if err != nil {
 				if errors.Is(err, p2p.ErrNoPeersAvailable) {
 					e.logger.Warn("no peers available, skipping sync")
@@ -851,17 +851,16 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				}
 			} else {
 				e.syncingStatus = SyncStatusAwaitingResponse
-				e.logger.Info("setting syncing target", zap.Binary("peer_id", peer))
-				e.syncingTarget = peer
-
-				channel := e.createPeerReceiveChannel(peer)
 				e.logger.Info(
-					"listening on peer receive channel",
-					zap.Binary("channel", channel),
+					"setting syncing target",
+					zap.String("peer_id", peer.ID(peerId).String()),
 				)
+				channel := e.createPeerReceiveChannel(peerId)
 				e.pubSub.Subscribe(channel, e.handleSync, true)
+				e.syncingTarget = peerId
+
 				e.pubSub.Subscribe(
-					append(append([]byte{}, e.filter...), peer...),
+					append(append([]byte{}, e.filter...), peerId...),
 					func(message *pb.Message) error { return nil },
 					true,
 				)
@@ -869,7 +868,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				go func() {
 					time.Sleep(2 * time.Second)
 					if err := e.publishMessage(
-						append(append([]byte{}, e.filter...), peer...),
+						append(append([]byte{}, e.filter...), peerId...),
 						&protobufs.ClockFramesRequest{
 							Filter:          e.filter,
 							FromFrameNumber: latest.FrameNumber + 1,

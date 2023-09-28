@@ -218,7 +218,7 @@ func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {
 			"get random peer",
 		)
 	}
-	b.logger.Info("selecting from peers", zap.Any("peer_ids", peers))
+	b.logger.Debug("selecting from peers", zap.Any("peer_ids", peers))
 	sel, err := rand.Int(rand.Reader, big.NewInt(int64(len(peers))))
 	if err != nil {
 		return nil, errors.Wrap(err, "get random peer")

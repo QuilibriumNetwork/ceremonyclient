@@ -96,7 +96,7 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 	}
 
 	if e.frame > frame.FrameNumber {
-		e.logger.Info(
+		e.logger.Debug(
 			"received anachronistic frame",
 			zap.Binary("sender", peerID),
 			zap.Binary("filter", frame.Filter),
@@ -107,7 +107,7 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 	}
 
 	if e.difficulty != frame.Difficulty {
-		e.logger.Info(
+		e.logger.Debug(
 			"frame difficulty mismatched",
 			zap.Uint32("difficulty", frame.Difficulty),
 		)
@@ -117,7 +117,7 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		)
 	}
 
-	e.logger.Info(
+	e.logger.Debug(
 		"got clock frame",
 		zap.Binary("sender", peerID),
 		zap.Binary("filter", frame.Filter),
@@ -154,7 +154,7 @@ func (e *MasterClockConsensusEngine) enqueueSeenFrame(
 		}
 	}
 	if !found {
-		e.logger.Info(
+		e.logger.Debug(
 			"enqueuing frame for consensus",
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
@@ -169,7 +169,7 @@ func (e *MasterClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
 	if e.state == consensus.EngineStatePublishing {
-		e.logger.Info(
+		e.logger.Debug(
 			"publishing frame",
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
