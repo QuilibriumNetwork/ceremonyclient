@@ -567,7 +567,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 					}
 				} else {
 					if err = e.publishMessage(
-						append(append([]byte{}, e.filter...), peerID...),
+						channel,
 						frame,
 					); err != nil {
 						return errors.Wrap(err, "handle clock frame request")
@@ -609,7 +609,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 					}
 
 					if err = e.publishMessage(
-						append(append([]byte{}, e.filter...), peerID...),
+						channel,
 						frame,
 					); err != nil {
 						return errors.Wrap(err, "handle clock frame request")
