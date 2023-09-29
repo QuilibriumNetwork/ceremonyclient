@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
@@ -104,6 +105,7 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 			message.From,
 			msg.Address,
 			any,
+			false,
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
@@ -123,7 +125,118 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 		if err := e.handleKeyBundle(message.From, msg.Address, any); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+	case protobufs.CeremonyPeerListAnnounceType:
+		if err := e.handleCeremonyPeerListAnnounce(
+			message.From,
+			msg.Address,
+			any,
+		); err != nil {
+			return errors.Wrap(err, "handle message")
+		}
 	}
+
+	return nil
+}
+
+func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
+	peerID []byte,
+	address []byte,
+	any *anypb.Any,
+) error {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
+	announce := &protobufs.CeremonyPeerListAnnounce{}
+	if err := any.UnmarshalTo(announce); err != nil {
+		return errors.Wrap(err, "handle ceremony peer list announce")
+	}
+
+	e.peerAnnounceMapMx.Lock()
+	e.peerAnnounceMap[string(peerID)] = announce
+	e.peerAnnounceMapMx.Unlock()
+
+	e.peerMapMx.Lock()
+	for _, p := range announce.PeerList {
+		if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
+			continue
+		}
+
+		pr, ok := e.peerMap[string(p.PeerId)]
+		if !ok {
+			if bytes.Equal(p.PeerId, peerID) {
+				e.peerMap[string(p.PeerId)] = &peerInfo{
+					peerId:    p.PeerId,
+					multiaddr: e.pubSub.GetMultiaddrOfPeer(peerID),
+					maxFrame:  p.MaxFrame,
+					direct:    bytes.Equal(p.PeerId, peerID),
+					lastSeen:  time.Now().Unix(),
+				}
+			} else {
+				e.peerMap[string(p.PeerId)] = &peerInfo{
+					peerId:    p.PeerId,
+					multiaddr: p.Multiaddr,
+					maxFrame:  p.MaxFrame,
+					direct:    bytes.Equal(p.PeerId, peerID),
+					lastSeen:  time.Now().Unix(),
+				}
+			}
+		} else {
+			if bytes.Equal(p.PeerId, peerID) {
+				e.peerMap[string(p.PeerId)] = &peerInfo{
+					peerId:    p.PeerId,
+					multiaddr: e.pubSub.GetMultiaddrOfPeer(peerID),
+					maxFrame:  p.MaxFrame,
+					direct:    bytes.Equal(p.PeerId, peerID),
+					lastSeen:  time.Now().Unix(),
+				}
+			} else {
+				if pr.direct {
+					dst := int64(p.MaxFrame) - int64(pr.maxFrame)
+					if time.Now().Unix()-pr.lastSeen > 30 {
+						e.peerMap[string(p.PeerId)] = &peerInfo{
+							peerId:    p.PeerId,
+							multiaddr: p.Multiaddr,
+							maxFrame:  p.MaxFrame,
+							direct:    false,
+							lastSeen:  time.Now().Unix(),
+						}
+					} else if dst > 4 {
+						e.logger.Warn(
+							"peer sent announcement with higher frame index for peer",
+							zap.String("sender_peer", peer.ID(peerID).String()),
+							zap.String("announced_peer", peer.ID(pr.peerId).String()),
+							zap.Int64("frame_distance", dst),
+						)
+					} else if dst < -4 {
+						e.logger.Debug(
+							"peer sent announcement with lower frame index for peer",
+							zap.String("sender_peer", peer.ID(peerID).String()),
+							zap.String("announced_peer", peer.ID(pr.peerId).String()),
+							zap.Int64("frame_distance", dst),
+						)
+					} else {
+						e.peerMap[string(p.PeerId)] = &peerInfo{
+							peerId:    p.PeerId,
+							multiaddr: p.Multiaddr,
+							maxFrame:  p.MaxFrame,
+							direct:    false,
+							lastSeen:  time.Now().Unix(),
+						}
+					}
+				} else {
+					e.peerMap[string(p.PeerId)] = &peerInfo{
+						peerId:    p.PeerId,
+						multiaddr: p.Multiaddr,
+						maxFrame:  p.MaxFrame,
+						direct:    false,
+						lastSeen:  time.Now().Unix(),
+					}
+				}
+			}
+		}
+	}
+	e.peerMapMx.Unlock()
 
 	return nil
 }
@@ -339,7 +452,12 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 	peerID []byte,
 	address []byte,
 	any *anypb.Any,
+	isSync bool,
 ) error {
+	if isSync && bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
 	frame := &protobufs.ClockFrame{}
 	if err := any.UnmarshalTo(frame); err != nil {
 		return errors.Wrap(err, "handle clock frame data")

@@ -47,6 +47,7 @@ func (e *CeremonyDataClockConsensusEngine) handleSync(
 			message.From,
 			msg.Address,
 			any,
+			true,
 		); err != nil {
 			return errors.Wrap(err, "handle sync")
 		}
@@ -85,24 +86,6 @@ func (e *CeremonyDataClockConsensusEngine) handleSync(
 	}
 
 	return nil
-}
-
-func (e *CeremonyDataClockConsensusEngine) createPeerReceiveChannel(
-	peerID []byte,
-) []byte {
-	return append(
-		append(append([]byte{}, e.filter...), peerID...),
-		e.pubSub.GetPeerID()...,
-	)
-}
-
-func (e *CeremonyDataClockConsensusEngine) createPeerSendChannel(
-	peerID []byte,
-) []byte {
-	return append(
-		append(append([]byte{}, e.filter...), e.pubSub.GetPeerID()...),
-		peerID...,
-	)
 }
 
 func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
@@ -399,8 +382,11 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
 		return nil
 	}
 
-	channel := e.createPeerSendChannel(peerID)
-	e.pubSub.Subscribe(channel, e.handleSync, true)
+	e.pubSub.Subscribe(
+		append(append([]byte{}, e.filter...), peerID...),
+		e.handleSync,
+		true,
+	)
 
 	e.logger.Debug(
 		"received proving key request",
@@ -453,8 +439,11 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
 		}
 	}
 
-	if err := e.publishMessage(channel, provingKey); err != nil {
-		return errors.Wrap(err, "handle proving key request")
+	if err := e.publishMessage(
+		append(append([]byte{}, e.filter...), peerID...),
+		provingKey,
+	); err != nil {
+		return nil
 	}
 
 	return nil
@@ -474,9 +463,11 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 		return errors.Wrap(err, "handle clock frame request")
 	}
 
-	channel := e.createPeerSendChannel(peerID)
-
-	e.pubSub.Subscribe(channel, e.handleSync, true)
+	e.pubSub.Subscribe(
+		append(append([]byte{}, e.filter...), peerID...),
+		e.handleSync,
+		true,
+	)
 
 	e.logger.Info(
 		"received clock frame request",
@@ -502,19 +493,22 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 			)
 			return errors.Wrap(err, "handle clock frame request")
 		} else {
-			e.logger.Info(
+			e.logger.Debug(
 				"peer asked for undiscovered frame",
 				zap.Binary("peer_id", peerID),
 				zap.Binary("address", address),
 				zap.Uint64("frame_number", request.FromFrameNumber),
 			)
 
-			if err = e.publishMessage(channel, &protobufs.ClockFramesResponse{
-				Filter:          request.Filter,
-				FromFrameNumber: 0,
-				ToFrameNumber:   0,
-				ClockFrames:     []*protobufs.ClockFrame{},
-			}); err != nil {
+			if err = e.publishMessage(
+				append(append([]byte{}, e.filter...), peerID...),
+				&protobufs.ClockFramesResponse{
+					Filter:          request.Filter,
+					FromFrameNumber: 0,
+					ToFrameNumber:   0,
+					ClockFrames:     []*protobufs.ClockFrame{},
+				},
+			); err != nil {
 				return errors.Wrap(err, "handle clock frame request")
 			}
 
@@ -567,7 +561,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 					}
 				} else {
 					if err = e.publishMessage(
-						channel,
+						append(append([]byte{}, e.filter...), peerID...),
 						frame,
 					); err != nil {
 						return errors.Wrap(err, "handle clock frame request")
@@ -609,7 +603,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 					}
 
 					if err = e.publishMessage(
-						channel,
+						append(append([]byte{}, e.filter...), peerID...),
 						frame,
 					); err != nil {
 						return errors.Wrap(err, "handle clock frame request")
@@ -623,24 +617,6 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesRequest(
 		}
 		currentNumber++
 		searchSpan = nextSpan
-	}
-
-	e.logger.Info(
-		"sending response",
-		zap.Binary("peer_id", peerID),
-		zap.Binary("address", address),
-		zap.Uint64("from", from),
-		zap.Uint64("to", to),
-		zap.Uint64("total_frames", uint64(len(set))),
-	)
-
-	if err = e.publishMessage(channel, &protobufs.ClockFramesResponse{
-		Filter:          request.Filter,
-		FromFrameNumber: request.FromFrameNumber,
-		ToFrameNumber:   to,
-		ClockFrames:     set,
-	}); err != nil {
-		return errors.Wrap(err, "handle clock frame request")
 	}
 
 	return nil

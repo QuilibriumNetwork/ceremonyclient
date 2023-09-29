@@ -16,7 +16,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
-	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
@@ -828,6 +827,29 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 	return current, nil
 }
 
+func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
+	[]byte,
+	uint64,
+	error,
+) {
+	e.peerMapMx.Lock()
+	max := e.frame
+	var peer []byte = nil
+	for _, v := range e.peerMap {
+		if v.maxFrame > max {
+			peer = v.peerId
+			max = v.maxFrame
+		}
+	}
+	e.peerMapMx.Unlock()
+
+	if peer == nil {
+		return nil, 0, p2p.ErrNoPeersAvailable
+	}
+
+	return peer, max, nil
+}
+
 func (e *CeremonyDataClockConsensusEngine) collect(
 	currentFramePublished *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
@@ -841,29 +863,25 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			return nil, errors.Wrap(err, "collect")
 		}
 
+		maxFrame := uint64(0)
 		if e.syncingStatus == SyncStatusNotSyncing {
-			peerId, err := e.pubSub.GetRandomPeer(e.filter)
+			var peerId []byte
+			peerId, maxFrame, err = e.GetMostAheadPeer()
 			if err != nil {
-				if errors.Is(err, p2p.ErrNoPeersAvailable) {
-					e.logger.Warn("no peers available, skipping sync")
-				} else {
-					e.logger.Error("error while fetching random peer", zap.Error(err))
-				}
+				e.logger.Warn("no peers available, skipping sync")
 			} else {
 				e.syncingStatus = SyncStatusAwaitingResponse
 				e.logger.Info(
 					"setting syncing target",
 					zap.String("peer_id", peer.ID(peerId).String()),
 				)
-				channel := e.createPeerReceiveChannel(peerId)
-				e.pubSub.Subscribe(channel, e.handleSync, true)
-				e.syncingTarget = peerId
 
 				e.pubSub.Subscribe(
 					append(append([]byte{}, e.filter...), peerId...),
-					func(message *pb.Message) error { return nil },
+					e.handleSync,
 					true,
 				)
+				e.syncingTarget = peerId
 
 				go func() {
 					time.Sleep(2 * time.Second)
@@ -882,6 +900,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			}
 		}
 
+		performedSync := false
 		waitDecay := time.Duration(2000)
 		for e.syncingStatus != SyncStatusNotSyncing {
 			e.logger.Info(
@@ -892,13 +911,14 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			time.Sleep(waitDecay * time.Millisecond)
 
 			waitDecay = waitDecay * 2
-			if waitDecay >= (100 * (2 << 6)) {
+			if waitDecay >= (100 * (2 << 7)) {
 				if e.syncingStatus == SyncStatusAwaitingResponse {
 					e.logger.Info("maximum wait for sync response, skipping sync")
 					e.syncingStatus = SyncStatusNotSyncing
 					break
 				} else {
-					waitDecay = 100 * (2 << 6)
+					waitDecay = 100 * (2 << 7)
+					performedSync = true
 				}
 			}
 		}
@@ -926,7 +946,8 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			zap.Uint64("frame_number", latestFrame.FrameNumber),
 		)
 
-		if latestFrame.FrameNumber >= currentFramePublished.FrameNumber {
+		if latestFrame.FrameNumber >= currentFramePublished.FrameNumber &&
+			(!performedSync || e.frame+32 >= maxFrame) {
 			e.setFrame(latestFrame)
 			e.state = consensus.EngineStateProving
 			return latestFrame, nil

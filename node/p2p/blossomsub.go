@@ -305,6 +305,10 @@ func (b *BlossomSub) GetNetworkPeersCount() int {
 	return len(b.h.Network().Peers())
 }
 
+func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {
+	return b.h.Peerstore().Addrs(peer.ID(peerId))[0].String()
+}
+
 func discoverPeers(
 	p2pConfig *config.P2PConfig,
 	ctx context.Context,

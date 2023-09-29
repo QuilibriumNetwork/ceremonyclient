@@ -21,6 +21,8 @@ const (
 	CeremonyInProgressStateType          = CeremonyPrefix + "CeremonyInProgressState"
 	CeremonyFinalizingStateType          = CeremonyPrefix + "CeremonyFinalizingState"
 	CeremonyValidatingStateType          = CeremonyPrefix + "CeremonyValidatingState"
+	CeremonyPeerListAnnounceType         = CeremonyPrefix + "CeremonyPeerListAnnounce"
+	CeremonyPeerType                     = CeremonyPrefix + "CeremonyPeer"
 	ApplicationType                      = AppPrefix + "Application"
 	ExecutionContextType                 = AppPrefix + "ExecutionContext"
 	MessageType                          = AppPrefix + "Message"

@@ -14,4 +14,5 @@ type PubSub interface {
 	GetPeerstoreCount() int
 	GetNetworkPeersCount() int
 	GetRandomPeer(bitmask []byte) ([]byte, error)
+	GetMultiaddrOfPeer(peerId []byte) string
 }

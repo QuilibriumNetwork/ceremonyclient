@@ -972,6 +972,116 @@ func (x *CeremonyValidatingState) GetNextRoundParticipants() []*Ed448PublicKey {
 	return nil
 }
 
+type CeremonyPeerListAnnounce struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	PeerList []*CeremonyPeer `protobuf:"bytes,1,rep,name=peer_list,json=peerList,proto3" json:"peer_list,omitempty"`
+}
+
+func (x *CeremonyPeerListAnnounce) Reset() {
+	*x = CeremonyPeerListAnnounce{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_ceremony_proto_msgTypes[13]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CeremonyPeerListAnnounce) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CeremonyPeerListAnnounce) ProtoMessage() {}
+
+func (x *CeremonyPeerListAnnounce) ProtoReflect() protoreflect.Message {
+	mi := &file_ceremony_proto_msgTypes[13]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CeremonyPeerListAnnounce.ProtoReflect.Descriptor instead.
+func (*CeremonyPeerListAnnounce) Descriptor() ([]byte, []int) {
+	return file_ceremony_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *CeremonyPeerListAnnounce) GetPeerList() []*CeremonyPeer {
+	if x != nil {
+		return x.PeerList
+	}
+	return nil
+}
+
+type CeremonyPeer struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	PeerId    []byte `protobuf:"bytes,1,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
+	Multiaddr string `protobuf:"bytes,2,opt,name=multiaddr,proto3" json:"multiaddr,omitempty"`
+	MaxFrame  uint64 `protobuf:"varint,3,opt,name=max_frame,json=maxFrame,proto3" json:"max_frame,omitempty"`
+}
+
+func (x *CeremonyPeer) Reset() {
+	*x = CeremonyPeer{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_ceremony_proto_msgTypes[14]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CeremonyPeer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CeremonyPeer) ProtoMessage() {}
+
+func (x *CeremonyPeer) ProtoReflect() protoreflect.Message {
+	mi := &file_ceremony_proto_msgTypes[14]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CeremonyPeer.ProtoReflect.Descriptor instead.
+func (*CeremonyPeer) Descriptor() ([]byte, []int) {
+	return file_ceremony_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CeremonyPeer) GetPeerId() []byte {
+	if x != nil {
+		return x.PeerId
+	}
+	return nil
+}
+
+func (x *CeremonyPeer) GetMultiaddr() string {
+	if x != nil {
+		return x.Multiaddr
+	}
+	return ""
+}
+
+func (x *CeremonyPeer) GetMaxFrame() uint64 {
+	if x != nil {
+		return x.MaxFrame
+	}
+	return 0
+}
+
 var File_ceremony_proto protoreflect.FileDescriptor
 
 var file_ceremony_proto_rawDesc = []byte{
@@ -1260,11 +1370,24 @@ var file_ceremony_proto_rawDesc = []byte{
 	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x6b, 0x65, 0x79, 0x73, 0x2e,
 	0x70, 0x62, 0x2e, 0x45, 0x64, 0x34, 0x34, 0x38, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65,
 	0x79, 0x52, 0x15, 0x6e, 0x65, 0x78, 0x74, 0x52, 0x6f, 0x75, 0x6e, 0x64, 0x50, 0x61, 0x72, 0x74,
-	0x69, 0x63, 0x69, 0x70, 0x61, 0x6e, 0x74, 0x73, 0x42, 0x3a, 0x5a, 0x38, 0x73, 0x6f, 0x75, 0x72,
-	0x63, 0x65, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x63, 0x6f,
-	0x6d, 0x2f, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2f, 0x6d, 0x6f, 0x6e,
-	0x6f, 0x72, 0x65, 0x70, 0x6f, 0x2f, 0x6e, 0x6f, 0x64, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f,
-	0x62, 0x75, 0x66, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x69, 0x63, 0x69, 0x70, 0x61, 0x6e, 0x74, 0x73, 0x22, 0x62, 0x0a, 0x18, 0x43, 0x65, 0x72, 0x65,
+	0x6d, 0x6f, 0x6e, 0x79, 0x50, 0x65, 0x65, 0x72, 0x4c, 0x69, 0x73, 0x74, 0x41, 0x6e, 0x6e, 0x6f,
+	0x75, 0x6e, 0x63, 0x65, 0x12, 0x46, 0x0a, 0x09, 0x70, 0x65, 0x65, 0x72, 0x5f, 0x6c, 0x69, 0x73,
+	0x74, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62,
+	0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x65, 0x72, 0x65, 0x6d, 0x6f,
+	0x6e, 0x79, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x50, 0x65,
+	0x65, 0x72, 0x52, 0x08, 0x70, 0x65, 0x65, 0x72, 0x4c, 0x69, 0x73, 0x74, 0x22, 0x62, 0x0a, 0x0c,
+	0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x50, 0x65, 0x65, 0x72, 0x12, 0x17, 0x0a, 0x07,
+	0x70, 0x65, 0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x06, 0x70,
+	0x65, 0x65, 0x72, 0x49, 0x64, 0x12, 0x1c, 0x0a, 0x09, 0x6d, 0x75, 0x6c, 0x74, 0x69, 0x61, 0x64,
+	0x64, 0x72, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x6d, 0x75, 0x6c, 0x74, 0x69, 0x61,
+	0x64, 0x64, 0x72, 0x12, 0x1b, 0x0a, 0x09, 0x6d, 0x61, 0x78, 0x5f, 0x66, 0x72, 0x61, 0x6d, 0x65,
+	0x18, 0x03, 0x20, 0x01, 0x28, 0x04, 0x52, 0x08, 0x6d, 0x61, 0x78, 0x46, 0x72, 0x61, 0x6d, 0x65,
+	0x42, 0x3a, 0x5a, 0x38, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69,
+	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62,
+	0x72, 0x69, 0x75, 0x6d, 0x2f, 0x6d, 0x6f, 0x6e, 0x6f, 0x72, 0x65, 0x70, 0x6f, 0x2f, 0x6e, 0x6f,
+	0x64, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x73, 0x62, 0x06, 0x70, 0x72,
+	0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -1279,7 +1402,7 @@ func file_ceremony_proto_rawDescGZIP() []byte {
 	return file_ceremony_proto_rawDescData
 }
 
-var file_ceremony_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_ceremony_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_ceremony_proto_goTypes = []interface{}{
 	(*CeremonyTranscript)(nil),               // 0: quilibrium.node.ceremony.pb.CeremonyTranscript
 	(*CeremonyLobbyState)(nil),               // 1: quilibrium.node.ceremony.pb.CeremonyLobbyState
@@ -1294,59 +1417,62 @@ var file_ceremony_proto_goTypes = []interface{}{
 	(*CeremonyInProgressState)(nil),          // 10: quilibrium.node.ceremony.pb.CeremonyInProgressState
 	(*CeremonyFinalizingState)(nil),          // 11: quilibrium.node.ceremony.pb.CeremonyFinalizingState
 	(*CeremonyValidatingState)(nil),          // 12: quilibrium.node.ceremony.pb.CeremonyValidatingState
-	(*BLS48581G1PublicKey)(nil),              // 13: quilibrium.node.keys.pb.BLS48581G1PublicKey
-	(*BLS48581G2PublicKey)(nil),              // 14: quilibrium.node.keys.pb.BLS48581G2PublicKey
-	(*Ed448PublicKey)(nil),                   // 15: quilibrium.node.keys.pb.Ed448PublicKey
-	(*Ed448Signature)(nil),                   // 16: quilibrium.node.keys.pb.Ed448Signature
-	(*BLS48581Signature)(nil),                // 17: quilibrium.node.keys.pb.BLS48581Signature
-	(*X448PublicKey)(nil),                    // 18: quilibrium.node.keys.pb.X448PublicKey
+	(*CeremonyPeerListAnnounce)(nil),         // 13: quilibrium.node.ceremony.pb.CeremonyPeerListAnnounce
+	(*CeremonyPeer)(nil),                     // 14: quilibrium.node.ceremony.pb.CeremonyPeer
+	(*BLS48581G1PublicKey)(nil),              // 15: quilibrium.node.keys.pb.BLS48581G1PublicKey
+	(*BLS48581G2PublicKey)(nil),              // 16: quilibrium.node.keys.pb.BLS48581G2PublicKey
+	(*Ed448PublicKey)(nil),                   // 17: quilibrium.node.keys.pb.Ed448PublicKey
+	(*Ed448Signature)(nil),                   // 18: quilibrium.node.keys.pb.Ed448Signature
+	(*BLS48581Signature)(nil),                // 19: quilibrium.node.keys.pb.BLS48581Signature
+	(*X448PublicKey)(nil),                    // 20: quilibrium.node.keys.pb.X448PublicKey
 }
 var file_ceremony_proto_depIdxs = []int32{
-	13, // 0: quilibrium.node.ceremony.pb.CeremonyTranscript.g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	14, // 1: quilibrium.node.ceremony.pb.CeremonyTranscript.g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	13, // 2: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g1_256_witnesses:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	14, // 3: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g2_256_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	15, // 0: quilibrium.node.ceremony.pb.CeremonyTranscript.g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	16, // 1: quilibrium.node.ceremony.pb.CeremonyTranscript.g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	15, // 2: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g1_256_witnesses:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	16, // 3: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g2_256_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
 	9,  // 4: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_open_state:type_name -> quilibrium.node.ceremony.pb.CeremonyOpenState
 	10, // 5: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_in_progress_state:type_name -> quilibrium.node.ceremony.pb.CeremonyInProgressState
 	11, // 6: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_finalizing_state:type_name -> quilibrium.node.ceremony.pb.CeremonyFinalizingState
 	12, // 7: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_validating_state:type_name -> quilibrium.node.ceremony.pb.CeremonyValidatingState
 	0,  // 8: quilibrium.node.ceremony.pb.CeremonyLobbyState.latest_transcript:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscript
-	15, // 9: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.seen_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	16, // 10: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	15, // 11: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.dropped_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	16, // 12: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	13, // 13: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	14, // 14: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	13, // 15: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	14, // 16: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	16, // 17: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	16, // 18: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	17, // 19: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.contribution_signature:type_name -> quilibrium.node.keys.pb.BLS48581Signature
+	17, // 9: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.seen_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	18, // 10: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	17, // 11: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.dropped_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	18, // 12: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	15, // 13: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	16, // 14: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	15, // 15: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	16, // 16: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	18, // 17: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	18, // 18: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	19, // 19: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.contribution_signature:type_name -> quilibrium.node.keys.pb.BLS48581Signature
 	5,  // 20: quilibrium.node.ceremony.pb.CeremonyAdvanceRound.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
-	18, // 21: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.identity_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
-	18, // 22: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.signed_pre_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
-	16, // 23: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.public_key_signature_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	20, // 21: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.identity_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
+	20, // 22: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.signed_pre_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
+	18, // 23: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.public_key_signature_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
 	7,  // 24: quilibrium.node.ceremony.pb.CeremonyOpenState.joined_participants:type_name -> quilibrium.node.ceremony.pb.CeremonyLobbyJoin
-	15, // 25: quilibrium.node.ceremony.pb.CeremonyOpenState.preferred_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	15, // 26: quilibrium.node.ceremony.pb.CeremonyInProgressState.active_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	17, // 25: quilibrium.node.ceremony.pb.CeremonyOpenState.preferred_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	17, // 26: quilibrium.node.ceremony.pb.CeremonyInProgressState.active_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	2,  // 27: quilibrium.node.ceremony.pb.CeremonyInProgressState.latest_seen_prover_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
 	3,  // 28: quilibrium.node.ceremony.pb.CeremonyInProgressState.dropped_participant_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
 	6,  // 29: quilibrium.node.ceremony.pb.CeremonyInProgressState.transcript_round_advance_commits:type_name -> quilibrium.node.ceremony.pb.CeremonyAdvanceRound
-	15, // 30: quilibrium.node.ceremony.pb.CeremonyInProgressState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	15, // 31: quilibrium.node.ceremony.pb.CeremonyFinalizingState.active_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	17, // 30: quilibrium.node.ceremony.pb.CeremonyInProgressState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	17, // 31: quilibrium.node.ceremony.pb.CeremonyFinalizingState.active_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	2,  // 32: quilibrium.node.ceremony.pb.CeremonyFinalizingState.latest_seen_prover_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
 	3,  // 33: quilibrium.node.ceremony.pb.CeremonyFinalizingState.dropped_participant_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
 	5,  // 34: quilibrium.node.ceremony.pb.CeremonyFinalizingState.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
 	4,  // 35: quilibrium.node.ceremony.pb.CeremonyFinalizingState.shares:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptShare
-	15, // 36: quilibrium.node.ceremony.pb.CeremonyFinalizingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	17, // 36: quilibrium.node.ceremony.pb.CeremonyFinalizingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	5,  // 37: quilibrium.node.ceremony.pb.CeremonyValidatingState.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
 	0,  // 38: quilibrium.node.ceremony.pb.CeremonyValidatingState.updated_transcript:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscript
-	15, // 39: quilibrium.node.ceremony.pb.CeremonyValidatingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	40, // [40:40] is the sub-list for method output_type
-	40, // [40:40] is the sub-list for method input_type
-	40, // [40:40] is the sub-list for extension type_name
-	40, // [40:40] is the sub-list for extension extendee
-	0,  // [0:40] is the sub-list for field type_name
+	17, // 39: quilibrium.node.ceremony.pb.CeremonyValidatingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	14, // 40: quilibrium.node.ceremony.pb.CeremonyPeerListAnnounce.peer_list:type_name -> quilibrium.node.ceremony.pb.CeremonyPeer
+	41, // [41:41] is the sub-list for method output_type
+	41, // [41:41] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_ceremony_proto_init() }
@@ -1512,6 +1638,30 @@ func file_ceremony_proto_init() {
 				return nil
 			}
 		}
+		file_ceremony_proto_msgTypes[13].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*CeremonyPeerListAnnounce); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_ceremony_proto_msgTypes[14].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*CeremonyPeer); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
 	}
 	file_ceremony_proto_msgTypes[1].OneofWrappers = []interface{}{
 		(*CeremonyLobbyState_CeremonyOpenState)(nil),
@@ -1525,7 +1675,7 @@ func file_ceremony_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_ceremony_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

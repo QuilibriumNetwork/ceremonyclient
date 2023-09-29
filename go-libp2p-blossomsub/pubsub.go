@@ -23,8 +23,8 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultMaximumMessageSize is 1mb.
-const DefaultMaxMessageSize = 1 << 20
+// DefaultMaximumMessageSize is 16.7 MB.
+const DefaultMaxMessageSize = 1 << 24
 
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
@@ -492,7 +492,7 @@ func WithRawTracer(tracer RawTracer) Option {
 }
 
 // WithMaxMessageSize sets the global maximum message size for pubsub wire
-// messages. The default value is 1MiB (DefaultMaxMessageSize).
+// messages. The default value is 16.7MiB (DefaultMaxMessageSize).
 //
 // Observe the following warnings when setting this option.
 //

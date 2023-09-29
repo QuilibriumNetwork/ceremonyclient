@@ -124,3 +124,13 @@ message CeremonyValidatingState {
   CeremonyTranscript updated_transcript = 2;
   repeated quilibrium.node.keys.pb.Ed448PublicKey next_round_participants = 3;
 }
+
+message CeremonyPeerListAnnounce {
+  repeated CeremonyPeer peer_list = 1;
+}
+
+message CeremonyPeer {
+  bytes peer_id = 1;
+  string multiaddr = 2;
+  uint64 max_frame = 3;
+}

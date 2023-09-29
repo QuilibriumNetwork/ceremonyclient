@@ -31,6 +31,14 @@ const (
 	SyncStatusSynchronizing
 )
 
+type peerInfo struct {
+	peerId    []byte
+	multiaddr string
+	maxFrame  uint64
+	lastSeen  int64
+	direct    bool
+}
+
 type CeremonyDataClockConsensusEngine struct {
 	frame                       uint64
 	activeFrame                 *protobufs.ClockFrame
@@ -69,7 +77,11 @@ type CeremonyDataClockConsensusEngine struct {
 	dependencyMapMx                sync.Mutex
 	stagedKeyCommitsMx             sync.Mutex
 	stagedLobbyStateTransitionsMx  sync.Mutex
+	peerMapMx                      sync.Mutex
+	peerAnnounceMapMx              sync.Mutex
 	lastKeyBundleAnnouncementFrame uint64
+	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
+	peerMap                        map[string]*peerInfo
 }
 
 var _ consensus.DataConsensusEngine = (*CeremonyDataClockConsensusEngine)(nil)
@@ -137,6 +149,8 @@ func NewCeremonyDataClockConsensusEngine(
 		stagedKeyCommits:     make(InclusionMap),
 		stagedKeyPolynomials: make(PolynomialMap),
 		syncingStatus:        SyncStatusNotSyncing,
+		peerAnnounceMap:      map[string]*protobufs.CeremonyPeerListAnnounce{},
+		peerMap:              map[string]*peerInfo{},
 	}
 
 	logger.Info("constructing consensus engine")
@@ -193,6 +207,35 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 	for i := int64(0); i < e.pendingCommitWorkers; i++ {
 		go e.handlePendingCommits(i)
 	}
+
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+
+			list := &protobufs.CeremonyPeerListAnnounce{
+				PeerList: []*protobufs.CeremonyPeer{},
+			}
+
+			e.peerMapMx.Lock()
+			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
+				peerId:    e.pubSub.GetPeerID(),
+				multiaddr: "",
+				maxFrame:  e.frame,
+			}
+			for _, v := range e.peerMap {
+				list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
+					PeerId:    v.peerId,
+					Multiaddr: v.multiaddr,
+					MaxFrame:  v.maxFrame,
+				})
+			}
+			e.peerMapMx.Unlock()
+
+			if err := e.publishMessage(e.filter, list); err != nil {
+				e.logger.Debug("error publishing message", zap.Error(err))
+			}
+		}
+	}()
 
 	go func() {
 		for e.state < consensus.EngineStateStopping {
