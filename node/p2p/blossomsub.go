@@ -306,6 +306,11 @@ func (b *BlossomSub) GetNetworkPeersCount() int {
 }
 
 func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {
+	addrs := b.h.Peerstore().Addrs(peer.ID(peerId))
+	if len(addrs) == 0 {
+		return ""
+	}
+
 	return b.h.Peerstore().Addrs(peer.ID(peerId))[0].String()
 }
 
