@@ -710,6 +710,18 @@ func (a *CeremonyApplication) ApplyTransition(
 					return nil, errors.Wrap(err, "apply transition")
 				}
 
+				if currentFrameNumber < join.FrameNumber {
+					return nil, errors.Wrap(
+						errors.New("too recent join"), "apply transition",
+					)
+				}
+
+				if currentFrameNumber-join.FrameNumber > 10 {
+					return nil, errors.Wrap(
+						errors.New("outdated join"), "apply transition",
+					)
+				}
+
 				if err = a.applyLobbyJoin(join); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
@@ -747,6 +759,18 @@ func (a *CeremonyApplication) ApplyTransition(
 					return nil, errors.Wrap(err, "apply transition")
 				}
 
+				if currentFrameNumber < seenProverAtt.LastSeenFrame {
+					return nil, errors.Wrap(
+						errors.New("too recent attestation"), "apply transition",
+					)
+				}
+
+				if currentFrameNumber-seenProverAtt.LastSeenFrame > 10 {
+					return nil, errors.Wrap(
+						errors.New("outdated attestation"), "apply transition",
+					)
+				}
+
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
@@ -755,6 +779,18 @@ func (a *CeremonyApplication) ApplyTransition(
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
 				if err != nil {
 					return nil, errors.Wrap(err, "apply transition")
+				}
+
+				if currentFrameNumber < droppedProverAtt.LastSeenFrame {
+					return nil, errors.Wrap(
+						errors.New("too recent attestation"), "apply transition",
+					)
+				}
+
+				if currentFrameNumber-droppedProverAtt.LastSeenFrame > 10 {
+					return nil, errors.Wrap(
+						errors.New("outdated attestation"), "apply transition",
+					)
 				}
 
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {
@@ -849,6 +885,18 @@ func (a *CeremonyApplication) ApplyTransition(
 					return nil, errors.Wrap(err, "apply transition")
 				}
 
+				if currentFrameNumber < seenProverAtt.LastSeenFrame {
+					return nil, errors.Wrap(
+						errors.New("too recent attestation"), "apply transition",
+					)
+				}
+
+				if currentFrameNumber-seenProverAtt.LastSeenFrame > 10 {
+					return nil, errors.Wrap(
+						errors.New("outdated attestation"), "apply transition",
+					)
+				}
+
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
@@ -857,6 +905,18 @@ func (a *CeremonyApplication) ApplyTransition(
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
 				if err != nil {
 					return nil, errors.Wrap(err, "apply transition")
+				}
+
+				if currentFrameNumber < droppedProverAtt.LastSeenFrame {
+					return nil, errors.Wrap(
+						errors.New("too recent attestation"), "apply transition",
+					)
+				}
+
+				if currentFrameNumber-droppedProverAtt.LastSeenFrame > 10 {
+					return nil, errors.Wrap(
+						errors.New("outdated attestation"), "apply transition",
+					)
 				}
 
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {

@@ -90,8 +90,8 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 	}
 
 	if err := eg.Wait(); err != nil {
-		e.logger.Error("rejecting invalid message", zap.Error(err))
-		return errors.Wrap(err, "execution failed")
+		e.logger.Debug("rejecting invalid message", zap.Error(err))
+		return nil
 	}
 
 	any := &anypb.Any{}
