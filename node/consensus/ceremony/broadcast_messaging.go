@@ -51,7 +51,7 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 				msg,
 			)
 			if err != nil {
-				e.logger.Error(
+				e.logger.Debug(
 					"could not process message for engine",
 					zap.Error(err),
 					zap.String("engine_name", name),

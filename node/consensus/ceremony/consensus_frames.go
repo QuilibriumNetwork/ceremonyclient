@@ -696,7 +696,10 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
 				e.logger.Info(
 					"committing candidate",
 					zap.Uint64("frame_number", s.FrameNumber),
-					zap.Binary("prover", s.GetPublicKeySignatureEd448().PublicKey.KeyValue),
+					zap.Binary(
+						"prover",
+						s.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+					),
 				)
 
 				addr, err := s.GetAddress()

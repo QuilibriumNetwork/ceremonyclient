@@ -98,7 +98,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFramesResponse(
 	}
 
 	if !bytes.Equal(peerID, e.syncingTarget) {
-		e.logger.Warn(
+		e.logger.Debug(
 			"received clock frames response from unexpected target",
 			zap.Binary("peer_id", peerID),
 			zap.Binary("expected_peer_id", e.syncingTarget),

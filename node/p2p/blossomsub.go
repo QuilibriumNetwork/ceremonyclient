@@ -76,7 +76,11 @@ func NewBlossomSub(
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
 
-	go discoverPeers(p2pConfig, ctx, logger, h)
+	kademliaDHT := initDHT(ctx, p2pConfig, logger, h)
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	util.Advertise(ctx, routingDiscovery, string(BITMASK_ALL))
+
+	go discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
 
 	// TODO: turn into an option flag for console logging, this is too noisy for
 	// default logging behavior
@@ -319,42 +323,49 @@ func discoverPeers(
 	ctx context.Context,
 	logger *zap.Logger,
 	h host.Host,
+	routingDiscovery *routing.RoutingDiscovery,
 ) {
 	logger.Info("initiating peer discovery")
 
-	kademliaDHT := initDHT(ctx, p2pConfig, logger, h)
-	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	util.Advertise(ctx, routingDiscovery, string(BITMASK_ALL))
-
-	peerCount := 0
-	for peerCount < p2pConfig.MinPeers {
-		peerChan, err := routingDiscovery.FindPeers(ctx, string(BITMASK_ALL))
-		if err != nil {
-			panic(err)
-		}
-
-		for peer := range peerChan {
-			if peer.ID == h.ID() {
-				continue
+	discover := func(peerCount int) {
+		for peerCount < p2pConfig.MinPeers {
+			peerChan, err := routingDiscovery.FindPeers(ctx, string(BITMASK_ALL))
+			if err != nil {
+				logger.Error("could not find peers", zap.Error(err))
 			}
 
-			logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
-			err := h.Connect(ctx, peer)
-			if err != nil {
-				logger.Warn(
-					"error while connecting to blossomsub peer",
-					zap.String("peer_id", peer.ID.Pretty()),
-					zap.Error(err),
-				)
-			} else {
-				logger.Info(
-					"connected to peer",
-					zap.String("peer_id", peer.ID.Pretty()),
-				)
-				peerCount++
+			for peer := range peerChan {
+				if peer.ID == h.ID() {
+					continue
+				}
+
+				logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
+				err := h.Connect(ctx, peer)
+				if err != nil {
+					logger.Warn(
+						"error while connecting to blossomsub peer",
+						zap.String("peer_id", peer.ID.Pretty()),
+						zap.Error(err),
+					)
+				} else {
+					logger.Info(
+						"connected to peer",
+						zap.String("peer_id", peer.ID.Pretty()),
+					)
+					peerCount++
+				}
 			}
 		}
 	}
+
+	discover(0)
+
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			discover(len(h.Network().Peers()))
+		}
+	}()
 
 	logger.Info("completed initial peer discovery")
 }
