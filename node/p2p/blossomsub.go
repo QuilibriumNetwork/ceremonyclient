@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -237,8 +238,27 @@ func initDHT(
 	logger *zap.Logger,
 	h host.Host,
 ) *dht.IpfsDHT {
+	isBootstrapPeer := false
+	for _, peerAddr := range p2pConfig.BootstrapPeers {
+		peerinfo, err := peer.AddrInfoFromString(peerAddr)
+		if err != nil {
+			panic(err)
+		}
+
+		if bytes.Equal([]byte(peerinfo.ID), []byte(h.ID())) {
+			isBootstrapPeer = true
+			break
+		}
+	}
+
 	logger.Info("establishing dht")
-	kademliaDHT, err := dht.New(ctx, h)
+	var kademliaDHT *dht.IpfsDHT
+	var err error
+	if isBootstrapPeer {
+		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
+	} else {
+		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeAuto))
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -249,7 +269,10 @@ func initDHT(
 	reconnect := func() {
 		var wg sync.WaitGroup
 
-		logger.Info("connecting to bootstrap", zap.String("peer_id", h.ID().String()))
+		logger.Info(
+			"connecting to bootstrap",
+			zap.String("peer_id", h.ID().String()),
+		)
 
 		defaultBootstrapPeers := p2pConfig.BootstrapPeers
 
@@ -264,6 +287,10 @@ func initDHT(
 				if err := h.Connect(ctx, *peerinfo); err != nil {
 					logger.Warn("error while connecting to dht peer", zap.Error(err))
 				}
+				logger.Info(
+					"connected to peer",
+					zap.String("peer_id", peerinfo.ID.String()),
+				)
 			}()
 		}
 		wg.Wait()
@@ -327,43 +354,40 @@ func discoverPeers(
 ) {
 	logger.Info("initiating peer discovery")
 
-	discover := func(peerCount int) {
-		for peerCount < p2pConfig.MinPeers {
-			peerChan, err := routingDiscovery.FindPeers(ctx, string(BITMASK_ALL))
-			if err != nil {
-				logger.Error("could not find peers", zap.Error(err))
+	discover := func() {
+		peerChan, err := routingDiscovery.FindPeers(ctx, string(BITMASK_ALL))
+		if err != nil {
+			logger.Error("could not find peers", zap.Error(err))
+		}
+
+		for peer := range peerChan {
+			if peer.ID == h.ID() {
+				continue
 			}
 
-			for peer := range peerChan {
-				if peer.ID == h.ID() {
-					continue
-				}
-
-				logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
-				err := h.Connect(ctx, peer)
-				if err != nil {
-					logger.Warn(
-						"error while connecting to blossomsub peer",
-						zap.String("peer_id", peer.ID.Pretty()),
-						zap.Error(err),
-					)
-				} else {
-					logger.Info(
-						"connected to peer",
-						zap.String("peer_id", peer.ID.Pretty()),
-					)
-					peerCount++
-				}
+			logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
+			err := h.Connect(ctx, peer)
+			if err != nil {
+				logger.Warn(
+					"error while connecting to blossomsub peer",
+					zap.String("peer_id", peer.ID.Pretty()),
+					zap.Error(err),
+				)
+			} else {
+				logger.Info(
+					"connected to peer",
+					zap.String("peer_id", peer.ID.Pretty()),
+				)
 			}
 		}
 	}
 
-	discover(0)
+	discover()
 
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			discover(len(h.Network().Peers()))
+			discover()
 		}
 	}()
 
