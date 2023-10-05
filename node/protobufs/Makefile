@@ -5,7 +5,7 @@ PWD = $(pwd)
 all: $(GO)
 
 %.pb.go: %.proto
-		protoc -I=. --go_out=paths=source_relative:. *.proto
+		protoc -I=. --go-grpc_out=paths=source_relative:. --go_out=paths=source_relative:. *.proto
 
 clean:
 		rm -f *.pb.go

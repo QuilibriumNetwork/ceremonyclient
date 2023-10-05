@@ -472,7 +472,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 
 	earliestFrame, _, count := e.frameProverTrie.Get(addr.Bytes())
 	_, latestFrame, _ := e.frameSeenProverTrie.Get(addr.Bytes())
-	if frame.FrameNumber == latestFrame {
+	if !isSync && frame.FrameNumber == latestFrame {
 		e.logger.Info(
 			"already received frame from address",
 			zap.Binary("address", address),
@@ -687,7 +687,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		// push a request to fill the gap, unless we're syncing or it's in step,
 		// then just lazily seek.
 		from := e.frame
-		if e.syncingStatus != SyncStatusNotSyncing || from >= frame.FrameNumber-1 {
+		if from >= frame.FrameNumber-1 {
 			from = frame.FrameNumber - 1
 		}
 

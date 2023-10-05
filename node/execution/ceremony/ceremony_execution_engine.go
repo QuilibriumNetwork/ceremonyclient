@@ -12,6 +12,7 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -197,6 +198,20 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 			fallthrough
 		case protobufs.CeremonyTranscriptType:
 			frame := e.activeClockFrame
+			hash := sha3.Sum256(any.Value)
+			if any.TypeUrl == protobufs.CeremonyTranscriptType {
+				e.seenMessageMx.Lock()
+				ref := string(hash[:])
+				if _, ok := e.seenMessageMap[ref]; !ok {
+					e.seenMessageMap[ref] = true
+				} else {
+					return nil, errors.Wrap(
+						errors.New("message already received"),
+						"process message",
+					)
+				}
+				e.seenMessageMx.Unlock()
+			}
 			if e.clock.IsInProverTrie(e.proverPublicKey) {
 				app, err := application.MaterializeApplicationFromFrame(frame)
 				if err != nil {
@@ -625,7 +640,19 @@ func (e *CeremonyExecutionEngine) connectToActivePeers(
 				return errors.Wrap(err, "connect to active peers")
 			}
 
+			client, err := e.clock.GetPublicChannelForProvingKey(
+				i > position,
+				p.KeyValue,
+			)
+			if err != nil {
+				e.logger.Error(
+					"peer does not support direct public channels",
+					zap.Binary("proving_key", p.KeyValue),
+					zap.Error(err),
+				)
+			}
 			e.peerChannels[string(p.KeyValue)], err = p2p.NewPublicP2PChannel(
+				client,
 				e.proverPublicKey,
 				p.KeyValue,
 				i > position,
@@ -696,7 +723,19 @@ func (e *CeremonyExecutionEngine) participateRound(
 			}
 
 			if _, ok := e.peerChannels[string(p.KeyValue)]; !ok {
+				client, err := e.clock.GetPublicChannelForProvingKey(
+					initiator,
+					p.KeyValue,
+				)
+				if err != nil {
+					e.logger.Error(
+						"peer does not support direct public channels",
+						zap.Binary("proving_key", p.KeyValue),
+						zap.Error(err),
+					)
+				}
 				e.peerChannels[string(p.KeyValue)], err = p2p.NewPublicP2PChannel(
+					client,
 					e.proverPublicKey,
 					p.KeyValue,
 					initiator,

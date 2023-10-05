@@ -8,6 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -39,7 +40,10 @@ type peerInfo struct {
 	direct    bool
 }
 
+type ChannelServer = protobufs.CeremonyService_GetPublicChannelServer
+
 type CeremonyDataClockConsensusEngine struct {
+	protobufs.UnimplementedCeremonyServiceServer
 	frame                       uint64
 	activeFrame                 *protobufs.ClockFrame
 	difficulty                  uint32
@@ -82,6 +86,7 @@ type CeremonyDataClockConsensusEngine struct {
 	lastKeyBundleAnnouncementFrame uint64
 	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
+	activeChannelsMap              map[string]ChannelServer
 }
 
 var _ consensus.DataConsensusEngine = (*CeremonyDataClockConsensusEngine)(nil)
@@ -201,6 +206,21 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 		e.handleSync,
 		true,
 	)
+
+	go func() {
+		server := grpc.NewServer(
+			grpc.MaxSendMsgSize(400*1024*1024),
+			grpc.MaxRecvMsgSize(400*1024*1024),
+		)
+		protobufs.RegisterCeremonyServiceServer(server, e)
+
+		if err := e.pubSub.StartDirectChannelListener(
+			e.pubSub.GetPeerID(),
+			server,
+		); err != nil {
+			panic(err)
+		}
+	}()
 
 	e.state = consensus.EngineStateCollecting
 

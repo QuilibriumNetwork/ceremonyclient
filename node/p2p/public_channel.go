@@ -18,20 +18,27 @@ import (
 // A simplified P2P channel – the pair of actors communicating is public
 // knowledge, even though the data itself is encrypted.
 type PublicP2PChannel struct {
-	participant   *crypto.DoubleRatchetParticipant
-	sendMap       map[uint64][]byte
-	receiveMap    map[uint64][]byte
-	pubSub        PubSub
-	sendFilter    []byte
-	receiveFilter []byte
-	initiator     bool
-	senderSeqNo   uint64
-	receiverSeqNo uint64
-	receiveChan   chan []byte
-	receiveMx     sync.Mutex
+	participant         *crypto.DoubleRatchetParticipant
+	sendMap             map[uint64][]byte
+	receiveMap          map[uint64][]byte
+	pubSub              PubSub
+	sendFilter          []byte
+	receiveFilter       []byte
+	initiator           bool
+	senderSeqNo         uint64
+	receiverSeqNo       uint64
+	receiveChan         chan []byte
+	receiveMx           sync.Mutex
+	publicChannelClient PublicChannelClient
+}
+
+type PublicChannelClient interface {
+	Send(m *protobufs.P2PChannelEnvelope) error
+	Recv() (*protobufs.P2PChannelEnvelope, error)
 }
 
 func NewPublicP2PChannel(
+	publicChannelClient PublicChannelClient,
 	senderIdentifier, receiverIdentifier []byte,
 	initiator bool,
 	sendingIdentityPrivateKey curves.Scalar,
@@ -52,15 +59,16 @@ func NewPublicP2PChannel(
 	)
 
 	channel := &PublicP2PChannel{
-		sendMap:       map[uint64][]byte{},
-		receiveMap:    map[uint64][]byte{},
-		initiator:     initiator,
-		sendFilter:    sendFilter,
-		receiveFilter: receiveFilter,
-		pubSub:        pubSub,
-		senderSeqNo:   0,
-		receiverSeqNo: 0,
-		receiveChan:   make(chan []byte),
+		publicChannelClient: publicChannelClient,
+		sendMap:             map[uint64][]byte{},
+		receiveMap:          map[uint64][]byte{},
+		initiator:           initiator,
+		sendFilter:          sendFilter,
+		receiveFilter:       receiveFilter,
+		pubSub:              pubSub,
+		senderSeqNo:         0,
+		receiverSeqNo:       0,
+		receiveChan:         make(chan []byte),
 	}
 
 	var err error
@@ -113,18 +121,19 @@ func NewPublicP2PChannel(
 	}
 
 	channel.participant = participant
+	if publicChannelClient == nil {
+		pubSub.Subscribe(
+			sendFilter,
+			func(message *pb.Message) error { return nil },
+			true,
+		)
 
-	pubSub.Subscribe(
-		sendFilter,
-		func(message *pb.Message) error { return nil },
-		true,
-	)
-
-	pubSub.Subscribe(
-		receiveFilter,
-		channel.handleReceive,
-		true,
-	)
+		pubSub.Subscribe(
+			receiveFilter,
+			channel.handleReceive,
+			true,
+		)
+	}
 
 	return channel, nil
 }
@@ -167,28 +176,63 @@ func (c *PublicP2PChannel) Send(message []byte) error {
 		return errors.Wrap(err, "send")
 	}
 
-	rawBytes, err := proto.Marshal(envelope)
-	if err != nil {
-		return errors.Wrap(err, "send")
+	if c.publicChannelClient == nil {
+		rawBytes, err := proto.Marshal(envelope)
+		if err != nil {
+			return errors.Wrap(err, "send")
+		}
+
+		c.sendMap[c.senderSeqNo] = rawBytes
+		return errors.Wrap(
+			c.pubSub.PublishToBitmask(c.sendFilter, rawBytes),
+			"send",
+		)
+	} else {
+		return errors.Wrap(
+			c.publicChannelClient.Send(envelope),
+			"send",
+		)
 	}
-
-	c.sendMap[c.senderSeqNo] = rawBytes
-
-	return errors.Wrap(c.pubSub.PublishToBitmask(c.sendFilter, rawBytes), "send")
 }
 
 func (c *PublicP2PChannel) Receive() ([]byte, error) {
 	c.receiverSeqNo++
-	after := time.After(20 * time.Second)
-	select {
-	case msg := <-c.receiveChan:
-		return msg, nil
-	case <-after:
-		return nil, errors.Wrap(errors.New("timed out"), "receive")
+	if c.publicChannelClient == nil {
+		after := time.After(20 * time.Second)
+		select {
+		case msg := <-c.receiveChan:
+			return msg, nil
+		case <-after:
+			return nil, errors.Wrap(errors.New("timed out"), "receive")
+		}
+	} else {
+		msg, err := c.publicChannelClient.Recv()
+		if err != nil {
+			return nil, errors.Wrap(err, "receive")
+		}
+
+		rawData, err := c.participant.RatchetDecrypt(msg)
+		if err != nil {
+			return nil, errors.Wrap(err, "receive")
+		}
+
+		seqNo := binary.BigEndian.Uint64(rawData[:8])
+
+		if seqNo == c.receiverSeqNo {
+			return rawData[8:], nil
+		} else {
+			c.receiveMx.Lock()
+			c.receiveMap[seqNo] = rawData[8:]
+			c.receiveMx.Unlock()
+		}
+
+		return nil, nil
 	}
 }
 
 func (c *PublicP2PChannel) Close() {
-	c.pubSub.Unsubscribe(c.sendFilter, true)
-	c.pubSub.Unsubscribe(c.receiveFilter, true)
+	if c.publicChannelClient == nil {
+		c.pubSub.Unsubscribe(c.sendFilter, true)
+		c.pubSub.Unsubscribe(c.receiveFilter, true)
+	}
 }

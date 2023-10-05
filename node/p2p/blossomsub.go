@@ -7,19 +7,25 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	gostream "github.com/libp2p/go-libp2p-gostream"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	libp2pconfig "github.com/libp2p/go-libp2p/config"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -343,6 +349,70 @@ func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {
 	}
 
 	return b.h.Peerstore().Addrs(peer.ID(peerId))[0].String()
+}
+
+func (b *BlossomSub) StartDirectChannelListener(
+	key []byte,
+	server *grpc.Server,
+) error {
+	bind, err := gostream.Listen(
+		b.h,
+		protocol.ID(
+			"/p2p/direct-channel/"+base58.Encode(key),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "start direct channel listener")
+	}
+
+	return errors.Wrap(server.Serve(bind), "start direct channel listener")
+}
+
+func (b *BlossomSub) GetDirectChannel(key []byte) (
+	dialCtx *grpc.ClientConn,
+	err error,
+) {
+	// Kind of a weird hack, but gostream can induce panics if the peer drops at
+	// the time of connection, this avoids the problem.
+	defer func() {
+		if r := recover(); r != nil {
+			dialCtx = nil
+			err = errors.New("connection failed")
+		}
+	}()
+
+	dialCtx, err = grpc.DialContext(
+		b.ctx,
+		base58.Encode(key),
+		grpc.WithDialer(
+			func(peerIdStr string, timeout time.Duration) (net.Conn, error) {
+				subCtx, subCtxCancel := context.WithTimeout(b.ctx, timeout)
+				defer subCtxCancel()
+
+				id, err := peer.Decode(peerIdStr)
+				if err != nil {
+					return nil, errors.Wrap(err, "dial context")
+				}
+
+				c, err := gostream.Dial(
+					subCtx,
+					b.h,
+					peer.ID(key),
+					protocol.ID(
+						"/p2p/direct-channel/"+peer.ID(id).String(),
+					),
+				)
+
+				return c, errors.Wrap(err, "dial context")
+			},
+		),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get direct channel")
+	}
+
+	return dialCtx, nil
 }
 
 func discoverPeers(

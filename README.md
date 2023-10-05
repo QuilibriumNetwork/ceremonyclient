@@ -28,7 +28,7 @@ to provide proofs of execution, and proofs of data availability for the network.
 
 For participating in a round of the ceremony, nodes will be allocated:
 
-    reward = 161 * log_2(participant_count)
+    reward = 161 * log_2(participant_count) QUIL
 
 ### Basic Flow
 

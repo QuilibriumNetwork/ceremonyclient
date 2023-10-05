@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 )
 
@@ -15,4 +16,9 @@ type PubSub interface {
 	GetNetworkPeersCount() int
 	GetRandomPeer(bitmask []byte) ([]byte, error)
 	GetMultiaddrOfPeer(peerId []byte) string
+	StartDirectChannelListener(
+		key []byte,
+		server *grpc.Server,
+	) error
+	GetDirectChannel(peerId []byte) (*grpc.ClientConn, error)
 }

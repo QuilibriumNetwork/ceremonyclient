@@ -4,6 +4,8 @@ package quilibrium.node.ceremony.pb;
 
 option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 
+import "channel.proto";
+import "clock.proto";
 import "keys.proto";
 
 // Describes the transcript of KZG ceremony execution
@@ -133,4 +135,34 @@ message CeremonyPeer {
   bytes peer_id = 1;
   string multiaddr = 2;
   uint64 max_frame = 3;
+}
+
+message CeremonyCompressedSync {
+  uint64 from_frame_number = 1;
+  uint64 to_frame_number = 2;
+  repeated quilibrium.node.clock.pb.ClockFrame truncated_clock_frames = 3;
+  repeated InclusionProofsMap proofs = 4;
+  repeated InclusionSegmentsMap segments = 5;
+}
+
+message InclusionProofsMap {
+  bytes frame_commit = 1;
+  bytes proof = 2;
+  repeated InclusionCommitmentsMap commitments = 3;
+}
+
+message InclusionSegmentsMap {
+  bytes hash = 1;
+  bytes data = 2;
+}
+
+message InclusionCommitmentsMap {
+  bytes commitment = 1;
+  string type_url = 2;
+  repeated bytes segment_hashes = 3;
+}
+
+service CeremonyService {
+  rpc GetCompressedSyncFrames (quilibrium.node.clock.pb.ClockFramesRequest) returns (stream CeremonyCompressedSync);
+  rpc GetPublicChannel (stream quilibrium.node.channel.pb.P2PChannelEnvelope) returns (stream quilibrium.node.channel.pb.P2PChannelEnvelope);
 }

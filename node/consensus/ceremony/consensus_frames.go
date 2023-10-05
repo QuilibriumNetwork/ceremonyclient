@@ -2,12 +2,13 @@ package ceremony
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math/big"
 	"strings"
-	"time"
 
 	"github.com/iden3/go-iden3-crypto/ff"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -15,6 +16,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
@@ -585,15 +587,13 @@ func (
 	return frame
 }
 
-func (e *CeremonyDataClockConsensusEngine) commitLongestPath() (
+func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
+	latest *protobufs.ClockFrame,
+) (
 	*protobufs.ClockFrame,
 	error,
 ) {
-	current, err := e.clockStore.GetLatestDataClockFrame(e.filter, nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "commit longest path")
-	}
-
+	current := latest
 	e.logger.Info(
 		"searching from committed frame",
 		zap.Uint64("frame_number", current.FrameNumber),
@@ -844,10 +844,15 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 			max = v.maxFrame
 		}
 	}
+	size := len(e.peerMap)
 	e.peerMapMx.Unlock()
 
 	if peer == nil {
-		return nil, 0, p2p.ErrNoPeersAvailable
+		if size > 1 {
+			return nil, 0, nil
+		} else {
+			return nil, 0, p2p.ErrNoPeersAvailable
+		}
 	}
 
 	return peer, max, nil
@@ -867,67 +872,85 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 		}
 
 		maxFrame := uint64(0)
-		if e.syncingStatus == SyncStatusNotSyncing {
-			var peerId []byte
-			peerId, maxFrame, err = e.GetMostAheadPeer()
-			if err != nil {
-				e.logger.Warn("no peers available, skipping sync")
-			} else {
-				e.syncingStatus = SyncStatusAwaitingResponse
-				e.logger.Info(
-					"setting syncing target",
-					zap.String("peer_id", peer.ID(peerId).String()),
-				)
-
-				e.pubSub.Subscribe(
-					append(append([]byte{}, e.filter...), peerId...),
-					e.handleSync,
-					true,
-				)
-				e.syncingTarget = peerId
-
-				go func() {
-					time.Sleep(2 * time.Second)
-					if err := e.publishMessage(
-						append(append([]byte{}, e.filter...), peerId...),
-						&protobufs.ClockFramesRequest{
-							Filter:          e.filter,
-							FromFrameNumber: latest.FrameNumber + 1,
-						}); err != nil {
-						e.logger.Error(
-							"could not publish clock frame request",
-							zap.Error(err),
-						)
-					}
-				}()
-			}
-		}
-
-		performedSync := false
-		waitDecay := time.Duration(2000)
-		for e.syncingStatus != SyncStatusNotSyncing {
+		var peerId []byte
+		peerId, maxFrame, err = e.GetMostAheadPeer()
+		if err != nil {
+			e.logger.Warn("no peers available, skipping sync")
+		} else if peerId == nil {
+			e.logger.Info("currently up to date, skipping sync")
+		} else {
+			e.syncingStatus = SyncStatusAwaitingResponse
 			e.logger.Info(
-				"waiting for sync to complete...",
-				zap.Duration("wait_decay", waitDecay),
+				"setting syncing target",
+				zap.String("peer_id", peer.ID(peerId).String()),
 			)
 
-			time.Sleep(waitDecay * time.Millisecond)
+			cc, err := e.pubSub.GetDirectChannel(peerId)
+			if err != nil {
+				e.logger.Error(
+					"could not establish direct channel",
+					zap.Error(err),
+				)
+			} else {
+				from := latest.FrameNumber
+				if from == 0 {
+					from = 1
+				} else if maxFrame-from > 32 {
+					// divergence is high, we need to confirm we're not in a fork
+					from = 1
+					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
+					if err != nil {
+						// This should never happen for healthy systems, if it does we're
+						// in a severely corrupted state.
+						e.logger.Error(
+							"could not find genesis frame, please reset your store",
+						)
+						panic(err)
+					}
+				}
 
-			waitDecay = waitDecay * 2
-			if waitDecay >= (100 * (2 << 7)) {
-				if e.syncingStatus == SyncStatusAwaitingResponse {
-					e.logger.Info("maximum wait for sync response, skipping sync")
-					e.syncingStatus = SyncStatusNotSyncing
-					break
+				client := protobufs.NewCeremonyServiceClient(cc)
+				s, err := client.GetCompressedSyncFrames(
+					context.Background(),
+					&protobufs.ClockFramesRequest{
+						Filter:          e.filter,
+						FromFrameNumber: from,
+						ToFrameNumber:   maxFrame,
+					},
+					grpc.MaxCallRecvMsgSize(400*1024*1024),
+				)
+				if err != nil {
+					e.logger.Error(
+						"error while retrieving sync",
+						zap.Error(err),
+					)
 				} else {
-					waitDecay = 100 * (2 << 7)
-					performedSync = true
+					var syncMsg *protobufs.CeremonyCompressedSync
+					for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+						e.logger.Info(
+							"received compressed sync frame",
+							zap.Uint64("from", syncMsg.FromFrameNumber),
+							zap.Uint64("to", syncMsg.ToFrameNumber),
+							zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
+							zap.Int("proofs", len(syncMsg.Proofs)),
+						)
+						if err = e.decompressAndStoreCandidates(syncMsg); err != nil {
+							break
+						}
+					}
+					if err != nil && err != io.EOF {
+						e.logger.Error("error while receiving sync", zap.Error(err))
+					}
+				}
+
+				if err := cc.Close(); err != nil {
+					e.logger.Error("error while closing connection", zap.Error(err))
 				}
 			}
 		}
 
 		e.logger.Info("selecting leader")
-		latestFrame, err := e.commitLongestPath()
+		latestFrame, err := e.commitLongestPath(latest)
 		if err != nil {
 			e.logger.Error("could not collect longest path", zap.Error(err))
 			return nil, errors.Wrap(err, "collect")
@@ -949,14 +972,9 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			zap.Uint64("frame_number", latestFrame.FrameNumber),
 		)
 
-		if latestFrame.FrameNumber >= currentFramePublished.FrameNumber &&
-			(!performedSync || e.frame+32 >= maxFrame) {
-			e.setFrame(latestFrame)
-			e.state = consensus.EngineStateProving
-			return latestFrame, nil
-		} else {
-			return latestFrame, nil
-		}
+		e.setFrame(latestFrame)
+		e.state = consensus.EngineStateProving
+		return latestFrame, nil
 	}
 
 	return nil, nil
