@@ -930,6 +930,10 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 						"error while retrieving sync",
 						zap.Error(err),
 					)
+					e.peerMapMx.Lock()
+					e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+					delete(e.peerMap, string(peerId))
+					e.peerMapMx.Unlock()
 				} else {
 					var syncMsg *protobufs.CeremonyCompressedSync
 					for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
