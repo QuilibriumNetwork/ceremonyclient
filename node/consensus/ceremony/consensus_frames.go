@@ -892,6 +892,10 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 					"could not establish direct channel",
 					zap.Error(err),
 				)
+				e.peerMapMx.Lock()
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				delete(e.peerMap, string(peerId))
+				e.peerMapMx.Unlock()
 			} else {
 				from := latest.FrameNumber
 				if from == 0 {

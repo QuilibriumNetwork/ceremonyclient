@@ -87,6 +87,7 @@ type CeremonyDataClockConsensusEngine struct {
 	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
 	activeChannelsMap              map[string]ChannelServer
+	uncooperativePeersMap          map[string]*peerInfo
 	fullResync                     bool
 }
 
@@ -146,17 +147,18 @@ func NewCeremonyDataClockConsensusEngine(
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		},
-		lastFrameReceivedAt:  time.Time{},
-		frameProverTrie:      &tries.RollingFrecencyCritbitTrie{},
-		frameSeenProverTrie:  &tries.RollingFrecencyCritbitTrie{},
-		pendingCommits:       make(chan *anypb.Any),
-		pendingCommitWorkers: engineConfig.PendingCommitWorkers,
-		prover:               qcrypto.DefaultKZGProver(),
-		stagedKeyCommits:     make(InclusionMap),
-		stagedKeyPolynomials: make(PolynomialMap),
-		syncingStatus:        SyncStatusNotSyncing,
-		peerAnnounceMap:      map[string]*protobufs.CeremonyPeerListAnnounce{},
-		peerMap:              map[string]*peerInfo{},
+		lastFrameReceivedAt:   time.Time{},
+		frameProverTrie:       &tries.RollingFrecencyCritbitTrie{},
+		frameSeenProverTrie:   &tries.RollingFrecencyCritbitTrie{},
+		pendingCommits:        make(chan *anypb.Any),
+		pendingCommitWorkers:  engineConfig.PendingCommitWorkers,
+		prover:                qcrypto.DefaultKZGProver(),
+		stagedKeyCommits:      make(InclusionMap),
+		stagedKeyPolynomials:  make(PolynomialMap),
+		syncingStatus:         SyncStatusNotSyncing,
+		peerAnnounceMap:       map[string]*protobufs.CeremonyPeerListAnnounce{},
+		peerMap:               map[string]*peerInfo{},
+		uncooperativePeersMap: map[string]*peerInfo{},
 	}
 
 	logger.Info("constructing consensus engine")

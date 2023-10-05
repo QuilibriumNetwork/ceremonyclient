@@ -158,6 +158,10 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 
 	e.peerMapMx.Lock()
 	for _, p := range announce.PeerList {
+		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
+			continue
+		}
+
 		if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
 			continue
 		}
