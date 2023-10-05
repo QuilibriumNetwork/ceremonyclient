@@ -87,6 +87,7 @@ type CeremonyDataClockConsensusEngine struct {
 	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
 	activeChannelsMap              map[string]ChannelServer
+	fullResync                     bool
 }
 
 var _ consensus.DataConsensusEngine = (*CeremonyDataClockConsensusEngine)(nil)

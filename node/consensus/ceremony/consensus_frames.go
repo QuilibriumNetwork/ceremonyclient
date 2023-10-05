@@ -885,6 +885,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				zap.String("peer_id", peer.ID(peerId).String()),
 			)
 
+			willPerformFullResync := false
 			cc, err := e.pubSub.GetDirectChannel(peerId)
 			if err != nil {
 				e.logger.Error(
@@ -895,7 +896,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				from := latest.FrameNumber
 				if from == 0 {
 					from = 1
-				} else if maxFrame-from > 32 {
+				} else if maxFrame-from > 32 && !e.fullResync {
 					// divergence is high, we need to confirm we're not in a fork
 					from = 1
 					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
@@ -907,6 +908,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 						)
 						panic(err)
 					}
+					willPerformFullResync = true
 				}
 
 				client := protobufs.NewCeremonyServiceClient(cc)
@@ -945,6 +947,10 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 				if err := cc.Close(); err != nil {
 					e.logger.Error("error while closing connection", zap.Error(err))
+				}
+
+				if willPerformFullResync {
+					e.fullResync = true
 				}
 			}
 		}
