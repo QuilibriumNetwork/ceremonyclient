@@ -687,12 +687,12 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 				zap.Int("commit_depth", len(runningFrames[0])),
 			)
 
-			txn, err := e.clockStore.NewTransaction()
-			if err != nil {
-				return nil, errors.Wrap(err, "commit longest path")
-			}
-
 			for _, s := range runningFrames[0][1:] {
+				txn, err := e.clockStore.NewTransaction()
+				if err != nil {
+					return nil, errors.Wrap(err, "commit longest path")
+				}
+
 				e.logger.Info(
 					"committing candidate",
 					zap.Uint64("frame_number", s.FrameNumber),
@@ -796,14 +796,14 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 						}
 					}
 				}
-			}
 
-			if err := txn.Commit(); err != nil {
-				e.logger.Error(
-					"could not commit candidates",
-					zap.Error(err),
-				)
-				return nil, errors.Wrap(err, "commit longest path")
+				if err := txn.Commit(); err != nil {
+					e.logger.Error(
+						"could not commit candidates",
+						zap.Error(err),
+					)
+					return nil, errors.Wrap(err, "commit longest path")
+				}
 			}
 
 			runningFrames = [][]*protobufs.ClockFrame{
