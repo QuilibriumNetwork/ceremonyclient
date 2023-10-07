@@ -86,7 +86,6 @@ type CeremonyDataClockConsensusEngine struct {
 	lastKeyBundleAnnouncementFrame uint64
 	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
-	activeChannelsMap              map[string]ChannelServer
 	uncooperativePeersMap          map[string]*peerInfo
 	fullResync                     bool
 }
