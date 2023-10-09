@@ -23,19 +23,19 @@ import (
 
 func NewNode(configConfig *config.Config) (*Node, error) {
 	zapLogger := logger()
-	engineConfig := configConfig.Engine
-	keyConfig := configConfig.Key
-	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	dbConfig := configConfig.DB
 	db := store.NewPebbleDB(dbConfig)
 	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
-	pebbleKeyStore := store.NewPebbleKeyStore(db, zapLogger)
 	p2PConfig := configConfig.P2P
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	engineConfig := configConfig.Engine
+	keyConfig := configConfig.Key
+	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
+	pebbleKeyStore := store.NewPebbleKeyStore(db, zapLogger)
 	ceremonyDataClockConsensusEngine := ceremony.NewCeremonyDataClockConsensusEngine(engineConfig, zapLogger, fileKeyManager, pebbleClockStore, pebbleKeyStore, blossomSub)
 	ceremonyExecutionEngine := ceremony2.NewCeremonyExecutionEngine(zapLogger, ceremonyDataClockConsensusEngine, engineConfig, fileKeyManager, blossomSub, pebbleClockStore, pebbleKeyStore)
 	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub)
-	node, err := newNode(ceremonyExecutionEngine, masterClockConsensusEngine)
+	node, err := newNode(zapLogger, pebbleClockStore, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
 	}

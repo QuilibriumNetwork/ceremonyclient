@@ -17,6 +17,17 @@ If you do not, or have already run the above, run:
 
     go run ./...
 
+## EXPERIMENTAL – gRPC/REST Support
+
+If you want to enable gRPC/REST, add the following entries to your config.yml:
+
+    listenGrpcMultiaddr: <multiaddr> 
+    listenRESTMultiaddr: <multiaddr>
+
+Please note: this interface, while read-only, is unauthenticated and not rate-
+limited. It is recommended that you only enable if you are properly controlling
+access via firewall or only query via localhost.
+
 ## Purpose
 
 The ceremony application provides a secure reference string (SRS) from which

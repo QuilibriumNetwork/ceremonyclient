@@ -1141,3 +1141,7 @@ func (e *CeremonyExecutionEngine) ensureSecrets(
 		)
 	}
 }
+
+func (e *CeremonyExecutionEngine) GetPeerInfo() *protobufs.PeerInfoResponse {
+	return e.clock.GetPeerInfo()
+}

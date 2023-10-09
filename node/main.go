@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 )
 
 var (
@@ -82,6 +83,28 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	if nodeConfig.ListenGRPCMultiaddr != "" {
+		srv, err := rpc.NewRPCServer(
+			nodeConfig.ListenGRPCMultiaddr,
+			nodeConfig.ListenRestMultiaddr,
+			node.GetLogger(),
+			node.GetClockStore(),
+			node.GetPubSub(),
+			node.GetExecutionEngines(),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		go func() {
+			err := srv.Start()
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+
 	node.Start()
 
 	<-done
@@ -205,5 +228,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.1.1 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.1.2 – Dawn")
 }

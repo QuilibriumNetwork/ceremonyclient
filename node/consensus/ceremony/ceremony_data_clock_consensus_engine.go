@@ -343,3 +343,29 @@ func (
 ) GetActiveFrame() *protobufs.ClockFrame {
 	return e.activeFrame
 }
+
+func (
+	e *CeremonyDataClockConsensusEngine,
+) GetPeerInfo() *protobufs.PeerInfoResponse {
+	resp := &protobufs.PeerInfoResponse{}
+	e.peerMapMx.Lock()
+	for _, v := range e.peerMap {
+		resp.PeerInfo = append(resp.PeerInfo, &protobufs.PeerInfo{
+			PeerId:     v.peerId,
+			Multiaddrs: []string{v.multiaddr},
+			MaxFrame:   v.maxFrame,
+		})
+	}
+	for _, v := range e.uncooperativePeersMap {
+		resp.UncooperativePeerInfo = append(
+			resp.UncooperativePeerInfo,
+			&protobufs.PeerInfo{
+				PeerId:     v.peerId,
+				Multiaddrs: []string{v.multiaddr},
+				MaxFrame:   v.maxFrame,
+			},
+		)
+	}
+	e.peerMapMx.Unlock()
+	return resp
+}

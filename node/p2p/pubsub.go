@@ -3,6 +3,7 @@ package p2p
 import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 type PubSub interface {
@@ -21,4 +22,5 @@ type PubSub interface {
 		server *grpc.Server,
 	) error
 	GetDirectChannel(peerId []byte) (*grpc.ClientConn, error)
+	GetNetworkInfo() *protobufs.NetworkInfoResponse
 }

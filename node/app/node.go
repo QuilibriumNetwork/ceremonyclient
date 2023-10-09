@@ -3,17 +3,26 @@ package app
 import (
 	"errors"
 
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type Node struct {
+	logger      *zap.Logger
+	clockStore  store.ClockStore
+	pubSub      p2p.PubSub
 	execEngines map[string]execution.ExecutionEngine
 	engine      consensus.ConsensusEngine
 }
 
 func newNode(
+	logger *zap.Logger,
+	clockStore store.ClockStore,
+	pubSub p2p.PubSub,
 	ceremonyExecutionEngine *ceremony.CeremonyExecutionEngine,
 	engine consensus.ConsensusEngine,
 ) (*Node, error) {
@@ -27,6 +36,9 @@ func newNode(
 	}
 
 	return &Node{
+		logger,
+		clockStore,
+		pubSub,
 		execEngines,
 		engine,
 	}, nil
@@ -49,4 +61,24 @@ func (n *Node) Stop() {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func (n *Node) GetLogger() *zap.Logger {
+	return n.logger
+}
+
+func (n *Node) GetClockStore() store.ClockStore {
+	return n.clockStore
+}
+
+func (n *Node) GetPubSub() p2p.PubSub {
+	return n.pubSub
+}
+
+func (n *Node) GetExecutionEngines() []execution.ExecutionEngine {
+	list := []execution.ExecutionEngine{}
+	for _, e := range n.execEngines {
+		list = append(list, e)
+	}
+	return list
 }

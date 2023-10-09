@@ -1,6 +1,8 @@
 package execution
 
-import "source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+import (
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+)
 
 type ExecutionEngine interface {
 	GetName() string
@@ -11,4 +13,5 @@ type ExecutionEngine interface {
 		address []byte,
 		message *protobufs.Message,
 	) ([]*protobufs.Message, error)
+	GetPeerInfo() *protobufs.PeerInfoResponse
 }

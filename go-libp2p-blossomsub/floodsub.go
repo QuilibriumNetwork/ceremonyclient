@@ -41,6 +41,10 @@ func (fs *FloodSubRouter) Attach(p *PubSub) {
 	fs.tracer = p.tracer
 }
 
+func (fs *FloodSubRouter) PeerScore(p peer.ID) float64 {
+	return fs.p.PeerScore(p)
+}
+
 func (fs *FloodSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
 	fs.tracer.AddPeer(p, proto)
 }

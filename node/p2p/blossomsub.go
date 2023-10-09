@@ -29,6 +29,7 @@ import (
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 type BlossomSub struct {
@@ -336,6 +337,23 @@ func (b *BlossomSub) GetBitmaskPeers() map[string][]string {
 
 func (b *BlossomSub) GetPeerstoreCount() int {
 	return len(b.h.Peerstore().Peers())
+}
+
+func (b *BlossomSub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
+	resp := &protobufs.NetworkInfoResponse{}
+	for _, p := range b.h.Network().Peers() {
+		addrs := b.h.Peerstore().Addrs(p)
+		multiaddrs := []string{}
+		for _, a := range addrs {
+			multiaddrs = append(multiaddrs, a.String())
+		}
+		resp.NetworkInfo = append(resp.NetworkInfo, &protobufs.NetworkInfo{
+			PeerId:     []byte(p),
+			Multiaddrs: multiaddrs,
+			PeerScore:  b.ps.PeerScore(p),
+		})
+	}
+	return resp
 }
 
 func (b *BlossomSub) GetNetworkPeersCount() int {

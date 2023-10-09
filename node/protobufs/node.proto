@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package quilibrium.node.node.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "clock.proto";
+
+message GetFramesRequest {
+  bytes filter = 1;
+  uint64 from_frame_number = 2;
+  uint64 to_frame_number = 3;
+  bool include_candidates = 4;
+}
+
+message GetFrameInfoRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  bytes selector = 3;
+}
+
+message GetPeerInfoRequest {}
+
+message GetNetworkInfoRequest {}
+
+message FramesResponse {
+  repeated quilibrium.node.clock.pb.ClockFrame truncated_clock_frames = 1;
+}
+
+message FrameInfoResponse {
+  quilibrium.node.clock.pb.ClockFrame clock_frame = 1;
+}
+
+message PeerInfo {
+  bytes peer_id = 1;
+  repeated string multiaddrs = 2;
+  uint64 max_frame = 3;
+}
+
+message PeerInfoResponse {
+  repeated PeerInfo peer_info = 1;
+  repeated PeerInfo uncooperative_peer_info = 2;
+}
+
+message NetworkInfo {
+  bytes peer_id = 1;
+  repeated string multiaddrs = 2;
+  double peer_score = 3;
+}
+
+message NetworkInfoResponse {
+  repeated NetworkInfo network_info = 1;
+}
+
+service NodeService {
+  rpc GetFrames(GetFramesRequest) returns (FramesResponse);
+  rpc GetFrameInfo(GetFrameInfoRequest) returns (FrameInfoResponse);
+  rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
+  rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
+}

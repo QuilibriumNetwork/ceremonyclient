@@ -17,11 +17,13 @@ import (
 )
 
 type Config struct {
-	Key     *KeyConfig    `yaml:"key"`
-	P2P     *P2PConfig    `yaml:"p2p"`
-	Engine  *EngineConfig `yaml:"engine"`
-	DB      *DBConfig     `yaml:"db"`
-	LogFile string        `yaml:"logFile"`
+	Key                 *KeyConfig    `yaml:"key"`
+	P2P                 *P2PConfig    `yaml:"p2p"`
+	Engine              *EngineConfig `yaml:"engine"`
+	DB                  *DBConfig     `yaml:"db"`
+	ListenGRPCMultiaddr string        `yaml:"listenGrpcMultiaddr"`
+	ListenRestMultiaddr string        `yaml:"listenRESTMultiaddr"`
+	LogFile             string        `yaml:"logFile"`
 }
 
 func NewConfig(configPath string) (*Config, error) {

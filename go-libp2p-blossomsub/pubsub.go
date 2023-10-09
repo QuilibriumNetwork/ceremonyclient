@@ -189,6 +189,9 @@ type PubSubRouter interface {
 	// Attach is invoked by the PubSub constructor to attach the router to a
 	// freshly initialized PubSub instance.
 	Attach(*PubSub)
+	// PeerScore returns the internal scoring basis for a given peer. This method should not be
+	// externally exposed to remote callers.
+	PeerScore(peer.ID) float64
 	// AddPeer notifies the router that a new peer has been connected.
 	AddPeer(peer.ID, protocol.ID)
 	// RemovePeer notifies the router that a peer has been disconnected.
@@ -1221,6 +1224,10 @@ func WithBitmaskMessageIdFn(msgId MsgIdFunction) BitmaskOpt {
 		t.p.idGen.Set(t.bitmask, msgId)
 		return nil
 	}
+}
+
+func (p *PubSub) PeerScore(pr peer.ID) float64 {
+	return p.rt.PeerScore(pr)
 }
 
 // Join joins the bitmask and returns a Bitmask handle. Only one Bitmask handle should exist per bitmask, and Join will error if

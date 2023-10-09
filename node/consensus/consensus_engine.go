@@ -47,4 +47,5 @@ type DataConsensusEngine interface {
 		engineConfig *config.EngineConfig,
 	) (crypto.Signer, keys.KeyType, []byte, []byte)
 	IsInProverTrie(key []byte) bool
+	GetPeerInfo() *protobufs.PeerInfoResponse
 }

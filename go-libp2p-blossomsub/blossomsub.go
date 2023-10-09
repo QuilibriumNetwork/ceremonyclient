@@ -619,6 +619,10 @@ func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 	return false
 }
 
+func (bs *BlossomSubRouter) PeerScore(p peer.ID) float64 {
+	return bs.score.Score(p)
+}
+
 func (bs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 	_, direct := bs.direct[p]
 	if direct {

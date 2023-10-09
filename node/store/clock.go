@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 
@@ -187,6 +188,26 @@ func (p *PebbleClockIterator) Valid() bool {
 	return p.i.Valid()
 }
 
+func (p *PebbleClockIterator) TruncatedValue() (
+	*protobufs.ClockFrame,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, ErrNotFound
+	}
+
+	value := p.i.Value()
+	frame := &protobufs.ClockFrame{}
+	if err := proto.Unmarshal(value, frame); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get candidate clock frame iterator value",
+		)
+	}
+
+	return frame, nil
+}
+
 func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 	if !p.i.Valid() {
 		return nil, ErrNotFound
@@ -225,6 +246,26 @@ func (p *PebbleCandidateClockIterator) Next() bool {
 
 func (p *PebbleCandidateClockIterator) Valid() bool {
 	return p.i.Valid()
+}
+
+func (p *PebbleCandidateClockIterator) TruncatedValue() (
+	*protobufs.ClockFrame,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, ErrNotFound
+	}
+
+	value := p.i.Value()
+	frame := &protobufs.ClockFrame{}
+	if err := proto.Unmarshal(value, frame); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get candidate clock frame iterator value",
+		)
+	}
+
+	return frame, nil
 }
 
 func (p *PebbleCandidateClockIterator) Value() (*protobufs.ClockFrame, error) {
@@ -1008,11 +1049,27 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 	parent []byte,
 	frameNumber uint64,
 ) (*PebbleCandidateClockIterator, error) {
+	fromParent := rightAlign(parent, 32)
+	toParent := rightAlign(parent, 32)
+
+	if bytes.Equal(parent, []byte{
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}) {
+		toParent = []byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		}
+	}
 	iter := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
-			rightAlign(parent, 32),
+			fromParent,
 			[]byte{
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1023,7 +1080,7 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 		UpperBound: clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
-			rightAlign(parent, 32),
+			toParent,
 			[]byte{
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
