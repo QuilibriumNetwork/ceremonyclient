@@ -74,8 +74,8 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 	bootstrapPeers := []string{
 		"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/QmUhm9iZVruSxyavjoPLCfuoRG94SGQEkfxEEoukEZmD5B",
 		"/ip4/204.186.74.47/udp/8317/quic/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
-		"/ip4/13.237.250.230/udp/8317/quic/p2p/QmazMeSUA9HPLuj53w56k6GUq3xVny3pHtosUZndejJeai",
-		"/ip4/13.236.219.103/udp/8317/quic/p2p/QmcJqNsJLNfxkAxeJijfLppiNQERaeFuwsbg3BGScKqrfh",
+		"/ip4/13.237.250.230/udp/8317/quic/p2p/QmUwMFVZbuqr3vjqYUfihN4v82W4aoqpcu84aLNEo1YFsB",
+		"/ip4/13.236.219.103/udp/8317/quic/p2p/QmczCDFuJHZLwpKDme7GsPg3sFmkrmKSX21ez8yFSw6vwH",
 		"/ip4/204.186.74.46/udp/8316/quic/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
 		"/ip4/186.233.184.181/udp/8336/quic/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
 		"/dns/quil.zanshindojo.org/udp/8336/quic/p2p/QmXbbmtS5D12rEc4HWiHWr6e83SCE4jeThPP4VJpAQPvXq",
