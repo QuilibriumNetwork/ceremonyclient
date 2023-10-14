@@ -855,6 +855,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.StateCount = 0
 			a.RoundCount = 0
 			for _, p := range a.ActiveParticipants {
+				p := p
 				if _, ok := droppedProversMap[string(p.KeyValue)]; !ok {
 					a.NextRoundPreferredParticipants = append(
 						append(
@@ -974,6 +975,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.StateCount = 0
 			a.RoundCount = 0
 			for _, p := range a.ActiveParticipants {
+				p := p
 				if _, ok := droppedProversMap[string(p.KeyValue)]; !ok {
 					a.NextRoundPreferredParticipants = append(
 						append(

@@ -1341,6 +1341,8 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 	}
 
 	for k, v := range proofs {
+		k := k
+		v := v
 		value, closer, err := p.db.Get(dataProofMetadataKey(filter, []byte(k)))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {

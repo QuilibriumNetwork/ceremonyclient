@@ -688,6 +688,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 			)
 
 			for _, s := range runningFrames[0][1:] {
+				s := s
 				txn, err := e.clockStore.NewTransaction()
 				if err != nil {
 					return nil, errors.Wrap(err, "commit longest path")
@@ -728,12 +729,14 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 				)
 
 				for _, p := range s.AggregateProofs {
+					p := p
 					e.logger.Debug(
 						"committing inclusions",
 						zap.Int("inclusions_count", len(p.InclusionCommitments)),
 					)
 
 					for _, c := range p.InclusionCommitments {
+						c := c
 						switch c.TypeUrl {
 						case protobufs.ProvingKeyAnnouncementType:
 							provingKey := &protobufs.ProvingKeyAnnouncement{}
@@ -885,7 +888,6 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				zap.String("peer_id", peer.ID(peerId).String()),
 			)
 
-			willPerformFullResync := false
 			cc, err := e.pubSub.GetDirectChannel(peerId)
 			if err != nil {
 				e.logger.Error(
@@ -898,9 +900,11 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 				e.peerMapMx.Unlock()
 			} else {
 				from := latest.FrameNumber
+				originalFrom := from
+				originalLatest := latest
 				if from == 0 {
 					from = 1
-				} else if maxFrame-from > 32 && !e.fullResync {
+				} else if maxFrame-from > 32 {
 					// divergence is high, we need to confirm we're not in a fork
 					from = 1
 					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
@@ -912,7 +916,6 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 						)
 						panic(err)
 					}
-					willPerformFullResync = true
 				}
 
 				client := protobufs.NewCeremonyServiceClient(cc)
@@ -922,6 +925,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 						Filter:          e.filter,
 						FromFrameNumber: from,
 						ToFrameNumber:   maxFrame,
+						ParentSelector:  latest.ParentSelector,
 					},
 					grpc.MaxCallRecvMsgSize(400*1024*1024),
 				)
@@ -930,13 +934,19 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 						"error while retrieving sync",
 						zap.Error(err),
 					)
+					latest = originalLatest
 					e.peerMapMx.Lock()
 					e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
 					delete(e.peerMap, string(peerId))
 					e.peerMapMx.Unlock()
 				} else {
 					var syncMsg *protobufs.CeremonyCompressedSync
+					askedFrom := from
 					for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+						if syncMsg.FromFrameNumber < askedFrom {
+							askedFrom = syncMsg.FromFrameNumber
+						}
+
 						e.logger.Info(
 							"received compressed sync frame",
 							zap.Uint64("from", syncMsg.FromFrameNumber),
@@ -945,20 +955,41 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 							zap.Int("proofs", len(syncMsg.Proofs)),
 						)
 						if err = e.decompressAndStoreCandidates(syncMsg); err != nil {
+							e.logger.Error(
+								"could not decompress and store candidate",
+								zap.Error(err),
+							)
+							from = originalFrom
+							latest = originalLatest
 							break
 						}
 					}
 					if err != nil && err != io.EOF {
 						e.logger.Error("error while receiving sync", zap.Error(err))
+						from = originalFrom
+						latest = originalLatest
+						askedFrom = from
+					}
+
+					if askedFrom < from {
+						e.logger.Info(
+							"peer provided deeper history due to fork, rewinding consensus " +
+								"head",
+						)
+						askedLatest, _, err := e.clockStore.GetDataClockFrame(
+							e.filter,
+							askedFrom-1,
+						)
+						if err != nil {
+							e.logger.Error("error while receiving sync", zap.Error(err))
+						} else {
+							latest = askedLatest
+						}
 					}
 				}
 
 				if err := cc.Close(); err != nil {
 					e.logger.Error("error while closing connection", zap.Error(err))
-				}
-
-				if willPerformFullResync {
-					e.fullResync = true
 				}
 			}
 		}

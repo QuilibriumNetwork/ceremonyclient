@@ -212,6 +212,13 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 							zap.String("announced_peer", peer.ID(pr.peerId).String()),
 							zap.Int64("frame_distance", dst),
 						)
+						e.peerMap[string(p.PeerId)] = &peerInfo{
+							peerId:    p.PeerId,
+							multiaddr: p.Multiaddr,
+							maxFrame:  p.MaxFrame,
+							direct:    false,
+							lastSeen:  time.Now().Unix(),
+						}
 					} else if dst < -4 {
 						e.logger.Debug(
 							"peer sent announcement with lower frame index for peer",

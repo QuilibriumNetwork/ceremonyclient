@@ -51,6 +51,7 @@ func (a *CeremonyApplication) applyLobbyJoin(
 	prepend := false
 	nextRoundPreferredParticipants := []*protobufs.Ed448PublicKey{}
 	for _, p := range a.NextRoundPreferredParticipants {
+		p := p
 		if !bytes.Equal(p.KeyValue, signature.PublicKey.KeyValue) {
 			nextRoundPreferredParticipants = append(
 				nextRoundPreferredParticipants,

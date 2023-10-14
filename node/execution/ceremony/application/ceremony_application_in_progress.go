@@ -54,6 +54,7 @@ func (a *CeremonyApplication) applySeenProverAttestation(
 
 	replaced := false
 	for i, att := range a.LatestSeenProverAttestations {
+		att := att
 		if bytes.Equal(
 			att.SeenProverKey.KeyValue,
 			seenProverAttestation.SeenProverKey.KeyValue,
@@ -126,6 +127,7 @@ func (a *CeremonyApplication) applyDroppedProverAttestation(
 
 	replaced := false
 	for i, att := range a.DroppedParticipantAttestations {
+		att := att
 		if bytes.Equal(
 			att.DroppedProverKey.KeyValue,
 			droppedProverAttestation.DroppedProverKey.KeyValue,

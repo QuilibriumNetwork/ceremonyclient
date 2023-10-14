@@ -54,6 +54,7 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 			}
 
 			for _, m := range messages {
+				m := m
 				if err := e.publishMessage(m.Address, m); err != nil {
 					e.logger.Error(
 						"could not publish message for engine",

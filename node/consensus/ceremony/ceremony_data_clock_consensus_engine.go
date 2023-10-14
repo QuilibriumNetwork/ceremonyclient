@@ -87,7 +87,6 @@ type CeremonyDataClockConsensusEngine struct {
 	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
 	uncooperativePeersMap          map[string]*peerInfo
-	fullResync                     bool
 }
 
 var _ consensus.DataConsensusEngine = (*CeremonyDataClockConsensusEngine)(nil)
@@ -265,16 +264,19 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 			case consensus.EngineStateCollecting:
 				if latestFrame, err = e.collect(latestFrame); err != nil {
 					e.logger.Error("could not collect", zap.Error(err))
+					e.state = consensus.EngineStateCollecting
 					errChan <- err
 				}
 			case consensus.EngineStateProving:
 				if latestFrame, err = e.prove(latestFrame); err != nil {
 					e.logger.Error("could not prove", zap.Error(err))
+					e.state = consensus.EngineStateCollecting
 					errChan <- err
 				}
 			case consensus.EngineStatePublishing:
 				if err = e.publishProof(latestFrame); err != nil {
 					e.logger.Error("could not publish", zap.Error(err))
+					e.state = consensus.EngineStateCollecting
 					errChan <- err
 				}
 			}

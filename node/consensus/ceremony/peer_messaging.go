@@ -76,7 +76,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 
 	from := request.FromFrameNumber
 
-	_, _, err := e.clockStore.GetDataClockFrame(
+	frame, _, err := e.clockStore.GetDataClockFrame(
 		request.Filter,
 		from,
 	)
@@ -105,6 +105,43 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 			}
 
 			return nil
+		}
+	}
+
+	parent := request.ParentSelector
+	if parent != nil {
+		if !bytes.Equal(frame.ParentSelector, parent) {
+			e.logger.Info(
+				"peer specified out of consensus head, seeking backwards for fork",
+			)
+		}
+
+		for !bytes.Equal(frame.ParentSelector, parent) {
+			ours, err := e.clockStore.GetParentDataClockFrame(
+				e.filter,
+				frame.FrameNumber-1,
+				frame.ParentSelector,
+			)
+			if err != nil {
+				from = 1
+				e.logger.Info("peer fully out of sync, rewinding sync head to start")
+				break
+			}
+
+			theirs, err := e.clockStore.GetParentDataClockFrame(
+				e.filter,
+				frame.FrameNumber-1,
+				parent,
+			)
+			if err != nil {
+				from = 1
+				e.logger.Info("peer fully out of sync, rewinding sync head to start")
+				break
+			}
+
+			from--
+			frame = ours
+			parent = theirs.ParentSelector
 		}
 	}
 
@@ -151,7 +188,14 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 	syncMsg *protobufs.CeremonyCompressedSync,
 ) error {
+	if len(syncMsg.TruncatedClockFrames) != int(
+		syncMsg.ToFrameNumber-syncMsg.FromFrameNumber+1,
+	) {
+		return errors.New("invalid continuity for compressed sync response")
+	}
+
 	for _, frame := range syncMsg.TruncatedClockFrames {
+		frame := frame
 		commits := (len(frame.Input) - 516) / 74
 		e.logger.Info(
 			"processing frame",
@@ -167,6 +211,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			commit := frame.Input[516+(j*74) : 516+((j+1)*74)]
 			var aggregateProof *protobufs.InclusionProofsMap
 			for _, a := range syncMsg.Proofs {
+				a := a
 				if bytes.Equal(a.FrameCommit, commit) {
 					e.logger.Info(
 						"found matching proof",
@@ -197,6 +242,8 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			}
 
 			for k, c := range aggregateProof.Commitments {
+				k := k
+				c := c
 				e.logger.Info(
 					"adding inclusion commitment",
 					zap.Uint64("frame_number", frame.FrameNumber),
@@ -217,7 +264,12 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 					output = &protobufs.IntrinsicExecutionOutput{}
 				}
 				for l, h := range c.SegmentHashes {
+					l := l
+					h := h
+
 					for _, s := range syncMsg.Segments {
+						s := s
+
 						if bytes.Equal(s.Hash, h) {
 							if output != nil {
 								if l == 0 {

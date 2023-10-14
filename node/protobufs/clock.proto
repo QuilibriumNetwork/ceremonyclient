@@ -71,6 +71,9 @@ message ClockFramesRequest {
   // The latest frame in the range requested, if provided. Capped to a maximum
   // size of 128 frames.
   uint64 to_frame_number = 3;
+  // The optional parent selector. If provided, will perform a check to confirm
+  // continuity, otherwise, will rewind the sync head to the beginning.
+  bytes parent_selector = 4;
 }
 
 // Represents a response for a range of clock frames. Used to stay synchronized

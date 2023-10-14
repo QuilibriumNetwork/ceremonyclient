@@ -240,6 +240,7 @@ func (
 	}
 
 	for _, frame := range committedSet {
+		frame := frame
 		if err = e.clockStore.PutMasterClockFrame(frame, txn); err != nil {
 			e.logger.Error("error while committing frame", zap.Error(err))
 			return nil, errors.Wrap(err, "confirm latest frame")

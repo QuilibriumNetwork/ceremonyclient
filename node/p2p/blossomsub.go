@@ -449,6 +449,7 @@ func discoverPeers(
 		}
 
 		for peer := range peerChan {
+			peer := peer
 			if peer.ID == h.ID() {
 				continue
 			}

@@ -50,6 +50,7 @@ func (e *MasterClockConsensusEngine) handleSync(message *pb.Message) error {
 			}
 
 			for _, m := range messages {
+				m := m
 				if err := e.publishMessage(e.filter, m); err != nil {
 					e.logger.Error(
 						"could not publish message for engine",
@@ -128,6 +129,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 	}
 
 	for _, frame := range response.ClockFrames {
+		frame := frame
 		e.logger.Debug(
 			"processing clock frame",
 			zap.Binary("sender", peerID),

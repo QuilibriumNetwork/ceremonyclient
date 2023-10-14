@@ -1,3 +1,5 @@
+//go:build !js && !wasm
+
 package main
 
 import (
@@ -228,5 +230,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.1.2 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.1.3 – Dawn")
 }
