@@ -810,7 +810,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 			}
 
 			runningFrames = [][]*protobufs.ClockFrame{
-				{nextRunningFrames[0][currentDepth+1]},
+				{nextRunningFrames[0][currentDepth]},
 			}
 			currentDepth = 0
 		} else {
