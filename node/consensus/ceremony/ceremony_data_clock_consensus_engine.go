@@ -22,6 +22,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
+const PEER_INFO_TTL = 5 * 60 * 1000
+const UNCOOPERATIVE_PEER_INFO_TTL = 60 * 60 * 1000
+
 type InclusionMap = map[curves.PairingPoint]*protobufs.InclusionCommitment
 type PolynomialMap = map[curves.PairingPoint][]curves.PairingScalar
 type SyncStatusType int
@@ -36,6 +39,7 @@ type peerInfo struct {
 	peerId    []byte
 	multiaddr string
 	maxFrame  uint64
+	timestamp int64
 	lastSeen  int64
 	direct    bool
 }
@@ -68,6 +72,7 @@ type CeremonyDataClockConsensusEngine struct {
 	stagedKeyCommits            InclusionMap
 	stagedKeyPolynomials        PolynomialMap
 	stagedLobbyStateTransitions *protobufs.CeremonyLobbyStateTransition
+	minimumPeersRequired        int
 
 	frameChan                      chan *protobufs.ClockFrame
 	executionEngines               map[string]execution.ExecutionEngine
@@ -127,6 +132,11 @@ func NewCeremonyDataClockConsensusEngine(
 		panic(errors.New("pubsub is nil"))
 	}
 
+	minimumPeersRequired := engineConfig.MinimumPeersRequired
+	if minimumPeersRequired == 0 {
+		minimumPeersRequired = 6
+	}
+
 	e := &CeremonyDataClockConsensusEngine{
 		frame:            0,
 		difficulty:       10000,
@@ -157,6 +167,7 @@ func NewCeremonyDataClockConsensusEngine(
 		peerAnnounceMap:       map[string]*protobufs.CeremonyPeerListAnnounce{},
 		peerMap:               map[string]*peerInfo{},
 		uncooperativePeersMap: map[string]*peerInfo{},
+		minimumPeersRequired:  minimumPeersRequired,
 	}
 
 	logger.Info("constructing consensus engine")
@@ -243,12 +254,27 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				multiaddr: "",
 				maxFrame:  e.frame,
 			}
+			deletes := []*peerInfo{}
 			for _, v := range e.peerMap {
-				list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
-					PeerId:    v.peerId,
-					Multiaddr: v.multiaddr,
-					MaxFrame:  v.maxFrame,
-				})
+				if v.timestamp > time.Now().UnixMilli()-PEER_INFO_TTL {
+					list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
+						PeerId:    v.peerId,
+						Multiaddr: v.multiaddr,
+						MaxFrame:  v.maxFrame,
+						Timestamp: v.timestamp,
+					})
+				} else {
+					deletes = append(deletes, v)
+				}
+			}
+			for _, v := range e.uncooperativePeersMap {
+				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL {
+					deletes = append(deletes, v)
+				}
+			}
+			for _, v := range deletes {
+				delete(e.peerMap, string(v.peerId))
+				delete(e.uncooperativePeersMap, string(v.peerId))
 			}
 			e.peerMapMx.Unlock()
 
@@ -259,25 +285,53 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 	}()
 
 	go func() {
+		latest := latestFrame
+		for {
+			time.Sleep(30 * time.Second)
+			peerCount := e.pubSub.GetNetworkPeersCount()
+			if peerCount >= e.minimumPeersRequired {
+				e.logger.Info("selecting leader")
+				latest, err = e.commitLongestPath(latest)
+				if err != nil {
+					e.logger.Error("could not collect longest path", zap.Error(err))
+					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
+					if err != nil {
+						panic(err)
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
 		for e.state < consensus.EngineStateStopping {
-			switch e.state {
-			case consensus.EngineStateCollecting:
-				if latestFrame, err = e.collect(latestFrame); err != nil {
-					e.logger.Error("could not collect", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					errChan <- err
-				}
-			case consensus.EngineStateProving:
-				if latestFrame, err = e.prove(latestFrame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					errChan <- err
-				}
-			case consensus.EngineStatePublishing:
-				if err = e.publishProof(latestFrame); err != nil {
-					e.logger.Error("could not publish", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					errChan <- err
+			peerCount := e.pubSub.GetNetworkPeersCount()
+			if peerCount < e.minimumPeersRequired {
+				e.logger.Info(
+					"waiting for minimum peers",
+					zap.Int("peer_count", peerCount),
+				)
+				time.Sleep(1 * time.Second)
+			} else {
+				switch e.state {
+				case consensus.EngineStateCollecting:
+					if latestFrame, err = e.collect(latestFrame); err != nil {
+						e.logger.Error("could not collect", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						errChan <- err
+					}
+				case consensus.EngineStateProving:
+					if latestFrame, err = e.prove(latestFrame); err != nil {
+						e.logger.Error("could not prove", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						errChan <- err
+					}
+				case consensus.EngineStatePublishing:
+					if err = e.publishProof(latestFrame); err != nil {
+						e.logger.Error("could not publish", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						errChan <- err
+					}
 				}
 			}
 		}
@@ -356,6 +410,7 @@ func (
 			PeerId:     v.peerId,
 			Multiaddrs: []string{v.multiaddr},
 			MaxFrame:   v.maxFrame,
+			Timestamp:  v.timestamp,
 		})
 	}
 	for _, v := range e.uncooperativePeersMap {
@@ -365,6 +420,7 @@ func (
 				PeerId:     v.peerId,
 				Multiaddrs: []string{v.multiaddr},
 				MaxFrame:   v.maxFrame,
+				Timestamp:  v.timestamp,
 			},
 		)
 	}

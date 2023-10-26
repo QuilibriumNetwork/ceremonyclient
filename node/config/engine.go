@@ -6,4 +6,5 @@ type EngineConfig struct {
 	GenesisSeed          string `yaml:"genesisSeed"`
 	MaxFrames            int64  `yaml:"maxFrames"`
 	PendingCommitWorkers int64  `yaml:"pendingCommitWorkers"`
+	MinimumPeersRequired int    `yaml:"minimumPeersRequired"`
 }

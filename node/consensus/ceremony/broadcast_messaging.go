@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
@@ -158,6 +157,10 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 
 	e.peerMapMx.Lock()
 	for _, p := range announce.PeerList {
+		if p.Timestamp < time.Now().UnixMilli()-PEER_INFO_TTL {
+			continue
+		}
+
 		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
 			continue
 		}
@@ -166,83 +169,40 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			continue
 		}
 
+		multiaddr := p.Multiaddr
+		if bytes.Equal(p.PeerId, peerID) {
+			// we have to fetch self-reported peer info
+			multiaddr = e.pubSub.GetMultiaddrOfPeer(peerID)
+		}
+
 		pr, ok := e.peerMap[string(p.PeerId)]
 		if !ok {
-			if bytes.Equal(p.PeerId, peerID) {
-				e.peerMap[string(p.PeerId)] = &peerInfo{
-					peerId:    p.PeerId,
-					multiaddr: e.pubSub.GetMultiaddrOfPeer(peerID),
-					maxFrame:  p.MaxFrame,
-					direct:    bytes.Equal(p.PeerId, peerID),
-					lastSeen:  time.Now().Unix(),
-				}
-			} else {
-				e.peerMap[string(p.PeerId)] = &peerInfo{
-					peerId:    p.PeerId,
-					multiaddr: p.Multiaddr,
-					maxFrame:  p.MaxFrame,
-					direct:    bytes.Equal(p.PeerId, peerID),
-					lastSeen:  time.Now().Unix(),
-				}
+			e.peerMap[string(p.PeerId)] = &peerInfo{
+				peerId:    p.PeerId,
+				multiaddr: multiaddr,
+				maxFrame:  p.MaxFrame,
+				direct:    bytes.Equal(p.PeerId, peerID),
+				lastSeen:  time.Now().Unix(),
+				timestamp: p.Timestamp,
 			}
 		} else {
 			if bytes.Equal(p.PeerId, peerID) {
 				e.peerMap[string(p.PeerId)] = &peerInfo{
 					peerId:    p.PeerId,
-					multiaddr: e.pubSub.GetMultiaddrOfPeer(peerID),
+					multiaddr: multiaddr,
 					maxFrame:  p.MaxFrame,
-					direct:    bytes.Equal(p.PeerId, peerID),
+					direct:    true,
 					lastSeen:  time.Now().Unix(),
+					timestamp: p.Timestamp,
 				}
-			} else {
-				if pr.direct {
-					dst := int64(p.MaxFrame) - int64(pr.maxFrame)
-					if time.Now().Unix()-pr.lastSeen > 30 {
-						e.peerMap[string(p.PeerId)] = &peerInfo{
-							peerId:    p.PeerId,
-							multiaddr: p.Multiaddr,
-							maxFrame:  p.MaxFrame,
-							direct:    false,
-							lastSeen:  time.Now().Unix(),
-						}
-					} else if dst > 4 {
-						e.logger.Warn(
-							"peer sent announcement with higher frame index for peer",
-							zap.String("sender_peer", peer.ID(peerID).String()),
-							zap.String("announced_peer", peer.ID(pr.peerId).String()),
-							zap.Int64("frame_distance", dst),
-						)
-						e.peerMap[string(p.PeerId)] = &peerInfo{
-							peerId:    p.PeerId,
-							multiaddr: p.Multiaddr,
-							maxFrame:  p.MaxFrame,
-							direct:    false,
-							lastSeen:  time.Now().Unix(),
-						}
-					} else if dst < -4 {
-						e.logger.Debug(
-							"peer sent announcement with lower frame index for peer",
-							zap.String("sender_peer", peer.ID(peerID).String()),
-							zap.String("announced_peer", peer.ID(pr.peerId).String()),
-							zap.Int64("frame_distance", dst),
-						)
-					} else {
-						e.peerMap[string(p.PeerId)] = &peerInfo{
-							peerId:    p.PeerId,
-							multiaddr: p.Multiaddr,
-							maxFrame:  p.MaxFrame,
-							direct:    false,
-							lastSeen:  time.Now().Unix(),
-						}
-					}
-				} else {
-					e.peerMap[string(p.PeerId)] = &peerInfo{
-						peerId:    p.PeerId,
-						multiaddr: p.Multiaddr,
-						maxFrame:  p.MaxFrame,
-						direct:    false,
-						lastSeen:  time.Now().Unix(),
-					}
+			} else if !pr.direct || time.Now().Unix()-pr.lastSeen > 30 {
+				e.peerMap[string(p.PeerId)] = &peerInfo{
+					peerId:    p.PeerId,
+					multiaddr: p.Multiaddr,
+					maxFrame:  p.MaxFrame,
+					direct:    false,
+					lastSeen:  time.Now().Unix(),
+					timestamp: p.Timestamp,
 				}
 			}
 		}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -16,6 +17,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
+
+var ErrNoNewFrames = errors.New("peer reported no frames")
 
 func (e *CeremonyDataClockConsensusEngine) handleSync(
 	message *pb.Message,
@@ -151,9 +154,9 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	for {
 		if to == 0 || to-from > 32 {
 			if max > from+31 {
-				to = from + 31
+				to = from + 32
 			} else {
-				to = max
+				to = max + 1
 			}
 		}
 
@@ -187,23 +190,29 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 
 func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 	syncMsg *protobufs.CeremonyCompressedSync,
-) error {
+	loggerFunc func(msg string, fields ...zapcore.Field),
+) (*protobufs.ClockFrame, error) {
+	if len(syncMsg.TruncatedClockFrames) == 0 {
+		return nil, ErrNoNewFrames
+	}
+
 	if len(syncMsg.TruncatedClockFrames) != int(
 		syncMsg.ToFrameNumber-syncMsg.FromFrameNumber+1,
 	) {
-		return errors.New("invalid continuity for compressed sync response")
+		return nil, errors.New("invalid continuity for compressed sync response")
 	}
 
+	var final *protobufs.ClockFrame
 	for _, frame := range syncMsg.TruncatedClockFrames {
 		frame := frame
 		commits := (len(frame.Input) - 516) / 74
-		e.logger.Info(
+		loggerFunc(
 			"processing frame",
 			zap.Uint64("frame_number", frame.FrameNumber),
 			zap.Int("aggregate_commits", commits),
 		)
 		for j := 0; j < commits; j++ {
-			e.logger.Info(
+			loggerFunc(
 				"processing commit",
 				zap.Uint64("frame_number", frame.FrameNumber),
 				zap.Int("commit_index", j),
@@ -213,7 +222,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			for _, a := range syncMsg.Proofs {
 				a := a
 				if bytes.Equal(a.FrameCommit, commit) {
-					e.logger.Info(
+					loggerFunc(
 						"found matching proof",
 						zap.Uint64("frame_number", frame.FrameNumber),
 						zap.Int("commit_index", j),
@@ -229,7 +238,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 					zap.Int("commit_index", j),
 					zap.Binary("proof", aggregateProof.Proof),
 				)
-				return errors.Wrap(
+				return nil, errors.Wrap(
 					store.ErrInvalidData,
 					"decompress and store candidates",
 				)
@@ -244,7 +253,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			for k, c := range aggregateProof.Commitments {
 				k := k
 				c := c
-				e.logger.Info(
+				loggerFunc(
 					"adding inclusion commitment",
 					zap.Uint64("frame_number", frame.FrameNumber),
 					zap.Int("commit_index", j),
@@ -273,7 +282,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 						if bytes.Equal(s.Hash, h) {
 							if output != nil {
 								if l == 0 {
-									e.logger.Info(
+									loggerFunc(
 										"found first half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -283,7 +292,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									output.Address = s.Data[:32]
 									output.Output = s.Data[32:]
 								} else {
-									e.logger.Info(
+									loggerFunc(
 										"found second half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -293,13 +302,16 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									output.Proof = s.Data
 									b, err := proto.Marshal(output)
 									if err != nil {
-										return errors.Wrap(err, "decompress and store candidates")
+										return nil, errors.Wrap(
+											err,
+											"decompress and store candidates",
+										)
 									}
 									incCommit.Data = b
 									break
 								}
 							} else {
-								e.logger.Info(
+								loggerFunc(
 									"found matching segment data",
 									zap.Uint64("frame_number", frame.FrameNumber),
 									zap.Int("commit_index", j),
@@ -326,7 +338,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 
 		f, err := proto.Marshal(frame)
 		if err != nil {
-			return errors.Wrap(err, "decompress and store candidates")
+			return nil, errors.Wrap(err, "decompress and store candidates")
 		}
 
 		any := &anypb.Any{
@@ -339,16 +351,17 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			any,
 			true,
 		); err != nil {
-			return errors.Wrap(err, "decompress and store candidates")
+			return nil, errors.Wrap(err, "decompress and store candidates")
 		}
+		final = frame
 	}
 
-	e.logger.Info(
+	loggerFunc(
 		"decompressed and stored sync for range",
 		zap.Uint64("from", syncMsg.FromFrameNumber),
 		zap.Uint64("to", syncMsg.ToFrameNumber),
 	)
-	return nil
+	return final, nil
 }
 
 type svr struct {
