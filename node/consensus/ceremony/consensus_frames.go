@@ -861,165 +861,215 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	return peer, max, nil
 }
 
-func (e *CeremonyDataClockConsensusEngine) collect(
-	currentFramePublished *protobufs.ClockFrame,
+func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
+	currentLatest *protobufs.ClockFrame,
+	maxFrame uint64,
+	peerId []byte,
 ) (*protobufs.ClockFrame, error) {
-	if e.state == consensus.EngineStateCollecting {
-		e.logger.Info("collecting vdf proofs")
+	latest := currentLatest
+	cc, err := e.pubSub.GetDirectChannel(peerId)
+	if err != nil {
+		e.logger.Error(
+			"could not establish direct channel",
+			zap.Error(err),
+		)
+		e.peerMapMx.Lock()
+		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+		delete(e.peerMap, string(peerId))
+		e.peerMapMx.Unlock()
+		e.syncingTarget = nil
+		return latest, errors.Wrap(err, "reverse optimistic sync")
+	}
 
-		latest, err := e.clockStore.GetLatestDataClockFrame(e.filter, nil)
+	client := protobufs.NewCeremonyServiceClient(cc)
+
+	from := latest.FrameNumber
+	if from == 0 {
+		from = 1
+	}
+
+	if maxFrame-from > 32 {
+		// divergence is high, ask them for the latest frame and if they
+		// respond with a valid answer, optimistically continue from this
+		// frame, if we hit a fault we'll mark them as uncooperative and move
+		// on
+		from = 1
+		s, err := client.GetCompressedSyncFrames(
+			context.Background(),
+			&protobufs.ClockFramesRequest{
+				Filter:          e.filter,
+				FromFrameNumber: maxFrame - 32,
+			},
+			grpc.MaxCallRecvMsgSize(400*1024*1024),
+		)
 		if err != nil {
-			e.logger.Error("could not obtain latest clock frame", zap.Error(err))
-
-			return nil, errors.Wrap(err, "collect")
-		}
-
-		maxFrame := uint64(0)
-		var peerId []byte
-		peerId, maxFrame, err = e.GetMostAheadPeer()
-		if err != nil {
-			e.logger.Warn("no peers available, skipping sync")
-		} else if peerId == nil {
-			e.logger.Info("currently up to date, skipping sync")
-		} else {
-			e.syncingStatus = SyncStatusAwaitingResponse
-			e.logger.Info(
-				"setting syncing target",
-				zap.String("peer_id", peer.ID(peerId).String()),
+			e.logger.Error(
+				"received error from peer",
+				zap.Error(err),
 			)
-
-			cc, err := e.pubSub.GetDirectChannel(peerId)
-			if err != nil {
+			e.peerMapMx.Lock()
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+			e.peerMapMx.Unlock()
+			e.syncingTarget = nil
+			return latest, errors.Wrap(err, "reverse optimistic sync")
+		}
+		var syncMsg *protobufs.CeremonyCompressedSync
+		for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+			e.logger.Info(
+				"received compressed sync frame",
+				zap.Uint64("from", syncMsg.FromFrameNumber),
+				zap.Uint64("to", syncMsg.ToFrameNumber),
+				zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
+				zap.Int("proofs", len(syncMsg.Proofs)),
+			)
+			var next *protobufs.ClockFrame
+			if next, err = e.decompressAndStoreCandidates(
+				syncMsg,
+				e.logger.Info,
+			); err != nil && !errors.Is(err, ErrNoNewFrames) {
 				e.logger.Error(
-					"could not establish direct channel",
+					"could not decompress and store candidate",
 					zap.Error(err),
 				)
 				e.peerMapMx.Lock()
 				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
 				delete(e.peerMap, string(peerId))
 				e.peerMapMx.Unlock()
-			} else {
-				from := latest.FrameNumber
-				originalFrom := from
-				originalLatest := latest
-				if from == 0 {
-					from = 1
-				} else if maxFrame-from > 32 {
-					// divergence is high, we need to confirm we're not in a fork
-					from = 1
-					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
-					if err != nil {
-						// This should never happen for healthy systems, if it does we're
-						// in a severely corrupted state.
-						e.logger.Error(
-							"could not find genesis frame, please reset your store",
-						)
-						panic(err)
-					}
-				}
-
-				client := protobufs.NewCeremonyServiceClient(cc)
-				s, err := client.GetCompressedSyncFrames(
-					context.Background(),
-					&protobufs.ClockFramesRequest{
-						Filter:          e.filter,
-						FromFrameNumber: from,
-						ToFrameNumber:   maxFrame,
-						ParentSelector:  latest.ParentSelector,
-					},
-					grpc.MaxCallRecvMsgSize(400*1024*1024),
-				)
-				if err != nil {
-					e.logger.Error(
-						"error while retrieving sync",
-						zap.Error(err),
-					)
-					latest = originalLatest
-					e.peerMapMx.Lock()
-					e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-					delete(e.peerMap, string(peerId))
-					e.peerMapMx.Unlock()
-				} else {
-					var syncMsg *protobufs.CeremonyCompressedSync
-					askedFrom := from
-					for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
-						if syncMsg.FromFrameNumber < askedFrom {
-							askedFrom = syncMsg.FromFrameNumber
-						}
-
-						e.logger.Info(
-							"received compressed sync frame",
-							zap.Uint64("from", syncMsg.FromFrameNumber),
-							zap.Uint64("to", syncMsg.ToFrameNumber),
-							zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
-							zap.Int("proofs", len(syncMsg.Proofs)),
-						)
-						if err = e.decompressAndStoreCandidates(syncMsg); err != nil {
-							e.logger.Error(
-								"could not decompress and store candidate",
-								zap.Error(err),
-							)
-							from = originalFrom
-							latest = originalLatest
-							break
-						}
-					}
-					if err != nil && err != io.EOF {
-						e.logger.Error("error while receiving sync", zap.Error(err))
-						from = originalFrom
-						latest = originalLatest
-						askedFrom = from
-					}
-
-					if askedFrom < from {
-						e.logger.Info(
-							"peer provided deeper history due to fork, rewinding consensus " +
-								"head",
-						)
-						askedLatest, _, err := e.clockStore.GetDataClockFrame(
-							e.filter,
-							askedFrom-1,
-						)
-						if err != nil {
-							e.logger.Error("error while receiving sync", zap.Error(err))
-						} else {
-							latest = askedLatest
-						}
-					}
-				}
 
 				if err := cc.Close(); err != nil {
 					e.logger.Error("error while closing connection", zap.Error(err))
 				}
+
+				e.syncingTarget = nil
+				return currentLatest, errors.Wrap(err, "reverse optimistic sync")
+			}
+			if next != nil {
+				latest = next
+			}
+		}
+		if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			e.logger.Error("error while receiving sync", zap.Error(err))
+			e.syncingTarget = nil
+			return latest, errors.Wrap(err, "reverse optimistic sync")
+		}
+	}
+
+	go func() {
+		defer func() { e.syncingTarget = nil }()
+		e.logger.Info("continuing sync in background")
+		s, err := client.GetCompressedSyncFrames(
+			context.Background(),
+			&protobufs.ClockFramesRequest{
+				Filter:          e.filter,
+				FromFrameNumber: from,
+				ToFrameNumber:   maxFrame,
+			},
+			grpc.MaxCallRecvMsgSize(400*1024*1024),
+		)
+		if err != nil {
+			e.logger.Error(
+				"error while retrieving sync",
+				zap.Error(err),
+			)
+			e.peerMapMx.Lock()
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+			e.peerMapMx.Unlock()
+
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			return
+		} else {
+			var syncMsg *protobufs.CeremonyCompressedSync
+			for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+				e.logger.Debug(
+					"received compressed sync frame",
+					zap.Uint64("from", syncMsg.FromFrameNumber),
+					zap.Uint64("to", syncMsg.ToFrameNumber),
+					zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
+					zap.Int("proofs", len(syncMsg.Proofs)),
+				)
+				if _, err = e.decompressAndStoreCandidates(
+					syncMsg,
+					e.logger.Debug,
+				); err != nil && !errors.Is(err, ErrNoNewFrames) {
+					e.logger.Error(
+						"could not decompress and store candidate",
+						zap.Error(err),
+					)
+
+					if err := cc.Close(); err != nil {
+						e.logger.Error("error while closing connection", zap.Error(err))
+					}
+					return
+				}
+			}
+			if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
+				e.logger.Error("error while receiving sync", zap.Error(err))
+				if err := cc.Close(); err != nil {
+					e.logger.Error("error while closing connection", zap.Error(err))
+				}
+				return
 			}
 		}
 
-		e.logger.Info("selecting leader")
-		latestFrame, err := e.commitLongestPath(latest)
+		if err := cc.Close(); err != nil {
+			e.logger.Error("error while closing connection", zap.Error(err))
+		}
+	}()
+
+	return latest, nil
+}
+
+func (e *CeremonyDataClockConsensusEngine) collect(
+	currentFramePublished *protobufs.ClockFrame,
+) (*protobufs.ClockFrame, error) {
+	if e.state == consensus.EngineStateCollecting {
+		e.logger.Info("collecting vdf proofs")
+
+		latest := currentFramePublished
+		maxFrame := uint64(0)
+		var peerId []byte
+		peerId, maxFrame, err := e.GetMostAheadPeer()
 		if err != nil {
-			e.logger.Error("could not collect longest path", zap.Error(err))
-			return nil, errors.Wrap(err, "collect")
+			e.logger.Warn("no peers available, skipping sync")
+		} else if peerId == nil {
+			e.logger.Info("currently up to date, skipping sync")
+		} else if e.syncingTarget == nil {
+			e.syncingStatus = SyncStatusAwaitingResponse
+			e.logger.Info(
+				"setting syncing target",
+				zap.String("peer_id", peer.ID(peerId).String()),
+			)
+
+			e.syncingTarget = peerId
+			latest, err = e.reverseOptimisticSync(latest, maxFrame, peerId)
 		}
 
 		go func() {
 			_, err = e.keyStore.GetProvingKey(e.provingKeyBytes)
 			if errors.Is(err, store.ErrNotFound) &&
-				latestFrame.FrameNumber-e.lastKeyBundleAnnouncementFrame > 6 {
+				latest.FrameNumber-e.lastKeyBundleAnnouncementFrame > 6 {
 				if err = e.announceKeyBundle(); err != nil {
 					panic(err)
 				}
-				e.lastKeyBundleAnnouncementFrame = latestFrame.FrameNumber
+				e.lastKeyBundleAnnouncementFrame = latest.FrameNumber
 			}
 		}()
 
 		e.logger.Info(
 			"returning leader frame",
-			zap.Uint64("frame_number", latestFrame.FrameNumber),
+			zap.Uint64("frame_number", latest.FrameNumber),
 		)
 
-		e.setFrame(latestFrame)
+		e.setFrame(latest)
 		e.state = consensus.EngineStateProving
-		return latestFrame, nil
+		return latest, nil
 	}
 
 	return nil, nil
