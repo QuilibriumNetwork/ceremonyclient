@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/big"
+	"sort"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -1338,6 +1340,143 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 
 	if err := iter.Close(); err != nil {
 		return nil, errors.Wrap(err, "get compressed data clock frames")
+	}
+
+	if len(syncMessage.TruncatedClockFrames) < int(
+		toFrameNumber-fromFrameNumber+1,
+	) {
+		newFrom := fromFrameNumber
+		if len(syncMessage.TruncatedClockFrames) > 0 {
+			newFrom = syncMessage.TruncatedClockFrames[len(
+				syncMessage.TruncatedClockFrames,
+			)-1].FrameNumber + 1
+		}
+		from := clockDataCandidateFrameKey(
+			filter,
+			newFrom,
+			[]byte{
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+			[]byte{
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+		)
+		to := clockDataCandidateFrameKey(
+			filter,
+			toFrameNumber+1,
+			[]byte{
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			},
+			[]byte{
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			},
+		)
+
+		iter := p.db.NewIter(&pebble.IterOptions{
+			LowerBound: from,
+			UpperBound: to,
+		})
+
+		candidates := []*protobufs.ClockFrame{}
+		for iter.First(); iter.Valid(); iter.Next() {
+			value := iter.Value()
+			frame := &protobufs.ClockFrame{}
+			if err := proto.Unmarshal(value, frame); err != nil {
+				return nil, errors.Wrap(err, "get compressed data clock frames")
+			}
+
+			candidates = append(candidates, frame)
+		}
+
+		if err := iter.Close(); err != nil {
+			return nil, errors.Wrap(err, "get compressed data clock frames")
+		}
+
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].FrameNumber < candidates[j].FrameNumber
+		})
+
+		if len(candidates) > 0 {
+			cursorStart := candidates[0].FrameNumber
+			paths := [][]*protobufs.ClockFrame{}
+			for _, frame := range candidates {
+				frame := frame
+				if frame.FrameNumber == cursorStart {
+					paths = append(paths, []*protobufs.ClockFrame{frame})
+				}
+				if frame.FrameNumber > cursorStart {
+					for i, path := range paths {
+						s, err := path[len(path)-1].GetSelector()
+						if err != nil {
+							return nil, errors.Wrap(err, "get compressed data clock frames")
+						}
+						parentSelector, _, _, err := frame.GetParentSelectorAndDistance()
+						if err != nil {
+							return nil, errors.Wrap(err, "get compressed data clock frames")
+						}
+						if s.Cmp(parentSelector) == 0 {
+							paths[i] = append(paths[i], frame)
+						}
+					}
+				}
+			}
+			sort.Slice(paths, func(i, j int) bool {
+				return len(paths[i]) > len(paths[j])
+			})
+
+			leadingIndex := 0
+			var leadingScore *big.Int
+			length := len(paths[0])
+			for i := 0; i < len(paths); i++ {
+				if len(paths[i]) < length {
+					break
+				}
+				score := new(big.Int)
+				for _, p := range paths[i] {
+					_, distance, _, err := p.GetParentSelectorAndDistance()
+					if err != nil {
+						return nil, errors.Wrap(err, "get compressed data clock frames")
+					}
+					score = score.Add(score, distance)
+				}
+				if leadingScore == nil || leadingScore.Cmp(score) > 0 {
+					leadingIndex = i
+					leadingScore = score
+				}
+			}
+			for _, frame := range paths[leadingIndex] {
+				frame := frame
+				syncMessage.TruncatedClockFrames = append(
+					syncMessage.TruncatedClockFrames,
+					frame,
+				)
+				if frame.FrameNumber == 0 {
+					continue
+				}
+
+				for i := 0; i < len(frame.Input[516:])/74; i++ {
+					aggregateCommit := frame.Input[516+(i*74) : 516+((i+1)*74)]
+
+					if _, ok := proofs[string(aggregateCommit)]; !ok {
+						proofs[string(aggregateCommit)] = &protobufs.InclusionProofsMap{
+							FrameCommit: aggregateCommit,
+						}
+					}
+				}
+			}
+		}
 	}
 
 	for k, v := range proofs {

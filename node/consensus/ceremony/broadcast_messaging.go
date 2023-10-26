@@ -398,6 +398,7 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 					"could not unmarshal key bundle announcement",
 					zap.Error(err),
 				)
+				return
 			}
 			if err := keyBundleAnnouncement.Verify(
 				provingKeyAnnouncement,
@@ -406,6 +407,7 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 					"could not verify key bundle announcement",
 					zap.Error(err),
 				)
+				return
 			}
 
 			e.pendingCommits <- e.dependencyMap[string(provingKey)]

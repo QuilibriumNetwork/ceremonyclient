@@ -34,6 +34,18 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 ) (*protobufs.ClockFrame, error) {
 	if e.state == consensus.EngineStateProving {
 		if !e.frameProverTrie.Contains(e.provingKeyAddress) {
+			e.stagedKeyCommitsMx.Lock()
+			e.stagedKeyCommits = make(
+				map[curves.PairingPoint]*protobufs.InclusionCommitment,
+			)
+			e.stagedKeyPolynomials = make(
+				map[curves.PairingPoint][]curves.PairingScalar,
+			)
+			e.stagedKeyCommitsMx.Unlock()
+			e.stagedLobbyStateTransitionsMx.Lock()
+			e.stagedLobbyStateTransitions = &protobufs.CeremonyLobbyStateTransition{}
+			e.stagedLobbyStateTransitionsMx.Unlock()
+
 			e.state = consensus.EngineStateCollecting
 			return previousFrame, nil
 		}
@@ -678,6 +690,10 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 			}
 
 			iter.Close()
+
+			if len(nextRunningFrames) == 1 && len(nextRunningFrames[0]) > 32 {
+				break
+			}
 		}
 
 		if commitReady && len(nextRunningFrames) == 1 {
@@ -1026,6 +1042,104 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 	return latest, nil
 }
 
+func (e *CeremonyDataClockConsensusEngine) sync(
+	currentLatest *protobufs.ClockFrame,
+	maxFrame uint64,
+	peerId []byte,
+) (*protobufs.ClockFrame, error) {
+	latest := currentLatest
+	e.logger.Info("polling peer for new frames", zap.Binary("peer_id", peerId))
+	cc, err := e.pubSub.GetDirectChannel(peerId)
+	if err != nil {
+		e.logger.Error(
+			"could not establish direct channel",
+			zap.Error(err),
+		)
+		e.peerMapMx.Lock()
+		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+		delete(e.peerMap, string(peerId))
+		e.peerMapMx.Unlock()
+		return latest, errors.Wrap(err, "reverse optimistic sync")
+	}
+
+	client := protobufs.NewCeremonyServiceClient(cc)
+
+	from := latest.FrameNumber
+	if from == 0 {
+		from = 1
+	}
+
+	if maxFrame > from {
+		from = 1
+		s, err := client.GetCompressedSyncFrames(
+			context.Background(),
+			&protobufs.ClockFramesRequest{
+				Filter:          e.filter,
+				FromFrameNumber: maxFrame - 16,
+			},
+			grpc.MaxCallRecvMsgSize(400*1024*1024),
+		)
+		if err != nil {
+			e.logger.Error(
+				"received error from peer",
+				zap.Error(err),
+			)
+			e.peerMapMx.Lock()
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+			e.peerMapMx.Unlock()
+			return latest, errors.Wrap(err, "reverse optimistic sync")
+		}
+		var syncMsg *protobufs.CeremonyCompressedSync
+		for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+			e.logger.Info(
+				"received compressed sync frame",
+				zap.Uint64("from", syncMsg.FromFrameNumber),
+				zap.Uint64("to", syncMsg.ToFrameNumber),
+				zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
+				zap.Int("proofs", len(syncMsg.Proofs)),
+			)
+			var next *protobufs.ClockFrame
+			if next, err = e.decompressAndStoreCandidates(
+				syncMsg,
+				e.logger.Info,
+			); err != nil && !errors.Is(err, ErrNoNewFrames) {
+				e.logger.Error(
+					"could not decompress and store candidate",
+					zap.Error(err),
+				)
+				e.peerMapMx.Lock()
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				delete(e.peerMap, string(peerId))
+				e.peerMapMx.Unlock()
+
+				if err := cc.Close(); err != nil {
+					e.logger.Error("error while closing connection", zap.Error(err))
+				}
+
+				return currentLatest, errors.Wrap(err, "reverse optimistic sync")
+			}
+			if next != nil {
+				latest = next
+			}
+		}
+		if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			e.logger.Error("error while receiving sync", zap.Error(err))
+			return latest, errors.Wrap(err, "reverse optimistic sync")
+		}
+
+		e.logger.Info("received new leading frame", zap.Uint64("frame_number", latest.FrameNumber))
+		if err := cc.Close(); err != nil {
+			e.logger.Error("error while closing connection", zap.Error(err))
+		}
+	}
+
+	return latest, nil
+}
+
 func (e *CeremonyDataClockConsensusEngine) collect(
 	currentFramePublished *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
@@ -1049,6 +1163,8 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 			e.syncingTarget = peerId
 			latest, err = e.reverseOptimisticSync(latest, maxFrame, peerId)
+		} else if maxFrame > latest.FrameNumber {
+			latest, err = e.sync(latest, maxFrame, peerId)
 		}
 
 		go func() {
