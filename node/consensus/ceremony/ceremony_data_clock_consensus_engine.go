@@ -134,7 +134,7 @@ func NewCeremonyDataClockConsensusEngine(
 
 	minimumPeersRequired := engineConfig.MinimumPeersRequired
 	if minimumPeersRequired == 0 {
-		minimumPeersRequired = 6
+		minimumPeersRequired = 3
 	}
 
 	e := &CeremonyDataClockConsensusEngine{
