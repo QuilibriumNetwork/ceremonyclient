@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"sync"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/pkg/errors"
@@ -21,6 +22,7 @@ type FileKeyManager struct {
 	logger         *zap.Logger
 	key            ByteString
 	store          map[string]Key
+	storeMx        sync.Mutex
 }
 
 var UnsupportedKeyTypeErr = errors.New("unsupported key type")
@@ -204,9 +206,12 @@ func (f *FileKeyManager) DeleteKey(id string) error {
 
 	d := yaml.NewEncoder(file)
 
+	f.storeMx.Lock()
 	delete(f.store, id)
 
 	err = d.Encode(f.store)
+	f.storeMx.Unlock()
+
 	return errors.Wrap(err, "could not store")
 }
 
@@ -224,6 +229,7 @@ func (f *FileKeyManager) GetKey(id string) (key *Key, err error) {
 func (f *FileKeyManager) ListKeys() ([]*Key, error) {
 	keys := []*Key{}
 
+	f.storeMx.Lock()
 	for k := range f.store {
 		storeKey, err := f.read(k)
 		if err != nil {
@@ -231,6 +237,7 @@ func (f *FileKeyManager) ListKeys() ([]*Key, error) {
 		}
 		keys = append(keys, &storeKey)
 	}
+	f.storeMx.Unlock()
 
 	return keys, nil
 }
@@ -258,6 +265,7 @@ func (f *FileKeyManager) save(id string, key Key) error {
 		return errors.Wrap(err, "could not encrypt")
 	}
 
+	f.storeMx.Lock()
 	f.store[id] = Key{
 		Id:         key.Id,
 		Type:       key.Type,
@@ -266,6 +274,8 @@ func (f *FileKeyManager) save(id string, key Key) error {
 	}
 
 	err = d.Encode(f.store)
+	f.storeMx.Unlock()
+
 	return errors.Wrap(err, "could not store")
 }
 
@@ -284,25 +294,31 @@ func (f *FileKeyManager) read(id string) (Key, error) {
 	defer file.Close()
 
 	d := yaml.NewDecoder(file)
+	f.storeMx.Lock()
 	if err = d.Decode(f.store); err != nil {
+		f.storeMx.Unlock()
 		return Key{}, errors.Wrap(err, "could not decode")
 	}
 
 	if _, ok := f.store[id]; !ok {
+		f.storeMx.Unlock()
 		return Key{}, KeyNotFoundErr
 	}
 
 	data, err := f.decrypt(f.store[id].PrivateKey)
 	if err != nil {
+		f.storeMx.Unlock()
 		return Key{}, errors.Wrap(err, "could not decrypt")
 	}
 
-	return Key{
+	key := Key{
 		Id:         f.store[id].Id,
 		Type:       f.store[id].Type,
 		PublicKey:  f.store[id].PublicKey,
 		PrivateKey: data,
-	}, nil
+	}
+	f.storeMx.Unlock()
+	return key, nil
 }
 
 func (f *FileKeyManager) encrypt(data []byte) ([]byte, error) {
