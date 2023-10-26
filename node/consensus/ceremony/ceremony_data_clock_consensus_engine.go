@@ -253,6 +253,7 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				peerId:    e.pubSub.GetPeerID(),
 				multiaddr: "",
 				maxFrame:  e.frame,
+				timestamp: time.Now().UnixMilli(),
 			}
 			deletes := []*peerInfo{}
 			for _, v := range e.peerMap {
