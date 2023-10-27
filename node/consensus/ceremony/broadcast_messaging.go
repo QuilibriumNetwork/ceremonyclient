@@ -170,41 +170,18 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 		}
 
 		multiaddr := p.Multiaddr
-		if bytes.Equal(p.PeerId, peerID) {
+		if bytes.Equal(p.PeerId, peerID) || p.Multiaddr == "" {
 			// we have to fetch self-reported peer info
 			multiaddr = e.pubSub.GetMultiaddrOfPeer(peerID)
 		}
 
-		pr, ok := e.peerMap[string(p.PeerId)]
-		if !ok {
-			e.peerMap[string(p.PeerId)] = &peerInfo{
-				peerId:    p.PeerId,
-				multiaddr: multiaddr,
-				maxFrame:  p.MaxFrame,
-				direct:    bytes.Equal(p.PeerId, peerID),
-				lastSeen:  time.Now().Unix(),
-				timestamp: p.Timestamp,
-			}
-		} else {
-			if bytes.Equal(p.PeerId, peerID) {
-				e.peerMap[string(p.PeerId)] = &peerInfo{
-					peerId:    p.PeerId,
-					multiaddr: multiaddr,
-					maxFrame:  p.MaxFrame,
-					direct:    true,
-					lastSeen:  time.Now().Unix(),
-					timestamp: p.Timestamp,
-				}
-			} else if !pr.direct || time.Now().Unix()-pr.lastSeen > 30 {
-				e.peerMap[string(p.PeerId)] = &peerInfo{
-					peerId:    p.PeerId,
-					multiaddr: p.Multiaddr,
-					maxFrame:  p.MaxFrame,
-					direct:    false,
-					lastSeen:  time.Now().Unix(),
-					timestamp: p.Timestamp,
-				}
-			}
+		e.peerMap[string(p.PeerId)] = &peerInfo{
+			peerId:    p.PeerId,
+			multiaddr: multiaddr,
+			maxFrame:  p.MaxFrame,
+			direct:    bytes.Equal(p.PeerId, peerID),
+			lastSeen:  time.Now().Unix(),
+			timestamp: p.Timestamp,
 		}
 	}
 	e.peerMapMx.Unlock()
