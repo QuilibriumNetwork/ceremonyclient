@@ -397,8 +397,8 @@ func (e *CeremonyDataClockConsensusEngine) GetPublicChannelForProvingKey(
 		after := time.After(20 * time.Second)
 		go func() {
 			server := grpc.NewServer(
-				grpc.MaxSendMsgSize(400*1024*1024),
-				grpc.MaxRecvMsgSize(400*1024*1024),
+				grpc.MaxSendMsgSize(600*1024*1024),
+				grpc.MaxRecvMsgSize(600*1024*1024),
 			)
 
 			s := &svr{
@@ -438,8 +438,8 @@ func (e *CeremonyDataClockConsensusEngine) GetPublicChannelForProvingKey(
 		client := protobufs.NewCeremonyServiceClient(cc)
 		s, err := client.GetPublicChannel(
 			context.Background(),
-			grpc.MaxCallSendMsgSize(400*1024*1024),
-			grpc.MaxCallRecvMsgSize(400*1024*1024),
+			grpc.MaxCallSendMsgSize(600*1024*1024),
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
 		return s, errors.Wrap(err, "get public channel for proving key")
 	}

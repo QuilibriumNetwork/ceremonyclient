@@ -229,8 +229,8 @@ func NewRPCServer(
 
 func (r *RPCServer) Start() error {
 	s := grpc.NewServer(
-		grpc.MaxRecvMsgSize(400*1024*1024),
-		grpc.MaxSendMsgSize(400*1024*1024),
+		grpc.MaxRecvMsgSize(600*1024*1024),
+		grpc.MaxSendMsgSize(600*1024*1024),
 	)
 	protobufs.RegisterNodeServiceServer(s, r)
 	reflection.Register(s)
@@ -272,8 +272,8 @@ func (r *RPCServer) Start() error {
 			opts := []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithDefaultCallOptions(
-					grpc.MaxCallRecvMsgSize(400*1024*1024),
-					grpc.MaxCallSendMsgSize(400*1024*1024),
+					grpc.MaxCallRecvMsgSize(600*1024*1024),
+					grpc.MaxCallSendMsgSize(600*1024*1024),
 				),
 			}
 

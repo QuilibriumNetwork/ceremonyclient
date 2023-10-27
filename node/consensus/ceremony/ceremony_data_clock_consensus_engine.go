@@ -221,8 +221,8 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 
 	go func() {
 		server := grpc.NewServer(
-			grpc.MaxSendMsgSize(400*1024*1024),
-			grpc.MaxRecvMsgSize(400*1024*1024),
+			grpc.MaxSendMsgSize(600*1024*1024),
+			grpc.MaxRecvMsgSize(600*1024*1024),
 		)
 		protobufs.RegisterCeremonyServiceServer(server, e)
 

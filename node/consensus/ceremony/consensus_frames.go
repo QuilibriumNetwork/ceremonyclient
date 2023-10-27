@@ -916,7 +916,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				Filter:          e.filter,
 				FromFrameNumber: maxFrame - 32,
 			},
-			grpc.MaxCallRecvMsgSize(400*1024*1024),
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
 		if err != nil {
 			e.logger.Error(
@@ -984,7 +984,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				FromFrameNumber: from,
 				ToFrameNumber:   maxFrame,
 			},
-			grpc.MaxCallRecvMsgSize(400*1024*1024),
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
 		if err != nil {
 			e.logger.Error(
@@ -1077,7 +1077,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 				Filter:          e.filter,
 				FromFrameNumber: maxFrame - 16,
 			},
-			grpc.MaxCallRecvMsgSize(400*1024*1024),
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
 		if err != nil {
 			e.logger.Error(
