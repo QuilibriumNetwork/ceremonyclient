@@ -7,6 +7,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
@@ -14,6 +15,7 @@ import (
 type Node struct {
 	logger      *zap.Logger
 	clockStore  store.ClockStore
+	keyManager  keys.KeyManager
 	pubSub      p2p.PubSub
 	execEngines map[string]execution.ExecutionEngine
 	engine      consensus.ConsensusEngine
@@ -22,6 +24,7 @@ type Node struct {
 func newNode(
 	logger *zap.Logger,
 	clockStore store.ClockStore,
+	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
 	ceremonyExecutionEngine *ceremony.CeremonyExecutionEngine,
 	engine consensus.ConsensusEngine,
@@ -38,6 +41,7 @@ func newNode(
 	return &Node{
 		logger,
 		clockStore,
+		keyManager,
 		pubSub,
 		execEngines,
 		engine,
@@ -69,6 +73,10 @@ func (n *Node) GetLogger() *zap.Logger {
 
 func (n *Node) GetClockStore() store.ClockStore {
 	return n.clockStore
+}
+
+func (n *Node) GetKeyManager() keys.KeyManager {
+	return n.keyManager
 }
 
 func (n *Node) GetPubSub() p2p.PubSub {

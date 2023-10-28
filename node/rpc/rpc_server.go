@@ -3,9 +3,11 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"math/big"
 	"net/http"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
@@ -14,9 +16,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 type RPCServer struct {
@@ -25,6 +30,7 @@ type RPCServer struct {
 	listenAddrHTTP   string
 	logger           *zap.Logger
 	clockStore       store.ClockStore
+	keyManager       keys.KeyManager
 	pubSub           p2p.PubSub
 	executionEngines []execution.ExecutionEngine
 }
@@ -209,11 +215,162 @@ func (r *RPCServer) GetPeerInfo(
 	return resp, nil
 }
 
+func (r *RPCServer) GetTokenInfo(
+	ctx context.Context,
+	req *protobufs.GetTokenInfoRequest,
+) (*protobufs.TokenInfoResponse, error) {
+	provingKey, err := r.keyManager.GetRawKey(
+		"default-proving-key",
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	addr, err := poseidon.HashBytes(provingKey.PublicKey)
+	if err != nil {
+		panic(err)
+	}
+
+	addrBytes := addr.Bytes()
+	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+
+	frame, err := r.clockStore.GetLatestDataClockFrame(
+		application.CEREMONY_ADDRESS,
+		nil,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	confirmed, err := application.MaterializeApplicationFromFrame(frame)
+	if err != nil {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	confirmedTotal := new(big.Int)
+	unconfirmedTotal := new(big.Int)
+	ownedTotal := new(big.Int)
+	if confirmed.RewardTrie.Root == nil ||
+		(confirmed.RewardTrie.Root.External == nil &&
+			confirmed.RewardTrie.Root.Internal == nil) {
+		return &protobufs.TokenInfoResponse{
+			ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
+			UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
+			OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
+		}, nil
+	}
+
+	limbs := []*tries.RewardInternalNode{}
+	if confirmed.RewardTrie.Root.Internal != nil {
+		limbs = append(limbs, confirmed.RewardTrie.Root.Internal)
+	} else {
+		confirmedTotal = confirmedTotal.Add(
+			confirmedTotal,
+			new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
+		)
+		if bytes.Equal(
+			confirmed.RewardTrie.Root.External.Key,
+			addrBytes,
+		) {
+			ownedTotal = ownedTotal.Add(
+				ownedTotal,
+				new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
+			)
+		}
+	}
+
+	for len(limbs) != 0 {
+		nextLimbs := []*tries.RewardInternalNode{}
+		for _, limb := range limbs {
+			for _, child := range limb.Child {
+				child := child
+				if child.Internal != nil {
+					nextLimbs = append(nextLimbs, child.Internal)
+				} else {
+					confirmedTotal = confirmedTotal.Add(
+						confirmedTotal,
+						new(big.Int).SetUint64(child.External.Total),
+					)
+					if bytes.Equal(
+						child.External.Key,
+						addrBytes,
+					) {
+						ownedTotal = ownedTotal.Add(
+							ownedTotal,
+							new(big.Int).SetUint64(child.External.Total),
+						)
+					}
+				}
+			}
+		}
+		limbs = nextLimbs
+	}
+
+	candidateFrame, err := r.clockStore.GetHighestCandidateDataClockFrame(
+		application.CEREMONY_ADDRESS,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	unconfirmed, err := application.MaterializeApplicationFromFrame(
+		candidateFrame,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	limbs = []*tries.RewardInternalNode{}
+	if unconfirmed.RewardTrie.Root.Internal != nil {
+		limbs = append(limbs, unconfirmed.RewardTrie.Root.Internal)
+	} else {
+		unconfirmedTotal = unconfirmedTotal.Add(
+			unconfirmedTotal,
+			new(big.Int).SetUint64(unconfirmed.RewardTrie.Root.External.Total),
+		)
+	}
+
+	for len(limbs) != 0 {
+		nextLimbs := []*tries.RewardInternalNode{}
+		for _, limb := range limbs {
+			for _, child := range limb.Child {
+				child := child
+				if child.Internal != nil {
+					nextLimbs = append(nextLimbs, child.Internal)
+				} else {
+					unconfirmedTotal = unconfirmedTotal.Add(
+						unconfirmedTotal,
+						new(big.Int).SetUint64(child.External.Total),
+					)
+				}
+			}
+		}
+		limbs = nextLimbs
+	}
+
+	// 1 QUIL = 0x1DCD65000 units
+	conversionFactor, ok := new(big.Int).SetString("1DCD65000", 16)
+	if !ok {
+		return nil, errors.Wrap(err, "get token info")
+	}
+
+	confirmedTotal = confirmedTotal.Mul(confirmedTotal, conversionFactor)
+	unconfirmedTotal = unconfirmedTotal.Mul(unconfirmedTotal, conversionFactor)
+	ownedTotal = ownedTotal.Mul(ownedTotal, conversionFactor)
+
+	return &protobufs.TokenInfoResponse{
+		ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
+		UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
+		OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
+	}, nil
+}
+
 func NewRPCServer(
 	listenAddrGRPC string,
 	listenAddrHTTP string,
 	logger *zap.Logger,
 	clockStore store.ClockStore,
+	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
 	executionEngines []execution.ExecutionEngine,
 ) (*RPCServer, error) {
@@ -222,6 +379,7 @@ func NewRPCServer(
 		listenAddrHTTP:   listenAddrHTTP,
 		logger:           logger,
 		clockStore:       clockStore,
+		keyManager:       keyManager,
 		pubSub:           pubSub,
 		executionEngines: executionEngines,
 	}, nil

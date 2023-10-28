@@ -53,9 +53,24 @@ message NetworkInfoResponse {
   repeated NetworkInfo network_info = 1;
 }
 
+message GetTokenInfoRequest {}
+
+message TokenInfoResponse {
+  // Total active token supply, as a 256 bit integer representing maximum
+  // divisble units. 1 QUIL = 8000000000 units, 50 QUIL would be represented by
+  // 0x0000000000000000000000000000000000000000000000000000005D21DBA000
+  bytes confirmed_token_supply = 1;
+  // Total token supply, including unconfirmed frame data, as a 256 bit integer.
+  bytes unconfirmed_token_supply = 2;
+  // The total number of tokens owned by the prover address associated with the
+  // node.
+  bytes owned_tokens = 3;
+}
+
 service NodeService {
   rpc GetFrames(GetFramesRequest) returns (FramesResponse);
   rpc GetFrameInfo(GetFrameInfoRequest) returns (FrameInfoResponse);
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
+  rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
 }

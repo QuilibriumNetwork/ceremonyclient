@@ -92,6 +92,7 @@ func main() {
 			nodeConfig.ListenRestMultiaddr,
 			node.GetLogger(),
 			node.GetClockStore(),
+			node.GetKeyManager(),
 			node.GetPubSub(),
 			node.GetExecutionEngines(),
 		)
