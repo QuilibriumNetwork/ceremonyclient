@@ -1329,7 +1329,6 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 		if frame.FrameNumber == 0 {
 			continue
 		}
-
 		for i := 0; i < len(frame.Input[516:])/74; i++ {
 			aggregateCommit := frame.Input[516+(i*74) : 516+((i+1)*74)]
 
@@ -1399,7 +1398,6 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			if err := proto.Unmarshal(value, frame); err != nil {
 				return nil, errors.Wrap(err, "get compressed data clock frames")
 			}
-
 			candidates = append(candidates, frame)
 		}
 

@@ -900,8 +900,8 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 	client := protobufs.NewCeremonyServiceClient(cc)
 
 	from := latest.FrameNumber
-	if from == 0 {
-		from = 1
+	if from <= 1 {
+		from = 2
 	}
 
 	if maxFrame-from > 32 {
@@ -909,7 +909,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 		// respond with a valid answer, optimistically continue from this
 		// frame, if we hit a fault we'll mark them as uncooperative and move
 		// on
-		from = 1
+		from = 2
 		s, err := client.GetCompressedSyncFrames(
 			context.Background(),
 			&protobufs.ClockFramesRequest{
@@ -941,6 +941,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 			)
 			var next *protobufs.ClockFrame
 			if next, err = e.decompressAndStoreCandidates(
+				peerId,
 				syncMsg,
 				e.logger.Info,
 			); err != nil && !errors.Is(err, ErrNoNewFrames) {
@@ -958,6 +959,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				}
 
 				e.syncingTarget = nil
+				e.syncingStatus = SyncStatusFailed
 				return currentLatest, errors.Wrap(err, "reverse optimistic sync")
 			}
 			if next != nil {
@@ -970,6 +972,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 			}
 			e.logger.Error("error while receiving sync", zap.Error(err))
 			e.syncingTarget = nil
+			e.syncingStatus = SyncStatusFailed
 			return latest, errors.Wrap(err, "reverse optimistic sync")
 		}
 	}
@@ -981,7 +984,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 			context.Background(),
 			&protobufs.ClockFramesRequest{
 				Filter:          e.filter,
-				FromFrameNumber: from,
+				FromFrameNumber: from - 1,
 				ToFrameNumber:   maxFrame,
 			},
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
@@ -995,6 +998,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
 			delete(e.peerMap, string(peerId))
 			e.peerMapMx.Unlock()
+			e.syncingStatus = SyncStatusFailed
 
 			if err := cc.Close(); err != nil {
 				e.logger.Error("error while closing connection", zap.Error(err))
@@ -1011,6 +1015,7 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 					zap.Int("proofs", len(syncMsg.Proofs)),
 				)
 				if _, err = e.decompressAndStoreCandidates(
+					peerId,
 					syncMsg,
 					e.logger.Debug,
 				); err != nil && !errors.Is(err, ErrNoNewFrames) {
@@ -1018,7 +1023,8 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 						"could not decompress and store candidate",
 						zap.Error(err),
 					)
-
+					e.syncingTarget = nil
+					e.syncingStatus = SyncStatusFailed
 					if err := cc.Close(); err != nil {
 						e.logger.Error("error while closing connection", zap.Error(err))
 					}
@@ -1026,6 +1032,8 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				}
 			}
 			if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
+				e.syncingTarget = nil
+				e.syncingStatus = SyncStatusFailed
 				e.logger.Error("error while receiving sync", zap.Error(err))
 				if err := cc.Close(); err != nil {
 					e.logger.Error("error while closing connection", zap.Error(err))
@@ -1037,6 +1045,9 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 		if err := cc.Close(); err != nil {
 			e.logger.Error("error while closing connection", zap.Error(err))
 		}
+
+		e.syncingTarget = nil
+		e.syncingStatus = SyncStatusNotSyncing
 	}()
 
 	return latest, nil
@@ -1070,7 +1081,6 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 	}
 
 	if maxFrame > from {
-		from = 1
 		s, err := client.GetCompressedSyncFrames(
 			context.Background(),
 			&protobufs.ClockFramesRequest{
@@ -1101,6 +1111,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			)
 			var next *protobufs.ClockFrame
 			if next, err = e.decompressAndStoreCandidates(
+				peerId,
 				syncMsg,
 				e.logger.Info,
 			); err != nil && !errors.Is(err, ErrNoNewFrames) {
@@ -1147,6 +1158,10 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 		e.logger.Info("collecting vdf proofs")
 
 		latest := currentFramePublished
+		if e.syncingStatus == SyncStatusFailed {
+			latest = e.previousHead
+			e.syncingStatus = SyncStatusNotSyncing
+		}
 		maxFrame := uint64(0)
 		var peerId []byte
 		peerId, maxFrame, err := e.GetMostAheadPeer()
@@ -1162,6 +1177,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			)
 
 			e.syncingTarget = peerId
+			e.previousHead = latest
 			latest, err = e.reverseOptimisticSync(latest, maxFrame, peerId)
 		} else if maxFrame > latest.FrameNumber {
 			latest, err = e.sync(latest, maxFrame, peerId)

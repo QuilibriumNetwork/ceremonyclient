@@ -2,6 +2,7 @@ package ceremony
 
 import (
 	"crypto"
+	"encoding/binary"
 	"math/big"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ const (
 	SyncStatusNotSyncing = iota
 	SyncStatusAwaitingResponse
 	SyncStatusSynchronizing
+	SyncStatusFailed
 )
 
 type peerInfo struct {
@@ -41,6 +43,9 @@ type peerInfo struct {
 	maxFrame  uint64
 	timestamp int64
 	lastSeen  int64
+	version   []byte
+	signature []byte
+	publicKey []byte
 	direct    bool
 }
 
@@ -81,6 +86,7 @@ type CeremonyDataClockConsensusEngine struct {
 	parentSelector                 []byte
 	syncingStatus                  SyncStatusType
 	syncingTarget                  []byte
+	previousHead                   *protobufs.ClockFrame
 	currentDistance                *big.Int
 	engineMx                       sync.Mutex
 	dependencyMapMx                sync.Mutex
@@ -248,25 +254,36 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				PeerList: []*protobufs.CeremonyPeer{},
 			}
 
+			timestamp := time.Now().UnixMilli()
+			msg := binary.BigEndian.AppendUint64([]byte{}, e.frame)
+			msg = append(msg, consensus.GetVersion()...)
+			msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
+			sig, err := e.pubSub.SignMessage(msg)
+			if err != nil {
+				panic(err)
+			}
+
 			e.peerMapMx.Lock()
 			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
 				peerId:    e.pubSub.GetPeerID(),
 				multiaddr: "",
 				maxFrame:  e.frame,
-				timestamp: time.Now().UnixMilli(),
+				version:   consensus.GetVersion(),
+				signature: sig,
+				publicKey: e.pubSub.GetPublicKey(),
+				timestamp: timestamp,
 			}
 			deletes := []*peerInfo{}
 			for _, v := range e.peerMap {
-				if v.timestamp > time.Now().UnixMilli()-PEER_INFO_TTL {
-					list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
-						PeerId:    v.peerId,
-						Multiaddr: v.multiaddr,
-						MaxFrame:  v.maxFrame,
-						Timestamp: v.timestamp,
-					})
-				} else {
-					deletes = append(deletes, v)
-				}
+				list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
+					PeerId:    v.peerId,
+					Multiaddr: v.multiaddr,
+					MaxFrame:  v.maxFrame,
+					Timestamp: v.timestamp,
+					Version:   v.version,
+					Signature: v.signature,
+					PublicKey: v.publicKey,
+				})
 			}
 			for _, v := range e.uncooperativePeersMap {
 				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL {
@@ -274,7 +291,6 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				}
 			}
 			for _, v := range deletes {
-				delete(e.peerMap, string(v.peerId))
 				delete(e.uncooperativePeersMap, string(v.peerId))
 			}
 			e.peerMapMx.Unlock()
@@ -412,6 +428,9 @@ func (
 			Multiaddrs: []string{v.multiaddr},
 			MaxFrame:   v.maxFrame,
 			Timestamp:  v.timestamp,
+			Version:    v.version,
+			Signature:  v.signature,
+			PublicKey:  v.publicKey,
 		})
 	}
 	for _, v := range e.uncooperativePeersMap {
@@ -422,6 +441,9 @@ func (
 				Multiaddrs: []string{v.multiaddr},
 				MaxFrame:   v.maxFrame,
 				Timestamp:  v.timestamp,
+				Version:    v.version,
+				Signature:  v.signature,
+				PublicKey:  v.publicKey,
 			},
 		)
 	}

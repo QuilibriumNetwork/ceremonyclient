@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rand"
+	"encoding/binary"
 	"strings"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
@@ -157,10 +160,6 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 
 	e.peerMapMx.Lock()
 	for _, p := range announce.PeerList {
-		if p.Timestamp < time.Now().UnixMilli()-PEER_INFO_TTL {
-			continue
-		}
-
 		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
 			continue
 		}
@@ -169,11 +168,70 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			continue
 		}
 
+		if p.PublicKey == nil || p.Signature == nil || p.Version == nil {
+			if time.Now().After(consensus.GetMinimumVersionCutoff()) {
+				if bytes.Equal(p.PeerId, peerID) {
+					e.logger.Warn(
+						"peer provided outdated version, penalizing app score",
+						zap.Binary("peer_id", p.PeerId),
+					)
+					e.pubSub.SetPeerScore(p.PeerId, -100)
+				}
+				continue
+			}
+		}
+
+		if p.PublicKey != nil && p.Signature != nil && p.Version != nil {
+			key, err := pcrypto.UnmarshalEd448PublicKey(p.PublicKey)
+			if err != nil {
+				e.logger.Error(
+					"peer announcement contained invalid pubkey",
+					zap.Binary("public_key", p.PublicKey),
+				)
+				continue
+			}
+
+			if !(peer.ID(p.PeerId)).MatchesPublicKey(key) {
+				e.logger.Error(
+					"peer announcement peer id does not match pubkey",
+					zap.Binary("peer_id", p.PeerId),
+					zap.Binary("public_key", p.PublicKey),
+				)
+				continue
+			}
+
+			msg := binary.BigEndian.AppendUint64([]byte{}, p.MaxFrame)
+			msg = append(msg, p.Version...)
+			msg = binary.BigEndian.AppendUint64(msg, uint64(p.Timestamp))
+			b, err := key.Verify(msg, p.Signature)
+			if err != nil || !b {
+				e.logger.Error(
+					"peer provided invalid signature",
+					zap.Binary("msg", msg),
+					zap.Binary("public_key", p.PublicKey),
+					zap.Binary("signature", p.Signature),
+				)
+				continue
+			}
+
+			if bytes.Compare(p.Version, consensus.GetMinimumVersion()) < 0 &&
+				time.Now().After(consensus.GetMinimumVersionCutoff()) {
+				e.logger.Warn(
+					"peer provided outdated version, penalizing app score",
+					zap.Binary("peer_id", p.PeerId),
+				)
+				e.pubSub.SetPeerScore(p.PeerId, -100)
+				continue
+			}
+		}
+
 		multiaddr := p.Multiaddr
 		if bytes.Equal(p.PeerId, peerID) || p.Multiaddr == "" {
 			// we have to fetch self-reported peer info
 			multiaddr = e.pubSub.GetMultiaddrOfPeer(peerID)
 		}
+
+		e.pubSub.SetPeerScore(p.PeerId, 10)
 
 		e.peerMap[string(p.PeerId)] = &peerInfo{
 			peerId:    p.PeerId,
@@ -182,6 +240,9 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			direct:    bytes.Equal(p.PeerId, peerID),
 			lastSeen:  time.Now().Unix(),
 			timestamp: p.Timestamp,
+			version:   p.Version,
+			signature: p.Signature,
+			publicKey: p.PublicKey,
 		}
 	}
 	e.peerMapMx.Unlock()

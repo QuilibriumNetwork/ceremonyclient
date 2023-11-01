@@ -78,6 +78,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	)
 
 	from := request.FromFrameNumber
+	parent := request.ParentSelector
 
 	frame, _, err := e.clockStore.GetDataClockFrame(
 		request.Filter,
@@ -91,27 +92,31 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 			)
 			return errors.Wrap(err, "get compressed sync frames")
 		} else {
-			e.logger.Debug(
-				"peer asked for undiscovered frame",
-				zap.Uint64("frame_number", request.FromFrameNumber),
-			)
+			frames, err := e.clockStore.GetCandidateDataClockFrames(e.filter, from)
+			if err != nil || len(frames) == 0 {
+				e.logger.Debug(
+					"peer asked for undiscovered frame",
+					zap.Uint64("frame_number", request.FromFrameNumber),
+				)
 
-			if err := server.SendMsg(
-				&protobufs.ClockFramesResponse{
-					Filter:          request.Filter,
-					FromFrameNumber: 0,
-					ToFrameNumber:   0,
-					ClockFrames:     []*protobufs.ClockFrame{},
-				},
-			); err != nil {
-				return errors.Wrap(err, "get compressed sync frames")
+				if err := server.SendMsg(
+					&protobufs.ClockFramesResponse{
+						Filter:          request.Filter,
+						FromFrameNumber: 0,
+						ToFrameNumber:   0,
+						ClockFrames:     []*protobufs.ClockFrame{},
+					},
+				); err != nil {
+					return errors.Wrap(err, "get compressed sync frames")
+				}
+
+				return nil
 			}
 
-			return nil
+			parent = nil
 		}
 	}
 
-	parent := request.ParentSelector
 	if parent != nil {
 		if !bytes.Equal(frame.ParentSelector, parent) {
 			e.logger.Info(
@@ -151,6 +156,12 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	max := e.frame
 	to := request.ToFrameNumber
 
+	// We need to slightly rewind, to compensate for unconfirmed frame heads on a
+	// given branch
+	if from >= 2 {
+		from--
+	}
+
 	for {
 		if to == 0 || to-from > 32 {
 			if max > from+31 {
@@ -189,6 +200,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 }
 
 func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
+	peerId []byte,
 	syncMsg *protobufs.CeremonyCompressedSync,
 	loggerFunc func(msg string, fields ...zapcore.Field),
 ) (*protobufs.ClockFrame, error) {
@@ -196,9 +208,13 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 		return nil, ErrNoNewFrames
 	}
 
-	if len(syncMsg.TruncatedClockFrames) != int(
+	if len(syncMsg.TruncatedClockFrames) < int(
 		syncMsg.ToFrameNumber-syncMsg.FromFrameNumber+1,
 	) {
+		e.peerMapMx.Lock()
+		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+		delete(e.peerMap, string(peerId))
+		e.peerMapMx.Unlock()
 		return nil, errors.New("invalid continuity for compressed sync response")
 	}
 

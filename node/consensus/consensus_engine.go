@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"crypto"
+	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
@@ -48,4 +49,16 @@ type DataConsensusEngine interface {
 	) (crypto.Signer, keys.KeyType, []byte, []byte)
 	IsInProverTrie(key []byte) bool
 	GetPeerInfo() *protobufs.PeerInfoResponse
+}
+
+func GetMinimumVersionCutoff() time.Time {
+	return time.Date(2023, time.November, 3, 0, 0, 0, 0, time.UTC)
+}
+
+func GetMinimumVersion() []byte {
+	return []byte{0x01, 0x01, 0x05}
+}
+
+func GetVersion() []byte {
+	return []byte{0x01, 0x01, 0x05}
 }

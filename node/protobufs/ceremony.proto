@@ -136,6 +136,9 @@ message CeremonyPeer {
   string multiaddr = 2;
   uint64 max_frame = 3;
   int64 timestamp = 4;
+  bytes version = 5;
+  bytes signature = 6;
+  bytes public_key = 7;
 }
 
 message CeremonyCompressedSync {
