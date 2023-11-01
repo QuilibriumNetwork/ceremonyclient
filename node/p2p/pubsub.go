@@ -23,4 +23,8 @@ type PubSub interface {
 	) error
 	GetDirectChannel(peerId []byte) (*grpc.ClientConn, error)
 	GetNetworkInfo() *protobufs.NetworkInfoResponse
+	SignMessage(msg []byte) ([]byte, error)
+	GetPublicKey() []byte
+	GetPeerScore(peerId []byte) int64
+	SetPeerScore(peerId []byte, score int64)
 }

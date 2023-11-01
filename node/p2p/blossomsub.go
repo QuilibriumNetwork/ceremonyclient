@@ -33,12 +33,15 @@ import (
 )
 
 type BlossomSub struct {
-	ps         *blossomsub.PubSub
-	ctx        context.Context
-	logger     *zap.Logger
-	peerID     peer.ID
-	bitmaskMap map[string]*blossomsub.Bitmask
-	h          host.Host
+	ps          *blossomsub.PubSub
+	ctx         context.Context
+	logger      *zap.Logger
+	peerID      peer.ID
+	bitmaskMap  map[string]*blossomsub.Bitmask
+	h           host.Host
+	signKey     crypto.PrivKey
+	peerScore   map[string]int64
+	peerScoreMx sync.Mutex
 }
 
 var _ PubSub = (*BlossomSub)(nil)
@@ -63,18 +66,27 @@ func NewBlossomSub(
 		libp2p.ListenAddrStrings(p2pConfig.ListenMultiaddr),
 	}
 
+	var privKey crypto.PrivKey
 	if p2pConfig.PeerPrivKey != "" {
 		peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 		if err != nil {
 			panic(errors.Wrap(err, "error unmarshaling peerkey"))
 		}
 
-		privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
+		privKey, err = crypto.UnmarshalEd448PrivateKey(peerPrivKey)
 		if err != nil {
 			panic(errors.Wrap(err, "error unmarshaling peerkey"))
 		}
 
 		opts = append(opts, libp2p.Identity(privKey))
+	}
+
+	bs := &BlossomSub{
+		ctx:        ctx,
+		logger:     logger,
+		bitmaskMap: make(map[string]*blossomsub.Bitmask),
+		signKey:    privKey,
+		peerScore:  make(map[string]int64),
 	}
 
 	h, err := libp2p.New(opts...)
@@ -109,6 +121,31 @@ func NewBlossomSub(
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
+	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
+		&blossomsub.PeerScoreParams{
+			SkipAtomicValidation:        false,
+			BitmaskScoreCap:             0,
+			IPColocationFactorWeight:    -1,
+			IPColocationFactorThreshold: 6,
+			BehaviourPenaltyWeight:      -1,
+			BehaviourPenaltyThreshold:   100,
+			BehaviourPenaltyDecay:       .5,
+			DecayInterval:               time.Minute,
+			DecayToZero:                 .1,
+			RetainScore:                 5 * time.Minute,
+			AppSpecificScore: func(p peer.ID) float64 {
+				return float64(bs.GetPeerScore([]byte(p)))
+			},
+			AppSpecificWeight: 10.0,
+		},
+		&blossomsub.PeerScoreThresholds{
+			SkipAtomicValidation:        false,
+			GossipThreshold:             -100,
+			PublishThreshold:            -100,
+			GraylistThreshold:           -100,
+			AcceptPXThreshold:           1,
+			OpportunisticGraftThreshold: 2,
+		}))
 
 	params := mergeDefaults(p2pConfig)
 	rt := blossomsub.NewBlossomSubRouter(h, params)
@@ -118,15 +155,12 @@ func NewBlossomSub(
 	}
 
 	peerID := h.ID()
+	bs.ps = ps
+	bs.peerID = peerID
+	bs.h = h
+	bs.signKey = privKey
 
-	return &BlossomSub{
-		ps,
-		ctx,
-		logger,
-		peerID,
-		make(map[string]*blossomsub.Bitmask),
-		h,
-	}
+	return bs
 }
 
 func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
@@ -318,6 +352,19 @@ func initDHT(
 	return kademliaDHT
 }
 
+func (b *BlossomSub) GetPeerScore(peerId []byte) int64 {
+	b.peerScoreMx.Lock()
+	score := b.peerScore[string(peerId)]
+	b.peerScoreMx.Unlock()
+	return score
+}
+
+func (b *BlossomSub) SetPeerScore(peerId []byte, score int64) {
+	b.peerScoreMx.Lock()
+	b.peerScore[string(peerId)] = score
+	b.peerScoreMx.Unlock()
+}
+
 func (b *BlossomSub) GetBitmaskPeers() map[string][]string {
 	peers := map[string][]string{}
 
@@ -431,6 +478,16 @@ func (b *BlossomSub) GetDirectChannel(key []byte) (
 	}
 
 	return dialCtx, nil
+}
+
+func (b *BlossomSub) GetPublicKey() []byte {
+	pub, _ := b.signKey.GetPublic().Raw()
+	return pub
+}
+
+func (b *BlossomSub) SignMessage(msg []byte) ([]byte, error) {
+	sig, err := b.signKey.Sign(msg)
+	return sig, errors.Wrap(err, "sign message")
 }
 
 func discoverPeers(
