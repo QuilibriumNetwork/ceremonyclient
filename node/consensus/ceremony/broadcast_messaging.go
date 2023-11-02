@@ -232,6 +232,24 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 		}
 
 		e.pubSub.SetPeerScore(p.PeerId, 10)
+		existing, ok := e.peerMap[string(p.PeerId)]
+		if ok {
+			if existing.signature != nil && p.Signature == nil {
+				continue
+			}
+
+			if existing.publicKey != nil && p.PublicKey == nil {
+				continue
+			}
+
+			if existing.version != nil && p.Version == nil {
+				continue
+			}
+
+			if existing.timestamp > p.Timestamp {
+				continue
+			}
+		}
 
 		e.peerMap[string(p.PeerId)] = &peerInfo{
 			peerId:    p.PeerId,
