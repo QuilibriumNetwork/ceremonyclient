@@ -286,6 +286,9 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				})
 			}
 			for _, v := range e.uncooperativePeersMap {
+				if v == nil {
+					continue
+				}
 				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL {
 					deletes = append(deletes, v)
 				}

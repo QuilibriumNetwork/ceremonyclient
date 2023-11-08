@@ -212,8 +212,10 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 		syncMsg.ToFrameNumber-syncMsg.FromFrameNumber+1,
 	) {
 		e.peerMapMx.Lock()
-		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-		delete(e.peerMap, string(peerId))
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+		}
 		e.peerMapMx.Unlock()
 		return nil, errors.New("invalid continuity for compressed sync response")
 	}

@@ -890,8 +890,10 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 			zap.Error(err),
 		)
 		e.peerMapMx.Lock()
-		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-		delete(e.peerMap, string(peerId))
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+		}
 		e.peerMapMx.Unlock()
 		e.syncingTarget = nil
 		return latest, errors.Wrap(err, "reverse optimistic sync")
@@ -924,8 +926,10 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				zap.Error(err),
 			)
 			e.peerMapMx.Lock()
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			delete(e.peerMap, string(peerId))
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				delete(e.peerMap, string(peerId))
+			}
 			e.peerMapMx.Unlock()
 			e.syncingTarget = nil
 			return latest, errors.Wrap(err, "reverse optimistic sync")
@@ -950,8 +954,10 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 					zap.Error(err),
 				)
 				e.peerMapMx.Lock()
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				delete(e.peerMap, string(peerId))
+				if _, ok := e.peerMap[string(peerId)]; ok {
+					e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+					delete(e.peerMap, string(peerId))
+				}
 				e.peerMapMx.Unlock()
 
 				if err := cc.Close(); err != nil {
@@ -995,8 +1001,10 @@ func (e *CeremonyDataClockConsensusEngine) reverseOptimisticSync(
 				zap.Error(err),
 			)
 			e.peerMapMx.Lock()
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			delete(e.peerMap, string(peerId))
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				delete(e.peerMap, string(peerId))
+			}
 			e.peerMapMx.Unlock()
 			e.syncingStatus = SyncStatusFailed
 
@@ -1067,8 +1075,10 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			zap.Error(err),
 		)
 		e.peerMapMx.Lock()
-		e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-		delete(e.peerMap, string(peerId))
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			delete(e.peerMap, string(peerId))
+		}
 		e.peerMapMx.Unlock()
 		return latest, errors.Wrap(err, "reverse optimistic sync")
 	}
@@ -1095,8 +1105,10 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 				zap.Error(err),
 			)
 			e.peerMapMx.Lock()
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			delete(e.peerMap, string(peerId))
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				delete(e.peerMap, string(peerId))
+			}
 			e.peerMapMx.Unlock()
 			return latest, errors.Wrap(err, "reverse optimistic sync")
 		}
@@ -1120,8 +1132,10 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 					zap.Error(err),
 				)
 				e.peerMapMx.Lock()
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				delete(e.peerMap, string(peerId))
+				if _, ok := e.peerMap[string(peerId)]; ok {
+					e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+					delete(e.peerMap, string(peerId))
+				}
 				e.peerMapMx.Unlock()
 
 				if err := cc.Close(); err != nil {
