@@ -240,6 +240,8 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 		}
 	}()
 
+	latestFrame = e.performSanityCheck(latestFrame)
+
 	e.state = consensus.EngineStateCollecting
 
 	for i := int64(0); i < e.pendingCommitWorkers; i++ {
@@ -286,6 +288,9 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 				})
 			}
 			for _, v := range e.uncooperativePeersMap {
+				if v == nil {
+					continue
+				}
 				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL {
 					deletes = append(deletes, v)
 				}
@@ -308,6 +313,17 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 			peerCount := e.pubSub.GetNetworkPeersCount()
 			if peerCount >= e.minimumPeersRequired {
 				e.logger.Info("selecting leader")
+				if e.frame > latest.FrameNumber && e.frame-latest.FrameNumber > 16 &&
+					e.syncingTarget == nil {
+					e.logger.Info("rewinding sync head due to large delta")
+					latest, _, err = e.clockStore.GetDataClockFrame(
+						e.filter,
+						0,
+					)
+					if err != nil {
+						panic(err)
+					}
+				}
 				latest, err = e.commitLongestPath(latest)
 				if err != nil {
 					e.logger.Error("could not collect longest path", zap.Error(err))
@@ -391,6 +407,127 @@ func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+func (e *CeremonyDataClockConsensusEngine) performSanityCheck(
+	frame *protobufs.ClockFrame,
+) *protobufs.ClockFrame {
+	e.logger.Info("performing sanity check")
+	start := uint64(0)
+	idx := start
+	end := frame.FrameNumber + 1
+	var prior *protobufs.ClockFrame
+	for start < end {
+		tail := end
+		if start+16 < tail {
+			tail = start + 16
+		}
+		iter, err := e.clockStore.RangeDataClockFrames(
+			e.filter,
+			start,
+			tail,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		for iter.First(); iter.Valid(); iter.Next() {
+			v, err := iter.Value()
+			if err != nil {
+				panic(err)
+			}
+
+			if v.FrameNumber != idx {
+				e.logger.Warn(
+					"discontinuity found, attempting to fix",
+					zap.Uint64("expected_frame_number", idx),
+					zap.Uint64("found_frame_number", v.FrameNumber),
+				)
+
+				disc := v
+				for disc.FrameNumber-idx > 0 {
+					frames, err := e.clockStore.GetCandidateDataClockFrames(
+						e.filter,
+						disc.FrameNumber-1,
+					)
+					if err != nil {
+						panic(err)
+					}
+
+					found := false
+					for _, candidate := range frames {
+						selector, err := candidate.GetSelector()
+						if err != nil {
+							panic(err)
+						}
+
+						parentSelector, _, _, err := disc.GetParentSelectorAndDistance()
+						if err != nil {
+							panic(err)
+						}
+
+						if selector.Cmp(parentSelector) == 0 {
+							found = true
+							_, priorTrie, err := e.clockStore.GetDataClockFrame(
+								e.filter,
+								prior.FrameNumber,
+							)
+							if err != nil {
+								panic(err)
+							}
+
+							txn, err := e.clockStore.NewTransaction()
+							if err != nil {
+								panic(err)
+							}
+
+							err = e.clockStore.PutDataClockFrame(
+								candidate,
+								priorTrie,
+								txn,
+								true,
+							)
+							if err != nil {
+								panic(err)
+							}
+
+							if err = txn.Commit(); err != nil {
+								panic(err)
+							}
+
+							disc = candidate
+						}
+					}
+
+					if !found {
+						e.logger.Error(
+							"could not resolve discontinuity, rewinding consensus head",
+						)
+
+						if err = iter.Close(); err != nil {
+							panic(err)
+						}
+
+						return prior
+					}
+				}
+
+				idx = v.FrameNumber
+			} else {
+				prior = v
+			}
+
+			idx++
+		}
+
+		if err = iter.Close(); err != nil {
+			panic(err)
+		}
+
+		start += 16
+	}
+
+	return frame
 }
 
 func (e *CeremonyDataClockConsensusEngine) GetDifficulty() uint32 {

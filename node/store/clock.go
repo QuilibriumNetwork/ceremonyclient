@@ -48,6 +48,7 @@ type ClockStore interface {
 		frame *protobufs.ClockFrame,
 		proverTrie *tries.RollingFrecencyCritbitTrie,
 		txn Transaction,
+		backfill bool,
 	) error
 	PutCandidateDataClockFrame(
 		parentSelector []byte,
@@ -187,6 +188,10 @@ func (p *PebbleClockIterator) First() bool {
 
 func (p *PebbleClockIterator) Next() bool {
 	return p.i.Next()
+}
+
+func (p *PebbleClockIterator) Prev() bool {
+	return p.i.Prev()
 }
 
 func (p *PebbleClockIterator) Valid() bool {
@@ -909,6 +914,7 @@ func (p *PebbleClockStore) PutDataClockFrame(
 	frame *protobufs.ClockFrame,
 	proverTrie *tries.RollingFrecencyCritbitTrie,
 	txn Transaction,
+	backfill bool,
 ) error {
 	if frame.FrameNumber != 0 {
 		if err := p.saveAggregateProofs(nil, frame); err != nil {
@@ -977,11 +983,13 @@ func (p *PebbleClockStore) PutDataClockFrame(
 		closer.Close()
 	}
 
-	if err = txn.Set(
-		clockDataLatestIndex(frame.Filter),
-		frameNumberBytes,
-	); err != nil {
-		return errors.Wrap(err, "put data clock frame")
+	if !backfill {
+		if err = txn.Set(
+			clockDataLatestIndex(frame.Filter),
+			frameNumberBytes,
+		); err != nil {
+			return errors.Wrap(err, "put data clock frame")
+		}
 	}
 
 	return nil
