@@ -587,6 +587,7 @@ func (
 		frame,
 		e.frameProverTrie,
 		txn,
+		false,
 	); err != nil {
 		panic(err)
 	}
@@ -729,6 +730,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 					s,
 					e.frameProverTrie,
 					txn,
+					false,
 				); err != nil {
 					e.logger.Error(
 						"could not commit candidate",
