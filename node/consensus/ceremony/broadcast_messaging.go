@@ -225,7 +225,7 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			}
 		}
 
-		multiaddr := e.pubSub.GetMultiaddrOfPeer(peerID)
+		multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
 
 		e.pubSub.SetPeerScore(p.PeerId, 10)
 		existing, ok := e.peerMap[string(p.PeerId)]
