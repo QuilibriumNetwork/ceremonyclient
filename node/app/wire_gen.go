@@ -43,12 +43,7 @@ func NewNode(configConfig *config.Config) (*Node, error) {
 }
 
 func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
-	dbConfig := configConfig.DB
-	db := store.NewPebbleDB(dbConfig)
-	zapLogger := logger()
-	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
-	pebbleDataProofStore := store.NewPebbleDataProofStore(db, zapLogger)
-	dbConsole, err := newDBConsole(pebbleClockStore, pebbleDataProofStore)
+	dbConsole, err := newDBConsole(configConfig)
 	if err != nil {
 		return nil, err
 	}

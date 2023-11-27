@@ -68,15 +68,19 @@ func generateBitSlices(
 // it assumes bitLength is a multiple of 32. If the filter size is not
 // conformant, this will generate biased indices.
 func getBloomFilterIndices(data []byte, bitLength int, k int) []byte {
-	byteSize := bitLength / 256
+	size := big.NewInt(int64(bitLength)).BitLen() - 1
 	digest := sha3.Sum256(data)
 	output := make([]byte, bitLength/8)
 	outputBI := big.NewInt(0)
+	digestBI := new(big.Int).SetBytes(digest[:])
 	for i := 0; i < k; i++ {
-		position := digest[i*byteSize : (i+1)*byteSize]
-		if outputBI.Bit(int(new(big.Int).SetBytes(position).Int64())) != 1 {
-			outputBI.SetBit(outputBI, int(new(big.Int).SetBytes(position).Int64()), 1)
-		} else if k*byteSize <= 32 {
+		position := uint(0)
+		for j := size*(i+1) - 1; j >= size*i; j-- {
+			position = position<<1 | (digestBI.Bit(j))
+		}
+		if outputBI.Bit(int(position)) != 1 {
+			outputBI.SetBit(outputBI, int(position), 1)
+		} else if k*size <= 32 {
 			// we need to extend the search
 			k++
 		} else {
