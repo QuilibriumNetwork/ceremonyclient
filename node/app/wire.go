@@ -87,7 +87,7 @@ func NewNode(*config.Config) (*Node, error) {
 }
 
 func NewDBConsole(*config.Config) (*DBConsole, error) {
-	panic(wire.Build(loggerSet, storeSet, newDBConsole))
+	panic(wire.Build(newDBConsole))
 }
 
 func NewClockStore(*config.Config) (store.ClockStore, error) {

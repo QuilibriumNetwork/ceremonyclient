@@ -56,9 +56,11 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 
-	printLogo()
-	printVersion()
-	fmt.Println(" ")
+	if !*dbConsole {
+		printLogo()
+		printVersion()
+		fmt.Println(" ")
+	}
 
 	nodeConfig, err := config.LoadConfig(*configDirectory, "")
 	if err != nil {
@@ -231,5 +233,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.1.6 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.1.7 – Dawn")
 }
