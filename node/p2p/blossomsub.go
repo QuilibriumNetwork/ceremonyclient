@@ -117,20 +117,22 @@ func NewBlossomSub(
 		}
 	}
 
-	blossomOpts := []blossomsub.Option{}
+	blossomOpts := []blossomsub.Option{
+		blossomsub.WithPeerExchange(true),
+	}
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
 	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
 		&blossomsub.PeerScoreParams{
 			SkipAtomicValidation:        false,
-			BitmaskScoreCap:             0,
+			BitmaskScoreCap:             100,
 			IPColocationFactorWeight:    -1,
 			IPColocationFactorThreshold: 6,
-			BehaviourPenaltyWeight:      -1,
+			BehaviourPenaltyWeight:      -80,
 			BehaviourPenaltyThreshold:   100,
 			BehaviourPenaltyDecay:       .5,
-			DecayInterval:               time.Minute,
+			DecayInterval:               10 * time.Second,
 			DecayToZero:                 .1,
 			RetainScore:                 5 * time.Minute,
 			AppSpecificScore: func(p peer.ID) float64 {
@@ -140,10 +142,10 @@ func NewBlossomSub(
 		},
 		&blossomsub.PeerScoreThresholds{
 			SkipAtomicValidation:        false,
-			GossipThreshold:             -100,
-			PublishThreshold:            -100,
-			GraylistThreshold:           -100,
-			AcceptPXThreshold:           1,
+			GossipThreshold:             -2000,
+			PublishThreshold:            -5000,
+			GraylistThreshold:           -10000,
+			AcceptPXThreshold:           100,
 			OpportunisticGraftThreshold: 2,
 		}))
 
@@ -533,7 +535,10 @@ func discoverPeers(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			discover()
+			if len(h.Network().Peers()) == 0 {
+				logger.Info("reinitiating discovery")
+				discover()
+			}
 		}
 	}()
 

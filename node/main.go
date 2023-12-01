@@ -233,5 +233,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.1.7 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.1.8 – Dawn")
 }
