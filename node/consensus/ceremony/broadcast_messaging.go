@@ -439,8 +439,9 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 		zap.Binary("proving_key", provingKey),
 	)
 
-	if e.dependencyMap[string(provingKey)] != nil {
-		go func() {
+	go func() {
+		e.dependencyMapMx.Lock()
+		if e.dependencyMap[string(provingKey)] != nil {
 			keyBundleAnnouncement := &protobufs.KeyBundleAnnouncement{}
 			if err := proto.Unmarshal(
 				e.dependencyMap[string(provingKey)].Value,
@@ -450,6 +451,7 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 					"could not unmarshal key bundle announcement",
 					zap.Error(err),
 				)
+				e.dependencyMapMx.Unlock()
 				return
 			}
 			if err := keyBundleAnnouncement.Verify(
@@ -459,16 +461,16 @@ func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
 					"could not verify key bundle announcement",
 					zap.Error(err),
 				)
+				e.dependencyMapMx.Unlock()
 				return
 			}
 
 			e.pendingCommits <- e.dependencyMap[string(provingKey)]
 
-			e.dependencyMapMx.Lock()
 			delete(e.dependencyMap, string(provingKey))
-			e.dependencyMapMx.Unlock()
-		}()
-	}
+		}
+		e.dependencyMapMx.Unlock()
+	}()
 
 	return nil
 }
