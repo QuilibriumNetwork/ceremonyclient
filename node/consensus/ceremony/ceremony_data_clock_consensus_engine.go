@@ -332,6 +332,8 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 						panic(err)
 					}
 				}
+
+				latest = e.performSanityCheck(latest)
 			}
 		}
 	}()

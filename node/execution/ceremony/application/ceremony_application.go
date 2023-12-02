@@ -14,6 +14,8 @@ var ErrInvalidStateTransition = errors.New("invalid state transition")
 
 type CeremonyApplicationState int
 
+const V118_CUTOFF = uint64(45000)
+
 var CEREMONY_ADDRESS = []byte{
 	// SHA3-256("q_kzg_ceremony")
 	0x34, 0x00, 0x1b, 0xe7, 0x43, 0x2c, 0x2e, 0x66,
@@ -750,6 +752,7 @@ func (a *CeremonyApplication) ApplyTransition(
 
 		return a, nil
 	case CEREMONY_APPLICATION_STATE_IN_PROGRESS:
+		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
 			case protobufs.CeremonySeenProverAttestationType:
@@ -774,6 +777,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			case protobufs.CeremonyDroppedProverAttestationType:
 				droppedProverAtt := &protobufs.CeremonyDroppedProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
@@ -796,6 +800,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			case protobufs.CeremonyTranscriptCommitType:
 				transcriptCommit := &protobufs.CeremonyTranscriptCommit{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], transcriptCommit)
@@ -806,6 +811,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applyTranscriptCommit(transcriptCommit); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			default:
 				return a, nil
 			}
@@ -850,6 +856,10 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
+		if currentFrameNumber > V118_CUTOFF && a.StateCount > 100 {
+			shouldReset = true
+		}
+
 		if shouldReset {
 			a.LobbyState = CEREMONY_APPLICATION_STATE_OPEN
 			a.StateCount = 0
@@ -877,6 +887,7 @@ func (a *CeremonyApplication) ApplyTransition(
 
 		return a, nil
 	case CEREMONY_APPLICATION_STATE_FINALIZING:
+		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
 			case protobufs.CeremonySeenProverAttestationType:
@@ -901,6 +912,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			case protobufs.CeremonyDroppedProverAttestationType:
 				droppedProverAtt := &protobufs.CeremonyDroppedProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
@@ -923,6 +935,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			case protobufs.CeremonyTranscriptShareType:
 				transcriptShare := &protobufs.CeremonyTranscriptShare{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], transcriptShare)
@@ -933,6 +946,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applyTranscriptShare(transcriptShare); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			default:
 				return a, nil
 			}
@@ -970,6 +984,10 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
+		if currentFrameNumber > V118_CUTOFF && a.StateCount > 100 {
+			shouldReset = true
+		}
+
 		if shouldReset {
 			a.LobbyState = CEREMONY_APPLICATION_STATE_OPEN
 			a.StateCount = 0
@@ -999,6 +1017,7 @@ func (a *CeremonyApplication) ApplyTransition(
 
 		return a, nil
 	case CEREMONY_APPLICATION_STATE_VALIDATING:
+		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
 			case protobufs.CeremonyTranscriptType:
@@ -1011,6 +1030,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				if err = a.applyTranscript(transcript); err != nil {
 					return nil, errors.Wrap(err, "apply transition")
 				}
+				a.StateCount = 0
 			default:
 				return a, nil
 			}

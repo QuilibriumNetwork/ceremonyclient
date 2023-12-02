@@ -704,7 +704,7 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 				zap.Int("commit_depth", len(runningFrames[0])),
 			)
 
-			for _, s := range runningFrames[0][1:] {
+			for _, s := range runningFrames[0][0:] {
 				s := s
 				txn, err := e.clockStore.NewTransaction()
 				if err != nil {
