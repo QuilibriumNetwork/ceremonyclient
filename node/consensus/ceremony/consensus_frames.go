@@ -705,6 +705,9 @@ func (e *CeremonyDataClockConsensusEngine) commitLongestPath(
 			)
 
 			for _, s := range runningFrames[0][0:] {
+				if s.FrameNumber == 0 {
+					continue
+				}
 				s := s
 				txn, err := e.clockStore.NewTransaction()
 				if err != nil {
