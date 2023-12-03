@@ -114,10 +114,13 @@ func internalGetAggregateProof(
 		Proof:                copied,
 	}
 
-	iter := db.NewIter(&pebble.IterOptions{
+	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: dataProofInclusionKey(filter, commitment, 0),
 		UpperBound: dataProofInclusionKey(filter, commitment, limit+1),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "get aggregate proof")
+	}
 
 	i := uint32(0)
 

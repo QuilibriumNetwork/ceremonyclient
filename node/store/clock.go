@@ -547,10 +547,13 @@ func (p *PebbleClockStore) RangeMasterClockFrames(
 		startFrameNumber = temp
 	}
 
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: clockMasterFrameKey(filter, startFrameNumber),
 		UpperBound: clockMasterFrameKey(filter, endFrameNumber),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "range master clock frames")
+	}
 
 	return &PebbleMasterClockIterator{i: iter}, nil
 }
@@ -1001,7 +1004,7 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 	filter []byte,
 	frameNumber uint64,
 ) ([]*protobufs.ClockFrame, error) {
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
@@ -1035,6 +1038,9 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 			},
 		),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "get candidate data clock frames")
+	}
 
 	frames := []*protobufs.ClockFrame{}
 	i := &PebbleCandidateClockIterator{i: iter, db: p}
@@ -1078,7 +1084,7 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		}
 	}
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
@@ -1102,6 +1108,9 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 			},
 		),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "range candidate data clock frames")
+	}
 
 	return &PebbleCandidateClockIterator{i: iter, db: p}, nil
 }
@@ -1118,10 +1127,13 @@ func (p *PebbleClockStore) RangeDataClockFrames(
 		startFrameNumber = temp
 	}
 
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: clockDataFrameKey(filter, startFrameNumber),
 		UpperBound: clockDataFrameKey(filter, endFrameNumber),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "get data clock frames")
+	}
 
 	return &PebbleClockIterator{i: iter, db: p}, nil
 }
@@ -1149,10 +1161,13 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 		},
 	)
 
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: from,
 		UpperBound: to,
 	})
+	if err != nil {
+		return errors.Wrap(err, "deduplicate")
+	}
 
 	i := 0
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -1190,10 +1205,13 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 	from = clockDataFrameKey(filter, 1)
 	to = clockDataFrameKey(filter, 20000)
 
-	iter = p.db.NewIter(&pebble.IterOptions{
+	iter, err = p.db.NewIter(&pebble.IterOptions{
 		LowerBound: from,
 		UpperBound: to,
 	})
+	if err != nil {
+		return errors.Wrap(err, "deduplicate")
+	}
 
 	i = 0
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -1261,10 +1279,13 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 		},
 	)
 
-	iter = p.db.NewIter(&pebble.IterOptions{
+	iter, err = p.db.NewIter(&pebble.IterOptions{
 		LowerBound: from,
 		UpperBound: to,
 	})
+	if err != nil {
+		return errors.Wrap(err, "deduplicate")
+	}
 
 	i = 0
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -1313,10 +1334,13 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 	from := clockDataFrameKey(filter, fromFrameNumber)
 	to := clockDataFrameKey(filter, toFrameNumber+1)
 
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: from,
 		UpperBound: to,
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "get compressed data clock frames")
+	}
 
 	syncMessage := &protobufs.CeremonyCompressedSync{}
 	proofs := map[string]*protobufs.InclusionProofsMap{}
@@ -1394,10 +1418,13 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			},
 		)
 
-		iter := p.db.NewIter(&pebble.IterOptions{
+		iter, err := p.db.NewIter(&pebble.IterOptions{
 			LowerBound: from,
 			UpperBound: to,
 		})
+		if err != nil {
+			return nil, errors.Wrap(err, "get compressed data clock frames")
+		}
 
 		candidates := []*protobufs.ClockFrame{}
 		for iter.First(); iter.Valid(); iter.Next() {
@@ -1508,7 +1535,7 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			return nil, errors.Wrap(err, "get compressed data clock frames")
 		}
 
-		iter := p.db.NewIter(&pebble.IterOptions{
+		iter, err := p.db.NewIter(&pebble.IterOptions{
 			LowerBound: dataProofInclusionKey(filter, []byte(k), 0),
 			UpperBound: dataProofInclusionKey(filter, []byte(k), limit+1),
 		})
@@ -1700,7 +1727,7 @@ func (p *PebbleClockStore) GetHighestCandidateDataClockFrame(
 		},
 	)
 
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: from,
 		UpperBound: to,
 	})

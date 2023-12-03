@@ -462,7 +462,7 @@ func (p *PebbleKeyStore) PutKeyBundle(
 }
 
 func (p *PebbleKeyStore) RangeProvingKeys() (*PebbleProvingKeyIterator, error) {
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: provingKeyKey([]byte{
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -484,6 +484,9 @@ func (p *PebbleKeyStore) RangeProvingKeys() (*PebbleProvingKeyIterator, error) {
 			0xff,
 		}),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "range proving keys")
+	}
 
 	return &PebbleProvingKeyIterator{i: iter}, nil
 }
@@ -492,7 +495,7 @@ func (p *PebbleKeyStore) RangeStagedProvingKeys() (
 	*PebbleStagedProvingKeyIterator,
 	error,
 ) {
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: stagedProvingKeyKey([]byte{
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -514,6 +517,9 @@ func (p *PebbleKeyStore) RangeStagedProvingKeys() (
 			0xff,
 		}),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "range staged proving keys")
+	}
 
 	return &PebbleStagedProvingKeyIterator{i: iter}, nil
 }
@@ -522,10 +528,13 @@ func (p *PebbleKeyStore) RangeKeyBundleKeys(provingKey []byte) (
 	*PebbleKeyBundleIterator,
 	error,
 ) {
-	iter := p.db.NewIter(&pebble.IterOptions{
+	iter, err := p.db.NewIter(&pebble.IterOptions{
 		LowerBound: keyBundleKey(provingKey, 0),
 		UpperBound: keyBundleKey(provingKey, 0xffffffffffffffff),
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "range key bundle keys")
+	}
 
 	return &PebbleKeyBundleIterator{i: iter}, nil
 }
