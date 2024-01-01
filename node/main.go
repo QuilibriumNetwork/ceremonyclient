@@ -25,7 +25,7 @@ import (
 var (
 	configDirectory = flag.String(
 		"config",
-		"./.config/",
+		filepath.Join(".", ".config"),
 		"the configuration directory",
 	)
 	importPrivKey = flag.String(
