@@ -8,10 +8,12 @@ import (
 	"hash"
 	"math/big"
 	"os"
+	"runtime"
 	"sync"
 
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581"
 )
@@ -307,12 +309,12 @@ func Init() {
 	g1s := make([]curves.PairingPoint, 65536)
 	g2s := make([]curves.PairingPoint, 257)
 	g1ffts := make([]curves.PairingPoint, 65536)
-	wg := sync.WaitGroup{}
-	wg.Add(65536)
+	wg := errgroup.Group{}
+	wg.SetLimit(runtime.NumCPU())
 
 	for i := 0; i < 65536; i++ {
 		i := i
-		go func() {
+		wg.Go(func() error {
 			b, err := hex.DecodeString(cs.PowersOfTau.G1Affines[i][2:])
 			if err != nil {
 				panic(err)
@@ -346,17 +348,14 @@ func Init() {
 				}
 				g2s[i] = g2.(curves.PairingPoint)
 			}
-			wg.Done()
-		}()
+			return nil
+		})
 	}
 
-	wg.Wait()
-
-	wg.Add(len(cs.Witness.RunningProducts))
 	CeremonyRunningProducts = make([]curves.PairingPoint, len(cs.Witness.RunningProducts))
 	for i, s := range cs.Witness.RunningProducts {
 		i, s := i, s
-		go func() {
+		wg.Go(func() error {
 			b, err := hex.DecodeString(s[2:])
 			if err != nil {
 				panic(err)
@@ -367,16 +366,14 @@ func Init() {
 				panic(err)
 			}
 			CeremonyRunningProducts[i] = g1.(curves.PairingPoint)
-			wg.Done()
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
 
-	wg.Add(len(cs.Witness.PotPubKeys))
 	CeremonyPotPubKeys = make([]curves.PairingPoint, len(cs.Witness.PotPubKeys))
 	for i, s := range cs.Witness.PotPubKeys {
 		i, s := i, s
-		go func() {
+		wg.Go(func() error {
 			b, err := hex.DecodeString(s[2:])
 			if err != nil {
 				panic(err)
@@ -387,16 +384,14 @@ func Init() {
 				panic(err)
 			}
 			CeremonyPotPubKeys[i] = g2.(curves.PairingPoint)
-			wg.Done()
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
 
-	wg.Add(len(cs.VoucherPubKeys))
 	CeremonySignatories = make([]curves.Point, len(cs.VoucherPubKeys))
 	for i, s := range cs.VoucherPubKeys {
 		i, s := i, s
-		go func() {
+		wg.Go(func() error {
 			b, err := hex.DecodeString(s[2:])
 			if err != nil {
 				panic(err)
@@ -406,8 +401,8 @@ func Init() {
 			if err != nil {
 				panic(err)
 			}
-			wg.Done()
-		}()
+			return nil
+		})
 	}
 	wg.Wait()
 
@@ -421,7 +416,8 @@ func Init() {
 	q := new(big.Int).SetBytes(modulus)
 	sizes := []int64{16, 128, 1024, 65536}
 
-	wg.Add(len(sizes))
+	wg = errgroup.Group{}
+	wg.SetLimit(runtime.NumCPU())
 	root := make([]curves.PairingScalar, 4)
 	roots := make([][]curves.PairingScalar, 4)
 	reverseRoots := make([][]curves.PairingScalar, 4)
@@ -430,7 +426,7 @@ func Init() {
 	for idx, i := range sizes {
 		i := i
 		idx := idx
-		go func() {
+		wg.Go(func() error {
 			exp := new(big.Int).Quo(
 				new(big.Int).Sub(q, big.NewInt(1)),
 				big.NewInt(i),
@@ -463,19 +459,20 @@ func Init() {
 			wg2.Wait()
 			roots[idx][i] = roots[idx][0]
 			reverseRoots[idx][0] = reverseRoots[idx][i]
-			wg.Done()
-		}()
+			return nil
+		})
 	}
 	wg.Wait()
 
-	wg.Add(len(sizes))
+	wg = errgroup.Group{}
+	wg.SetLimit(runtime.NumCPU())
 	for i := range root {
 		i := i
 		RootOfUnityBLS48581[uint64(sizes[i])] = root[i]
 		RootsOfUnityBLS48581[uint64(sizes[i])] = roots[i]
 		ReverseRootsOfUnityBLS48581[uint64(sizes[i])] = reverseRoots[i]
 
-		go func() {
+		wg.Go(func() error {
 			// We precomputed 65536, others are cheap and will be fully precomputed
 			// post-ceremony
 			if sizes[i] < 65536 {
@@ -495,8 +492,8 @@ func Init() {
 			} else {
 				ffts[i] = g1ffts
 			}
-			wg.Done()
-		}()
+			return nil
+		})
 	}
 	wg.Wait()
 
