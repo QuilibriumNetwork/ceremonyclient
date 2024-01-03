@@ -226,6 +226,12 @@ func (r *RPCServer) GetTokenInfo(
 		return nil, errors.Wrap(err, "get token info")
 	}
 
+	peerBytes := r.pubSub.GetPeerID()
+	peerAddr, err := poseidon.HashBytes(peerBytes)
+	if err != nil {
+		panic(err)
+	}
+
 	addr, err := poseidon.HashBytes(provingKey.PublicKey)
 	if err != nil {
 		panic(err)
@@ -233,6 +239,9 @@ func (r *RPCServer) GetTokenInfo(
 
 	addrBytes := addr.Bytes()
 	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+
+	peerAddrBytes := peerAddr.Bytes()
+	peerAddrBytes = append(make([]byte, 32-len(peerAddrBytes)), peerAddrBytes...)
 
 	frame, err := r.clockStore.GetLatestDataClockFrame(
 		append(
@@ -297,6 +306,15 @@ func (r *RPCServer) GetTokenInfo(
 					if bytes.Equal(
 						child.External.Key,
 						addrBytes,
+					) {
+						ownedTotal = ownedTotal.Add(
+							ownedTotal,
+							new(big.Int).SetUint64(child.External.Total),
+						)
+					}
+					if bytes.Equal(
+						child.External.Key,
+						peerAddrBytes,
 					) {
 						ownedTotal = ownedTotal.Add(
 							ownedTotal,
