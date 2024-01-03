@@ -11,11 +11,11 @@ All commands are to be run in the `node/` folder.
 
 If you have a voucher from the offline ceremony, first run:
 
-    go run ./... -import-priv-key `cat /path/to/voucher.hex`
+    GOEXPERIMENT=arenas go run ./... -import-priv-key `cat /path/to/voucher.hex`
 
 If you do not, or have already run the above, run:
 
-    go run ./...
+    GOEXPERIMENT=arenas go run ./...
 
 ## EXPERIMENTAL – gRPC/REST Support
 
