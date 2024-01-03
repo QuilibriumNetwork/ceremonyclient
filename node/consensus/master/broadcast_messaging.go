@@ -36,7 +36,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 
 	eg := errgroup.Group{}
 	eg.SetLimit(len(e.executionEngines))
-
 	for name := range e.executionEngines {
 		name := name
 		eg.Go(func() error {
@@ -52,7 +51,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 				)
 				return errors.Wrap(err, "handle message")
 			}
-
 			for _, m := range messages {
 				m := m
 				if err := e.publishMessage(m.Address, m); err != nil {
@@ -64,11 +62,9 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 					return errors.Wrap(err, "handle message")
 				}
 			}
-
 			return nil
 		})
 	}
-
 	if err := eg.Wait(); err != nil {
 		e.logger.Error("rejecting invalid message", zap.Error(err))
 		return errors.Wrap(err, "execution failed")
@@ -96,7 +92,7 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	if e.frame > frame.FrameNumber {
+	if e.frame.FrameNumber > frame.FrameNumber {
 		e.logger.Debug(
 			"received anachronistic frame",
 			zap.Binary("sender", peerID),
@@ -131,7 +127,7 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	if e.frame < frame.FrameNumber {
+	if e.frame.FrameNumber < frame.FrameNumber {
 		if err := e.enqueueSeenFrame(frame); err != nil {
 			e.logger.Error("could not enqueue seen clock frame", zap.Error(err))
 			return errors.Wrap(err, "handle clock frame data")

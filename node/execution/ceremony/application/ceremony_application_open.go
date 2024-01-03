@@ -89,11 +89,11 @@ func (a *CeremonyApplication) finalizeParticipantSet() error {
 		power = power >> 1
 	}
 
-	a.ActiveParticipants = []*protobufs.Ed448PublicKey{}
+	a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
 	for i := 0; i < int(power); i++ {
 		a.ActiveParticipants = append(
 			a.ActiveParticipants,
-			a.LobbyJoins[i].PublicKeySignatureEd448.PublicKey,
+			a.LobbyJoins[i],
 		)
 	}
 

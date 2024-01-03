@@ -81,7 +81,7 @@ func TestMain(m *testing.M) {
 	// Post-ceremony, precompute everything and put it in the finalized ceremony
 	// state
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	sizes := []int64{16}
 
@@ -173,7 +173,7 @@ func TestMain(m *testing.M) {
 
 func TestKzgBytesToPoly(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
@@ -215,7 +215,7 @@ func TestKzgBytesToPoly(t *testing.T) {
 
 func TestPolynomialCommitment(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
@@ -263,7 +263,7 @@ func TestPolynomialCommitment(t *testing.T) {
 
 func TestKZGProof(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
@@ -290,27 +290,51 @@ func TestKZGProof(t *testing.T) {
 			curves.BLS48581G1().NewGeneratorPoint(),
 		),
 		16,
-		false,
+		true,
 	)
 	require.NoError(t, err)
 
-	commit, err := p.Commit(evalPoly)
+	commit, err := p.Commit(poly)
 	require.NoError(t, err)
 
-	z, err := (&curves.ScalarBls48581{}).SetBigInt(big.NewInt(2))
+	z := crypto.RootsOfUnityBLS48581[16][2]
 	require.NoError(t, err)
 
-	checky := poly[len(poly)-1]
-	for i := len(poly) - 2; i >= 0; i-- {
-		checky = checky.Mul(z).Add(poly[i]).(curves.PairingScalar)
+	checky := evalPoly[len(poly)-1]
+	for i := len(evalPoly) - 2; i >= 0; i-- {
+		checky = checky.Mul(z).Add(evalPoly[i]).(curves.PairingScalar)
 	}
-	y, err := p.EvaluateLagrangeForm(evalPoly, z.(curves.PairingScalar), 16, 0)
-	require.NoError(t, err)
-	require.Equal(t, y.Cmp(checky), 0)
+	fmt.Printf("%+x\n", checky.Bytes())
 
-	proof, err := p.Prove(evalPoly, commit, z.(curves.PairingScalar))
+	divisors := make([]curves.PairingScalar, 2)
+	divisors[0] = (&curves.ScalarBls48581{}).Zero().Sub(z).(*curves.ScalarBls48581)
+	divisors[1] = (&curves.ScalarBls48581{}).One().(*curves.ScalarBls48581)
+
+	a := make([]curves.PairingScalar, len(evalPoly))
+	for i := 0; i < len(a); i++ {
+		a[i] = evalPoly[i].Clone().(*curves.ScalarBls48581)
+	}
+
+	// Adapted from Feist's amortized proofs:
+	aPos := len(a) - 1
+	bPos := len(divisors) - 1
+	diff := aPos - bPos
+	out := make([]curves.PairingScalar, diff+1, diff+1)
+	for diff >= 0 {
+		out[diff] = a[aPos].Div(divisors[bPos]).(*curves.ScalarBls48581)
+		for i := bPos; i >= 0; i-- {
+			a[diff+i] = a[diff+i].Sub(
+				out[diff].Mul(divisors[i]),
+			).(*curves.ScalarBls48581)
+		}
+		aPos -= 1
+		diff -= 1
+	}
+
+	proof, err := p.PointLinearCombination(crypto.CeremonyBLS48581G1[:15], out)
+	// proof, err := p.Prove(evalPoly, commit, z.(curves.PairingScalar))
 	require.NoError(t, err)
-	require.True(t, p.Verify(commit, z.(curves.PairingScalar), y, proof))
+	require.True(t, p.Verify(commit, z, checky, proof))
 
 	commitments, err := p.CommitAggregate(
 		[][]curves.PairingScalar{evalPoly},

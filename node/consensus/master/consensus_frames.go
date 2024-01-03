@@ -43,8 +43,7 @@ func (e *MasterClockConsensusEngine) setFrame(frame *protobufs.ClockFrame) {
 	copy(previousSelectorBytes[:], frame.Output[:516])
 
 	e.logger.Debug("set frame", zap.Uint64("frame_number", frame.FrameNumber))
-	e.frame = frame.FrameNumber
-	e.latestFrame = frame
+	e.frame = frame
 
 	go func() {
 		e.frameChan <- e.frame
@@ -53,7 +52,7 @@ func (e *MasterClockConsensusEngine) setFrame(frame *protobufs.ClockFrame) {
 
 func (
 	e *MasterClockConsensusEngine,
-) createGenesisFrame() *protobufs.ClockFrame {
+) CreateGenesisFrame() *protobufs.ClockFrame {
 	e.logger.Debug("creating genesis frame")
 	b := sha3.Sum256(e.input)
 	v := vdf.New(e.difficulty, b)
@@ -65,7 +64,7 @@ func (
 	e.logger.Debug("proving genesis frame")
 	input := []byte{}
 	input = append(input, e.filter...)
-	input = binary.BigEndian.AppendUint64(input, e.frame)
+	input = binary.BigEndian.AppendUint64(input, 0)
 	input = binary.BigEndian.AppendUint32(input, e.difficulty)
 	if bytes.Equal(e.input, []byte{0x00}) {
 		value := [516]byte{}
@@ -82,7 +81,7 @@ func (
 
 	frame := &protobufs.ClockFrame{
 		Filter:      e.filter,
-		FrameNumber: e.frame,
+		FrameNumber: 0,
 		Timestamp:   0,
 		Difficulty:  e.difficulty,
 		Input:       inputMessage,
@@ -107,13 +106,13 @@ func (e *MasterClockConsensusEngine) collect(
 	if e.state == consensus.EngineStateCollecting {
 		e.logger.Debug("collecting vdf proofs")
 
-		latest := e.latestFrame
+		latest := e.frame
 
 		if e.syncingStatus == SyncStatusNotSyncing {
 			peer, err := e.pubSub.GetRandomPeer(e.filter)
 			if err != nil {
 				if errors.Is(err, p2p.ErrNoPeersAvailable) {
-					e.logger.Warn("no peers available, skipping sync")
+					e.logger.Debug("no peers available, skipping sync")
 				} else {
 					e.logger.Error("error while fetching random peer", zap.Error(err))
 				}
@@ -200,10 +199,10 @@ func (
 	})
 
 	if len(e.seenFrames) == 0 {
-		return e.latestFrame, nil
+		return e.frame, nil
 	}
 
-	prev := e.latestFrame
+	prev := e.frame
 	committedSet := []*protobufs.ClockFrame{}
 
 	for len(e.seenFrames) > 0 {

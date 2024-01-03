@@ -105,7 +105,7 @@ message CeremonyOpenState {
 }
 
 message CeremonyInProgressState { 
-  repeated quilibrium.node.keys.pb.Ed448PublicKey active_participants = 1;
+  repeated CeremonyLobbyJoin active_participants = 1;
   repeated CeremonySeenProverAttestation latest_seen_prover_attestations = 2;
   repeated CeremonyDroppedProverAttestation dropped_participant_attestations = 3;
   repeated CeremonyAdvanceRound transcript_round_advance_commits = 4;
@@ -113,7 +113,7 @@ message CeremonyInProgressState {
 }
 
 message CeremonyFinalizingState {
-  repeated quilibrium.node.keys.pb.Ed448PublicKey active_participants = 1;
+  repeated CeremonyLobbyJoin active_participants = 1;
   repeated CeremonySeenProverAttestation latest_seen_prover_attestations = 2;
   repeated CeremonyDroppedProverAttestation dropped_participant_attestations = 3;
   repeated CeremonyTranscriptCommit commits = 4;

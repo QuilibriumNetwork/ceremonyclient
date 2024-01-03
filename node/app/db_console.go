@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
@@ -431,7 +432,7 @@ func (m model) View() string {
 
 	list := []string{}
 	for i, item := range m.filters {
-		str := item[0:12] + ".." + item[52:]
+		str := item[0:12] + ".." + item[len(item)-12:]
 		if m.selectedFilter == item {
 			list = append(list, selectedListStyle.Render(str))
 		} else if i == m.cursor {
@@ -584,7 +585,7 @@ func (m model) View() string {
 
 					for _, active := range app.ActiveParticipants {
 						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							active.KeyValue,
+							active.PublicKeySignatureEd448.PublicKey.KeyValue,
 						) + "\n"
 					}
 
@@ -624,7 +625,7 @@ func (m model) View() string {
 
 					for _, active := range app.ActiveParticipants {
 						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							active.KeyValue,
+							active.PublicKeySignatureEd448.PublicKey.KeyValue,
 						) + "\n"
 					}
 
@@ -656,8 +657,10 @@ func (m model) View() string {
 						) + "\n"
 					}
 				case application.CEREMONY_APPLICATION_STATE_VALIDATING:
+					explorerContent += fmt.Sprintf(
+						"G1 Powers: %d\n", len(app.UpdatedTranscript.G1Powers),
+					)
 					explorerContent += "Preferred Next Round Participants: \n"
-
 					for _, next := range app.NextRoundPreferredParticipants {
 						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
 							next.KeyValue,
@@ -727,7 +730,10 @@ func consoleModel(
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			}),
-			hex.EncodeToString(application.CEREMONY_ADDRESS),
+			hex.EncodeToString(append(
+				p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+				p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+			)),
 		},
 		cursor:   0,
 		conn:     conn,

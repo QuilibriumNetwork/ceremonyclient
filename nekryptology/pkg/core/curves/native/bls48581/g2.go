@@ -21,7 +21,9 @@
 
 package bls48581
 
-//import "fmt"
+import (
+	"arena"
+)
 
 type ECP8 struct {
 	x *FP8
@@ -29,17 +31,26 @@ type ECP8 struct {
 	z *FP8
 }
 
-func NewECP8() *ECP8 {
-	E := new(ECP8)
-	E.x = NewFP8()
-	E.y = NewFP8int(1)
-	E.z = NewFP8()
+func NewECP8(mem *arena.Arena) *ECP8 {
+	var E *ECP8
+	if mem != nil {
+		E = arena.New[ECP8](mem)
+		E.x = NewFP8(mem)
+		E.y = NewFP8int(1, mem)
+		E.z = NewFP8(mem)
+	} else {
+		E = new(ECP8)
+		E.x = NewFP8(nil)
+		E.y = NewFP8int(1, nil)
+		E.z = NewFP8(nil)
+	}
+
 	return E
 }
 
 /* Test this=O? */
-func (E *ECP8) Is_infinity() bool {
-	return E.x.IsZero() && E.z.IsZero()
+func (E *ECP8) Is_infinity(mem *arena.Arena) bool {
+	return E.x.IsZero(mem) && E.z.IsZero(mem)
 }
 
 /* copy this=P */
@@ -57,9 +68,9 @@ func (E *ECP8) inf() {
 }
 
 /* set this=-this */
-func (E *ECP8) Neg() {
+func (E *ECP8) Neg(mem *arena.Arena) {
 	E.y.norm()
-	E.y.Neg()
+	E.y.Neg(mem)
 	E.y.norm()
 }
 
@@ -72,7 +83,7 @@ func (E *ECP8) cmove(Q *ECP8, d int) {
 
 /* Constant time select from pre-computed table */
 func (E *ECP8) selector(W []*ECP8, b int32) {
-	MP := NewECP8()
+	MP := NewECP8(nil)
 	m := b >> 31
 	babs := (b ^ m) - m
 
@@ -88,25 +99,26 @@ func (E *ECP8) selector(W []*ECP8, b int32) {
 	E.cmove(W[7], teq(babs, 7))
 
 	MP.Copy(E)
-	MP.Neg()
+	MP.Neg(nil)
 	E.cmove(MP, int(m&1))
 }
 
 /* Test if P == Q */
 func (E *ECP8) Equals(Q *ECP8) bool {
-
-	a := NewFP8copy(E.x)
-	b := NewFP8copy(Q.x)
-	a.Mul(Q.z)
-	b.Mul(E.z)
+	mem := arena.NewArena()
+	defer mem.Free()
+	a := NewFP8copy(E.x, mem)
+	b := NewFP8copy(Q.x, mem)
+	a.Mul(Q.z, mem)
+	b.Mul(E.z, mem)
 
 	if !a.Equals(b) {
 		return false
 	}
 	a.copy(E.y)
 	b.copy(Q.y)
-	a.Mul(Q.z)
-	b.Mul(E.z)
+	a.Mul(Q.z, mem)
+	b.Mul(E.z, mem)
 	if !a.Equals(b) {
 		return false
 	}
@@ -115,38 +127,38 @@ func (E *ECP8) Equals(Q *ECP8) bool {
 }
 
 /* set to Affine - (x,y,z) to (x,y) */
-func (E *ECP8) Affine() {
-	if E.Is_infinity() {
+func (E *ECP8) Affine(mem *arena.Arena) {
+	if E.Is_infinity(mem) {
 		return
 	}
-	one := NewFP8int(1)
+	one := NewFP8int(1, mem)
 	if E.z.Equals(one) {
-		E.x.reduce()
-		E.y.reduce()
+		E.x.reduce(mem)
+		E.y.reduce(mem)
 		return
 	}
-	E.z.Invert(nil)
+	E.z.Invert(nil, mem)
 
-	E.x.Mul(E.z)
-	E.x.reduce()
-	E.y.Mul(E.z)
-	E.y.reduce()
+	E.x.Mul(E.z, mem)
+	E.x.reduce(mem)
+	E.y.Mul(E.z, mem)
+	E.y.reduce(mem)
 	E.z.copy(one)
 }
 
 /* extract affine x as FP2 */
-func (E *ECP8) GetX() *FP8 {
-	W := NewECP8()
+func (E *ECP8) GetX(mem *arena.Arena) *FP8 {
+	W := NewECP8(mem)
 	W.Copy(E)
-	W.Affine()
+	W.Affine(mem)
 	return W.x
 }
 
 /* extract affine y as FP2 */
-func (E *ECP8) GetY() *FP8 {
-	W := NewECP8()
+func (E *ECP8) GetY(mem *arena.Arena) *FP8 {
+	W := NewECP8(mem)
 	W.Copy(E)
-	W.Affine()
+	W.Affine(mem)
 	return W.y
 }
 
@@ -169,47 +181,24 @@ func (E *ECP8) getz() *FP8 {
 func (E *ECP8) ToBytes(b []byte, compress bool) {
 	var t [8 * int(MODBYTES)]byte
 	MB := 8 * int(MODBYTES)
-	alt := false
-	W := NewECP8()
+	W := NewECP8(nil)
 	W.Copy(E)
-	W.Affine()
+	W.Affine(nil)
 	W.x.ToBytes(t[:])
 
-	if (MODBITS-1)%8 <= 4 && ALLOW_ALT_COMPRESS {
-		alt = true
+	for i := 0; i < MB; i++ {
+		b[i+1] = t[i]
 	}
-
-	if alt {
+	if !compress {
+		b[0] = 0x04
+		W.y.ToBytes(t[:])
 		for i := 0; i < MB; i++ {
-			b[i] = t[i]
+			b[i+MB+1] = t[i]
 		}
-		if !compress {
-			W.y.ToBytes(t[:])
-			for i := 0; i < MB; i++ {
-				b[i+MB] = t[i]
-			}
-		} else {
-			b[0] |= 0x80
-			if W.y.islarger() == 1 {
-				b[0] |= 0x20
-			}
-		}
-
 	} else {
-		for i := 0; i < MB; i++ {
-			b[i+1] = t[i]
-		}
-		if !compress {
-			b[0] = 0x04
-			W.y.ToBytes(t[:])
-			for i := 0; i < MB; i++ {
-				b[i+MB+1] = t[i]
-			}
-		} else {
-			b[0] = 0x02
-			if W.y.sign() == 1 {
-				b[0] = 0x03
-			}
+		b[0] = 0x02
+		if W.y.sign(nil) == 1 {
+			b[0] = 0x03
 		}
 	}
 }
@@ -219,92 +208,64 @@ func ECP8_fromBytes(b []byte) *ECP8 {
 	var t [8 * int(MODBYTES)]byte
 	MB := 8 * int(MODBYTES)
 	typ := int(b[0])
-	alt := false
 
-	if (MODBITS-1)%8 <= 4 && ALLOW_ALT_COMPRESS {
-		alt = true
+	for i := 0; i < MB; i++ {
+		t[i] = b[i+1]
 	}
-
-	if alt {
+	rx := FP8_fromBytes(t[:])
+	if typ == 0x04 {
 		for i := 0; i < MB; i++ {
-			t[i] = b[i]
+			t[i] = b[i+MB+1]
 		}
-		t[0] &= 0x1f
-		rx := FP8_fromBytes(t[:])
-		if (b[0] & 0x80) == 0 {
-			for i := 0; i < MB; i++ {
-				t[i] = b[i+MB]
-			}
-			ry := FP8_fromBytes(t[:])
-			return NewECP8fp8s(rx, ry)
-		} else {
-			sgn := (b[0] & 0x20) >> 5
-			P := NewECP8fp8(rx, 0)
-			cmp := P.y.islarger()
-			if (sgn == 1 && cmp != 1) || (sgn == 0 && cmp == 1) {
-				P.Neg()
-			}
-			return P
-		}
+		ry := FP8_fromBytes(t[:])
+		return NewECP8fp8s(rx, ry, nil)
 	} else {
-		for i := 0; i < MB; i++ {
-			t[i] = b[i+1]
-		}
-		rx := FP8_fromBytes(t[:])
-		if typ == 0x04 {
-			for i := 0; i < MB; i++ {
-				t[i] = b[i+MB+1]
-			}
-			ry := FP8_fromBytes(t[:])
-			return NewECP8fp8s(rx, ry)
-		} else {
-			return NewECP8fp8(rx, typ&1)
-		}
+		return NewECP8fp8(rx, typ&1, nil)
 	}
 }
 
 /* convert this to hex string */
 func (E *ECP8) ToString() string {
-	W := NewECP8()
+	W := NewECP8(nil)
 	W.Copy(E)
-	W.Affine()
-	if W.Is_infinity() {
+	W.Affine(nil)
+	if W.Is_infinity(nil) {
 		return "infinity"
 	}
 	return "(" + W.x.toString() + "," + W.y.toString() + ")"
 }
 
 /* Calculate RHS of twisted curve equation x^3+B/i */
-func RHS8(x *FP8) *FP8 {
-	r := NewFP8copy(x)
-	r.Sqr()
-	b2 := NewFP2big(NewBIGints(CURVE_B))
-	b4 := NewFP4fp2(b2)
-	b := NewFP8fp4(b4)
+func RHS8(x *FP8, mem *arena.Arena) *FP8 {
+	r := NewFP8copy(x, mem)
+	r.Sqr(mem)
+	b2 := NewFP2big(NewBIGints(CURVE_B, mem), mem)
+	b4 := NewFP4fp2(b2, mem)
+	b := NewFP8fp4(b4, mem)
 
-	if SEXTIC_TWIST == D_TYPE {
-		b.div_i()
-	}
-	if SEXTIC_TWIST == M_TYPE {
-		b.times_i()
-	}
-	r.Mul(x)
-	r.Add(b)
+	b.div_i(mem)
+	r.Mul(x, mem)
+	r.Add(b, mem)
 
-	r.reduce()
+	r.reduce(mem)
 	return r
 }
 
 /* construct this from (x,y) - but set to O if not on curve */
-func NewECP8fp8s(ix *FP8, iy *FP8) *ECP8 {
-	E := new(ECP8)
-	E.x = NewFP8copy(ix)
-	E.y = NewFP8copy(iy)
-	E.z = NewFP8int(1)
+func NewECP8fp8s(ix *FP8, iy *FP8, mem *arena.Arena) *ECP8 {
+	var E *ECP8
+	if mem != nil {
+		E = arena.New[ECP8](mem)
+	} else {
+		E = new(ECP8)
+	}
+	E.x = NewFP8copy(ix, mem)
+	E.y = NewFP8copy(iy, mem)
+	E.z = NewFP8int(1, mem)
 	E.x.norm()
-	rhs := RHS8(E.x)
-	y2 := NewFP8copy(E.y)
-	y2.Sqr()
+	rhs := RHS8(E.x, mem)
+	y2 := NewFP8copy(E.y, mem)
+	y2.Sqr(mem)
 	if !y2.Equals(rhs) {
 		E.inf()
 	}
@@ -312,20 +273,25 @@ func NewECP8fp8s(ix *FP8, iy *FP8) *ECP8 {
 }
 
 /* construct this from x - but set to O if not on curve */
-func NewECP8fp8(ix *FP8, s int) *ECP8 {
-	E := new(ECP8)
-	h := NewFP()
-	E.x = NewFP8copy(ix)
-	E.y = NewFP8int(1)
-	E.z = NewFP8int(1)
+func NewECP8fp8(ix *FP8, s int, mem *arena.Arena) *ECP8 {
+	var E *ECP8
+	if mem != nil {
+		E = arena.New[ECP8](mem)
+	} else {
+		E = new(ECP8)
+	}
+	h := NewFP(mem)
+	E.x = NewFP8copy(ix, mem)
+	E.y = NewFP8int(1, mem)
+	E.z = NewFP8int(1, mem)
 	E.x.norm()
-	rhs := RHS8(E.x)
+	rhs := RHS8(E.x, mem)
 	if rhs.qr(h) == 1 {
-		rhs.Sqrt(h)
-		if rhs.sign() != s {
-			rhs.Neg()
+		rhs.Sqrt(h, mem)
+		if rhs.sign(mem) != s {
+			rhs.Neg(mem)
 		}
-		rhs.reduce()
+		rhs.reduce(mem)
 		E.y.copy(rhs)
 
 	} else {
@@ -335,55 +301,48 @@ func NewECP8fp8(ix *FP8, s int) *ECP8 {
 }
 
 /* this+=this */
-func (E *ECP8) Dbl() int {
-	iy := NewFP8copy(E.y)
-	if SEXTIC_TWIST == D_TYPE {
-		iy.times_i()
-	}
+func (E *ECP8) Dbl(mem *arena.Arena) int {
+	iy := NewFP8copy(E.y, mem)
+	iy.times_i(mem)
 
-	t0 := NewFP8copy(E.y)
-	t0.Sqr()
-	if SEXTIC_TWIST == D_TYPE {
-		t0.times_i()
-	}
-	t1 := NewFP8copy(iy)
-	t1.Mul(E.z)
-	t2 := NewFP8copy(E.z)
-	t2.Sqr()
+	t0 := NewFP8copy(E.y, mem)
+	t0.Sqr(mem)
+	t0.times_i(mem)
+	t1 := NewFP8copy(iy, mem)
+	t1.Mul(E.z, mem)
+	t2 := NewFP8copy(E.z, mem)
+	t2.Sqr(mem)
 
 	E.z.copy(t0)
-	E.z.Add(t0)
+	E.z.Add(t0, mem)
 	E.z.norm()
-	E.z.Add(E.z)
-	E.z.Add(E.z)
+	E.z.Add(E.z, mem)
+	E.z.Add(E.z, mem)
 	E.z.norm()
 
-	t2.imul(3 * CURVE_B_I)
-	if SEXTIC_TWIST == M_TYPE {
-		t2.times_i()
-	}
-	x3 := NewFP8copy(t2)
-	x3.Mul(E.z)
+	t2.imul(3*CURVE_B_I, mem)
+	x3 := NewFP8copy(t2, mem)
+	x3.Mul(E.z, mem)
 
-	y3 := NewFP8copy(t0)
+	y3 := NewFP8copy(t0, mem)
 
-	y3.Add(t2)
+	y3.Add(t2, mem)
 	y3.norm()
-	E.z.Mul(t1)
+	E.z.Mul(t1, mem)
 	t1.copy(t2)
-	t1.Add(t2)
-	t2.Add(t1)
+	t1.Add(t2, mem)
+	t2.Add(t1, mem)
 	t2.norm()
-	t0.Sub(t2)
+	t0.Sub(t2, mem)
 	t0.norm() //y^2-9bz^2
-	y3.Mul(t0)
-	y3.Add(x3) //(y^2+3z*2)(y^2-9z^2)+3b.z^2.8y^2
+	y3.Mul(t0, mem)
+	y3.Add(x3, mem) //(y^2+3z*2)(y^2-9z^2)+3b.z^2.8y^2
 	t1.copy(E.x)
-	t1.Mul(iy) //
+	t1.Mul(iy, mem) //
 	E.x.copy(t0)
 	E.x.norm()
-	E.x.Mul(t1)
-	E.x.Add(E.x) //(y^2-9bz^2)xy2
+	E.x.Mul(t1, mem)
+	E.x.Add(E.x, mem) //(y^2-9bz^2)xy2
 
 	E.x.norm()
 	E.y.copy(y3)
@@ -393,90 +352,78 @@ func (E *ECP8) Dbl() int {
 }
 
 /* this+=Q - return 0 for Add, 1 for double, -1 for O */
-func (E *ECP8) Add(Q *ECP8) int {
+func (E *ECP8) Add(Q *ECP8, mem *arena.Arena) int {
 	b := 3 * CURVE_B_I
-	t0 := NewFP8copy(E.x)
-	t0.Mul(Q.x) // x.Q.x
-	t1 := NewFP8copy(E.y)
-	t1.Mul(Q.y) // y.Q.y
+	t0 := NewFP8copy(E.x, mem)
+	t0.Mul(Q.x, mem) // x.Q.x
+	t1 := NewFP8copy(E.y, mem)
+	t1.Mul(Q.y, mem) // y.Q.y
 
-	t2 := NewFP8copy(E.z)
-	t2.Mul(Q.z)
-	t3 := NewFP8copy(E.x)
-	t3.Add(E.y)
+	t2 := NewFP8copy(E.z, mem)
+	t2.Mul(Q.z, mem)
+	t3 := NewFP8copy(E.x, mem)
+	t3.Add(E.y, mem)
 	t3.norm() //t3=X1+Y1
-	t4 := NewFP8copy(Q.x)
-	t4.Add(Q.y)
-	t4.norm()  //t4=X2+Y2
-	t3.Mul(t4) //t3=(X1+Y1)(X2+Y2)
+	t4 := NewFP8copy(Q.x, mem)
+	t4.Add(Q.y, mem)
+	t4.norm()       //t4=X2+Y2
+	t3.Mul(t4, mem) //t3=(X1+Y1)(X2+Y2)
 	t4.copy(t0)
-	t4.Add(t1) //t4=X1.X2+Y1.Y2
+	t4.Add(t1, mem) //t4=X1.X2+Y1.Y2
 
-	t3.Sub(t4)
+	t3.Sub(t4, mem)
 	t3.norm()
-	if SEXTIC_TWIST == D_TYPE {
-		t3.times_i() //t3=(X1+Y1)(X2+Y2)-(X1.X2+Y1.Y2) = X1.Y2+X2.Y1
-	}
+	t3.times_i(mem) //t3=(X1+Y1)(X2+Y2)-(X1.X2+Y1.Y2) = X1.Y2+X2.Y1
 	t4.copy(E.y)
-	t4.Add(E.z)
+	t4.Add(E.z, mem)
 	t4.norm() //t4=Y1+Z1
-	x3 := NewFP8copy(Q.y)
-	x3.Add(Q.z)
+	x3 := NewFP8copy(Q.y, mem)
+	x3.Add(Q.z, mem)
 	x3.norm() //x3=Y2+Z2
 
-	t4.Mul(x3)  //t4=(Y1+Z1)(Y2+Z2)
-	x3.copy(t1) //
-	x3.Add(t2)  //X3=Y1.Y2+Z1.Z2
+	t4.Mul(x3, mem) //t4=(Y1+Z1)(Y2+Z2)
+	x3.copy(t1)     //
+	x3.Add(t2, mem) //X3=Y1.Y2+Z1.Z2
 
-	t4.Sub(x3)
+	t4.Sub(x3, mem)
 	t4.norm()
-	if SEXTIC_TWIST == D_TYPE {
-		t4.times_i() //t4=(Y1+Z1)(Y2+Z2) - (Y1.Y2+Z1.Z2) = Y1.Z2+Y2.Z1
-	}
+	t4.times_i(mem) //t4=(Y1+Z1)(Y2+Z2) - (Y1.Y2+Z1.Z2) = Y1.Z2+Y2.Z1
 	x3.copy(E.x)
-	x3.Add(E.z)
+	x3.Add(E.z, mem)
 	x3.norm() // x3=X1+Z1
-	y3 := NewFP8copy(Q.x)
-	y3.Add(Q.z)
-	y3.norm()  // y3=X2+Z2
-	x3.Mul(y3) // x3=(X1+Z1)(X2+Z2)
+	y3 := NewFP8copy(Q.x, mem)
+	y3.Add(Q.z, mem)
+	y3.norm()       // y3=X2+Z2
+	x3.Mul(y3, mem) // x3=(X1+Z1)(X2+Z2)
 	y3.copy(t0)
-	y3.Add(t2) // y3=X1.X2+Z1+Z2
-	y3.rsub(x3)
+	y3.Add(t2, mem) // y3=X1.X2+Z1+Z2
+	y3.rsub(x3, mem)
 	y3.norm() // y3=(X1+Z1)(X2+Z2) - (X1.X2+Z1.Z2) = X1.Z2+X2.Z1
 
-	if SEXTIC_TWIST == D_TYPE {
-		t0.times_i() // x.Q.x
-		t1.times_i() // y.Q.y
-	}
+	t0.times_i(mem) // x.Q.x
+	t1.times_i(mem) // y.Q.y
 	x3.copy(t0)
-	x3.Add(t0)
-	t0.Add(x3)
+	x3.Add(t0, mem)
+	t0.Add(x3, mem)
 	t0.norm()
-	t2.imul(b)
-	if SEXTIC_TWIST == M_TYPE {
-		t2.times_i()
-	}
-	z3 := NewFP8copy(t1)
-	z3.Add(t2)
+	t2.imul(b, mem)
+	z3 := NewFP8copy(t1, mem)
+	z3.Add(t2, mem)
 	z3.norm()
-	t1.Sub(t2)
+	t1.Sub(t2, mem)
 	t1.norm()
-	y3.imul(b)
-	if SEXTIC_TWIST == M_TYPE {
-		y3.times_i()
-	}
+	y3.imul(b, mem)
 	x3.copy(y3)
-	x3.Mul(t4)
+	x3.Mul(t4, mem)
 	t2.copy(t3)
-	t2.Mul(t1)
-	x3.rsub(t2)
-	y3.Mul(t0)
-	t1.Mul(z3)
-	y3.Add(t1)
-	t0.Mul(t3)
-	z3.Mul(t4)
-	z3.Add(t0)
+	t2.Mul(t1, mem)
+	x3.rsub(t2, mem)
+	y3.Mul(t0, mem)
+	t1.Mul(z3, mem)
+	y3.Add(t1, mem)
+	t0.Mul(t3, mem)
+	z3.Mul(t4, mem)
+	z3.Add(t0, mem)
 
 	E.x.copy(x3)
 	E.x.norm()
@@ -489,51 +436,42 @@ func (E *ECP8) Add(Q *ECP8) int {
 }
 
 /* set this-=Q */
-func (E *ECP8) Sub(Q *ECP8) int {
-	NQ := NewECP8()
+func (E *ECP8) Sub(Q *ECP8, mem *arena.Arena) int {
+	NQ := NewECP8(mem)
 	NQ.Copy(Q)
-	NQ.Neg()
-	D := E.Add(NQ)
+	NQ.Neg(mem)
+	D := E.Add(NQ, mem)
 	return D
 }
 
 func ECP8_frob_constants() [3]*FP2 {
-	Fra := NewBIGints(Fra)
-	Frb := NewBIGints(Frb)
-	X := NewFP2bigs(Fra, Frb)
+	Fra := NewBIGints(Fra, nil)
+	Frb := NewBIGints(Frb, nil)
+	X := NewFP2bigs(Fra, Frb, nil)
 
-	F0 := NewFP2copy(X)
-	F0.Sqr()
-	F2 := NewFP2copy(F0)
-	F2.Mul_ip()
+	F0 := NewFP2copy(X, nil)
+	F0.Sqr(nil)
+	F2 := NewFP2copy(F0, nil)
+	F2.Mul_ip(nil)
 	F2.norm()
-	F1 := NewFP2copy(F2)
-	F1.Sqr()
-	F2.Mul(F1)
+	F1 := NewFP2copy(F2, nil)
+	F1.Sqr(nil)
+	F2.Mul(F1, nil)
 
-	F2.Mul_ip()
+	F2.Mul_ip(nil)
 	F2.norm()
 
 	F1.copy(X)
-	if SEXTIC_TWIST == M_TYPE {
-		F1.Mul_ip()
-		F1.norm()
-		F1.Invert(nil)
-		F0.copy(F1)
-		F0.Sqr()
-		F1.Mul(F0)
-	}
-	if SEXTIC_TWIST == D_TYPE {
-		F0.copy(F1)
-		F0.Sqr()
-		F1.Mul(F0)
-		F0.Mul_ip()
-		F0.norm()
-		F1.Mul_ip()
-		F1.norm()
-		F1.Mul_ip()
-		F1.norm()
-	}
+
+	F0.copy(F1)
+	F0.Sqr(nil)
+	F1.Mul(F0, nil)
+	F0.Mul_ip(nil)
+	F0.norm()
+	F1.Mul_ip(nil)
+	F1.norm()
+	F1.Mul_ip(nil)
+	F1.norm()
 
 	F := [3]*FP2{F0, F1, F2}
 	return F
@@ -542,41 +480,27 @@ func ECP8_frob_constants() [3]*FP2 {
 /* set this*=q, where q is Modulus, using Frobenius */
 func (E *ECP8) frob(F [3]*FP2, n int) {
 	for i := 0; i < n; i++ {
-		E.x.frob(F[2])
-		if SEXTIC_TWIST == M_TYPE {
-			E.x.qmul(F[0])
-			E.x.times_i2()
-		}
-		if SEXTIC_TWIST == D_TYPE {
-			E.x.qmul(F[0])
-			E.x.times_i2()
-		}
-		E.y.frob(F[2])
-		if SEXTIC_TWIST == M_TYPE {
-			E.y.qmul(F[1])
-			E.y.times_i2()
-			E.y.times_i()
-		}
-		if SEXTIC_TWIST == D_TYPE {
-			E.y.qmul(F[1])
-			E.y.times_i()
-		}
-
-		E.z.frob(F[2])
+		E.x.frob(F[2], nil)
+		E.x.qmul(F[0], nil)
+		E.x.times_i2(nil)
+		E.y.frob(F[2], nil)
+		E.y.qmul(F[1], nil)
+		E.y.times_i(nil)
+		E.z.frob(F[2], nil)
 	}
 }
 
 /* P*=e */
-func (E *ECP8) mul(e *BIG) *ECP8 {
+func (E *ECP8) mul(e *BIG, mem *arena.Arena) *ECP8 {
 	/* fixed size windows */
-	mt := NewBIG()
-	t := NewBIG()
-	P := NewECP8()
-	Q := NewECP8()
-	C := NewECP8()
+	mt := NewBIG(mem)
+	t := NewBIG(mem)
+	P := NewECP8(nil)
+	Q := NewECP8(mem)
+	C := NewECP8(mem)
 
-	if E.Is_infinity() {
-		return NewECP8()
+	if E.Is_infinity(mem) {
+		return NewECP8(mem)
 	}
 
 	var W []*ECP8
@@ -584,15 +508,15 @@ func (E *ECP8) mul(e *BIG) *ECP8 {
 
 	/* precompute table */
 	Q.Copy(E)
-	Q.Dbl()
+	Q.Dbl(mem)
 
-	W = append(W, NewECP8())
+	W = append(W, NewECP8(mem))
 	W[0].Copy(E)
 
 	for i := 1; i < 8; i++ {
-		W = append(W, NewECP8())
+		W = append(W, NewECP8(mem))
 		W[i].Copy(W[i-1])
-		W[i].Add(Q)
+		W[i].Add(Q, mem)
 	}
 
 	/* make exponent odd - Add 2P if even, P if odd */
@@ -622,81 +546,80 @@ func (E *ECP8) mul(e *BIG) *ECP8 {
 	P.selector(W, int32(w[nb]))
 	for i := nb - 1; i >= 0; i-- {
 		Q.selector(W, int32(w[i]))
-		P.Dbl()
-		P.Dbl()
-		P.Dbl()
-		P.Dbl()
-		P.Add(Q)
+		P.Dbl(mem)
+		P.Dbl(mem)
+		P.Dbl(mem)
+		P.Dbl(mem)
+		P.Add(Q, mem)
 	}
-	P.Sub(C)
-	P.Affine()
+	P.Sub(C, mem)
+	P.Affine(mem)
 	return P
 }
 
 /* Public version */
-func (E *ECP8) Mul(e *BIG) *ECP8 {
-	return E.mul(e)
+func (E *ECP8) Mul(e *BIG, mem *arena.Arena) *ECP8 {
+	return E.mul(e, mem)
 }
 
 /* needed for SOK */
 func (E *ECP8) Cfp() {
 
 	F := ECP8_frob_constants()
-	x := NewBIGints(CURVE_Bnx)
+	x := NewBIGints(CURVE_Bnx, nil)
 
-	xQ := E.Mul(x)
-	x2Q := xQ.Mul(x)
-	x3Q := x2Q.Mul(x)
-	x4Q := x3Q.Mul(x)
-	x5Q := x4Q.Mul(x)
-	x6Q := x5Q.Mul(x)
-	x7Q := x6Q.Mul(x)
-	x8Q := x7Q.Mul(x)
+	xQ := E.Mul(x, nil)
+	x2Q := xQ.Mul(x, nil)
+	x3Q := x2Q.Mul(x, nil)
+	x4Q := x3Q.Mul(x, nil)
+	x5Q := x4Q.Mul(x, nil)
+	x6Q := x5Q.Mul(x, nil)
+	x7Q := x6Q.Mul(x, nil)
+	x8Q := x7Q.Mul(x, nil)
 
-	if SIGN_OF_X == NEGATIVEX {
-		xQ.Neg()
-		x3Q.Neg()
-		x5Q.Neg()
-		x7Q.Neg()
-	}
-	x8Q.Sub(x7Q)
-	x8Q.Sub(E)
+	xQ.Neg(nil)
+	x3Q.Neg(nil)
+	x5Q.Neg(nil)
+	x7Q.Neg(nil)
 
-	x7Q.Sub(x6Q)
+	x8Q.Sub(x7Q, nil)
+	x8Q.Sub(E, nil)
+
+	x7Q.Sub(x6Q, nil)
 	x7Q.frob(F, 1)
 
-	x6Q.Sub(x5Q)
+	x6Q.Sub(x5Q, nil)
 	x6Q.frob(F, 2)
 
-	x5Q.Sub(x4Q)
+	x5Q.Sub(x4Q, nil)
 	x5Q.frob(F, 3)
 
-	x4Q.Sub(x3Q)
+	x4Q.Sub(x3Q, nil)
 	x4Q.frob(F, 4)
 
-	x3Q.Sub(x2Q)
+	x3Q.Sub(x2Q, nil)
 	x3Q.frob(F, 5)
 
-	x2Q.Sub(xQ)
+	x2Q.Sub(xQ, nil)
 	x2Q.frob(F, 6)
 
-	xQ.Sub(E)
+	xQ.Sub(E, nil)
 	xQ.frob(F, 7)
 
-	E.Dbl()
+	E.Dbl(nil)
 	E.frob(F, 8)
 
-	E.Add(x8Q)
-	E.Add(x7Q)
-	E.Add(x6Q)
-	E.Add(x5Q)
+	E.Add(x8Q, nil)
+	E.Add(x7Q, nil)
+	E.Add(x6Q, nil)
+	E.Add(x5Q, nil)
 
-	E.Add(x4Q)
-	E.Add(x3Q)
-	E.Add(x2Q)
-	E.Add(xQ)
+	E.Add(x4Q, nil)
+	E.Add(x3Q, nil)
+	E.Add(x2Q, nil)
+	E.Add(xQ, nil)
 
-	E.Affine()
+	E.Affine(nil)
 }
 
 func ECP8_generator() *ECP8 {
@@ -704,34 +627,34 @@ func ECP8_generator() *ECP8 {
 	G = NewECP8fp8s(
 		NewFP8fp4s(
 			NewFP4fp2s(
-				NewFP2bigs(NewBIGints(CURVE_Pxaaa), NewBIGints(CURVE_Pxaab)),
-				NewFP2bigs(NewBIGints(CURVE_Pxaba), NewBIGints(CURVE_Pxabb))),
+				NewFP2bigs(NewBIGints(CURVE_Pxaaa, nil), NewBIGints(CURVE_Pxaab, nil), nil),
+				NewFP2bigs(NewBIGints(CURVE_Pxaba, nil), NewBIGints(CURVE_Pxabb, nil), nil), nil),
 			NewFP4fp2s(
-				NewFP2bigs(NewBIGints(CURVE_Pxbaa), NewBIGints(CURVE_Pxbab)),
-				NewFP2bigs(NewBIGints(CURVE_Pxbba), NewBIGints(CURVE_Pxbbb)))),
+				NewFP2bigs(NewBIGints(CURVE_Pxbaa, nil), NewBIGints(CURVE_Pxbab, nil), nil),
+				NewFP2bigs(NewBIGints(CURVE_Pxbba, nil), NewBIGints(CURVE_Pxbbb, nil), nil), nil), nil),
 		NewFP8fp4s(
 			NewFP4fp2s(
-				NewFP2bigs(NewBIGints(CURVE_Pyaaa), NewBIGints(CURVE_Pyaab)),
-				NewFP2bigs(NewBIGints(CURVE_Pyaba), NewBIGints(CURVE_Pyabb))),
+				NewFP2bigs(NewBIGints(CURVE_Pyaaa, nil), NewBIGints(CURVE_Pyaab, nil), nil),
+				NewFP2bigs(NewBIGints(CURVE_Pyaba, nil), NewBIGints(CURVE_Pyabb, nil), nil), nil),
 			NewFP4fp2s(
-				NewFP2bigs(NewBIGints(CURVE_Pybaa), NewBIGints(CURVE_Pybab)),
-				NewFP2bigs(NewBIGints(CURVE_Pybba), NewBIGints(CURVE_Pybbb)))))
+				NewFP2bigs(NewBIGints(CURVE_Pybaa, nil), NewBIGints(CURVE_Pybab, nil), nil),
+				NewFP2bigs(NewBIGints(CURVE_Pybba, nil), NewBIGints(CURVE_Pybbb, nil), nil), nil), nil), nil)
 	return G
 }
 
 func ECP8_hap2point(h *BIG) *ECP8 {
-	one := NewBIGint(1)
-	x := NewBIGcopy(h)
+	one := NewBIGint(1, nil)
+	x := NewBIGcopy(h, nil)
 	var X2 *FP2
 	var X4 *FP4
 	var X8 *FP8
 	var Q *ECP8
 	for true {
-		X2 = NewFP2bigs(one, x)
-		X4 = NewFP4fp2(X2)
-		X8 = NewFP8fp4(X4)
-		Q = NewECP8fp8(X8, 0)
-		if !Q.Is_infinity() {
+		X2 = NewFP2bigs(one, x, nil)
+		X4 = NewFP4fp2(X2, nil)
+		X8 = NewFP8fp4(X4, nil)
+		Q = NewECP8fp8(X8, 0, nil)
+		if !Q.Is_infinity(nil) {
 			break
 		}
 		x.inc(1)
@@ -743,83 +666,83 @@ func ECP8_hap2point(h *BIG) *ECP8 {
 /* Deterministic mapping of Fp to point on curve */
 func ECP8_map2point(H *FP8) *ECP8 {
 	// Shallue and van de Woestijne
-	NY := NewFP8int(1)
-	T := NewFP8copy(H)
-	sgn := T.sign()
+	NY := NewFP8int(1, nil)
+	T := NewFP8copy(H, nil)
+	sgn := T.sign(nil)
 
-	Z := NewFPint(RIADZG2A)
-	X1 := NewFP8fp(Z)
-	X3 := NewFP8copy(X1)
-	A := RHS8(X1)
-	W := NewFP8copy(A)
-	W.Sqrt(nil)
+	Z := NewFPint(RIADZG2A, nil)
+	X1 := NewFP8fp(Z, nil)
+	X3 := NewFP8copy(X1, nil)
+	A := RHS8(X1, nil)
+	W := NewFP8copy(A, nil)
+	W.Sqrt(nil, nil)
 
-	s := NewFPbig(NewBIGints(SQRTm3))
-	Z.Mul(s)
+	s := NewFPbig(NewBIGints(SQRTm3, nil), nil)
+	Z.Mul(s, nil)
 
-	T.Sqr()
-	Y := NewFP8copy(A)
-	Y.Mul(T)
+	T.Sqr(nil)
+	Y := NewFP8copy(A, nil)
+	Y.Mul(T, nil)
 	T.copy(NY)
-	T.Add(Y)
+	T.Add(Y, nil)
 	T.norm()
-	Y.rsub(NY)
+	Y.rsub(NY, nil)
 	Y.norm()
 	NY.copy(T)
-	NY.Mul(Y)
+	NY.Mul(Y, nil)
 
-	NY.tmul(Z)
-	NY.Invert(nil)
+	NY.tmul(Z, nil)
+	NY.Invert(nil, nil)
 
-	W.tmul(Z)
-	if W.sign() == 1 {
-		W.Neg()
+	W.tmul(Z, nil)
+	if W.sign(nil) == 1 {
+		W.Neg(nil)
 		W.norm()
 	}
-	W.tmul(Z)
-	W.Mul(H)
-	W.Mul(Y)
-	W.Mul(NY)
+	W.tmul(Z, nil)
+	W.Mul(H, nil)
+	W.Mul(Y, nil)
+	W.Mul(NY, nil)
 
-	X1.Neg()
+	X1.Neg(nil)
 	X1.norm()
-	X1.div2()
-	X2 := NewFP8copy(X1)
-	X1.Sub(W)
+	X1.div2(nil)
+	X2 := NewFP8copy(X1, nil)
+	X1.Sub(W, nil)
 	X1.norm()
-	X2.Add(W)
+	X2.Add(W, nil)
 	X2.norm()
-	A.Add(A)
-	A.Add(A)
+	A.Add(A, nil)
+	A.Add(A, nil)
 	A.norm()
-	T.Sqr()
-	T.Mul(NY)
-	T.Sqr()
-	A.Mul(T)
-	X3.Add(A)
+	T.Sqr(nil)
+	T.Mul(NY, nil)
+	T.Sqr(nil)
+	A.Mul(T, nil)
+	X3.Add(A, nil)
 	X3.norm()
 
-	Y.copy(RHS8(X2))
+	Y.copy(RHS8(X2, nil))
 	X3.cmove(X2, Y.qr(nil))
-	Y.copy(RHS8(X1))
+	Y.copy(RHS8(X1, nil))
 	X3.cmove(X1, Y.qr(nil))
-	Y.copy(RHS8(X3))
-	Y.Sqrt(nil)
+	Y.copy(RHS8(X3, nil))
+	Y.Sqrt(nil, nil)
 
-	ne := Y.sign() ^ sgn
+	ne := Y.sign(nil) ^ sgn
 	W.copy(Y)
-	W.Neg()
+	W.Neg(nil)
 	W.norm()
 	Y.cmove(W, ne)
 
-	return NewECP8fp8s(X3, Y)
+	return NewECP8fp8s(X3, Y, nil)
 }
 
 /* Map octet string to curve point */
 func ECP8_mapit(h []byte) *ECP8 {
-	q := NewBIGints(Modulus)
+	q := NewBIGints(Modulus, nil)
 	dx := DBIG_fromBytes(h)
-	x := dx.Mod(q)
+	x := dx.Mod(q, nil)
 
 	Q := ECP8_hap2point(x)
 	Q.Cfp()
@@ -830,14 +753,14 @@ func ECP8_mapit(h []byte) *ECP8 {
 // Bos & Costello https://eprint.iacr.org/2013/458.pdf
 // Faz-Hernandez & Longa & Sanchez  https://eprint.iacr.org/2013/158.pdf
 // Side channel attack secure
-func Mul16(Q []*ECP8, u []*BIG) *ECP8 {
-	W := NewECP8()
-	P := NewECP8()
+func Mul16(Q []*ECP8, u []*BIG, mem *arena.Arena) *ECP8 {
+	W := NewECP8(mem)
+	P := NewECP8(mem)
 	var T1 []*ECP8
 	var T2 []*ECP8
 	var T3 []*ECP8
 	var T4 []*ECP8
-	mt := NewBIG()
+	mt := NewBIG(mem)
 	var t []*BIG
 	var bt int8
 	var k int
@@ -852,104 +775,104 @@ func Mul16(Q []*ECP8, u []*BIG) *ECP8 {
 	var s4 [NLEN*int(BASEBITS) + 1]int8
 
 	for i := 0; i < 16; i++ {
-		t = append(t, NewBIGcopy(u[i]))
+		t = append(t, NewBIGcopy(u[i], mem))
 	}
 
-	T1 = append(T1, NewECP8())
+	T1 = append(T1, NewECP8(mem))
 	T1[0].Copy(Q[0]) // Q[0]
-	T1 = append(T1, NewECP8())
+	T1 = append(T1, NewECP8(mem))
 	T1[1].Copy(T1[0])
-	T1[1].Add(Q[1]) // Q[0]+Q[1]
-	T1 = append(T1, NewECP8())
+	T1[1].Add(Q[1], mem) // Q[0]+Q[1]
+	T1 = append(T1, NewECP8(mem))
 	T1[2].Copy(T1[0])
-	T1[2].Add(Q[2]) // Q[0]+Q[2]
-	T1 = append(T1, NewECP8())
+	T1[2].Add(Q[2], mem) // Q[0]+Q[2]
+	T1 = append(T1, NewECP8(mem))
 	T1[3].Copy(T1[1])
-	T1[3].Add(Q[2]) // Q[0]+Q[1]+Q[2]
-	T1 = append(T1, NewECP8())
+	T1[3].Add(Q[2], mem) // Q[0]+Q[1]+Q[2]
+	T1 = append(T1, NewECP8(mem))
 	T1[4].Copy(T1[0])
-	T1[4].Add(Q[3]) // Q[0]+Q[3]
-	T1 = append(T1, NewECP8())
+	T1[4].Add(Q[3], mem) // Q[0]+Q[3]
+	T1 = append(T1, NewECP8(mem))
 	T1[5].Copy(T1[1])
-	T1[5].Add(Q[3]) // Q[0]+Q[1]+Q[3]
-	T1 = append(T1, NewECP8())
+	T1[5].Add(Q[3], mem) // Q[0]+Q[1]+Q[3]
+	T1 = append(T1, NewECP8(mem))
 	T1[6].Copy(T1[2])
-	T1[6].Add(Q[3]) // Q[0]+Q[2]+Q[3]
-	T1 = append(T1, NewECP8())
+	T1[6].Add(Q[3], mem) // Q[0]+Q[2]+Q[3]
+	T1 = append(T1, NewECP8(mem))
 	T1[7].Copy(T1[3])
-	T1[7].Add(Q[3]) // Q[0]+Q[1]+Q[2]+Q[3]
+	T1[7].Add(Q[3], mem) // Q[0]+Q[1]+Q[2]+Q[3]
 
-	T2 = append(T2, NewECP8())
+	T2 = append(T2, NewECP8(mem))
 	T2[0].Copy(Q[4]) // Q[0]
-	T2 = append(T2, NewECP8())
+	T2 = append(T2, NewECP8(mem))
 	T2[1].Copy(T2[0])
-	T2[1].Add(Q[5]) // Q[0]+Q[1]
-	T2 = append(T2, NewECP8())
+	T2[1].Add(Q[5], mem) // Q[0]+Q[1]
+	T2 = append(T2, NewECP8(mem))
 	T2[2].Copy(T2[0])
-	T2[2].Add(Q[6]) // Q[0]+Q[2]
-	T2 = append(T2, NewECP8())
+	T2[2].Add(Q[6], mem) // Q[0]+Q[2]
+	T2 = append(T2, NewECP8(mem))
 	T2[3].Copy(T2[1])
-	T2[3].Add(Q[6]) // Q[0]+Q[1]+Q[2]
-	T2 = append(T2, NewECP8())
+	T2[3].Add(Q[6], mem) // Q[0]+Q[1]+Q[2]
+	T2 = append(T2, NewECP8(mem))
 	T2[4].Copy(T2[0])
-	T2[4].Add(Q[7]) // Q[0]+Q[3]
-	T2 = append(T2, NewECP8())
+	T2[4].Add(Q[7], mem) // Q[0]+Q[3]
+	T2 = append(T2, NewECP8(mem))
 	T2[5].Copy(T2[1])
-	T2[5].Add(Q[7]) // Q[0]+Q[1]+Q[3]
-	T2 = append(T2, NewECP8())
+	T2[5].Add(Q[7], mem) // Q[0]+Q[1]+Q[3]
+	T2 = append(T2, NewECP8(mem))
 	T2[6].Copy(T2[2])
-	T2[6].Add(Q[7]) // Q[0]+Q[2]+Q[3]
-	T2 = append(T2, NewECP8())
+	T2[6].Add(Q[7], mem) // Q[0]+Q[2]+Q[3]
+	T2 = append(T2, NewECP8(mem))
 	T2[7].Copy(T2[3])
-	T2[7].Add(Q[7]) // Q[0]+Q[1]+Q[2]+Q[3]
+	T2[7].Add(Q[7], mem) // Q[0]+Q[1]+Q[2]+Q[3]
 
-	T3 = append(T3, NewECP8())
+	T3 = append(T3, NewECP8(mem))
 	T3[0].Copy(Q[8]) // Q[0]
-	T3 = append(T3, NewECP8())
+	T3 = append(T3, NewECP8(mem))
 	T3[1].Copy(T3[0])
-	T3[1].Add(Q[9]) // Q[0]+Q[1]
-	T3 = append(T3, NewECP8())
+	T3[1].Add(Q[9], mem) // Q[0]+Q[1]
+	T3 = append(T3, NewECP8(mem))
 	T3[2].Copy(T3[0])
-	T3[2].Add(Q[10]) // Q[0]+Q[2]
-	T3 = append(T3, NewECP8())
+	T3[2].Add(Q[10], mem) // Q[0]+Q[2]
+	T3 = append(T3, NewECP8(mem))
 	T3[3].Copy(T3[1])
-	T3[3].Add(Q[10]) // Q[0]+Q[1]+Q[2]
-	T3 = append(T3, NewECP8())
+	T3[3].Add(Q[10], mem) // Q[0]+Q[1]+Q[2]
+	T3 = append(T3, NewECP8(mem))
 	T3[4].Copy(T3[0])
-	T3[4].Add(Q[11]) // Q[0]+Q[3]
-	T3 = append(T3, NewECP8())
+	T3[4].Add(Q[11], mem) // Q[0]+Q[3]
+	T3 = append(T3, NewECP8(mem))
 	T3[5].Copy(T3[1])
-	T3[5].Add(Q[11]) // Q[0]+Q[1]+Q[3]
-	T3 = append(T3, NewECP8())
+	T3[5].Add(Q[11], mem) // Q[0]+Q[1]+Q[3]
+	T3 = append(T3, NewECP8(mem))
 	T3[6].Copy(T3[2])
-	T3[6].Add(Q[11]) // Q[0]+Q[2]+Q[3]
-	T3 = append(T3, NewECP8())
+	T3[6].Add(Q[11], mem) // Q[0]+Q[2]+Q[3]
+	T3 = append(T3, NewECP8(mem))
 	T3[7].Copy(T3[3])
-	T3[7].Add(Q[11]) // Q[0]+Q[1]+Q[2]+Q[3]
+	T3[7].Add(Q[11], mem) // Q[0]+Q[1]+Q[2]+Q[3]
 
-	T4 = append(T4, NewECP8())
+	T4 = append(T4, NewECP8(mem))
 	T4[0].Copy(Q[12]) // Q[0]
-	T4 = append(T4, NewECP8())
+	T4 = append(T4, NewECP8(mem))
 	T4[1].Copy(T4[0])
-	T4[1].Add(Q[13]) // Q[0]+Q[1]
-	T4 = append(T4, NewECP8())
+	T4[1].Add(Q[13], mem) // Q[0]+Q[1]
+	T4 = append(T4, NewECP8(mem))
 	T4[2].Copy(T4[0])
-	T4[2].Add(Q[14]) // Q[0]+Q[2]
-	T4 = append(T4, NewECP8())
+	T4[2].Add(Q[14], mem) // Q[0]+Q[2]
+	T4 = append(T4, NewECP8(mem))
 	T4[3].Copy(T4[1])
-	T4[3].Add(Q[14]) // Q[0]+Q[1]+Q[2]
-	T4 = append(T4, NewECP8())
+	T4[3].Add(Q[14], mem) // Q[0]+Q[1]+Q[2]
+	T4 = append(T4, NewECP8(mem))
 	T4[4].Copy(T4[0])
-	T4[4].Add(Q[15]) // Q[0]+Q[3]
-	T4 = append(T4, NewECP8())
+	T4[4].Add(Q[15], mem) // Q[0]+Q[3]
+	T4 = append(T4, NewECP8(mem))
 	T4[5].Copy(T4[1])
-	T4[5].Add(Q[15]) // Q[0]+Q[1]+Q[3]
-	T4 = append(T4, NewECP8())
+	T4[5].Add(Q[15], mem) // Q[0]+Q[1]+Q[3]
+	T4 = append(T4, NewECP8(mem))
 	T4[6].Copy(T4[2])
-	T4[6].Add(Q[15]) // Q[0]+Q[2]+Q[3]
-	T4 = append(T4, NewECP8())
+	T4[6].Add(Q[15], mem) // Q[0]+Q[2]+Q[3]
+	T4 = append(T4, NewECP8(mem))
 	T4[7].Copy(T4[3])
-	T4[7].Add(Q[15]) // Q[0]+Q[1]+Q[2]+Q[3]
+	T4[7].Add(Q[15], mem) // Q[0]+Q[1]+Q[2]+Q[3]
 
 	// Make them odd
 	pb1 := 1 - t[0].parity()
@@ -1037,38 +960,38 @@ func Mul16(Q []*ECP8, u []*BIG) *ECP8 {
 	// Main loop
 	P.selector(T1, int32(2*w1[nb-1]+1))
 	W.selector(T2, int32(2*w2[nb-1]+1))
-	P.Add(W)
+	P.Add(W, mem)
 	W.selector(T3, int32(2*w3[nb-1]+1))
-	P.Add(W)
+	P.Add(W, mem)
 	W.selector(T4, int32(2*w4[nb-1]+1))
-	P.Add(W)
+	P.Add(W, mem)
 	for i := nb - 2; i >= 0; i-- {
-		P.Dbl()
+		P.Dbl(mem)
 		W.selector(T1, int32(2*w1[i]+s1[i]))
-		P.Add(W)
+		P.Add(W, mem)
 		W.selector(T2, int32(2*w2[i]+s2[i]))
-		P.Add(W)
+		P.Add(W, mem)
 		W.selector(T3, int32(2*w3[i]+s3[i]))
-		P.Add(W)
+		P.Add(W, mem)
 		W.selector(T4, int32(2*w4[i]+s4[i]))
-		P.Add(W)
+		P.Add(W, mem)
 
 	}
 
 	// apply correction
 	W.Copy(P)
-	W.Sub(Q[0])
+	W.Sub(Q[0], mem)
 	P.cmove(W, pb1)
 	W.Copy(P)
-	W.Sub(Q[4])
+	W.Sub(Q[4], mem)
 	P.cmove(W, pb2)
 	W.Copy(P)
-	W.Sub(Q[8])
+	W.Sub(Q[8], mem)
 	P.cmove(W, pb3)
 	W.Copy(P)
-	W.Sub(Q[12])
+	W.Sub(Q[12], mem)
 	P.cmove(W, pb4)
 
-	P.Affine()
+	P.Affine(mem)
 	return P
 }

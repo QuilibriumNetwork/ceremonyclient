@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
-	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -19,52 +18,6 @@ import (
 )
 
 var ErrNoNewFrames = errors.New("peer reported no frames")
-
-func (e *CeremonyDataClockConsensusEngine) handleSync(
-	message *pb.Message,
-) error {
-	e.logger.Debug(
-		"received message",
-		zap.Binary("data", message.Data),
-		zap.Binary("from", message.From),
-		zap.Binary("signature", message.Signature),
-	)
-	if bytes.Equal(message.From, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
-	msg := &protobufs.Message{}
-
-	if err := proto.Unmarshal(message.Data, msg); err != nil {
-		return errors.Wrap(err, "handle sync")
-	}
-
-	any := &anypb.Any{}
-	if err := proto.Unmarshal(msg.Payload, any); err != nil {
-		return errors.Wrap(err, "handle sync")
-	}
-
-	switch any.TypeUrl {
-	case protobufs.ProvingKeyAnnouncementType:
-		if err := e.handleProvingKey(
-			message.From,
-			msg.Address,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle sync")
-		}
-	case protobufs.KeyBundleAnnouncementType:
-		if err := e.handleKeyBundle(
-			message.From,
-			msg.Address,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle sync")
-		}
-	}
-
-	return nil
-}
 
 // GetCompressedSyncFrames implements protobufs.CeremonyServiceServer.
 func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
@@ -153,7 +106,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 		}
 	}
 
-	max := e.frame
+	max := e.frame.FrameNumber
 	to := request.ToFrameNumber
 
 	// We need to slightly rewind, to compensate for unconfirmed frame heads on a
@@ -468,94 +421,4 @@ func (e *CeremonyDataClockConsensusEngine) GetPublicChannel(
 	server protobufs.CeremonyService_GetPublicChannelServer,
 ) error {
 	return errors.New("not supported")
-}
-
-func (e *CeremonyDataClockConsensusEngine) handleProvingKeyRequest(
-	peerID []byte,
-	address []byte,
-	any *anypb.Any,
-) error {
-	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
-	request := &protobufs.ProvingKeyRequest{}
-	if err := any.UnmarshalTo(request); err != nil {
-		return nil
-	}
-
-	if len(request.ProvingKeyBytes) == 0 {
-		e.logger.Debug(
-			"received proving key request for empty key",
-			zap.Binary("peer_id", peerID),
-			zap.Binary("address", address),
-		)
-		return nil
-	}
-
-	e.pubSub.Subscribe(
-		append(append([]byte{}, e.filter...), peerID...),
-		e.handleSync,
-		true,
-	)
-
-	e.logger.Debug(
-		"received proving key request",
-		zap.Binary("peer_id", peerID),
-		zap.Binary("address", address),
-		zap.Binary("proving_key", request.ProvingKeyBytes),
-	)
-
-	var provingKey *protobufs.ProvingKeyAnnouncement
-	inclusion, err := e.keyStore.GetProvingKey(request.ProvingKeyBytes)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			e.logger.Debug(
-				"peer asked for proving key that returned error",
-				zap.Binary("peer_id", peerID),
-				zap.Binary("address", address),
-				zap.Binary("proving_key", request.ProvingKeyBytes),
-			)
-			return nil
-		}
-
-		provingKey, err = e.keyStore.GetStagedProvingKey(request.ProvingKeyBytes)
-		if !errors.Is(err, store.ErrNotFound) {
-			e.logger.Debug(
-				"peer asked for proving key that returned error",
-				zap.Binary("peer_id", peerID),
-				zap.Binary("address", address),
-				zap.Binary("proving_key", request.ProvingKeyBytes),
-			)
-			return nil
-		} else if err != nil {
-			e.logger.Debug(
-				"peer asked for unknown proving key",
-				zap.Binary("peer_id", peerID),
-				zap.Binary("address", address),
-				zap.Binary("proving_key", request.ProvingKeyBytes),
-			)
-			return nil
-		}
-	} else {
-		err := proto.Unmarshal(inclusion.Data, provingKey)
-		if err != nil {
-			e.logger.Debug(
-				"inclusion commitment could not be deserialized",
-				zap.Binary("peer_id", peerID),
-				zap.Binary("address", address),
-				zap.Binary("proving_key", request.ProvingKeyBytes),
-			)
-			return nil
-		}
-	}
-
-	if err := e.publishMessage(
-		append(append([]byte{}, e.filter...), peerID...),
-		provingKey,
-	); err != nil {
-		return nil
-	}
-
-	return nil
 }

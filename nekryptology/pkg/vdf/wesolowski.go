@@ -16,8 +16,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/iqc"
 )
 
-//Creates L and k parameters from papers, based on how many iterations need to be
-//performed, and how much memory should be used.
+// Creates L and k parameters from papers, based on how many iterations need to be
+// performed, and how much memory should be used.
 func approximateParameters(T uint32) (int, int, int) {
 	//log_memory = math.log(10000000, 2)
 	log_memory := math.Log(10000000) / math.Log(2)
@@ -86,11 +86,35 @@ func GenerateVDFWithStopChan(seed []byte, iterations, int_size_bits uint32, stop
 	}
 }
 
+func GenerateVDFIteration(seed, x_blob []byte, iterations, int_size_bits uint32) ([]byte, []byte) {
+	int_size := (int_size_bits + 16) >> 4
+	D := iqc.CreateDiscriminant(seed, int_size_bits)
+	x, _ := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
+
+	y, proof := calculateVDF(D, x, iterations, int_size_bits, nil)
+
+	if (y == nil) || (proof == nil) {
+		return nil, nil
+	} else {
+		return y.Serialize(), proof.Serialize()
+	}
+}
+
 func VerifyVDF(seed, proof_blob []byte, iterations, int_size_bits uint32) bool {
 	int_size := (int_size_bits + 16) >> 4
 
 	D := iqc.CreateDiscriminant(seed, int_size_bits)
 	x := iqc.NewClassGroupFromAbDiscriminant(big.NewInt(2), big.NewInt(1), D)
+	y, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
+	proof, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
+
+	return verifyProof(x, y, proof, iterations)
+}
+
+func VerifyVDFIteration(seed, x_blob, proof_blob []byte, iterations, int_size_bits uint32) bool {
+	int_size := (int_size_bits + 16) >> 4
+	D := iqc.CreateDiscriminant(seed, int_size_bits)
+	x, _ := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
 	y, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
 	proof, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
 
@@ -133,7 +157,7 @@ func getBlock(i, k, T int, B *big.Int) *big.Int {
 	return iqc.FloorDivision(new(big.Int).Mul(p1, p2), B)
 }
 
-//Optimized evalutation of h ^ (2^T // B)
+// Optimized evalutation of h ^ (2^T // B)
 func evalOptimized(identity, h *iqc.ClassGroup, B *big.Int, T uint32, k, l int, C map[int]*iqc.ClassGroup) *iqc.ClassGroup {
 	//k1 = k//2
 	var k1 int = k / 2
@@ -219,7 +243,7 @@ func evalOptimized(identity, h *iqc.ClassGroup, B *big.Int, T uint32, k, l int, 
 	return x
 }
 
-//generate y = x ^ (2 ^T) and pi
+// generate y = x ^ (2 ^T) and pi
 func generateProof(identity, x, y *iqc.ClassGroup, T uint32, k, l int, powers map[int]*iqc.ClassGroup) *iqc.ClassGroup {
 	//x_s = x.serialize()
 	x_s := x.Serialize()
@@ -236,10 +260,12 @@ func generateProof(identity, x, y *iqc.ClassGroup, T uint32, k, l int, powers ma
 
 func calculateVDF(discriminant *big.Int, x *iqc.ClassGroup, iterations, int_size_bits uint32, stop <-chan struct{}) (y, proof *iqc.ClassGroup) {
 	L, k, _ := approximateParameters(iterations)
-
 	loopCount := int(math.Ceil(float64(iterations) / float64(k*L)))
+	// NB: Dusk needs to do the disjoint set arithmetic, marking this spot down
+	// as the insertion point
 	powers_to_calculate := make([]int, loopCount+2)
 
+	// link into next
 	for i := 0; i < loopCount+1; i++ {
 		powers_to_calculate[i] = i * k * L
 	}

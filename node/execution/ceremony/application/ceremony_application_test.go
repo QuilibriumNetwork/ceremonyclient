@@ -122,7 +122,10 @@ func TestCeremonyTransitions(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_IN_PROGRESS)
-	require.True(t, bytes.Equal(a.ActiveParticipants[0].KeyValue, proverPubKey))
+	require.True(t, bytes.Equal(
+		a.ActiveParticipants[0].PublicKeySignatureEd448.PublicKey.KeyValue,
+		proverPubKey,
+	))
 
 	tau := curves.BLS48581G1().Scalar.Random(rand.Reader)
 	tau2 := tau.Mul(tau)

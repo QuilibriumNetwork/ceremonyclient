@@ -18,7 +18,7 @@ type VDF struct {
 	finished   bool
 }
 
-//size of long integers in quadratic function group
+// size of long integers in quadratic function group
 const sizeInBits = 2048
 
 // New create a new instance of VDF.
@@ -53,10 +53,29 @@ func (vdf *VDF) Execute() {
 	vdf.finished = true
 }
 
+func (vdf *VDF) ExecuteIteration(x_blob []byte) {
+	vdf.finished = false
+
+	yBuf, proofBuf := GenerateVDFIteration(vdf.input[:], x_blob, vdf.difficulty, sizeInBits)
+
+	copy(vdf.output[:], yBuf)
+	copy(vdf.output[258:], proofBuf)
+
+	go func() {
+		vdf.outputChan <- vdf.output
+	}()
+
+	vdf.finished = true
+}
+
 // Verify runs the verification of generated proof
 // currently on i7-6700K, verification takes about 350 ms
 func (vdf *VDF) Verify(proof [516]byte) bool {
 	return VerifyVDF(vdf.input[:], proof[:], vdf.difficulty, sizeInBits)
+}
+
+func (vdf *VDF) VerifyIteration(x_blob [258]byte, proof [516]byte, iterations uint32) bool {
+	return VerifyVDFIteration(vdf.input[:], x_blob[:], proof[:], vdf.difficulty, sizeInBits)
 }
 
 // IsFinished returns whether the vdf execution is finished or not.

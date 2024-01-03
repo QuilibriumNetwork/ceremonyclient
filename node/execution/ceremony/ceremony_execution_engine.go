@@ -37,6 +37,7 @@ type CeremonyExecutionEngine struct {
 	keyManager                 keys.KeyManager
 	engineConfig               *config.EngineConfig
 	pubSub                     p2p.PubSub
+	peerIdHash                 []byte
 	provingKey                 crypto.Signer
 	proverPublicKey            []byte
 	provingKeyAddress          []byte
@@ -48,11 +49,11 @@ type CeremonyExecutionEngine struct {
 	alreadyPublishedTranscript bool
 	seenMessageMap             map[string]bool
 	seenMessageMx              sync.Mutex
+	intrinsicFilter            []byte
 }
 
 func NewCeremonyExecutionEngine(
 	logger *zap.Logger,
-	clock *ceremony.CeremonyDataClockConsensusEngine,
 	engineConfig *config.EngineConfig,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
@@ -62,6 +63,27 @@ func NewCeremonyExecutionEngine(
 	if logger == nil {
 		panic(errors.New("logger is nil"))
 	}
+
+	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
+	if err != nil {
+		panic(err)
+	}
+
+	intrinsicFilter := append(
+		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	)
+
+	clock := ceremony.NewCeremonyDataClockConsensusEngine(
+		engineConfig,
+		logger,
+		keyManager,
+		clockStore,
+		keyStore,
+		pubSub,
+		intrinsicFilter,
+		seed,
+	)
 
 	e := &CeremonyExecutionEngine{
 		logger:                logger,
@@ -76,8 +98,18 @@ func NewCeremonyExecutionEngine(
 		alreadyPublishedShare: false,
 		seenMessageMx:         sync.Mutex{},
 		seenMessageMap:        map[string]bool{},
+		intrinsicFilter:       intrinsicFilter,
 	}
 
+	peerId := e.pubSub.GetPeerID()
+	addr, err := poseidon.HashBytes(peerId)
+	if err != nil {
+		panic(err)
+	}
+
+	addrBytes := addr.Bytes()
+	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+	e.peerIdHash = addrBytes
 	provingKey, _, publicKeyBytes, provingKeyAddress := e.clock.GetProvingKey(
 		engineConfig,
 	)
@@ -117,15 +149,7 @@ func (e *CeremonyExecutionEngine) Start() <-chan error {
 	))
 
 	go func() {
-		seed, err := hex.DecodeString(e.engineConfig.GenesisSeed)
-		if err != nil {
-			panic(err)
-		}
-
-		err = <-e.clock.Start(
-			application.CEREMONY_ADDRESS,
-			seed,
-		)
+		err := <-e.clock.Start()
 		if err != nil {
 			panic(err)
 		}
@@ -175,7 +199,7 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 				return nil, errors.Wrap(err, "process message")
 			}
 
-			if frame.FrameNumber < e.clock.GetFrame() {
+			if frame.FrameNumber < e.clock.GetFrame().FrameNumber {
 				return nil, nil
 			}
 
@@ -270,7 +294,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 	frameChan := e.clock.GetFrameChannel()
 	for {
 		frameFromBuffer := <-frameChan
-		frame := e.clock.GetActiveFrame()
+		frame := e.clock.GetFrame()
 		e.activeClockFrame = frame
 		e.logger.Info(
 			"evaluating next frame",
@@ -289,9 +313,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 		}
 
 		_, _, reward := app.RewardTrie.Get(e.provingKeyAddress)
+		_, _, retro := app.RewardTrie.Get(e.peerIdHash)
 		e.logger.Info(
 			"current application state",
-			zap.Uint64("my_balance", reward),
+			zap.Uint64("my_balance", reward+retro),
 			zap.String("lobby_state", app.LobbyState.String()),
 		)
 
@@ -313,7 +338,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 			e.logger.Info(
 				"lobby open for joins",
 				zap.Int("joined_participants", len(app.LobbyJoins)),
-				zap.Int("preferred_participants", len(app.NextRoundPreferredParticipants)),
+				zap.Int(
+					"preferred_participants",
+					len(app.NextRoundPreferredParticipants),
+				),
 				zap.Bool("in_lobby", alreadyJoined),
 				zap.Uint64("state_count", app.StateCount),
 			)
@@ -337,7 +365,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 		case application.CEREMONY_APPLICATION_STATE_IN_PROGRESS:
 			inRound := false
 			for _, p := range app.ActiveParticipants {
-				if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+				if bytes.Equal(
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
+					e.proverPublicKey,
+				) {
 					inRound = true
 					break
 				}
@@ -353,7 +384,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 			e.logger.Info(
 				"round in progress",
 				zap.Any("participants", app.ActiveParticipants),
-				zap.Any("current_seen_attestations", len(app.LatestSeenProverAttestations)),
+				zap.Any(
+					"current_seen_attestations",
+					len(app.LatestSeenProverAttestations),
+				),
 				zap.Any(
 					"current_dropped_attestations",
 					len(app.DroppedParticipantAttestations),
@@ -371,7 +405,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 			if len(e.peerChannels) == 0 && app.RoundCount == 1 &&
 				len(app.ActiveParticipants) > 1 {
 				for i, p := range app.ActiveParticipants {
-					if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+					if bytes.Equal(
+						p.PublicKeySignatureEd448.PublicKey.KeyValue,
+						e.proverPublicKey,
+					) {
 						shouldConnect = true
 						position = i
 						break
@@ -418,7 +455,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 					}
 				}
 			} else if len(app.ActiveParticipants) == 1 &&
-				bytes.Equal(app.ActiveParticipants[0].KeyValue, e.proverPublicKey) {
+				bytes.Equal(
+					app.ActiveParticipants[0].PublicKeySignatureEd448.PublicKey.KeyValue,
+					e.proverPublicKey,
+				) {
 				if err = e.commitRound(e.activeSecrets); err != nil {
 					e.logger.Error("error while participating in round", zap.Error(err))
 				}
@@ -427,7 +467,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 			e.logger.Info(
 				"round contribution finalizing",
 				zap.Any("participants", len(app.ActiveParticipants)),
-				zap.Any("current_seen_attestations", len(app.LatestSeenProverAttestations)),
+				zap.Any(
+					"current_seen_attestations",
+					len(app.LatestSeenProverAttestations),
+				),
 				zap.Any(
 					"current_dropped_attestations",
 					len(app.DroppedParticipantAttestations),
@@ -450,7 +493,10 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 
 			shouldPublish := false
 			for _, p := range app.ActiveParticipants {
-				if bytes.Equal(p.KeyValue, e.proverPublicKey) {
+				if bytes.Equal(
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
+					e.proverPublicKey,
+				) {
 					shouldPublish = true
 					break
 				}
@@ -587,7 +633,7 @@ func (e *CeremonyExecutionEngine) announceJoin(
 
 	return errors.Wrap(
 		e.publishMessage(
-			application.CEREMONY_ADDRESS,
+			e.intrinsicFilter,
 			join,
 		),
 		"announce join",
@@ -607,34 +653,20 @@ func (e *CeremonyExecutionEngine) connectToActivePeers(
 		return errors.Wrap(err, "connect to active peers")
 	}
 
-	for i, p := range app.ActiveParticipants {
-		if !bytes.Equal(p.KeyValue, e.proverPublicKey) {
-			ic, err := e.keyStore.GetLatestKeyBundle(p.KeyValue)
-			if err != nil {
-				return errors.Wrap(err, "connect to active peers")
-			}
-
-			var kba *protobufs.KeyBundleAnnouncement
-			switch ic.TypeUrl {
-			case protobufs.KeyBundleAnnouncementType:
-				kba = &protobufs.KeyBundleAnnouncement{}
-				if err := proto.Unmarshal(
-					ic.Data,
-					kba,
-				); err != nil {
-					return errors.Wrap(err, "connect to active peers")
-				}
-			}
-
+	for i, p := range app.LobbyJoins {
+		if !bytes.Equal(
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			e.proverPublicKey,
+		) {
 			receiverIdk, err := curves.ED448().Point.FromAffineCompressed(
-				kba.IdentityKey.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+				p.IdentityKey.KeyValue,
 			)
 			if err != nil {
 				return errors.Wrap(err, "connect to active peers")
 			}
 
 			receiverSpk, err := curves.ED448().Point.FromAffineCompressed(
-				kba.SignedPreKey.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+				p.SignedPreKey.KeyValue,
 			)
 			if err != nil {
 				return errors.Wrap(err, "connect to active peers")
@@ -642,19 +674,24 @@ func (e *CeremonyExecutionEngine) connectToActivePeers(
 
 			client, err := e.clock.GetPublicChannelForProvingKey(
 				i > position,
-				p.KeyValue,
+				p.PublicKeySignatureEd448.PublicKey.KeyValue,
 			)
 			if err != nil {
 				e.logger.Error(
 					"peer does not support direct public channels",
-					zap.Binary("proving_key", p.KeyValue),
+					zap.Binary(
+						"proving_key",
+						p.PublicKeySignatureEd448.PublicKey.KeyValue,
+					),
 					zap.Error(err),
 				)
 			}
-			e.peerChannels[string(p.KeyValue)], err = p2p.NewPublicP2PChannel(
+			e.peerChannels[string(
+				p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			)], err = p2p.NewPublicP2PChannel(
 				client,
 				e.proverPublicKey,
-				p.KeyValue,
+				p.PublicKeySignatureEd448.PublicKey.KeyValue,
 				i > position,
 				idk,
 				spk,
@@ -690,8 +727,13 @@ func (e *CeremonyExecutionEngine) participateRound(
 	idks := []curves.Point{}
 	initiator := false
 	for _, p := range app.ActiveParticipants {
-		if !bytes.Equal(p.KeyValue, e.proverPublicKey) {
-			ic, err := e.keyStore.GetLatestKeyBundle(p.KeyValue)
+		if !bytes.Equal(
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			e.proverPublicKey,
+		) {
+			ic, err := e.keyStore.GetLatestKeyBundle(
+				p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			)
 			if err != nil {
 				return errors.Wrap(err, "participate round")
 			}
@@ -722,22 +764,29 @@ func (e *CeremonyExecutionEngine) participateRound(
 				return errors.Wrap(err, "participate round")
 			}
 
-			if _, ok := e.peerChannels[string(p.KeyValue)]; !ok {
+			if _, ok := e.peerChannels[string(
+				p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			)]; !ok {
 				client, err := e.clock.GetPublicChannelForProvingKey(
 					initiator,
-					p.KeyValue,
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
 				)
 				if err != nil {
 					e.logger.Error(
 						"peer does not support direct public channels",
-						zap.Binary("proving_key", p.KeyValue),
+						zap.Binary(
+							"proving_key",
+							p.PublicKeySignatureEd448.PublicKey.KeyValue,
+						),
 						zap.Error(err),
 					)
 				}
-				e.peerChannels[string(p.KeyValue)], err = p2p.NewPublicP2PChannel(
+				e.peerChannels[string(
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
+				)], err = p2p.NewPublicP2PChannel(
 					client,
 					e.proverPublicKey,
-					p.KeyValue,
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
 					initiator,
 					idk,
 					spk,
@@ -761,7 +810,10 @@ func (e *CeremonyExecutionEngine) participateRound(
 
 	pubKeys := [][]byte{}
 	for _, p := range app.ActiveParticipants {
-		pubKeys = append(pubKeys, p.KeyValue)
+		pubKeys = append(
+			pubKeys,
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
+		)
 	}
 
 	newSecrets, err := application.ProcessRound(
@@ -834,7 +886,7 @@ func (e *CeremonyExecutionEngine) commitRound(secrets []curves.Scalar) error {
 	}
 
 	if err := e.publishMessage(
-		application.CEREMONY_ADDRESS,
+		e.intrinsicFilter,
 		advance,
 	); err != nil {
 		return errors.Wrap(err, "commit round")
@@ -849,7 +901,7 @@ func (e *CeremonyExecutionEngine) commitRound(secrets []curves.Scalar) error {
 func (e *CeremonyExecutionEngine) publishDroppedParticipant(
 	participant []byte,
 ) {
-	frameNumber := e.clock.GetFrame()
+	frameNumber := e.clock.GetFrame().FrameNumber
 
 	b := binary.BigEndian.AppendUint64([]byte("dropped"), frameNumber)
 	b = append(b, participant...)
@@ -876,7 +928,7 @@ func (e *CeremonyExecutionEngine) publishDroppedParticipant(
 	}
 
 	err = e.publishMessage(
-		application.CEREMONY_ADDRESS,
+		e.intrinsicFilter,
 		dropped,
 	)
 	if err != nil {
@@ -893,7 +945,7 @@ func (e *CeremonyExecutionEngine) publishDroppedParticipant(
 func (e *CeremonyExecutionEngine) publishLastSeenParticipant(
 	participant []byte,
 ) {
-	frameNumber := e.clock.GetFrame()
+	frameNumber := e.clock.GetFrame().FrameNumber
 
 	b := binary.BigEndian.AppendUint64([]byte("lastseen"), frameNumber)
 	b = append(b, participant...)
@@ -919,7 +971,7 @@ func (e *CeremonyExecutionEngine) publishLastSeenParticipant(
 		},
 	}
 	err = e.publishMessage(
-		application.CEREMONY_ADDRESS,
+		e.intrinsicFilter,
 		seen,
 	)
 	if err != nil {
@@ -1019,7 +1071,7 @@ func (e *CeremonyExecutionEngine) publishTranscriptShare(
 
 	err = errors.Wrap(
 		e.publishMessage(
-			application.CEREMONY_ADDRESS,
+			e.intrinsicFilter,
 			transcriptShare,
 		),
 		"publish transcript share",
@@ -1035,7 +1087,7 @@ func (e *CeremonyExecutionEngine) publishTranscriptShare(
 func (e *CeremonyExecutionEngine) VerifyExecution(
 	frame *protobufs.ClockFrame,
 ) error {
-	if e.clock.GetFrame() != frame.FrameNumber-1 {
+	if e.clock.GetFrame().FrameNumber != frame.FrameNumber-1 {
 		return nil
 	}
 
@@ -1102,7 +1154,7 @@ func (e *CeremonyExecutionEngine) publishTranscript(
 	e.alreadyPublishedTranscript = true
 	err := errors.Wrap(
 		e.publishMessage(
-			application.CEREMONY_ADDRESS,
+			e.intrinsicFilter,
 			app.UpdatedTranscript,
 		),
 		"publish transcript share",

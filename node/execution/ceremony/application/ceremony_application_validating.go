@@ -2,9 +2,9 @@ package application
 
 import (
 	"bytes"
+	"crypto/rand"
 
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -37,59 +37,47 @@ func (a *CeremonyApplication) applyTranscript(
 		)
 	}
 
-	g1s := make([]*curves.PointBls48581G1, len(a.UpdatedTranscript.G1Powers))
-	eg := errgroup.Group{}
-	eg.SetLimit(100)
+	g1s := make([]curves.Point, len(a.UpdatedTranscript.G1Powers))
 
 	for i := range a.UpdatedTranscript.G1Powers {
 		i := i
-		eg.Go(func() error {
-			if !bytes.Equal(
-				a.UpdatedTranscript.G1Powers[i].KeyValue,
-				transcript.G1Powers[i].KeyValue,
-			) {
-				return errors.Wrap(errors.New("invalid g1s"), "apply transcript")
-			}
+		if !bytes.Equal(
+			a.UpdatedTranscript.G1Powers[i].KeyValue,
+			transcript.G1Powers[i].KeyValue,
+		) {
+			return errors.Wrap(errors.New("invalid g1s"), "apply transcript")
+		}
 
-			g1 := &curves.PointBls48581G1{}
-			x, err := g1.FromAffineCompressed(a.UpdatedTranscript.G1Powers[i].KeyValue)
-			if err != nil {
-				return errors.Wrap(err, "apply transcript")
-			}
-			g1, _ = x.(*curves.PointBls48581G1)
+		g1 := &curves.PointBls48581G1{}
+		x, err := g1.FromAffineCompressed(
+			a.UpdatedTranscript.G1Powers[i].KeyValue,
+		)
+		if err != nil {
+			return errors.Wrap(err, "apply transcript")
+		}
 
-			g1s[i] = g1
-
-			return nil
-		})
+		g1s[i] = x
 	}
 
-	g2s := make([]*curves.PointBls48581G2, len(a.UpdatedTranscript.G2Powers))
+	g2s := make([]curves.Point, len(a.UpdatedTranscript.G2Powers))
 	for i := range a.UpdatedTranscript.G2Powers {
 		i := i
-		eg.Go(func() error {
-			if !bytes.Equal(
-				a.UpdatedTranscript.G2Powers[i].KeyValue,
-				transcript.G2Powers[i].KeyValue,
-			) {
-				return errors.Wrap(errors.New("invalid g2s"), "apply transcript")
-			}
+		if !bytes.Equal(
+			a.UpdatedTranscript.G2Powers[i].KeyValue,
+			transcript.G2Powers[i].KeyValue,
+		) {
+			return errors.Wrap(errors.New("invalid g2s"), "apply transcript")
+		}
 
-			g2 := &curves.PointBls48581G2{}
-			x, err := g2.FromAffineCompressed(a.UpdatedTranscript.G2Powers[i].KeyValue)
-			if err != nil {
-				return errors.Wrap(err, "apply transcript")
-			}
-			g2, _ = x.(*curves.PointBls48581G2)
+		g2 := &curves.PointBls48581G2{}
+		x, err := g2.FromAffineCompressed(
+			a.UpdatedTranscript.G2Powers[i].KeyValue,
+		)
+		if err != nil {
+			return errors.Wrap(err, "apply transcript")
+		}
 
-			g2s[i] = g2
-
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		return err
+		g2s[i] = x
 	}
 
 	g1Witnesses := []*curves.PointBls48581G1{}
@@ -168,52 +156,70 @@ func (a *CeremonyApplication) applyTranscript(
 		}
 	}
 
-	mp := []curves.PairingPoint{}
 	mpg2 := curves.BLS48581G2().Point.Generator().(curves.PairingPoint)
 	mpg2n := g2s[1].Neg().(curves.PairingPoint)
 
-	for i := 0; i < len(g1s)-1; i++ {
-		mp = append(mp, g1s[i])
-		mp = append(mp, mpg2n)
-		mp = append(mp, g1s[i+1])
-		mp = append(mp, mpg2)
-	}
-
-	mp2 := []curves.PairingPoint{}
 	mpg1 := curves.BLS48581G1().Point.Generator().(curves.PairingPoint)
 	mpg1n := g1s[1].Neg().(curves.PairingPoint)
-	for i := 0; i < len(g2s)-1; i++ {
-		mp2 = append(mp2, mpg1n)
-		mp2 = append(mp2, g2s[i])
-		mp2 = append(mp2, mpg1)
-		mp2 = append(mp2, g2s[i+1])
+
+	randoms := []curves.Scalar{}
+	sum := curves.BLS48581G1().Scalar.Zero()
+
+	for i := 0; i < len(g1s)-1; i++ {
+		randoms = append(randoms, curves.BLS48581G1().Scalar.Random(rand.Reader))
+		sum = sum.Add(randoms[i])
 	}
 
-	l := g1s[0].MultiPairing(mp...)
-	if !l.IsOne() {
+	g1CheckR := g1s[0].SumOfProducts(g1s[1:], randoms)
+	g1CheckL := g1s[0].SumOfProducts(g1s[:len(g1s)-1], randoms)
+
+	if !mpg2.MultiPairing(
+		g1CheckL.(curves.PairingPoint),
+		mpg2n.Mul(sum).(curves.PairingPoint),
+		g1CheckR.(curves.PairingPoint),
+		mpg2.Mul(sum).(curves.PairingPoint),
+	).IsOne() {
 		return errors.Wrap(
 			errors.New("pairing check failed for g1s"),
 			"apply transcript",
 		)
 	}
 
-	l = g1s[0].MultiPairing(mp2...)
-	if !l.IsOne() {
+	var g2CheckL, g2CheckR curves.Point
+	g2Sum := curves.BLS48581G1().Scalar.Zero()
+	for i := 0; i < len(g2s)-1; i++ {
+		g2Sum = g2Sum.Add(randoms[i])
+		if g2CheckL == nil {
+			g2CheckL = g2s[0].Mul(randoms[0])
+			g2CheckR = g2s[1].Mul(randoms[0])
+		} else {
+			g2CheckL = g2CheckL.Add(g2s[i].Mul(randoms[i]))
+			g2CheckR = g2CheckR.Add(g2s[i+1].Mul(randoms[i]))
+		}
+	}
+
+	if !mpg2.MultiPairing(
+		mpg1n.Mul(g2Sum).(curves.PairingPoint),
+		g2CheckL.(curves.PairingPoint),
+		mpg1.Mul(g2Sum).(curves.PairingPoint),
+		g2CheckR.(curves.PairingPoint),
+	).IsOne() {
 		return errors.Wrap(
 			errors.New("pairing check failed for g2s"),
 			"apply transcript",
 		)
 	}
 
-	mp3 := []curves.PairingPoint{}
+	mp3 := make([]curves.PairingPoint, (len(g2Powers)-1)*4)
 	for i := 0; i < len(g2Powers)-1; i++ {
-		mp3 = append(mp3, g1Witnesses[i+1].Neg().(curves.PairingPoint))
-		mp3 = append(mp3, g2Powers[i])
-		mp3 = append(mp3, mpg1)
-		mp3 = append(mp3, g2Powers[i+1])
+		i := i
+		mp3[i*4+0] = g1Witnesses[i+1].Neg().(curves.PairingPoint)
+		mp3[i*4+1] = g2Powers[i]
+		mp3[i*4+2] = mpg1
+		mp3[i*4+3] = g2Powers[i+1]
 	}
 
-	l = g1s[0].MultiPairing(mp3...)
+	l := mp3[0].MultiPairing(mp3...)
 	if !l.IsOne() {
 		return errors.Wrap(
 			errors.New("pairing check failed for witnesses"),

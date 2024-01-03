@@ -97,29 +97,29 @@ type ClockStore interface {
 }
 
 type PebbleClockStore struct {
-	db     *pebble.DB
+	db     KVDB
 	logger *zap.Logger
 }
 
 var _ ClockStore = (*PebbleClockStore)(nil)
 
 type PebbleMasterClockIterator struct {
-	i *pebble.Iterator
+	i Iterator
 }
 
 type PebbleClockIterator struct {
-	i  *pebble.Iterator
+	i  Iterator
 	db *PebbleClockStore
 }
 
 type PebbleCandidateClockIterator struct {
-	i  *pebble.Iterator
+	i  Iterator
 	db *PebbleClockStore
 }
 
-var _ Iterator[*protobufs.ClockFrame] = (*PebbleMasterClockIterator)(nil)
-var _ Iterator[*protobufs.ClockFrame] = (*PebbleClockIterator)(nil)
-var _ Iterator[*protobufs.ClockFrame] = (*PebbleCandidateClockIterator)(nil)
+var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleMasterClockIterator)(nil)
+var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleClockIterator)(nil)
+var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleCandidateClockIterator)(nil)
 
 func (p *PebbleMasterClockIterator) First() bool {
 	return p.i.First()
@@ -173,7 +173,7 @@ func (p *PebbleMasterClockIterator) Value() (*protobufs.ClockFrame, error) {
 		return nil, errors.Wrap(err, "get master clock frame iterator value")
 	}
 
-	frame.ParentSelector = parent.Bytes()
+	frame.ParentSelector = parent.FillBytes(make([]byte, 32))
 
 	return frame, nil
 }
@@ -306,7 +306,7 @@ func (p *PebbleCandidateClockIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing candidate clock frame iterator")
 }
 
-func NewPebbleClockStore(db *pebble.DB, logger *zap.Logger) *PebbleClockStore {
+func NewPebbleClockStore(db KVDB, logger *zap.Logger) *PebbleClockStore {
 	return &PebbleClockStore{
 		db,
 		logger,
@@ -446,9 +446,7 @@ func clockProverTrieKey(filter []byte, frameNumber uint64) []byte {
 }
 
 func (p *PebbleClockStore) NewTransaction() (Transaction, error) {
-	return &PebbleTransaction{
-		b: p.db.NewBatch(),
-	}, nil
+	return p.db.NewBatch(), nil
 }
 
 // GetEarliestMasterClockFrame implements ClockStore.
@@ -530,7 +528,7 @@ func (p *PebbleClockStore) GetMasterClockFrame(
 		return nil, errors.Wrap(err, "get master clock frame")
 	}
 
-	frame.ParentSelector = parent.Bytes()
+	frame.ParentSelector = parent.FillBytes(make([]byte, 32))
 
 	return frame, nil
 }
@@ -547,10 +545,10 @@ func (p *PebbleClockStore) RangeMasterClockFrames(
 		startFrameNumber = temp
 	}
 
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: clockMasterFrameKey(filter, startFrameNumber),
-		UpperBound: clockMasterFrameKey(filter, endFrameNumber),
-	})
+	iter, err := p.db.NewIter(
+		clockMasterFrameKey(filter, startFrameNumber),
+		clockMasterFrameKey(filter, endFrameNumber),
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "range master clock frames")
 	}
@@ -863,7 +861,7 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 	frame *protobufs.ClockFrame,
 	txn Transaction,
 ) error {
-	if err := p.saveAggregateProofs(nil, frame); err != nil {
+	if err := p.saveAggregateProofs(txn, frame); err != nil {
 		return errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
 			"put candidate data clock frame",
@@ -920,7 +918,7 @@ func (p *PebbleClockStore) PutDataClockFrame(
 	backfill bool,
 ) error {
 	if frame.FrameNumber != 0 {
-		if err := p.saveAggregateProofs(nil, frame); err != nil {
+		if err := p.saveAggregateProofs(txn, frame); err != nil {
 			return errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"put candidate data clock frame",
@@ -1004,8 +1002,8 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 	filter []byte,
 	frameNumber uint64,
 ) ([]*protobufs.ClockFrame, error) {
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: clockDataCandidateFrameKey(
+	iter, err := p.db.NewIter(
+		clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
 			[]byte{
@@ -1021,7 +1019,7 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			},
 		),
-		UpperBound: clockDataCandidateFrameKey(
+		clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
 			[]byte{
@@ -1037,7 +1035,7 @@ func (p *PebbleClockStore) GetCandidateDataClockFrames(
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			},
 		),
-	})
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "get candidate data clock frames")
 	}
@@ -1084,8 +1082,8 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		}
 	}
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: clockDataCandidateFrameKey(
+	iter, err := p.db.NewIter(
+		clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
 			fromParent,
@@ -1096,7 +1094,7 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			},
 		),
-		UpperBound: clockDataCandidateFrameKey(
+		clockDataCandidateFrameKey(
 			filter,
 			frameNumber,
 			toParent,
@@ -1107,7 +1105,7 @@ func (p *PebbleClockStore) RangeCandidateDataClockFrames(
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			},
 		),
-	})
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "range candidate data clock frames")
 	}
@@ -1127,10 +1125,10 @@ func (p *PebbleClockStore) RangeDataClockFrames(
 		startFrameNumber = temp
 	}
 
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: clockDataFrameKey(filter, startFrameNumber),
-		UpperBound: clockDataFrameKey(filter, endFrameNumber),
-	})
+	iter, err := p.db.NewIter(
+		clockDataFrameKey(filter, startFrameNumber),
+		clockDataFrameKey(filter, endFrameNumber),
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "get data clock frames")
 	}
@@ -1161,10 +1159,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 		},
 	)
 
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: from,
-		UpperBound: to,
-	})
+	iter, err := p.db.NewIter(from, to)
 	if err != nil {
 		return errors.Wrap(err, "deduplicate")
 	}
@@ -1187,7 +1182,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 			return err
 		}
 
-		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		err = p.db.Set(iter.Key(), newValue)
 		if err != nil {
 			return err
 		}
@@ -1205,10 +1200,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 	from = clockDataFrameKey(filter, 1)
 	to = clockDataFrameKey(filter, 20000)
 
-	iter, err = p.db.NewIter(&pebble.IterOptions{
-		LowerBound: from,
-		UpperBound: to,
-	})
+	iter, err = p.db.NewIter(from, to)
 	if err != nil {
 		return errors.Wrap(err, "deduplicate")
 	}
@@ -1231,7 +1223,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 			return err
 		}
 
-		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		err = p.db.Set(iter.Key(), newValue)
 		if err != nil {
 			return err
 		}
@@ -1279,10 +1271,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 		},
 	)
 
-	iter, err = p.db.NewIter(&pebble.IterOptions{
-		LowerBound: from,
-		UpperBound: to,
-	})
+	iter, err = p.db.NewIter(from, to)
 	if err != nil {
 		return errors.Wrap(err, "deduplicate")
 	}
@@ -1305,7 +1294,7 @@ func (p *PebbleClockStore) Deduplicate(filter []byte) error {
 			return err
 		}
 
-		err = p.db.Set(iter.Key(), newValue, &pebble.WriteOptions{Sync: true})
+		err = p.db.Set(iter.Key(), newValue)
 		if err != nil {
 			return err
 		}
@@ -1334,10 +1323,7 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 	from := clockDataFrameKey(filter, fromFrameNumber)
 	to := clockDataFrameKey(filter, toFrameNumber+1)
 
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: from,
-		UpperBound: to,
-	})
+	iter, err := p.db.NewIter(from, to)
 	if err != nil {
 		return nil, errors.Wrap(err, "get compressed data clock frames")
 	}
@@ -1418,10 +1404,7 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			},
 		)
 
-		iter, err := p.db.NewIter(&pebble.IterOptions{
-			LowerBound: from,
-			UpperBound: to,
-		})
+		iter, err := p.db.NewIter(from, to)
 		if err != nil {
 			return nil, errors.Wrap(err, "get compressed data clock frames")
 		}
@@ -1458,7 +1441,7 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 						if err != nil {
 							return nil, errors.Wrap(err, "get compressed data clock frames")
 						}
-						parentSelector, _, _, err := frame.GetParentSelectorAndDistance()
+						parentSelector, _, _, err := frame.GetParentSelectorAndDistance(nil)
 						if err != nil {
 							return nil, errors.Wrap(err, "get compressed data clock frames")
 						}
@@ -1480,8 +1463,28 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 					break
 				}
 				score := new(big.Int)
-				for _, p := range paths[i] {
-					_, distance, _, err := p.GetParentSelectorAndDistance()
+				for _, path := range paths[i] {
+					master, err := p.GetMasterClockFrame(
+						[]byte{
+							0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+							0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+							0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+							0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+						},
+						path.FrameNumber,
+					)
+					if err != nil {
+						return nil, errors.Wrap(err, "get compressed data clock frames")
+					}
+
+					discriminator, err := master.GetSelector()
+					if err != nil {
+						return nil, errors.Wrap(err, "get compressed data clock frames")
+					}
+
+					_, distance, _, err := path.GetParentSelectorAndDistance(
+						discriminator,
+					)
 					if err != nil {
 						return nil, errors.Wrap(err, "get compressed data clock frames")
 					}
@@ -1535,10 +1538,13 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			return nil, errors.Wrap(err, "get compressed data clock frames")
 		}
 
-		iter, err := p.db.NewIter(&pebble.IterOptions{
-			LowerBound: dataProofInclusionKey(filter, []byte(k), 0),
-			UpperBound: dataProofInclusionKey(filter, []byte(k), limit+1),
-		})
+		iter, err := p.db.NewIter(
+			dataProofInclusionKey(filter, []byte(k), 0),
+			dataProofInclusionKey(filter, []byte(k), limit+1),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "get compressed data clock frames")
+		}
 
 		for iter.First(); iter.Valid(); iter.Next() {
 			incCommit := iter.Value()
@@ -1632,9 +1638,6 @@ func (p *PebbleClockStore) SetLatestDataClockFrameNumber(
 	err := p.db.Set(
 		clockDataLatestIndex(filter),
 		binary.BigEndian.AppendUint64(nil, frameNumber),
-		&pebble.WriteOptions{
-			Sync: true,
-		},
 	)
 
 	return errors.Wrap(err, "set latest data clock frame number")
@@ -1678,9 +1681,6 @@ func (p *PebbleClockStore) DeleteCandidateDataClockFrameRange(
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			},
 		),
-		&pebble.WriteOptions{
-			Sync: true,
-		},
 	)
 	return errors.Wrap(err, "delete candidate data clock frame range")
 }
@@ -1727,10 +1727,13 @@ func (p *PebbleClockStore) GetHighestCandidateDataClockFrame(
 		},
 	)
 
-	iter, err := p.db.NewIter(&pebble.IterOptions{
-		LowerBound: from,
-		UpperBound: to,
-	})
+	iter, err := p.db.NewIter(from, to)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, ErrInvalidData.Error()),
+			"get highest candidate data clock frame",
+		)
+	}
 
 	found := iter.SeekLT(to)
 	if found {

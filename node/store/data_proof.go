@@ -30,12 +30,12 @@ type DataProofStore interface {
 }
 
 type PebbleDataProofStore struct {
-	db     *pebble.DB
+	db     KVDB
 	logger *zap.Logger
 }
 
 func NewPebbleDataProofStore(
-	db *pebble.DB,
+	db KVDB,
 	logger *zap.Logger,
 ) *PebbleDataProofStore {
 	return &PebbleDataProofStore{
@@ -81,13 +81,11 @@ func dataProofSegmentKey(
 }
 
 func (p *PebbleDataProofStore) NewTransaction() (Transaction, error) {
-	return &PebbleTransaction{
-		b: p.db.NewBatch(),
-	}, nil
+	return p.db.NewBatch(), nil
 }
 
 func internalGetAggregateProof(
-	db *pebble.DB,
+	db KVDB,
 	filter []byte,
 	commitment []byte,
 	frameNumber uint64,
@@ -114,10 +112,10 @@ func internalGetAggregateProof(
 		Proof:                copied,
 	}
 
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: dataProofInclusionKey(filter, commitment, 0),
-		UpperBound: dataProofInclusionKey(filter, commitment, limit+1),
-	})
+	iter, err := db.NewIter(
+		dataProofInclusionKey(filter, commitment, 0),
+		dataProofInclusionKey(filter, commitment, limit+1),
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "get aggregate proof")
 	}
@@ -206,7 +204,7 @@ func (p *PebbleDataProofStore) GetAggregateProof(
 }
 
 func internalPutAggregateProof(
-	db *pebble.DB,
+	db KVDB,
 	txn Transaction,
 	aggregateProof *protobufs.InclusionAggregateProof,
 	commitment []byte,

@@ -53,8 +53,7 @@ type ChannelServer = protobufs.CeremonyService_GetPublicChannelServer
 
 type CeremonyDataClockConsensusEngine struct {
 	protobufs.UnimplementedCeremonyServiceServer
-	frame                       uint64
-	activeFrame                 *protobufs.ClockFrame
+	frame                       *protobufs.ClockFrame
 	difficulty                  uint32
 	logger                      *zap.Logger
 	state                       consensus.EngineState
@@ -113,6 +112,8 @@ func NewCeremonyDataClockConsensusEngine(
 	clockStore store.ClockStore,
 	keyStore store.KeyStore,
 	pubSub p2p.PubSub,
+	filter []byte,
+	seed []byte,
 ) *CeremonyDataClockConsensusEngine {
 	if logger == nil {
 		panic(errors.New("logger is nil"))
@@ -143,9 +144,14 @@ func NewCeremonyDataClockConsensusEngine(
 		minimumPeersRequired = 3
 	}
 
+	difficulty := engineConfig.Difficulty
+	if difficulty == 0 {
+		difficulty = 10000
+	}
+
 	e := &CeremonyDataClockConsensusEngine{
-		frame:            0,
-		difficulty:       10000,
+		frame:            nil,
+		difficulty:       difficulty,
 		logger:           logger,
 		state:            consensus.EngineStateStopped,
 		clockStore:       clockStore,
@@ -182,6 +188,8 @@ func NewCeremonyDataClockConsensusEngine(
 		engineConfig,
 	)
 
+	e.filter = filter
+	e.input = seed
 	e.provingKey = signer
 	e.provingKeyType = keyType
 	e.provingKeyBytes = bytes
@@ -190,16 +198,10 @@ func NewCeremonyDataClockConsensusEngine(
 	return e
 }
 
-func (e *CeremonyDataClockConsensusEngine) Start(
-	filter []byte,
-	seed []byte,
-) <-chan error {
+func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	e.logger.Info("starting ceremony consensus engine")
 	e.state = consensus.EngineStateStarting
 	errChan := make(chan error)
-
-	e.filter = filter
-	e.input = seed
 	e.state = consensus.EngineStateLoading
 
 	e.logger.Info("loading last seen state")
@@ -214,16 +216,16 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 	if latestFrame != nil {
 		e.setFrame(latestFrame)
 	} else {
-		latestFrame = e.createGenesisFrame()
+		latestFrame = e.CreateGenesisFrame(nil)
+	}
+
+	err = e.createCommunicationKeys()
+	if err != nil {
+		panic(err)
 	}
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
-	e.pubSub.Subscribe(
-		append(append([]byte{}, e.filter...), e.pubSub.GetPeerID()...),
-		e.handleSync,
-		true,
-	)
 
 	go func() {
 		server := grpc.NewServer(
@@ -240,8 +242,6 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 		}
 	}()
 
-	latestFrame = e.performSanityCheck(latestFrame)
-
 	e.state = consensus.EngineStateCollecting
 
 	for i := int64(0); i < e.pendingCommitWorkers; i++ {
@@ -257,7 +257,7 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 			}
 
 			timestamp := time.Now().UnixMilli()
-			msg := binary.BigEndian.AppendUint64([]byte{}, e.frame)
+			msg := binary.BigEndian.AppendUint64([]byte{}, e.frame.FrameNumber)
 			msg = append(msg, consensus.GetVersion()...)
 			msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
 			sig, err := e.pubSub.SignMessage(msg)
@@ -269,7 +269,7 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
 				peerId:    e.pubSub.GetPeerID(),
 				multiaddr: "",
-				maxFrame:  e.frame,
+				maxFrame:  e.frame.FrameNumber,
 				version:   consensus.GetVersion(),
 				signature: sig,
 				publicKey: e.pubSub.GetPublicKey(),
@@ -307,38 +307,8 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 	}()
 
 	go func() {
-		latest := latestFrame
-		for {
-			time.Sleep(30 * time.Second)
-			peerCount := e.pubSub.GetNetworkPeersCount()
-			if peerCount >= e.minimumPeersRequired {
-				e.logger.Info("selecting leader")
-				if e.frame > latest.FrameNumber && e.frame-latest.FrameNumber > 16 &&
-					e.syncingTarget == nil {
-					e.logger.Info("rewinding sync head due to large delta")
-					latest, _, err = e.clockStore.GetDataClockFrame(
-						e.filter,
-						0,
-					)
-					if err != nil {
-						panic(err)
-					}
-				}
-				latest, err = e.commitLongestPath(latest)
-				if err != nil {
-					e.logger.Error("could not collect longest path", zap.Error(err))
-					latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
-					if err != nil {
-						panic(err)
-					}
-				}
-
-				latest = e.performSanityCheck(latest)
-			}
-		}
-	}()
-
-	go func() {
+		e.logger.Info("waiting for peer list mappings")
+		time.Sleep(30 * time.Second)
 		for e.state < consensus.EngineStateStopping {
 			peerCount := e.pubSub.GetNetworkPeersCount()
 			if peerCount < e.minimumPeersRequired {
@@ -350,22 +320,23 @@ func (e *CeremonyDataClockConsensusEngine) Start(
 			} else {
 				switch e.state {
 				case consensus.EngineStateCollecting:
+					currentFrame := latestFrame
 					if latestFrame, err = e.collect(latestFrame); err != nil {
 						e.logger.Error("could not collect", zap.Error(err))
 						e.state = consensus.EngineStateCollecting
-						errChan <- err
+						latestFrame = currentFrame
 					}
 				case consensus.EngineStateProving:
+					currentFrame := latestFrame
 					if latestFrame, err = e.prove(latestFrame); err != nil {
 						e.logger.Error("could not prove", zap.Error(err))
 						e.state = consensus.EngineStateCollecting
-						errChan <- err
+						latestFrame = currentFrame
 					}
 				case consensus.EngineStatePublishing:
 					if err = e.publishProof(latestFrame); err != nil {
 						e.logger.Error("could not publish", zap.Error(err))
 						e.state = consensus.EngineStateCollecting
-						errChan <- err
 					}
 				}
 			}
@@ -389,7 +360,7 @@ func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
 	for name := range e.executionEngines {
 		name := name
 		go func(name string) {
-			err := <-e.UnregisterExecutor(name, e.frame, force)
+			err := <-e.UnregisterExecutor(name, e.frame.FrameNumber, force)
 			if err != nil {
 				errChan <- err
 			}
@@ -463,7 +434,7 @@ func (e *CeremonyDataClockConsensusEngine) performSanityCheck(
 							panic(err)
 						}
 
-						parentSelector, _, _, err := disc.GetParentSelectorAndDistance()
+						parentSelector, _, _, err := disc.GetParentSelectorAndDistance(nil)
 						if err != nil {
 							panic(err)
 						}
@@ -536,7 +507,7 @@ func (e *CeremonyDataClockConsensusEngine) GetDifficulty() uint32 {
 	return e.difficulty
 }
 
-func (e *CeremonyDataClockConsensusEngine) GetFrame() uint64 {
+func (e *CeremonyDataClockConsensusEngine) GetFrame() *protobufs.ClockFrame {
 	return e.frame
 }
 
@@ -548,12 +519,6 @@ func (
 	e *CeremonyDataClockConsensusEngine,
 ) GetFrameChannel() <-chan *protobufs.ClockFrame {
 	return e.frameChan
-}
-
-func (
-	e *CeremonyDataClockConsensusEngine,
-) GetActiveFrame() *protobufs.ClockFrame {
-	return e.activeFrame
 }
 
 func (

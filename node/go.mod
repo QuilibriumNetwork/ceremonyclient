@@ -11,9 +11,11 @@ replace github.com/libp2p/go-libp2p-gostream => ../go-libp2p-gostream
 
 replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-libp2p-blossomsub
 
+replace github.com/cockroachdb/pebble => ../pebble
+
 require (
 	filippo.io/edwards25519 v1.0.0-rc.1
-	github.com/cockroachdb/pebble v0.0.0-20231025190044-422dce910055
+	github.com/cockroachdb/pebble v0.0.0-20231210175920-b4d301aeb46a
 	github.com/libp2p/go-libp2p v0.31.0
 	github.com/libp2p/go-libp2p-gostream v0.6.0
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0
@@ -57,11 +59,9 @@ require (
 	github.com/quic-go/qtls-go1-19 v0.3.3 // indirect
 	github.com/quic-go/qtls-go1-20 v0.2.3 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
-	golang.org/x/term v0.14.0 // indirect
-	google.golang.org/genproto v0.0.0-20230803162519-f966b187b2e5 // indirect
+	golang.org/x/term v0.14.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20230822172742-b8732ec3820d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d // indirect
-	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.3.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
@@ -126,7 +126,7 @@ require (
 	github.com/mikioh/tcpinfo v0.0.0-20190314235526-30a79bb1804b // indirect
 	github.com/mikioh/tcpopt v0.0.0-20190314235656-172688c1accc // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
-	github.com/mr-tron/base58 v1.2.0 // indirect
+	github.com/mr-tron/base58 v1.2.0
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
 	github.com/multiformats/go-multiaddr-dns v0.3.1 // indirect

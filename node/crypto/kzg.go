@@ -75,6 +75,221 @@ var CeremonyPotPubKeys []curves.PairingPoint
 var CeremonySignatories []curves.Point
 var FFTBLS48581 map[uint64][]curves.PairingPoint = make(map[uint64][]curves.PairingPoint)
 
+func TestInit(file string) {
+	// start with phase 1 ceremony:
+	csBytes, err := os.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	bls48581.Init()
+
+	cs := &CeremonyState{}
+	if err := json.Unmarshal(csBytes, cs); err != nil {
+		panic(err)
+	}
+
+	g1s := make([]curves.PairingPoint, 1024)
+	g2s := make([]curves.PairingPoint, 257)
+	g1ffts := make([]curves.PairingPoint, 1024)
+	wg := sync.WaitGroup{}
+	wg.Add(1024)
+
+	for i := 0; i < 1024; i++ {
+		i := i
+		go func() {
+			b, err := hex.DecodeString(cs.PowersOfTau.G1Affines[i][2:])
+			if err != nil {
+				panic(err)
+			}
+			g1, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(b)
+			if err != nil {
+				panic(err)
+			}
+			g1s[i] = g1.(curves.PairingPoint)
+
+			f, err := hex.DecodeString(cs.PowersOfTau.G1FFT[i][2:])
+			if err != nil {
+				panic(err)
+			}
+			g1fft, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(f)
+			if err != nil {
+				panic(err)
+			}
+			g1ffts[i] = g1fft.(curves.PairingPoint)
+
+			if i < 257 {
+				b, err := hex.DecodeString(cs.PowersOfTau.G2Affines[i][2:])
+				if err != nil {
+					panic(err)
+				}
+				g2, err := curves.BLS48581G2().NewGeneratorPoint().FromAffineCompressed(
+					b,
+				)
+				if err != nil {
+					panic(err)
+				}
+				g2s[i] = g2.(curves.PairingPoint)
+			}
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+
+	wg.Add(len(cs.Witness.RunningProducts))
+	CeremonyRunningProducts = make([]curves.PairingPoint, len(cs.Witness.RunningProducts))
+	for i, s := range cs.Witness.RunningProducts {
+		i, s := i, s
+		go func() {
+			b, err := hex.DecodeString(s[2:])
+			if err != nil {
+				panic(err)
+			}
+
+			g1, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(b)
+			if err != nil {
+				panic(err)
+			}
+			CeremonyRunningProducts[i] = g1.(curves.PairingPoint)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	wg.Add(len(cs.Witness.PotPubKeys))
+	CeremonyPotPubKeys = make([]curves.PairingPoint, len(cs.Witness.PotPubKeys))
+	for i, s := range cs.Witness.PotPubKeys {
+		i, s := i, s
+		go func() {
+			b, err := hex.DecodeString(s[2:])
+			if err != nil {
+				panic(err)
+			}
+
+			g2, err := curves.BLS48581G2().NewGeneratorPoint().FromAffineCompressed(b)
+			if err != nil {
+				panic(err)
+			}
+			CeremonyPotPubKeys[i] = g2.(curves.PairingPoint)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	wg.Add(len(cs.VoucherPubKeys))
+	CeremonySignatories = make([]curves.Point, len(cs.VoucherPubKeys))
+	for i, s := range cs.VoucherPubKeys {
+		i, s := i, s
+		go func() {
+			b, err := hex.DecodeString(s[2:])
+			if err != nil {
+				panic(err)
+			}
+
+			CeremonySignatories[i], err = curves.ED448().Point.FromAffineCompressed(b)
+			if err != nil {
+				panic(err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	CeremonyBLS48581G1 = g1s
+	CeremonyBLS48581G2 = g2s
+
+	// Post-ceremony, precompute everything and put it in the finalized ceremony
+	// state
+	modulus := make([]byte, 73)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	q := new(big.Int).SetBytes(modulus)
+	sizes := []int64{16, 128, 1024}
+
+	wg.Add(len(sizes))
+	root := make([]curves.PairingScalar, 3)
+	roots := make([][]curves.PairingScalar, 3)
+	reverseRoots := make([][]curves.PairingScalar, 3)
+	ffts := make([][]curves.PairingPoint, 3)
+
+	for idx, i := range sizes {
+		i := i
+		idx := idx
+		go func() {
+			exp := new(big.Int).Quo(
+				new(big.Int).Sub(q, big.NewInt(1)),
+				big.NewInt(i),
+			)
+			rootOfUnity := new(big.Int).Exp(big.NewInt(int64(37)), exp, q)
+			roots[idx] = make([]curves.PairingScalar, i+1)
+			reverseRoots[idx] = make([]curves.PairingScalar, i+1)
+			wg2 := sync.WaitGroup{}
+			wg2.Add(int(i))
+			for j := int64(0); j < i; j++ {
+				j := j
+				go func() {
+					rev := big.NewInt(int64(j))
+					r := new(big.Int).Exp(
+						rootOfUnity,
+						rev,
+						q,
+					)
+					scalar, _ := (&curves.ScalarBls48581{}).SetBigInt(r)
+
+					if rev.Cmp(big.NewInt(1)) == 0 {
+						root[idx] = scalar.(curves.PairingScalar)
+					}
+
+					roots[idx][j] = scalar.(curves.PairingScalar)
+					reverseRoots[idx][i-j] = roots[idx][j]
+					wg2.Done()
+				}()
+			}
+			wg2.Wait()
+			roots[idx][i] = roots[idx][0]
+			reverseRoots[idx][0] = reverseRoots[idx][i]
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	wg.Add(len(sizes))
+	for i := range root {
+		i := i
+		RootOfUnityBLS48581[uint64(sizes[i])] = root[i]
+		RootsOfUnityBLS48581[uint64(sizes[i])] = roots[i]
+		ReverseRootsOfUnityBLS48581[uint64(sizes[i])] = reverseRoots[i]
+
+		go func() {
+			// We precomputed 65536, others are cheap and will be fully precomputed
+			// post-ceremony
+			if sizes[i] < 65536 {
+				fftG1, err := FFTG1(
+					CeremonyBLS48581G1[:sizes[i]],
+					*curves.BLS48581(
+						curves.BLS48581G1().NewGeneratorPoint(),
+					),
+					uint64(sizes[i]),
+					true,
+				)
+				if err != nil {
+					panic(err)
+				}
+
+				ffts[i] = fftG1
+			} else {
+				ffts[i] = g1ffts
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	for i := range root {
+		FFTBLS48581[uint64(sizes[i])] = ffts[i]
+	}
+}
+
 func Init() {
 	// start with phase 1 ceremony:
 	csBytes, err := os.ReadFile("./ceremony.json")
@@ -202,7 +417,7 @@ func Init() {
 	// Post-ceremony, precompute everything and put it in the finalized ceremony
 	// state
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	sizes := []int64{16, 128, 1024, 65536}
 
@@ -310,7 +525,7 @@ func NewKZGProver(
 
 func DefaultKZGProver() *KZGProver {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	return NewKZGProver(
 		curves.BLS48581(curves.BLS48581G1().Point),
@@ -426,7 +641,7 @@ func (p *KZGProver) EvaluateLagrangeForm(
 
 	xBI := x.BigInt()
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	xBI.Exp(xBI, width.BigInt(), q)
 	xBI.Sub(xBI, big.NewInt(1))

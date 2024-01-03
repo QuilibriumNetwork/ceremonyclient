@@ -11,9 +11,8 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
-	ceremony2 "source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -24,16 +23,15 @@ import (
 func NewNode(configConfig *config.Config) (*Node, error) {
 	zapLogger := logger()
 	dbConfig := configConfig.DB
-	db := store.NewPebbleDB(dbConfig)
-	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
+	pebbleDB := store.NewPebbleDB(dbConfig)
+	pebbleClockStore := store.NewPebbleClockStore(pebbleDB, zapLogger)
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	engineConfig := configConfig.Engine
-	pebbleKeyStore := store.NewPebbleKeyStore(db, zapLogger)
-	ceremonyDataClockConsensusEngine := ceremony.NewCeremonyDataClockConsensusEngine(engineConfig, zapLogger, fileKeyManager, pebbleClockStore, pebbleKeyStore, blossomSub)
-	ceremonyExecutionEngine := ceremony2.NewCeremonyExecutionEngine(zapLogger, ceremonyDataClockConsensusEngine, engineConfig, fileKeyManager, blossomSub, pebbleClockStore, pebbleKeyStore)
+	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
+	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, pebbleClockStore, pebbleKeyStore)
 	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub)
 	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
 	if err != nil {
@@ -52,9 +50,9 @@ func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
 
 func NewClockStore(configConfig *config.Config) (store.ClockStore, error) {
 	dbConfig := configConfig.DB
-	db := store.NewPebbleDB(dbConfig)
+	pebbleDB := store.NewPebbleDB(dbConfig)
 	zapLogger := logger()
-	pebbleClockStore := store.NewPebbleClockStore(db, zapLogger)
+	pebbleClockStore := store.NewPebbleClockStore(pebbleDB, zapLogger)
 	return pebbleClockStore, nil
 }
 
@@ -75,17 +73,11 @@ var loggerSet = wire.NewSet(
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))
 
-var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)))
+var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)))
 
 var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)))
 
-var dataConsensusSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), ceremony.NewCeremonyDataClockConsensusEngine, wire.Bind(
-	new(consensus.DataConsensusEngine),
-	new(*ceremony.CeremonyDataClockConsensusEngine),
-),
-)
-
-var engineSet = wire.NewSet(ceremony2.NewCeremonyExecutionEngine)
+var engineSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), ceremony.NewCeremonyExecutionEngine)
 
 var consensusSet = wire.NewSet(master.NewMasterClockConsensusEngine, wire.Bind(
 	new(consensus.ConsensusEngine),

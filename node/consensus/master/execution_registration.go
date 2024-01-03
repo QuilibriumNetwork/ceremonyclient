@@ -17,7 +17,7 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 	go func() {
 		logger.Info(
 			"starting execution engine at frame",
-			zap.Uint64("current_frame", e.frame),
+			zap.Uint64("current_frame", e.frame.FrameNumber),
 		)
 		err := <-exec.Start()
 		if err != nil {
@@ -29,11 +29,11 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 		for {
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame),
+				zap.Uint64("current_frame", e.frame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame
+			newFrame := e.frame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"injecting execution engine at frame",
@@ -76,11 +76,11 @@ func (e *MasterClockConsensusEngine) UnregisterExecutor(
 		for {
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame),
+				zap.Uint64("current_frame", e.frame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame
+			newFrame := e.frame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"removing execution engine at frame",
