@@ -1,7 +1,7 @@
 #!/bin/bash
 
 start_process() {
-    go run ./... &
+    GOEXPERIMENT=arenas go run ./... &
     process_pid=$!
     child_process_pid=$(pgrep -P $process_pid)
 }
