@@ -25,7 +25,7 @@ import (
 var (
 	configDirectory = flag.String(
 		"config",
-		"./.config/",
+		filepath.Join(".", ".config"),
 		"the configuration directory",
 	)
 	importPrivKey = flag.String(
@@ -233,5 +233,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.1.8 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.2.0 – Dawn")
 }

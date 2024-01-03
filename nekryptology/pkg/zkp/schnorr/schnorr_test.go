@@ -25,13 +25,13 @@ func TestZKPOverMultipleCurves(t *testing.T) {
 	}
 	for i, curve := range curveInstances {
 		uniqueSessionId := sha3.New256().Sum([]byte("random seed"))
-		prover := NewProver(curve, nil, uniqueSessionId)
+		prover := NewProver(curve, nil, sha3.New256(), uniqueSessionId)
 
 		secret := curve.Scalar.Random(rand.Reader)
 		proof, err := prover.Prove(secret)
 		require.NoError(t, err, fmt.Sprintf("failed in curve %d", i))
 
-		err = Verify(proof, curve, nil, uniqueSessionId)
+		err = Verify(proof, curve, nil, sha3.New256(), uniqueSessionId)
 		require.NoError(t, err, fmt.Sprintf("failed in curve %d", i))
 	}
 }

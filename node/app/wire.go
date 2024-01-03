@@ -8,7 +8,6 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
-	ceremonyConsensus "source.quilibrium.com/quilibrium/monorepo/node/consensus/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -38,6 +37,7 @@ var keyManagerSet = wire.NewSet(
 var storeSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "DB"),
 	store.NewPebbleDB,
+	wire.Bind(new(store.KVDB), new(*store.PebbleDB)),
 	store.NewPebbleClockStore,
 	store.NewPebbleKeyStore,
 	store.NewPebbleDataProofStore,
@@ -52,16 +52,8 @@ var pubSubSet = wire.NewSet(
 	wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)),
 )
 
-var dataConsensusSet = wire.NewSet(
-	wire.FieldsOf(new(*config.Config), "Engine"),
-	ceremonyConsensus.NewCeremonyDataClockConsensusEngine,
-	wire.Bind(
-		new(consensus.DataConsensusEngine),
-		new(*ceremonyConsensus.CeremonyDataClockConsensusEngine),
-	),
-)
-
 var engineSet = wire.NewSet(
+	wire.FieldsOf(new(*config.Config), "Engine"),
 	ceremony.NewCeremonyExecutionEngine,
 )
 
@@ -80,7 +72,6 @@ func NewNode(*config.Config) (*Node, error) {
 		storeSet,
 		pubSubSet,
 		engineSet,
-		dataConsensusSet,
 		consensusSet,
 		newNode,
 	))

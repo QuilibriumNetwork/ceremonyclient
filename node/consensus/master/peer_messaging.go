@@ -5,7 +5,6 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -27,46 +26,6 @@ func (e *MasterClockConsensusEngine) handleSync(message *pb.Message) error {
 
 	any := &anypb.Any{}
 	if err := proto.Unmarshal(msg.Payload, any); err != nil {
-		return errors.Wrap(err, "handle sync")
-	}
-
-	eg := errgroup.Group{}
-	eg.SetLimit(len(e.executionEngines))
-
-	for name := range e.executionEngines {
-		name := name
-		eg.Go(func() error {
-			messages, err := e.executionEngines[name].ProcessMessage(
-				msg.Address,
-				msg,
-			)
-			if err != nil {
-				e.logger.Error(
-					"could not process message for engine",
-					zap.Error(err),
-					zap.String("engine_name", name),
-				)
-				return errors.Wrap(err, "handle message")
-			}
-
-			for _, m := range messages {
-				m := m
-				if err := e.publishMessage(e.filter, m); err != nil {
-					e.logger.Error(
-						"could not publish message for engine",
-						zap.Error(err),
-						zap.String("engine_name", name),
-					)
-					return errors.Wrap(err, "handle message")
-				}
-			}
-
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		e.logger.Error("rejecting invalid message", zap.Error(err))
 		return errors.Wrap(err, "handle sync")
 	}
 
@@ -149,7 +108,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
 
-		if e.frame < frame.FrameNumber {
+		if e.frame.FrameNumber < frame.FrameNumber {
 			if err := e.enqueueSeenFrame(frame); err != nil {
 				e.logger.Error("could not enqueue seen clock frame", zap.Error(err))
 				return errors.Wrap(err, "handle clock frame response")
@@ -186,7 +145,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 
 	from := request.FromFrameNumber
 
-	if e.frame < from || len(e.historicFrames) == 0 {
+	if e.frame.FrameNumber < from || len(e.historicFrames) == 0 {
 		e.logger.Debug(
 			"peer asked for undiscovered frame",
 			zap.Binary("peer_id", peerID),
@@ -210,8 +169,8 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 		to = request.FromFrameNumber + 127
 	}
 
-	if int(to) > int(e.latestFrame.FrameNumber) {
-		to = e.latestFrame.FrameNumber
+	if int(to) > int(e.frame.FrameNumber) {
+		to = e.frame.FrameNumber
 	}
 
 	e.logger.Debug(

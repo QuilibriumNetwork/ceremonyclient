@@ -121,7 +121,9 @@ func (frame *ClockFrame) VerifyMasterClockFrame() error {
 	return nil
 }
 
-func (frame *ClockFrame) GetParentSelectorAndDistance() (
+func (frame *ClockFrame) GetParentSelectorAndDistance(
+	discriminator *big.Int,
+) (
 	*big.Int,
 	*big.Int,
 	*big.Int,
@@ -141,27 +143,20 @@ func (frame *ClockFrame) GetParentSelectorAndDistance() (
 
 	parentSelector := new(big.Int).SetBytes(frame.ParentSelector)
 
-	var pubkey []byte
-	ed448PublicKey := frame.GetPublicKeySignatureEd448()
-	if ed448PublicKey != nil {
-		pubkey = ed448PublicKey.PublicKey.KeyValue
-	} else {
-		return nil, nil, nil, errors.Wrap(
-			errors.New("no valid signature provided"),
-			"get parent selector and distance",
+	var distance *big.Int
+	if discriminator != nil {
+		l := new(big.Int).Mod(
+			new(big.Int).Sub(selector, discriminator),
+			ff.Modulus(),
 		)
-	}
-
-	discriminator, err := poseidon.HashBytes(pubkey)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "get parent selector and distance")
-	}
-
-	l := new(big.Int).Mod(new(big.Int).Sub(selector, discriminator), ff.Modulus())
-	r := new(big.Int).Mod(new(big.Int).Sub(discriminator, selector), ff.Modulus())
-	distance := r
-	if l.Cmp(r) == -1 {
-		distance = l
+		r := new(big.Int).Mod(
+			new(big.Int).Sub(discriminator, selector),
+			ff.Modulus(),
+		)
+		distance = r
+		if l.Cmp(r) == 1 {
+			distance = l
+		}
 	}
 
 	return parentSelector, distance, selector, nil

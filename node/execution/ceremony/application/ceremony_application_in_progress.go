@@ -22,7 +22,10 @@ func (a *CeremonyApplication) applySeenProverAttestation(
 
 	inParticipantList := false
 	for _, p := range a.ActiveParticipants {
-		if bytes.Equal(p.KeyValue, seenProverAttestation.SeenProverKey.KeyValue) {
+		if bytes.Equal(
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
+			seenProverAttestation.SeenProverKey.KeyValue,
+		) {
 			inParticipantList = true
 			break
 		}
@@ -93,7 +96,7 @@ func (a *CeremonyApplication) applyDroppedProverAttestation(
 	inParticipantList := false
 	for _, p := range a.ActiveParticipants {
 		if bytes.Equal(
-			p.KeyValue,
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
 			droppedProverAttestation.DroppedProverKey.KeyValue,
 		) {
 			inParticipantList = true
@@ -189,7 +192,7 @@ func (a *CeremonyApplication) applyTranscriptCommit(
 	inParticipantList := false
 	for _, p := range a.ActiveParticipants {
 		if bytes.Equal(
-			p.KeyValue,
+			p.PublicKeySignatureEd448.PublicKey.KeyValue,
 			transcriptCommit.ProverSignature.PublicKey.KeyValue,
 		) {
 			inParticipantList = true

@@ -17,6 +17,7 @@ import (
 	libp2pconfig "github.com/libp2p/go-libp2p/config"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -47,8 +48,6 @@ type BlossomSub struct {
 var _ PubSub = (*BlossomSub)(nil)
 var ErrNoPeersAvailable = errors.New("no peers available")
 
-// Crucial note, bitmask lengths should always be a power of two so as to reduce
-// index bias with hash functions
 var BITMASK_ALL = []byte{
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -180,7 +179,8 @@ func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
 }
 
 func (b *BlossomSub) Publish(data []byte) error {
-	bitmask := getBloomFilterIndices(data, 256, 3)
+	bitmask := GetBloomFilter(data, 256, 3)
+	bitmask = append(bitmask, GetBloomFilterIndices(data, 65536, 24)...)
 	return b.PublishToBitmask(bitmask, data)
 }
 
@@ -509,7 +509,8 @@ func discoverPeers(
 
 		for peer := range peerChan {
 			peer := peer
-			if peer.ID == h.ID() {
+			if peer.ID == h.ID() ||
+				h.Network().Connectedness(peer.ID) == network.Connected {
 				continue
 			}
 
@@ -535,10 +536,7 @@ func discoverPeers(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			if len(h.Network().Peers()) == 0 {
-				logger.Info("reinitiating discovery")
-				discover()
-			}
+			discover()
 		}
 	}()
 

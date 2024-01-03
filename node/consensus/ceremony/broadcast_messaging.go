@@ -2,8 +2,6 @@ package ceremony
 
 import (
 	"bytes"
-	"crypto"
-	"crypto/rand"
 	"encoding/binary"
 	"strings"
 	"time"
@@ -19,7 +17,6 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/zkp/schnorr"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -109,22 +106,6 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 			any,
 			false,
 		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-	case protobufs.ProvingKeyRequestType:
-		if err := e.handleProvingKeyRequest(
-			message.From,
-			msg.Address,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-	case protobufs.ProvingKeyAnnouncementType:
-		if err := e.handleProvingKey(message.From, msg.Address, any); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-	case protobufs.KeyBundleAnnouncementType:
-		if err := e.handleKeyBundle(message.From, msg.Address, any); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
 	case protobufs.CeremonyPeerListAnnounceType:
@@ -301,177 +282,6 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyLobbyStateTransition(
 		}
 	}
 	e.stagedLobbyStateTransitionsMx.Unlock()
-	return nil
-}
-
-func (e *CeremonyDataClockConsensusEngine) handleKeyBundle(
-	peerID []byte,
-	address []byte,
-	any *anypb.Any,
-) error {
-	e.logger.Debug("received key bundle")
-	keyBundleAnnouncement := &protobufs.KeyBundleAnnouncement{}
-	if err := any.UnmarshalTo(keyBundleAnnouncement); err != nil {
-		return errors.Wrap(err, "handle key bundle")
-	}
-
-	if len(keyBundleAnnouncement.ProvingKeyBytes) == 0 {
-		return errors.Wrap(errors.New("proving key is nil"), "handle key bundle")
-	}
-
-	k, err := e.keyStore.GetLatestKeyBundle(keyBundleAnnouncement.ProvingKeyBytes)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return errors.Wrap(err, "handle key bundle")
-	}
-
-	if k != nil {
-		latestAnnouncement := &protobufs.KeyBundleAnnouncement{}
-		err := proto.Unmarshal(k.Data, latestAnnouncement)
-		if err != nil {
-			return errors.Wrap(err, "handle key bundle")
-		}
-
-		if bytes.Equal(
-			latestAnnouncement.IdentityKey.Challenge,
-			keyBundleAnnouncement.IdentityKey.Challenge,
-		) && bytes.Equal(
-			latestAnnouncement.IdentityKey.Response,
-			keyBundleAnnouncement.IdentityKey.Response,
-		) && bytes.Equal(
-			latestAnnouncement.IdentityKey.Statement,
-			keyBundleAnnouncement.IdentityKey.Statement,
-		) && bytes.Equal(
-			latestAnnouncement.SignedPreKey.Challenge,
-			keyBundleAnnouncement.SignedPreKey.Challenge,
-		) && bytes.Equal(
-			latestAnnouncement.SignedPreKey.Response,
-			keyBundleAnnouncement.SignedPreKey.Response,
-		) && bytes.Equal(
-			latestAnnouncement.SignedPreKey.Statement,
-			keyBundleAnnouncement.SignedPreKey.Statement,
-		) {
-			// This has already been proven, ignore
-			return nil
-		}
-	}
-
-	var provingKey *protobufs.ProvingKeyAnnouncement
-	inclusion, err := e.keyStore.GetProvingKey(
-		keyBundleAnnouncement.ProvingKeyBytes,
-	)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			return errors.Wrap(err, "handle key bundle")
-		}
-
-		provingKey, err = e.keyStore.GetStagedProvingKey(
-			keyBundleAnnouncement.ProvingKeyBytes,
-		)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return errors.Wrap(err, "handle key bundle")
-		}
-	} else {
-		err := proto.Unmarshal(inclusion.Data, provingKey)
-		if err != nil {
-			return errors.Wrap(err, "handle key bundle")
-		}
-	}
-
-	// We have a matching proving key, we can set this up to be committed.
-	if provingKey != nil {
-		e.logger.Debug("verifying key bundle announcement")
-		if err := keyBundleAnnouncement.Verify(provingKey); err != nil {
-			e.logger.Debug(
-				"could not verify key bundle announcement",
-				zap.Error(err),
-			)
-			return nil
-		}
-
-		go func() {
-			e.logger.Debug("adding key bundle announcement to pending commits")
-
-			e.pendingCommits <- any
-		}()
-
-		return nil
-	} else {
-		e.logger.Debug("proving key not found, requesting from peers")
-
-		if err = e.publishMessage(e.filter, &protobufs.ProvingKeyRequest{
-			ProvingKeyBytes: keyBundleAnnouncement.ProvingKeyBytes,
-		}); err != nil {
-			return errors.Wrap(err, "handle key bundle")
-		}
-
-		e.dependencyMapMx.Lock()
-		e.dependencyMap[string(keyBundleAnnouncement.ProvingKeyBytes)] = any
-		e.dependencyMapMx.Unlock()
-	}
-
-	return nil
-}
-
-func (e *CeremonyDataClockConsensusEngine) handleProvingKey(
-	peerID []byte,
-	address []byte,
-	any *anypb.Any,
-) error {
-	e.logger.Debug("received proving key")
-
-	provingKeyAnnouncement := &protobufs.ProvingKeyAnnouncement{}
-	if err := any.UnmarshalTo(provingKeyAnnouncement); err != nil {
-		return errors.Wrap(err, "handle proving key")
-	}
-
-	if err := provingKeyAnnouncement.Verify(); err != nil {
-		return errors.Wrap(err, "handle proving key")
-	}
-
-	if err := e.keyStore.StageProvingKey(provingKeyAnnouncement); err != nil {
-		return errors.Wrap(err, "handle proving key")
-	}
-
-	provingKey := provingKeyAnnouncement.PublicKey()
-
-	e.logger.Debug(
-		"proving key staged",
-		zap.Binary("proving_key", provingKey),
-	)
-
-	go func() {
-		e.dependencyMapMx.Lock()
-		if e.dependencyMap[string(provingKey)] != nil {
-			keyBundleAnnouncement := &protobufs.KeyBundleAnnouncement{}
-			if err := proto.Unmarshal(
-				e.dependencyMap[string(provingKey)].Value,
-				keyBundleAnnouncement,
-			); err != nil {
-				e.logger.Error(
-					"could not unmarshal key bundle announcement",
-					zap.Error(err),
-				)
-				e.dependencyMapMx.Unlock()
-				return
-			}
-			if err := keyBundleAnnouncement.Verify(
-				provingKeyAnnouncement,
-			); err != nil {
-				e.logger.Error(
-					"could not verify key bundle announcement",
-					zap.Error(err),
-				)
-				e.dependencyMapMx.Unlock()
-				return
-			}
-
-			e.pendingCommits <- e.dependencyMap[string(provingKey)]
-
-			delete(e.dependencyMap, string(provingKey))
-		}
-		e.dependencyMapMx.Unlock()
-	}()
-
 	return nil
 }
 
@@ -694,16 +504,30 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		zap.Binary("filter", frame.Filter),
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
+	masterFrame, err := e.clockStore.GetMasterClockFrame(
+		[]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+		frame.FrameNumber-1,
+	)
+	if err != nil {
+		e.logger.Info("received frame with no known master, needs sync")
+		return nil
+	}
 
-	parentSelector, selector, distance, err :=
-		frame.GetParentSelectorAndDistance()
+	discriminator, err := masterFrame.GetSelector()
 	if err != nil {
 		return errors.Wrap(err, "handle clock frame data")
 	}
-	e.logger.Debug(
-		"difference between selector/discriminator",
-		zap.Binary("difference", distance.Bytes()),
-	)
+
+	parentSelector, distance, selector, err :=
+		frame.GetParentSelectorAndDistance(discriminator)
+	if err != nil {
+		return errors.Wrap(err, "handle clock frame data")
+	}
 
 	if _, err := e.clockStore.GetParentDataClockFrame(
 		frame.Filter,
@@ -713,7 +537,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		// If this is a frame number higher than what we're already caught up to,
 		// push a request to fill the gap, unless we're syncing or it's in step,
 		// then just lazily seek.
-		from := e.frame
+		from := e.frame.FrameNumber
 		if from >= frame.FrameNumber-1 {
 			from = frame.FrameNumber - 1
 		}
@@ -737,9 +561,9 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 	}
 
 	if err := e.clockStore.PutCandidateDataClockFrame(
-		parentSelector.Bytes(),
-		distance.Bytes(),
-		selector.Bytes(),
+		parentSelector.FillBytes(make([]byte, 32)),
+		distance.FillBytes(make([]byte, 32)),
+		selector.FillBytes(make([]byte, 32)),
 		frame,
 		txn,
 	); err != nil {
@@ -752,7 +576,7 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	if e.frame < frame.FrameNumber {
+	if e.frame.FrameNumber < frame.FrameNumber {
 		e.latestFrameReceived = frame.FrameNumber
 		e.lastFrameReceivedAt = time.Now().UTC()
 	}
@@ -819,12 +643,11 @@ func (e *CeremonyDataClockConsensusEngine) publishMessage(
 	return e.pubSub.PublishToBitmask(filter, data)
 }
 
-func (e *CeremonyDataClockConsensusEngine) announceKeyBundle() error {
-	e.logger.Debug("announcing key bundle")
-	idk, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
+func (e *CeremonyDataClockConsensusEngine) createCommunicationKeys() error {
+	_, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
 	if err != nil {
 		if errors.Is(err, keys.KeyNotFoundErr) {
-			idk, err = e.keyManager.CreateAgreementKey(
+			_, err = e.keyManager.CreateAgreementKey(
 				"q-ratchet-idk",
 				keys.KeyTypeX448,
 			)
@@ -836,10 +659,10 @@ func (e *CeremonyDataClockConsensusEngine) announceKeyBundle() error {
 		}
 	}
 
-	spk, err := e.keyManager.GetAgreementKey("q-ratchet-spk")
+	_, err = e.keyManager.GetAgreementKey("q-ratchet-spk")
 	if err != nil {
 		if errors.Is(err, keys.KeyNotFoundErr) {
-			spk, err = e.keyManager.CreateAgreementKey(
+			_, err = e.keyManager.CreateAgreementKey(
 				"q-ratchet-spk",
 				keys.KeyTypeX448,
 			)
@@ -851,110 +674,5 @@ func (e *CeremonyDataClockConsensusEngine) announceKeyBundle() error {
 		}
 	}
 
-	idkPoint := curves.ED448().NewGeneratorPoint().Mul(idk)
-	idkProver := schnorr.NewProver(
-		curves.ED448(),
-		curves.ED448().NewGeneratorPoint(),
-		sha3.New256(),
-		[]byte{},
-	)
-
-	spkPoint := curves.ED448().NewGeneratorPoint().Mul(spk)
-	spkProver := schnorr.NewProver(
-		curves.ED448(),
-		curves.ED448().NewGeneratorPoint(),
-		sha3.New256(),
-		[]byte{},
-	)
-
-	idkProof, idkCommitment, err := idkProver.ProveCommit(idk)
-	if err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	spkProof, spkCommitment, err := spkProver.ProveCommit(spk)
-	if err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	msg := append(
-		append([]byte{}, idkCommitment...),
-		spkCommitment...,
-	)
-
-	signature, err := e.provingKey.Sign(rand.Reader, msg, crypto.Hash(0))
-	if err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	signatureProto := &protobufs.ProvingKeyAnnouncement_ProvingKeySignatureEd448{
-		ProvingKeySignatureEd448: &protobufs.Ed448Signature{
-			PublicKey: &protobufs.Ed448PublicKey{
-				KeyValue: e.provingKeyBytes,
-			},
-			Signature: signature,
-		},
-	}
-	provingKeyAnnouncement := &protobufs.ProvingKeyAnnouncement{
-		IdentityCommitment:  idkCommitment,
-		PrekeyCommitment:    spkCommitment,
-		ProvingKeySignature: signatureProto,
-	}
-
-	if err := e.publishMessage(e.filter, provingKeyAnnouncement); err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	idkSignature, err := e.provingKey.Sign(
-		rand.Reader,
-		idkPoint.ToAffineCompressed(),
-		crypto.Hash(0),
-	)
-	if err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	spkSignature, err := e.provingKey.Sign(
-		rand.Reader,
-		spkPoint.ToAffineCompressed(),
-		crypto.Hash(0),
-	)
-	if err != nil {
-		return errors.Wrap(err, "announce key bundle")
-	}
-
-	keyBundleAnnouncement := &protobufs.KeyBundleAnnouncement{
-		ProvingKeyBytes: e.provingKeyBytes,
-		IdentityKey: &protobufs.IdentityKey{
-			Challenge: idkProof.C.Bytes(),
-			Response:  idkProof.S.Bytes(),
-			Statement: idkProof.Statement.ToAffineCompressed(),
-			IdentityKeySignature: &protobufs.IdentityKey_PublicKeySignatureEd448{
-				PublicKeySignatureEd448: &protobufs.Ed448Signature{
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: idkPoint.ToAffineCompressed(),
-					},
-					Signature: idkSignature,
-				},
-			},
-		},
-		SignedPreKey: &protobufs.SignedPreKey{
-			Challenge: spkProof.C.Bytes(),
-			Response:  spkProof.S.Bytes(),
-			Statement: spkProof.Statement.ToAffineCompressed(),
-			SignedPreKeySignature: &protobufs.SignedPreKey_PublicKeySignatureEd448{
-				PublicKeySignatureEd448: &protobufs.Ed448Signature{
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: spkPoint.ToAffineCompressed(),
-					},
-					Signature: spkSignature,
-				},
-			},
-		},
-	}
-
-	return errors.Wrap(
-		e.publishMessage(e.filter, keyBundleAnnouncement),
-		"announce key bundle",
-	)
+	return nil
 }

@@ -7,6 +7,7 @@
 package curves
 
 import (
+	"arena"
 	"errors"
 	"fmt"
 	"io"
@@ -47,9 +48,9 @@ func (s *ScalarBls48581) Random(reader io.Reader) Scalar {
 func (s *ScalarBls48581) Hash(bytes []byte) Scalar {
 	DST := []byte("BLS_SIG_BLS48581G1_XMD:SHA-512_SVDW_RO_NUL_")
 	u := bls48581.Hash_to_field(ext.MC_SHA2, bls48581.HASH_TYPE, DST, bytes, 2)
-	u[0].Add(u[1])
-	b := u[0].Redc()
-	b.Mod(bls48581.NewBIGints(bls48581.CURVE_Order))
+	u[0].Add(u[1], nil)
+	b := u[0].Redc(nil)
+	b.Mod(bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
 	return &ScalarBls48581{
 		Value: b,
 		point: s.point,
@@ -58,14 +59,14 @@ func (s *ScalarBls48581) Hash(bytes []byte) Scalar {
 
 func (s *ScalarBls48581) Zero() Scalar {
 	return &ScalarBls48581{
-		Value: bls48581.NewBIGint(0),
+		Value: bls48581.NewBIGint(0, nil),
 		point: s.point,
 	}
 }
 
 func (s *ScalarBls48581) One() Scalar {
 	return &ScalarBls48581{
-		Value: bls48581.NewBIGint(1),
+		Value: bls48581.NewBIGint(1, nil),
 		point: s.point,
 	}
 }
@@ -75,7 +76,7 @@ func (s *ScalarBls48581) IsZero() bool {
 }
 
 func (s *ScalarBls48581) IsOne() bool {
-	t := bls48581.NewBIGint(1)
+	t := bls48581.NewBIGint(1, nil)
 	t.Sub(s.Value)
 	return t.IsZero()
 }
@@ -94,15 +95,15 @@ func (s *ScalarBls48581) IsEven() bool {
 
 func (s *ScalarBls48581) New(value int) Scalar {
 	if value > 0 {
-		t := bls48581.NewBIGint(value)
-		t.Mod(bls48581.NewBIGints(bls48581.CURVE_Order))
+		t := bls48581.NewBIGint(value, nil)
+		t.Mod(bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
 		return &ScalarBls48581{
 			Value: t,
 			point: s.point,
 		}
 	} else {
-		t := bls48581.NewBIGint(-value)
-		v := bls48581.NewBIGints(bls48581.CURVE_Order)
+		t := bls48581.NewBIGint(-value, nil)
+		v := bls48581.NewBIGints(bls48581.CURVE_Order, nil)
 		v.Sub(t)
 		return &ScalarBls48581{
 			Value: v,
@@ -121,8 +122,8 @@ func (s *ScalarBls48581) Cmp(rhs Scalar) int {
 }
 
 func (s *ScalarBls48581) Square() Scalar {
-	sqr := bls48581.NewBIGcopy(s.Value)
-	sqr = bls48581.Modsqr(sqr, bls48581.NewBIGints(bls48581.CURVE_Order))
+	sqr := bls48581.NewBIGcopy(s.Value, nil)
+	sqr = bls48581.Modsqr(sqr, bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
 	return &ScalarBls48581{
 		Value: sqr,
 		point: s.point,
@@ -130,8 +131,13 @@ func (s *ScalarBls48581) Square() Scalar {
 }
 
 func (s *ScalarBls48581) Double() Scalar {
-	dbl := bls48581.NewBIGcopy(s.Value)
-	dbl = bls48581.Modmul(dbl, bls48581.NewBIGint(2), bls48581.NewBIGints(bls48581.CURVE_Order))
+	dbl := bls48581.NewBIGcopy(s.Value, nil)
+	dbl = bls48581.Modmul(
+		dbl,
+		bls48581.NewBIGint(2, nil),
+		bls48581.NewBIGints(bls48581.CURVE_Order, nil),
+		nil,
+	)
 	return &ScalarBls48581{
 		Value: dbl,
 		point: s.point,
@@ -139,8 +145,8 @@ func (s *ScalarBls48581) Double() Scalar {
 }
 
 func (s *ScalarBls48581) Invert() (Scalar, error) {
-	v := bls48581.NewBIGcopy(s.Value)
-	v.Invmodp(bls48581.NewBIGints(bls48581.CURVE_Order))
+	v := bls48581.NewBIGcopy(s.Value, nil)
+	v.Invmodp(bls48581.NewBIGints(bls48581.CURVE_Order, nil))
 	if v == nil {
 		return nil, fmt.Errorf("inverse doesn't exist")
 	}
@@ -155,9 +161,9 @@ func (s *ScalarBls48581) Sqrt() (Scalar, error) {
 }
 
 func (s *ScalarBls48581) Cube() Scalar {
-	value := bls48581.NewBIGcopy(s.Value)
-	value = bls48581.Modsqr(value, bls48581.NewBIGints(bls48581.CURVE_Order))
-	value = bls48581.Modmul(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order))
+	value := bls48581.NewBIGcopy(s.Value, nil)
+	value = bls48581.Modsqr(value, bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
+	value = bls48581.Modmul(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: s.point,
@@ -167,8 +173,11 @@ func (s *ScalarBls48581) Cube() Scalar {
 func (s *ScalarBls48581) Add(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		value := bls48581.NewBIGcopy(s.Value)
-		value = bls48581.ModAdd(value, r.Value, bls48581.NewBIGints(bls48581.CURVE_Order))
+		mem := arena.NewArena()
+		defer mem.Free()
+		value := bls48581.NewBIGcopy(s.Value, mem)
+		value = bls48581.ModAdd(value, r.Value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+		value = bls48581.NewBIGcopy(value, nil)
 		return &ScalarBls48581{
 			Value: value,
 			point: s.point,
@@ -181,9 +190,12 @@ func (s *ScalarBls48581) Add(rhs Scalar) Scalar {
 func (s *ScalarBls48581) Sub(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		value := bls48581.NewBIGcopy(r.Value)
-		value = bls48581.Modneg(value, bls48581.NewBIGints(bls48581.CURVE_Order))
-		value = bls48581.ModAdd(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order))
+		mem := arena.NewArena()
+		defer mem.Free()
+		value := bls48581.NewBIGcopy(r.Value, mem)
+		value = bls48581.Modneg(value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+		value = bls48581.ModAdd(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+		value = bls48581.NewBIGcopy(value, nil)
 		return &ScalarBls48581{
 			Value: value,
 			point: s.point,
@@ -196,8 +208,11 @@ func (s *ScalarBls48581) Sub(rhs Scalar) Scalar {
 func (s *ScalarBls48581) Mul(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		value := bls48581.NewBIGcopy(s.Value)
-		value = bls48581.Modmul(value, r.Value, bls48581.NewBIGints(bls48581.CURVE_Order))
+		mem := arena.NewArena()
+		defer mem.Free()
+		value := bls48581.NewBIGcopy(s.Value, mem)
+		value = bls48581.Modmul(value, r.Value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+		value = bls48581.NewBIGcopy(value, nil)
 		return &ScalarBls48581{
 			Value: value,
 			point: s.point,
@@ -214,9 +229,12 @@ func (s *ScalarBls48581) MulAdd(y, z Scalar) Scalar {
 func (s *ScalarBls48581) Div(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		value := bls48581.NewBIGcopy(r.Value)
-		value.Invmodp(bls48581.NewBIGints(bls48581.CURVE_Order))
-		value = bls48581.Modmul(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order))
+		mem := arena.NewArena()
+		defer mem.Free()
+		value := bls48581.NewBIGcopy(r.Value, mem)
+		value.Invmodp(bls48581.NewBIGints(bls48581.CURVE_Order, mem))
+		value = bls48581.Modmul(value, s.Value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+		value = bls48581.NewBIGcopy(value, nil)
 		return &ScalarBls48581{
 			Value: value,
 			point: s.point,
@@ -227,8 +245,11 @@ func (s *ScalarBls48581) Div(rhs Scalar) Scalar {
 }
 
 func (s *ScalarBls48581) Neg() Scalar {
-	value := bls48581.NewBIGcopy(s.Value)
-	value = bls48581.Modneg(value, bls48581.NewBIGints(bls48581.CURVE_Order))
+	mem := arena.NewArena()
+	defer mem.Free()
+	value := bls48581.NewBIGcopy(s.Value, mem)
+	value = bls48581.Modneg(value, bls48581.NewBIGints(bls48581.CURVE_Order, mem), mem)
+	value = bls48581.NewBIGcopy(value, nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: s.point,
@@ -244,7 +265,7 @@ func (s *ScalarBls48581) SetBigInt(v *big.Int) (Scalar, error) {
 	copy(t[bls48581.MODBYTES-uint(len(b)):], b)
 
 	i := bls48581.FromBytes(t)
-	i.Mod(bls48581.NewBIGints(bls48581.CURVE_Order))
+	i.Mod(bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
 	return &ScalarBls48581{
 		Value: i,
 		point: s.point,
@@ -298,7 +319,7 @@ func (s *ScalarBls48581) Point() Point {
 }
 
 func (s *ScalarBls48581) Clone() Scalar {
-	value := bls48581.NewBIGcopy(s.Value)
+	value := bls48581.NewBIGcopy(s.Value, nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: s.point,
@@ -306,7 +327,7 @@ func (s *ScalarBls48581) Clone() Scalar {
 }
 
 func (s *ScalarBls48581) SetPoint(p Point) PairingScalar {
-	value := bls48581.NewBIGcopy(s.Value)
+	value := bls48581.NewBIGcopy(s.Value, nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: p,
@@ -314,7 +335,7 @@ func (s *ScalarBls48581) SetPoint(p Point) PairingScalar {
 }
 
 func (s *ScalarBls48581) Order() *big.Int {
-	b := bls48581.NewBIGints(bls48581.CURVE_Order)
+	b := bls48581.NewBIGints(bls48581.CURVE_Order, nil)
 	bytes := make([]byte, bls48581.MODBYTES)
 	b.ToBytes(bytes)
 	return new(big.Int).SetBytes(bytes)
@@ -369,7 +390,7 @@ func (p *PointBls48581G1) Hash(bytes []byte) Point {
 
 func (p *PointBls48581G1) Identity() Point {
 	g1 := bls48581.ECP_generator()
-	g1 = g1.Mul(bls48581.NewBIGint(0))
+	g1 = g1.Mul(bls48581.NewBIGint(0, nil), nil, nil)
 	return &PointBls48581G1{
 		Value: g1,
 	}
@@ -384,7 +405,7 @@ func (p *PointBls48581G1) Generator() Point {
 }
 
 func (p *PointBls48581G1) IsIdentity() bool {
-	return p.Value.Is_infinity()
+	return p.Value.Is_infinity(nil)
 }
 
 func (p *PointBls48581G1) IsNegative() bool {
@@ -395,18 +416,18 @@ func (p *PointBls48581G1) IsNegative() bool {
 }
 
 func (p *PointBls48581G1) IsOnCurve() bool {
-	return bls48581.G1member(p.Value)
+	return bls48581.G1member(p.Value, nil)
 }
 
 func (p *PointBls48581G1) Double() Point {
-	v := bls48581.NewECP()
+	v := bls48581.NewECP(nil)
 	v.Copy(p.Value)
-	v.Dbl()
+	v.Dbl(nil)
 	return &PointBls48581G1{v}
 }
 
 func (p *PointBls48581G1) Scalar() Scalar {
-	value := bls48581.NewBIG()
+	value := bls48581.NewBIG(nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: new(PointBls48581G1),
@@ -414,9 +435,9 @@ func (p *PointBls48581G1) Scalar() Scalar {
 }
 
 func (p *PointBls48581G1) Neg() Point {
-	v := bls48581.NewECP()
+	v := bls48581.NewECP(nil)
 	v.Copy(p.Value)
-	v.Neg()
+	v.Neg(nil)
 	return &PointBls48581G1{v}
 }
 
@@ -426,9 +447,9 @@ func (p *PointBls48581G1) Add(rhs Point) Point {
 	}
 	r, ok := rhs.(*PointBls48581G1)
 	if ok {
-		v := bls48581.NewECP()
+		v := bls48581.NewECP(nil)
 		v.Copy(p.Value)
-		v.Add(r.Value)
+		v.Add(r.Value, nil)
 		return &PointBls48581G1{v}
 	} else {
 		return nil
@@ -441,9 +462,9 @@ func (p *PointBls48581G1) Sub(rhs Point) Point {
 	}
 	r, ok := rhs.(*PointBls48581G1)
 	if ok {
-		v := bls48581.NewECP()
+		v := bls48581.NewECP(nil)
 		v.Copy(p.Value)
-		v.Sub(r.Value)
+		v.Sub(r.Value, nil)
 		return &PointBls48581G1{v}
 	} else {
 		return nil
@@ -456,9 +477,11 @@ func (p *PointBls48581G1) Mul(rhs Scalar) Point {
 	}
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		v := bls48581.NewECP()
+		mem := arena.NewArena()
+		defer mem.Free()
+		v := bls48581.NewECP(mem)
 		v.Copy(p.Value)
-		v = v.Mul(r.Value)
+		v = v.Mul(r.Value, nil, mem)
 		return &PointBls48581G1{v}
 	} else {
 		return nil
@@ -481,7 +504,7 @@ func (p *PointBls48581G1) Set(x, y *big.Int) (Point, error) {
 	y.FillBytes(yBytes)
 	xBig := bls48581.FromBytes(xBytes)
 	yBig := bls48581.FromBytes(yBytes)
-	v := bls48581.NewECPbigs(xBig, yBig)
+	v := bls48581.NewECPbigs(xBig, yBig, nil)
 	if v == nil {
 		return nil, fmt.Errorf("invalid coordinates")
 	}
@@ -504,7 +527,7 @@ func (p *PointBls48581G1) FromAffineCompressed(bytes []byte) (Point, error) {
 	var b [bls48581.MODBYTES + 1]byte
 	copy(b[:], bytes)
 	value := bls48581.ECP_fromBytes(b[:])
-	if value == nil || value.Is_infinity() {
+	if value == nil || value.Is_infinity(nil) {
 		return nil, errors.New("could not decode")
 	}
 	return &PointBls48581G1{value}, nil
@@ -514,7 +537,7 @@ func (p *PointBls48581G1) FromAffineUncompressed(bytes []byte) (Point, error) {
 	var b [bls48581.MODBYTES*2 + 1]byte
 	copy(b[:], bytes)
 	value := bls48581.ECP_fromBytes(b[:])
-	if value == nil || value.Is_infinity() {
+	if value == nil || value.Is_infinity(nil) {
 		return nil, errors.New("could not decode")
 	}
 	return &PointBls48581G1{value}, nil
@@ -541,8 +564,10 @@ func (p *PointBls48581G1) SumOfProducts(points []Point, scalars []Scalar) Point 
 		}
 		nScalars[i] = s.Value
 	}
-	value := bls48581.ECP_muln(len(points), nPoints, nScalars)
-	if value == nil || value.Is_infinity() {
+	mem := arena.NewArena()
+	defer mem.Free()
+	value := bls48581.ECP_muln(len(points), nPoints, nScalars, mem)
+	if value == nil || value.Is_infinity(mem) {
 		return nil
 	}
 	return &PointBls48581G1{value}
@@ -563,77 +588,60 @@ func (p *PointBls48581G1) Pairing(rhs PairingPoint) Scalar {
 	return &ScalarBls48581Gt{pair}
 }
 
+func (p *PointBls48581G1) Ate2Pairing(
+	rhs *PointBls48581G2,
+	lhs2 *PointBls48581G1,
+	rhs2 *PointBls48581G2,
+) Scalar {
+	ate2 := bls48581.Ate2(rhs2.Value, p.Value, rhs2.Value, lhs2.Value)
+
+	return &ScalarBls48581Gt{ate2}
+}
+
 func (p *PointBls48581G1) MultiPairing(points ...PairingPoint) Scalar {
 	return bls48multiPairing(points...)
 }
 
 func (p *PointBls48581G1) X() *big.Int {
 	bytes := make([]byte, bls48581.MODBYTES)
-	p.Value.GetX().ToBytes(bytes[:])
+	p.Value.GetX(nil).ToBytes(bytes[:])
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G1) Y() *big.Int {
 	bytes := make([]byte, bls48581.MODBYTES)
-	p.Value.GetY().ToBytes(bytes[:])
+	p.Value.GetY(nil).ToBytes(bytes[:])
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G1) Modulus() *big.Int {
-	b := bls48581.NewBIGints(bls48581.Modulus)
+	b := bls48581.NewBIGints(bls48581.Modulus, nil)
 	bytes := make([]byte, bls48581.MODBYTES)
 	b.ToBytes(bytes)
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G1) MarshalBinary() ([]byte, error) {
-	return pointMarshalBinary(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G1) UnmarshalBinary(input []byte) error {
-	pt, err := pointUnmarshalBinary(input)
-	if err != nil {
-		return err
-	}
-	ppt, ok := pt.(*PointBls48581G1)
-	if !ok {
-		return fmt.Errorf("invalid point")
-	}
-	p.Value = ppt.Value
 	return nil
 }
 
 func (p *PointBls48581G1) MarshalText() ([]byte, error) {
-	return pointMarshalText(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G1) UnmarshalText(input []byte) error {
-	pt, err := pointUnmarshalText(input)
-	if err != nil {
-		return err
-	}
-	ppt, ok := pt.(*PointBls48581G1)
-	if !ok {
-		return fmt.Errorf("invalid point")
-	}
-	p.Value = ppt.Value
 	return nil
 }
 
 func (p *PointBls48581G1) MarshalJSON() ([]byte, error) {
-	return pointMarshalJson(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G1) UnmarshalJSON(input []byte) error {
-	pt, err := pointUnmarshalJson(input)
-	if err != nil {
-		return err
-	}
-	P, ok := pt.(*PointBls48581G1)
-	if !ok {
-		return fmt.Errorf("invalid type")
-	}
-	p.Value = P.Value
 	return nil
 }
 
@@ -646,15 +654,15 @@ func (p *PointBls48581G2) Random(reader io.Reader) Point {
 func (p *PointBls48581G2) Hash(bytes []byte) Point {
 	DST := []byte("BLS_SIG_BLS48581G2_XMD:SHA-512_SVDW_RO_NUL_")
 	u := bls48581.Hash_to_field(ext.MC_SHA2, bls48581.HASH_TYPE, DST, bytes, 2)
-	u[0].Add(u[1])
-	fp8 := bls48581.NewFP8fp(u[0])
+	u[0].Add(u[1], nil)
+	fp8 := bls48581.NewFP8fp(u[0], nil)
 	v := bls48581.ECP8_map2point(fp8)
 	return &PointBls48581G2{v}
 }
 
 func (p *PointBls48581G2) Identity() Point {
 	g2 := bls48581.ECP8_generator()
-	g2 = g2.Mul(bls48581.NewBIGint(0))
+	g2 = g2.Mul(bls48581.NewBIGint(0, nil), nil)
 	return &PointBls48581G2{
 		Value: g2,
 	}
@@ -669,7 +677,7 @@ func (p *PointBls48581G2) Generator() Point {
 }
 
 func (p *PointBls48581G2) IsIdentity() bool {
-	return p.Value.Is_infinity()
+	return p.Value.Is_infinity(nil)
 }
 
 func (p *PointBls48581G2) IsNegative() bool {
@@ -680,18 +688,18 @@ func (p *PointBls48581G2) IsNegative() bool {
 }
 
 func (p *PointBls48581G2) IsOnCurve() bool {
-	return bls48581.G2member(p.Value)
+	return bls48581.G2member(p.Value, nil)
 }
 
 func (p *PointBls48581G2) Double() Point {
-	v := bls48581.NewECP8()
+	v := bls48581.NewECP8(nil)
 	v.Copy(p.Value)
-	v.Dbl()
+	v.Dbl(nil)
 	return &PointBls48581G2{v}
 }
 
 func (p *PointBls48581G2) Scalar() Scalar {
-	value := bls48581.NewBIG()
+	value := bls48581.NewBIG(nil)
 	return &ScalarBls48581{
 		Value: value,
 		point: new(PointBls48581G2),
@@ -699,9 +707,9 @@ func (p *PointBls48581G2) Scalar() Scalar {
 }
 
 func (p *PointBls48581G2) Neg() Point {
-	v := bls48581.NewECP8()
+	v := bls48581.NewECP8(nil)
 	v.Copy(p.Value)
-	v.Neg()
+	v.Neg(nil)
 	return &PointBls48581G2{v}
 }
 
@@ -711,9 +719,9 @@ func (p *PointBls48581G2) Add(rhs Point) Point {
 	}
 	r, ok := rhs.(*PointBls48581G2)
 	if ok {
-		v := bls48581.NewECP8()
+		v := bls48581.NewECP8(nil)
 		v.Copy(p.Value)
-		v.Add(r.Value)
+		v.Add(r.Value, nil)
 		return &PointBls48581G2{v}
 	} else {
 		return nil
@@ -726,9 +734,9 @@ func (p *PointBls48581G2) Sub(rhs Point) Point {
 	}
 	r, ok := rhs.(*PointBls48581G2)
 	if ok {
-		v := bls48581.NewECP8()
+		v := bls48581.NewECP8(nil)
 		v.Copy(p.Value)
-		v.Sub(r.Value)
+		v.Sub(r.Value, nil)
 		return &PointBls48581G2{v}
 	} else {
 		return nil
@@ -741,11 +749,11 @@ func (p *PointBls48581G2) Mul(rhs Scalar) Point {
 	}
 	r, ok := rhs.(*ScalarBls48581)
 	if ok {
-		v := bls48581.NewECP8()
+		mem := arena.NewArena()
+		defer mem.Free()
+		v := bls48581.NewECP8(nil)
 		v.Copy(p.Value)
-		bytes := make([]byte, bls48581.MODBYTES)
-		r.Value.ToBytes(bytes)
-		v = v.Mul(bls48581.FromBytes(bytes))
+		v = v.Mul(r.Value, mem)
 		return &PointBls48581G2{v}
 	} else {
 		return nil
@@ -768,8 +776,8 @@ func (p *PointBls48581G2) Set(x, y *big.Int) (Point, error) {
 	y.FillBytes(yBytes)
 	xBig := bls48581.FP8_fromBytes(xBytes)
 	yBig := bls48581.FP8_fromBytes(yBytes)
-	v := bls48581.NewECP8fp8s(xBig, yBig)
-	if v == nil || v.Is_infinity() {
+	v := bls48581.NewECP8fp8s(xBig, yBig, nil)
+	if v == nil || v.Is_infinity(nil) {
 		return nil, fmt.Errorf("invalid coordinates")
 	}
 	return &PointBls48581G2{v}, nil
@@ -791,7 +799,7 @@ func (p *PointBls48581G2) FromAffineCompressed(bytes []byte) (Point, error) {
 	var b [bls48581.MODBYTES*8 + 1]byte
 	copy(b[:], bytes)
 	value := bls48581.ECP8_fromBytes(b[:])
-	if value == nil || value.Is_infinity() {
+	if value == nil || value.Is_infinity(nil) {
 		return nil, errors.New("could not decode")
 	}
 	return &PointBls48581G2{value}, nil
@@ -801,7 +809,7 @@ func (p *PointBls48581G2) FromAffineUncompressed(bytes []byte) (Point, error) {
 	var b [bls48581.MODBYTES*16 + 1]byte
 	copy(b[:], bytes)
 	value := bls48581.ECP8_fromBytes(b[:])
-	if value == nil || value.Is_infinity() {
+	if value == nil || value.Is_infinity(nil) {
 		return nil, errors.New("could not decode")
 	}
 	return &PointBls48581G2{value}, nil
@@ -828,8 +836,8 @@ func (p *PointBls48581G2) SumOfProducts(points []Point, scalars []Scalar) Point 
 		}
 		nScalars[i] = s.Value
 	}
-	value := bls48581.Mul16(nPoints, nScalars)
-	if value == nil || value.Is_infinity() {
+	value := bls48581.Mul16(nPoints, nScalars, nil)
+	if value == nil || value.Is_infinity(nil) {
 		return nil
 	}
 	return &PointBls48581G2{value}
@@ -855,74 +863,47 @@ func (p *PointBls48581G2) MultiPairing(points ...PairingPoint) Scalar {
 }
 
 func (p *PointBls48581G2) X() *big.Int {
-	x := p.Value.GetX()
+	x := p.Value.GetX(nil)
 	bytes := make([]byte, 8*bls48581.MODBYTES)
 	x.ToBytes(bytes)
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G2) Y() *big.Int {
-	y := p.Value.GetY()
+	y := p.Value.GetY(nil)
 	bytes := make([]byte, 8*bls48581.MODBYTES)
 	y.ToBytes(bytes)
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G2) Modulus() *big.Int {
-	b := bls48581.NewBIGints(bls48581.Modulus)
+	b := bls48581.NewBIGints(bls48581.Modulus, nil)
 	bytes := make([]byte, bls48581.MODBYTES)
 	b.ToBytes(bytes)
 	return new(big.Int).SetBytes(bytes)
 }
 
 func (p *PointBls48581G2) MarshalBinary() ([]byte, error) {
-	return pointMarshalBinary(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G2) UnmarshalBinary(input []byte) error {
-	pt, err := pointUnmarshalBinary(input)
-	if err != nil {
-		return err
-	}
-	ppt, ok := pt.(*PointBls48581G2)
-	if !ok {
-		return fmt.Errorf("invalid point")
-	}
-	p.Value = ppt.Value
 	return nil
 }
 
 func (p *PointBls48581G2) MarshalText() ([]byte, error) {
-	return pointMarshalText(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G2) UnmarshalText(input []byte) error {
-	pt, err := pointUnmarshalText(input)
-	if err != nil {
-		return err
-	}
-	ppt, ok := pt.(*PointBls48581G2)
-	if !ok {
-		return fmt.Errorf("invalid point")
-	}
-	p.Value = ppt.Value
 	return nil
 }
 
 func (p *PointBls48581G2) MarshalJSON() ([]byte, error) {
-	return pointMarshalJson(p)
+	return nil, nil
 }
 
 func (p *PointBls48581G2) UnmarshalJSON(input []byte) error {
-	pt, err := pointUnmarshalJson(input)
-	if err != nil {
-		return err
-	}
-	P, ok := pt.(*PointBls48581G2)
-	if !ok {
-		return fmt.Errorf("invalid type")
-	}
-	p.Value = P.Value
 	return nil
 }
 
@@ -931,21 +912,25 @@ func bls48multiPairing(points ...PairingPoint) Scalar {
 		return nil
 	}
 	valid := true
-	r := bls48581.Initmp()
+	mem := arena.NewArena()
+	defer mem.Free()
+	r := bls48581.Initmp(mem)
 	for i := 0; i < len(points); i += 2 {
 		pt1, ok := points[i].(*PointBls48581G1)
 		valid = valid && ok
 		pt2, ok := points[i+1].(*PointBls48581G2)
 		valid = valid && ok
 		if valid {
-			bls48581.Another(r, pt2.Value, pt1.Value)
+			inner := arena.NewArena()
+			bls48581.Another(r, pt2.Value, pt1.Value, inner)
+			inner.Free()
 		}
 	}
 	if !valid {
 		return nil
 	}
 
-	v := bls48581.Miller(r)
+	v := bls48581.Miller(r, mem)
 	v = bls48581.Fexp(v)
 	return &ScalarBls48581Gt{v}
 }
@@ -973,15 +958,15 @@ func (s *ScalarBls48581Gt) Hash(bytes []byte) Scalar {
 }
 
 func (s *ScalarBls48581Gt) Zero() Scalar {
-	return &ScalarBls48581Gt{bls48581.NewFP48int(0)}
+	return &ScalarBls48581Gt{bls48581.NewFP48int(0, nil)}
 }
 
 func (s *ScalarBls48581Gt) One() Scalar {
-	return &ScalarBls48581Gt{bls48581.NewFP48int(1)}
+	return &ScalarBls48581Gt{bls48581.NewFP48int(1, nil)}
 }
 
 func (s *ScalarBls48581Gt) IsZero() bool {
-	return s.Value.IsZero()
+	return s.Value.IsZero(nil)
 }
 
 func (s *ScalarBls48581Gt) IsOne() bool {
@@ -1034,7 +1019,7 @@ func (s *ScalarBls48581Gt) IsEven() bool {
 }
 
 func (s *ScalarBls48581Gt) New(input int) Scalar {
-	fp := bls48581.NewFP48int(input)
+	fp := bls48581.NewFP48int(input, nil)
 	return &ScalarBls48581Gt{fp}
 }
 
@@ -1048,20 +1033,20 @@ func (s *ScalarBls48581Gt) Cmp(rhs Scalar) int {
 }
 
 func (s *ScalarBls48581Gt) Square() Scalar {
-	v := bls48581.NewFP48copy(s.Value)
-	v.Sqr()
+	v := bls48581.NewFP48copy(s.Value, nil)
+	v.Sqr(nil)
 	return &ScalarBls48581Gt{v}
 }
 
 func (s *ScalarBls48581Gt) Double() Scalar {
-	v := bls48581.NewFP48copy(s.Value)
-	v.Mul(bls48581.NewFP48int(2))
+	v := bls48581.NewFP48copy(s.Value, nil)
+	v.Mul(bls48581.NewFP48int(2, nil), nil)
 	return &ScalarBls48581Gt{v}
 }
 
 func (s *ScalarBls48581Gt) Invert() (Scalar, error) {
-	v := bls48581.NewFP48copy(s.Value)
-	v.Invert()
+	v := bls48581.NewFP48copy(s.Value, nil)
+	v.Invert(nil)
 	if v == nil {
 		return nil, fmt.Errorf("not invertible")
 	}
@@ -1074,9 +1059,9 @@ func (s *ScalarBls48581Gt) Sqrt() (Scalar, error) {
 }
 
 func (s *ScalarBls48581Gt) Cube() Scalar {
-	v := bls48581.NewFP48copy(s.Value)
-	v.Sqr()
-	v.Mul(s.Value)
+	v := bls48581.NewFP48copy(s.Value, nil)
+	v.Sqr(nil)
+	v.Mul(s.Value, nil)
 	return &ScalarBls48581Gt{v}
 }
 
@@ -1093,8 +1078,8 @@ func (s *ScalarBls48581Gt) Sub(rhs Scalar) Scalar {
 func (s *ScalarBls48581Gt) Mul(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581Gt)
 	if ok {
-		v := bls48581.NewFP48copy(s.Value)
-		v.Mul(r.Value)
+		v := bls48581.NewFP48copy(s.Value, nil)
+		v.Mul(r.Value, nil)
 		return &ScalarBls48581Gt{v}
 	} else {
 		return nil
@@ -1108,9 +1093,9 @@ func (s *ScalarBls48581Gt) MulAdd(y, z Scalar) Scalar {
 func (s *ScalarBls48581Gt) Div(rhs Scalar) Scalar {
 	r, ok := rhs.(*ScalarBls48581Gt)
 	if ok {
-		v := bls48581.NewFP48copy(r.Value)
-		v.Invert()
-		v.Mul(s.Value)
+		v := bls48581.NewFP48copy(r.Value, nil)
+		v.Invert(nil)
+		v.Mul(s.Value, nil)
 		return &ScalarBls48581Gt{v}
 	} else {
 		return nil
@@ -1160,7 +1145,7 @@ func (s *ScalarBls48581Gt) SetBytesWide(bytes []byte) (Scalar, error) {
 }
 
 func (s *ScalarBls48581Gt) Clone() Scalar {
-	fp := bls48581.NewFP48copy(s.Value)
+	fp := bls48581.NewFP48copy(s.Value, nil)
 	return &ScalarBls48581Gt{
 		Value: fp,
 	}

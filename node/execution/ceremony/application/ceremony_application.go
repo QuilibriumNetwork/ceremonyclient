@@ -14,8 +14,6 @@ var ErrInvalidStateTransition = errors.New("invalid state transition")
 
 type CeremonyApplicationState int
 
-const V118_CUTOFF = uint64(45000)
-
 var CEREMONY_ADDRESS = []byte{
 	// SHA3-256("q_kzg_ceremony")
 	0x34, 0x00, 0x1b, 0xe7, 0x43, 0x2c, 0x2e, 0x66,
@@ -50,7 +48,7 @@ type CeremonyApplication struct {
 	StateCount                     uint64
 	RoundCount                     uint64
 	LobbyState                     CeremonyApplicationState
-	ActiveParticipants             []*protobufs.Ed448PublicKey
+	ActiveParticipants             []*protobufs.CeremonyLobbyJoin
 	NextRoundPreferredParticipants []*protobufs.Ed448PublicKey
 	LatestSeenProverAttestations   []*protobufs.CeremonySeenProverAttestation
 	DroppedParticipantAttestations []*protobufs.CeremonyDroppedProverAttestation
@@ -82,8 +80,22 @@ func (a *CeremonyApplication) Equals(b *CeremonyApplication) bool {
 
 	for i := range a.ActiveParticipants {
 		if !bytes.Equal(
-			a.ActiveParticipants[i].KeyValue,
-			b.ActiveParticipants[i].KeyValue,
+			a.ActiveParticipants[i].PublicKeySignatureEd448.PublicKey.KeyValue,
+			b.ActiveParticipants[i].PublicKeySignatureEd448.PublicKey.KeyValue,
+		) {
+			return false
+		}
+
+		if !bytes.Equal(
+			a.ActiveParticipants[i].IdentityKey.KeyValue,
+			b.ActiveParticipants[i].IdentityKey.KeyValue,
+		) {
+			return false
+		}
+
+		if !bytes.Equal(
+			a.ActiveParticipants[i].SignedPreKey.KeyValue,
+			b.ActiveParticipants[i].SignedPreKey.KeyValue,
 		) {
 			return false
 		}
@@ -856,7 +868,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
-		if currentFrameNumber > V118_CUTOFF && a.StateCount > 100 {
+		if a.StateCount > 10 {
 			shouldReset = true
 		}
 
@@ -866,17 +878,19 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.RoundCount = 0
 			for _, p := range a.ActiveParticipants {
 				p := p
-				if _, ok := droppedProversMap[string(p.KeyValue)]; !ok {
+				if _, ok := droppedProversMap[string(
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
+				)]; !ok {
 					a.NextRoundPreferredParticipants = append(
 						append(
 							[]*protobufs.Ed448PublicKey{},
-							p,
+							p.PublicKeySignatureEd448.PublicKey,
 						),
 						a.NextRoundPreferredParticipants...,
 					)
 				}
 			}
-			a.ActiveParticipants = []*protobufs.Ed448PublicKey{}
+			a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
 			a.DroppedParticipantAttestations =
 				[]*protobufs.CeremonyDroppedProverAttestation{}
 			a.LatestSeenProverAttestations =
@@ -958,7 +972,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 
 			a.LobbyState = CEREMONY_APPLICATION_STATE_VALIDATING
-			a.ActiveParticipants = []*protobufs.Ed448PublicKey{}
+			a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
 			a.DroppedParticipantAttestations =
 				[]*protobufs.CeremonyDroppedProverAttestation{}
 			a.LatestSeenProverAttestations =
@@ -984,7 +998,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
-		if currentFrameNumber > V118_CUTOFF && a.StateCount > 100 {
+		if a.StateCount > 10 {
 			shouldReset = true
 		}
 
@@ -994,17 +1008,19 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.RoundCount = 0
 			for _, p := range a.ActiveParticipants {
 				p := p
-				if _, ok := droppedProversMap[string(p.KeyValue)]; !ok {
+				if _, ok := droppedProversMap[string(
+					p.PublicKeySignatureEd448.PublicKey.KeyValue,
+				)]; !ok {
 					a.NextRoundPreferredParticipants = append(
 						append(
 							[]*protobufs.Ed448PublicKey{},
-							p,
+							p.PublicKeySignatureEd448.PublicKey,
 						),
 						a.NextRoundPreferredParticipants...,
 					)
 				}
 			}
-			a.ActiveParticipants = []*protobufs.Ed448PublicKey{}
+			a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
 			a.DroppedParticipantAttestations =
 				[]*protobufs.CeremonyDroppedProverAttestation{}
 			a.LatestSeenProverAttestations =
@@ -1036,7 +1052,25 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
-		if a.UpdatedTranscript == nil {
+		shouldReset := false
+		if a.StateCount > 100 {
+			shouldReset = true
+		}
+
+		if shouldReset {
+			a.LobbyState = CEREMONY_APPLICATION_STATE_OPEN
+			a.StateCount = 0
+			a.RoundCount = 0
+			a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
+			a.DroppedParticipantAttestations =
+				[]*protobufs.CeremonyDroppedProverAttestation{}
+			a.LatestSeenProverAttestations =
+				[]*protobufs.CeremonySeenProverAttestation{}
+			a.TranscriptRoundAdvanceCommits =
+				[]*protobufs.CeremonyAdvanceRound{}
+			a.TranscriptShares =
+				[]*protobufs.CeremonyTranscriptShare{}
+		} else if a.UpdatedTranscript == nil {
 			rewardMultiplier := uint64(1)
 			for i := 0; i < len(a.FinalCommits)-1; i++ {
 				rewardMultiplier = rewardMultiplier << 1
@@ -1064,7 +1098,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.LobbyState = CEREMONY_APPLICATION_STATE_OPEN
 			a.StateCount = 0
 			a.RoundCount = 0
-			a.ActiveParticipants = []*protobufs.Ed448PublicKey{}
+			a.ActiveParticipants = []*protobufs.CeremonyLobbyJoin{}
 			a.DroppedParticipantAttestations =
 				[]*protobufs.CeremonyDroppedProverAttestation{}
 			a.LatestSeenProverAttestations =
