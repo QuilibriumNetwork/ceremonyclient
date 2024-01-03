@@ -235,7 +235,10 @@ func (r *RPCServer) GetTokenInfo(
 	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
 
 	frame, err := r.clockStore.GetLatestDataClockFrame(
-		application.CEREMONY_ADDRESS,
+		append(
+			p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+			p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+		),
 		nil,
 	)
 	if err != nil {
@@ -307,7 +310,10 @@ func (r *RPCServer) GetTokenInfo(
 	}
 
 	candidateFrame, err := r.clockStore.GetHighestCandidateDataClockFrame(
-		application.CEREMONY_ADDRESS,
+		append(
+			p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+			p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+		),
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "get token info")
