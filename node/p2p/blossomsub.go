@@ -126,7 +126,7 @@ func NewBlossomSub(
 		&blossomsub.PeerScoreParams{
 			SkipAtomicValidation:        false,
 			BitmaskScoreCap:             100,
-			IPColocationFactorWeight:    -1,
+			IPColocationFactorWeight:    0,
 			IPColocationFactorThreshold: 6,
 			BehaviourPenaltyWeight:      -80,
 			BehaviourPenaltyThreshold:   100,
