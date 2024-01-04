@@ -17,6 +17,14 @@ If you do not, or have already run the above, run:
 
     GOEXPERIMENT=arenas go run ./...
 
+## Peer ID
+
+In order to find the peer id of a running node, execute the following command from the `node/` folder:
+
+    GOEXPERIMENT=arenas go run ./... --peer-id
+
+The peer id will be printed to stdout.
+
 ## EXPERIMENTAL – gRPC/REST Support
 
 If you want to enable gRPC/REST, add the following entries to your config.yml:
