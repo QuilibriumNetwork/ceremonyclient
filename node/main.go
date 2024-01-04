@@ -38,10 +38,26 @@ var (
 		false,
 		"starts the node in database console mode",
 	)
+
+	peerId = flag.Bool(
+		"peer-id",
+		false,
+		"print the peer id to stdout from the config and exit",
+	)
 )
 
 func main() {
 	flag.Parse()
+
+	if *peerId {
+		config, err := config.LoadConfig(*configDirectory, "")
+		if err != nil {
+			panic(err)
+		}
+
+		printPeerID(config.P2P)
+		return
+	}
 
 	if *importPrivKey != "" {
 		config, err := config.LoadConfig(*configDirectory, *importPrivKey)
