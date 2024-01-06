@@ -415,7 +415,7 @@ func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {
 		return ""
 	}
 
-	return b.h.Peerstore().Addrs(peer.ID(peerId))[0].String()
+	return addrs[0].String()
 }
 
 func (b *BlossomSub) StartDirectChannelListener(
