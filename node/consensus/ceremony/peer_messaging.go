@@ -85,7 +85,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 			)
 			if err != nil {
 				from = 1
-				e.logger.Info("peer fully out of sync, rewinding sync head to start")
+				e.logger.Debug("peer fully out of sync, rewinding sync head to start")
 				break
 			}
 
@@ -95,8 +95,8 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				parent,
 			)
 			if err != nil {
-				from = 1
-				e.logger.Info("peer fully out of sync, rewinding sync head to start")
+				from = frame.FrameNumber - 16
+				e.logger.Debug("peer fully out of sync, rewinding sync head to min")
 				break
 			}
 
@@ -167,6 +167,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 		e.peerMapMx.Lock()
 		if _, ok := e.peerMap[string(peerId)]; ok {
 			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
 			delete(e.peerMap, string(peerId))
 		}
 		e.peerMapMx.Unlock()
