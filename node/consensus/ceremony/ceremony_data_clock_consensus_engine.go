@@ -249,6 +249,8 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	}
 
 	go func() {
+		thresholdBeforeConfirming := 4
+
 		for {
 			time.Sleep(30 * time.Second)
 
@@ -291,7 +293,8 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				if v == nil {
 					continue
 				}
-				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL {
+				if v.timestamp <= time.Now().UnixMilli()-UNCOOPERATIVE_PEER_INFO_TTL ||
+					thresholdBeforeConfirming > 0 {
 					deletes = append(deletes, v)
 				}
 			}
@@ -303,11 +306,17 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 			if err := e.publishMessage(e.filter, list); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
 			}
+
+			if thresholdBeforeConfirming > 0 {
+				thresholdBeforeConfirming--
+			}
 		}
 	}()
 
 	go func() {
 		e.logger.Info("waiting for peer list mappings")
+		// We need to re-tune this so that libp2p's peerstore activation threshold
+		// considers DHT peers to be correct:
 		time.Sleep(30 * time.Second)
 		for e.state < consensus.EngineStateStopping {
 			peerCount := e.pubSub.GetNetworkPeersCount()

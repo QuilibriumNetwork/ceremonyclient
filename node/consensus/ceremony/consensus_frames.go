@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/ff"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -913,20 +914,16 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	max := e.frame.FrameNumber
 	var peer []byte = nil
 	for _, v := range e.peerMap {
-		if v.maxFrame > max {
+		_, ok := e.uncooperativePeersMap[string(v.peerId)]
+		if v.maxFrame > max && !ok {
 			peer = v.peerId
 			max = v.maxFrame
 		}
 	}
-	size := len(e.peerMap)
 	e.peerMapMx.Unlock()
 
 	if peer == nil {
-		if size > 1 {
-			return nil, 0, nil
-		} else {
-			return nil, 0, p2p.ErrNoPeersAvailable
-		}
+		return nil, 0, p2p.ErrNoPeersAvailable
 	}
 
 	return peer, max, nil
@@ -948,10 +945,11 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		e.peerMapMx.Lock()
 		if _, ok := e.peerMap[string(peerId)]; ok {
 			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
 			delete(e.peerMap, string(peerId))
 		}
 		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "reverse optimistic sync")
+		return latest, errors.Wrap(err, "sync")
 	}
 
 	client := protobufs.NewCeremonyServiceClient(cc)
@@ -981,11 +979,15 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		e.peerMapMx.Lock()
 		if _, ok := e.peerMap[string(peerId)]; ok {
 			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
 			delete(e.peerMap, string(peerId))
 		}
 		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "reverse optimistic sync")
+		return latest, errors.Wrap(err, "sync")
 	}
+
+	firstPass := true
+
 	var syncMsg *protobufs.CeremonyCompressedSync
 	for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
 		e.logger.Info(
@@ -995,6 +997,31 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
 			zap.Int("proofs", len(syncMsg.Proofs)),
 		)
+
+		// This can only happen if we get a peer with state that was initially
+		// farther ahead, but something happened. However, this has a sticking
+		// effect that doesn't go away for them until they're caught up again,
+		// so let's not penalize their score and make everyone else suffer,
+		// let's just move on:
+		if syncMsg.FromFrameNumber == 0 &&
+			syncMsg.ToFrameNumber == 0 &&
+			firstPass {
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+
+			e.peerMapMx.Lock()
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().
+					UnixMilli()
+				delete(e.peerMap, string(peerId))
+			}
+			e.peerMapMx.Unlock()
+
+			return currentLatest, errors.Wrap(ErrNoNewFrames, "sync")
+		}
+
 		var next *protobufs.ClockFrame
 		if next, err = e.decompressAndStoreCandidates(
 			peerId,
@@ -1008,6 +1035,8 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			e.peerMapMx.Lock()
 			if _, ok := e.peerMap[string(peerId)]; ok {
 				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().
+					UnixMilli()
 				delete(e.peerMap, string(peerId))
 			}
 			e.peerMapMx.Unlock()
@@ -1016,18 +1045,28 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 				e.logger.Error("error while closing connection", zap.Error(err))
 			}
 
-			return currentLatest, errors.Wrap(err, "reverse optimistic sync")
+			return currentLatest, errors.Wrap(err, "sync")
 		}
 		if next != nil {
 			latest = next
 		}
 	}
 	if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
+		e.logger.Error("error while receiving sync", zap.Error(err))
+
 		if err := cc.Close(); err != nil {
 			e.logger.Error("error while closing connection", zap.Error(err))
 		}
-		e.logger.Error("error while receiving sync", zap.Error(err))
-		return latest, errors.Wrap(err, "reverse optimistic sync")
+
+		e.peerMapMx.Lock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+		e.peerMapMx.Unlock()
+
+		return latest, errors.Wrap(err, "sync")
 	}
 
 	e.logger.Info(
@@ -1052,13 +1091,20 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			latest = e.previousHead
 			e.syncingStatus = SyncStatusNotSyncing
 		}
-		peerId, maxFrame, err := e.GetMostAheadPeer()
-		if err != nil {
-			e.logger.Warn("no peers available, skipping sync")
-		} else if peerId == nil {
-			e.logger.Info("currently up to date, skipping sync")
-		} else if maxFrame-2 > latest.FrameNumber {
-			latest, err = e.sync(latest, maxFrame, peerId)
+		for {
+			peerId, maxFrame, err := e.GetMostAheadPeer()
+			if err != nil {
+				e.logger.Warn("no peers available, skipping sync")
+				break
+			} else if peerId == nil {
+				e.logger.Info("currently up to date, skipping sync")
+				break
+			} else if maxFrame-2 > latest.FrameNumber {
+				latest, err = e.sync(latest, maxFrame, peerId)
+				if err == nil {
+					break
+				}
+			}
 		}
 
 		e.logger.Info(
@@ -1068,7 +1114,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 		e.logger.Info("selecting leader")
 
-		latest, err = e.commitLongestPath(latest)
+		latest, err := e.commitLongestPath(latest)
 		if err != nil {
 			e.logger.Error("could not collect longest path", zap.Error(err))
 			latest, _, err = e.clockStore.GetDataClockFrame(e.filter, 0)
