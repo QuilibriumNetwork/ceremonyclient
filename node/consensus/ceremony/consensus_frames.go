@@ -1091,7 +1091,15 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			latest = e.previousHead
 			e.syncingStatus = SyncStatusNotSyncing
 		}
-		for {
+
+		// With large networks and slow syncing machines, this can lead to an
+		// infinite loop if the list is refreshing fast enough, so make the size
+		// of the map the maximum loop case:
+		e.peerMapMx.Lock()
+		size := len(e.peerMap)
+		e.peerMapMx.Unlock()
+
+		for i := 0; i < size; i++ {
 			peerId, maxFrame, err := e.GetMostAheadPeer()
 			if err != nil {
 				e.logger.Warn("no peers available, skipping sync")
