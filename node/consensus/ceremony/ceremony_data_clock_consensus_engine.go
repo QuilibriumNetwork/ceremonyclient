@@ -213,6 +213,17 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 		panic(err)
 	}
 
+	candidateLatestFrame, err := e.clockStore.GetLatestCandidateDataClockFrame(
+		e.filter,
+	)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		panic(err)
+	}
+
+	if candidateLatestFrame != nil {
+		latestFrame = candidateLatestFrame
+	}
+
 	if latestFrame != nil {
 		e.setFrame(latestFrame)
 	} else {

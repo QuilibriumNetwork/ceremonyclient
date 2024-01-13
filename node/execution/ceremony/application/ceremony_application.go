@@ -646,8 +646,33 @@ func MaterializeApplicationFromFrame(
 			roundCount--
 		}
 
+		stateCount := uint64(0)
+		setCount := false
+
+		if len(inProgress.DroppedParticipantAttestations) > 0 {
+			stateCount = frame.FrameNumber -
+				inProgress.DroppedParticipantAttestations[len(inProgress.DroppedParticipantAttestations)-1].LastSeenFrame
+			setCount = true
+		}
+
+		if len(inProgress.LatestSeenProverAttestations) > 0 {
+			seenCount := frame.FrameNumber -
+				inProgress.LatestSeenProverAttestations[len(inProgress.LatestSeenProverAttestations)-1].LastSeenFrame
+			if !setCount || seenCount < stateCount {
+				stateCount = seenCount
+			}
+		}
+
+		if len(inProgress.ActiveParticipants) > 0 {
+			lastStateCount := frame.FrameNumber -
+				inProgress.ActiveParticipants[len(inProgress.ActiveParticipants)-1].FrameNumber
+			if !setCount || (lastStateCount < stateCount && lastStateCount > 20) {
+				stateCount = lastStateCount - 20
+			}
+		}
+
 		return &CeremonyApplication{
-			StateCount:                     0,
+			StateCount:                     stateCount,
 			RoundCount:                     uint64(roundCount),
 			LobbyState:                     CEREMONY_APPLICATION_STATE_IN_PROGRESS,
 			NextRoundPreferredParticipants: inProgress.NextRoundParticipants,
@@ -667,8 +692,33 @@ func MaterializeApplicationFromFrame(
 			)
 		}
 
+		stateCount := uint64(0)
+		setCount := false
+
+		if len(finalizing.DroppedParticipantAttestations) > 0 {
+			stateCount = frame.FrameNumber -
+				finalizing.DroppedParticipantAttestations[len(finalizing.DroppedParticipantAttestations)-1].LastSeenFrame
+			setCount = true
+		}
+
+		if len(finalizing.LatestSeenProverAttestations) > 0 {
+			seenCount := frame.FrameNumber -
+				finalizing.LatestSeenProverAttestations[len(finalizing.LatestSeenProverAttestations)-1].LastSeenFrame
+			if !setCount || seenCount < stateCount {
+				stateCount = seenCount
+			}
+		}
+
+		if len(finalizing.ActiveParticipants) > 0 {
+			lastStateCount := frame.FrameNumber -
+				finalizing.ActiveParticipants[len(finalizing.ActiveParticipants)-1].FrameNumber
+			if !setCount || (lastStateCount < stateCount && lastStateCount > 200) {
+				stateCount = lastStateCount - 200
+			}
+		}
+
 		return &CeremonyApplication{
-			StateCount:                     0,
+			StateCount:                     stateCount,
 			RoundCount:                     0,
 			LobbyState:                     CEREMONY_APPLICATION_STATE_FINALIZING,
 			ActiveParticipants:             finalizing.ActiveParticipants,
