@@ -34,6 +34,9 @@ type ClockStore interface {
 		filter []byte,
 		proverTrie *tries.RollingFrecencyCritbitTrie,
 	) (*protobufs.ClockFrame, error)
+	GetLatestCandidateDataClockFrame(
+		filter []byte,
+	) (*protobufs.ClockFrame, error)
 	GetEarliestDataClockFrame(filter []byte) (*protobufs.ClockFrame, error)
 	GetDataClockFrame(
 		filter []byte,
@@ -324,6 +327,8 @@ const CLOCK_MASTER_FRAME_INDEX_PARENT = 0x30 | CLOCK_MASTER_FRAME_DATA
 const CLOCK_DATA_FRAME_INDEX_EARLIEST = 0x10 | CLOCK_DATA_FRAME_DATA
 const CLOCK_DATA_FRAME_INDEX_LATEST = 0x20 | CLOCK_DATA_FRAME_DATA
 const CLOCK_DATA_FRAME_INDEX_PARENT = 0x30 | CLOCK_DATA_FRAME_DATA
+const CLOCK_DATA_FRAME_CANDIDATE_INDEX_LATEST = 0x20 |
+	CLOCK_DATA_FRAME_CANDIDATE_DATA
 
 //
 // DB Keys
@@ -382,6 +387,10 @@ func clockMasterLatestIndex(filter []byte) []byte {
 
 func clockDataLatestIndex(filter []byte) []byte {
 	return clockLatestIndex(filter, CLOCK_DATA_FRAME_INDEX_LATEST)
+}
+
+func clockDataCandidateLatestIndex(filter []byte) []byte {
+	return clockLatestIndex(filter, CLOCK_DATA_FRAME_CANDIDATE_INDEX_LATEST)
 }
 
 func clockEarliestIndex(filter []byte, frameType byte) []byte {
@@ -801,6 +810,33 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	return frame, nil
 }
 
+func (p *PebbleClockStore) GetLatestCandidateDataClockFrame(
+	filter []byte,
+) (*protobufs.ClockFrame, error) {
+	idxValue, closer, err := p.db.Get(clockDataCandidateLatestIndex(filter))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get latest candidate data clock frame")
+	}
+
+	frameNumber := binary.BigEndian.Uint64(idxValue)
+	frames, err := p.GetCandidateDataClockFrames(filter, frameNumber)
+	if err != nil {
+		return nil, errors.Wrap(err, "get latest candidate data clock frame")
+	}
+
+	closer.Close()
+
+	if len(frames) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return frames[0], nil
+}
+
 // GetLeadingCandidateDataClockFrame implements ClockStore.
 func (p *PebbleClockStore) GetLeadingCandidateDataClockFrame(
 	filter []byte,
@@ -905,6 +941,29 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 		data,
 	); err != nil {
 		return errors.Wrap(err, "put candidate data clock frame")
+	}
+
+	numberBytes, closer, err := p.db.Get(clockDataCandidateLatestIndex(frame.Filter))
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return errors.Wrap(err, "put candidate data clock frame")
+	}
+
+	existingNumber := uint64(0)
+
+	if numberBytes != nil {
+		existingNumber = binary.BigEndian.Uint64(numberBytes)
+		closer.Close()
+	}
+
+	if frame.FrameNumber > existingNumber {
+		frameNumberBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(frameNumberBytes, frame.FrameNumber)
+		if err = txn.Set(
+			clockDataCandidateLatestIndex(frame.Filter),
+			frameNumberBytes,
+		); err != nil {
+			return errors.Wrap(err, "put candidate data clock frame")
+		}
 	}
 
 	return nil
@@ -1683,6 +1742,24 @@ func (p *PebbleClockStore) DeleteCandidateDataClockFrameRange(
 		),
 	)
 	return errors.Wrap(err, "delete candidate data clock frame range")
+}
+
+func (p *PebbleClockStore) DeleteDataClockFrameRange(
+	filter []byte,
+	fromFrameNumber uint64,
+	toFrameNumber uint64,
+) error {
+	err := p.db.DeleteRange(
+		clockDataFrameKey(
+			filter,
+			fromFrameNumber,
+		),
+		clockDataFrameKey(
+			filter,
+			toFrameNumber,
+		),
+	)
+	return errors.Wrap(err, "delete data clock frame range")
 }
 
 func (p *PebbleClockStore) GetHighestCandidateDataClockFrame(

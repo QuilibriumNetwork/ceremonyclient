@@ -972,7 +972,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
 	if err != nil {
-		e.logger.Error(
+		e.logger.Debug(
 			"received error from peer",
 			zap.Error(err),
 		)
@@ -1052,7 +1052,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		}
 	}
 	if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
-		e.logger.Error("error while receiving sync", zap.Error(err))
+		e.logger.Debug("error while receiving sync", zap.Error(err))
 
 		if err := cc.Close(); err != nil {
 			e.logger.Error("error while closing connection", zap.Error(err))

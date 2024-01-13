@@ -398,6 +398,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 				),
 				zap.Bool("in_round", inRound),
 				zap.Uint64("current_sub_round", app.RoundCount),
+				zap.Uint64("stale_state_count", app.StateCount),
 			)
 
 			shouldConnect := false

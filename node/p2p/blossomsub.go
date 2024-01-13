@@ -328,7 +328,7 @@ func initDHT(
 			go func() {
 				defer wg.Done()
 				if err := h.Connect(ctx, *peerinfo); err != nil {
-					logger.Warn("error while connecting to dht peer", zap.Error(err))
+					logger.Debug("error while connecting to dht peer", zap.Error(err))
 				}
 				logger.Info(
 					"connected to peer",
@@ -517,7 +517,7 @@ func discoverPeers(
 			logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
 			err := h.Connect(ctx, peer)
 			if err != nil {
-				logger.Warn(
+				logger.Debug(
 					"error while connecting to blossomsub peer",
 					zap.String("peer_id", peer.ID.Pretty()),
 					zap.Error(err),
