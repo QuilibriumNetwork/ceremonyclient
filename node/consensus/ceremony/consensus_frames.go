@@ -915,7 +915,8 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	var peer []byte = nil
 	for _, v := range e.peerMap {
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
-		if v.maxFrame > max && !ok {
+		if v.maxFrame > max &&
+			v.timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() && !ok {
 			peer = v.peerId
 			max = v.maxFrame
 		}

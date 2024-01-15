@@ -100,6 +100,12 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 
 	switch any.TypeUrl {
 	case protobufs.ClockFrameType:
+		e.peerMapMx.Lock()
+		if peer, ok := e.peerMap[string(message.From)]; !ok ||
+			bytes.Compare(peer.version, consensus.GetMinimumVersion()) < 0 {
+			return nil
+		}
+		e.peerMapMx.Unlock()
 		if err := e.handleClockFrameData(
 			message.From,
 			msg.Address,
@@ -150,22 +156,13 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 		}
 
 		if p.PublicKey == nil || p.Signature == nil || p.Version == nil {
-			if time.Now().After(consensus.GetMinimumVersionCutoff()) {
-				if bytes.Equal(p.PeerId, peerID) {
-					e.logger.Warn(
-						"peer provided outdated version, penalizing app score",
-						zap.Binary("peer_id", p.PeerId),
-					)
-					e.pubSub.SetPeerScore(p.PeerId, -100)
-				}
-				continue
-			}
+			continue
 		}
 
 		if p.PublicKey != nil && p.Signature != nil && p.Version != nil {
 			key, err := pcrypto.UnmarshalEd448PublicKey(p.PublicKey)
 			if err != nil {
-				e.logger.Error(
+				e.logger.Warn(
 					"peer announcement contained invalid pubkey",
 					zap.Binary("public_key", p.PublicKey),
 				)
@@ -173,7 +170,7 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			}
 
 			if !(peer.ID(p.PeerId)).MatchesPublicKey(key) {
-				e.logger.Error(
+				e.logger.Warn(
 					"peer announcement peer id does not match pubkey",
 					zap.Binary("peer_id", p.PeerId),
 					zap.Binary("public_key", p.PublicKey),
@@ -186,7 +183,7 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			msg = binary.BigEndian.AppendUint64(msg, uint64(p.Timestamp))
 			b, err := key.Verify(msg, p.Signature)
 			if err != nil || !b {
-				e.logger.Error(
+				e.logger.Warn(
 					"peer provided invalid signature",
 					zap.Binary("msg", msg),
 					zap.Binary("public_key", p.PublicKey),
@@ -196,8 +193,8 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			}
 
 			if bytes.Compare(p.Version, consensus.GetMinimumVersion()) < 0 &&
-				time.Now().After(consensus.GetMinimumVersionCutoff()) {
-				e.logger.Warn(
+				p.Timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() {
+				e.logger.Debug(
 					"peer provided outdated version, penalizing app score",
 					zap.Binary("peer_id", p.PeerId),
 				)
