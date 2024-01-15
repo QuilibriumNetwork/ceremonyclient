@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -84,18 +85,21 @@ func newDBConsole(nodeConfig *config.Config) (*DBConsole, error) {
 }
 
 type model struct {
-	filters        []string
-	cursor         int
-	selectedFilter string
-	conn           *grpc.ClientConn
-	client         protobufs.NodeServiceClient
-	peerId         string
-	errorMsg       string
-	frame          *protobufs.ClockFrame
-	frames         []*protobufs.ClockFrame
-	frameIndex     int
-	grpcWarn       bool
-	committed      bool
+	filters          []string
+	cursor           int
+	selectedFilter   string
+	conn             *grpc.ClientConn
+	client           protobufs.NodeServiceClient
+	peerId           string
+	errorMsg         string
+	frame            *protobufs.ClockFrame
+	frames           []*protobufs.ClockFrame
+	frameIndex       int
+	grpcWarn         bool
+	committed        bool
+	lastChecked      int64
+	owned            *big.Int
+	unconfirmedOwned *big.Int
 }
 
 func (m model) Init() tea.Cmd {
@@ -103,8 +107,24 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
+	if m.conn.GetState() == connectivity.Ready {
+		if m.lastChecked < (time.Now().UnixMilli() - 10_000) {
+			m.lastChecked = time.Now().UnixMilli()
+			info, err := m.client.GetTokenInfo(
+				context.Background(),
+				&protobufs.GetTokenInfoRequest{},
+			)
+			if err == nil {
+				conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
+				m.owned = new(big.Int).SetBytes(info.OwnedTokens)
+				m.owned.Div(m.owned, conversionFactor)
+				m.unconfirmedOwned = new(big.Int).SetBytes(info.UnconfirmedOwnedTokens)
+				m.unconfirmedOwned.Div(m.unconfirmedOwned, conversionFactor)
+			}
+		}
+	}
 
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
@@ -462,9 +482,23 @@ func (m model) View() string {
 		}
 	}
 
+	ownedVal := statusItemStyle.Copy().
+		Render("Owned: " + m.owned.String())
+	if m.owned.Cmp(big.NewInt(-1)) == 0 {
+		ownedVal = statusItemStyle.Copy().
+			Render("")
+	}
+
+	unconfirmedOwnedVal := statusItemStyle.Copy().
+		Render("Unconfirmed: " + m.unconfirmedOwned.String())
+	if m.unconfirmedOwned.Cmp(big.NewInt(-1)) == 0 {
+		unconfirmedOwnedVal = statusItemStyle.Copy().
+			Render("")
+	}
 	peerIdVal := statusItemStyle.Render(m.peerId)
 	statusVal := statusBarStyle.Copy().
-		Width(physicalWidth-w(statusKey)-w(info)-w(peerIdVal)).
+		Width(physicalWidth-w(statusKey)-w(info)-w(peerIdVal)-w(ownedVal)-
+			w(unconfirmedOwnedVal)).
 		Padding(0, 1).
 		Render(onlineStatus)
 
@@ -473,6 +507,8 @@ func (m model) View() string {
 		statusVal,
 		info,
 		peerIdVal,
+		ownedVal,
+		unconfirmedOwnedVal,
 	)
 
 	explorerContent := ""
@@ -735,11 +771,13 @@ func consoleModel(
 				p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
 			)),
 		},
-		cursor:   0,
-		conn:     conn,
-		client:   protobufs.NewNodeServiceClient(conn),
-		peerId:   id.String(),
-		grpcWarn: grpcWarn,
+		cursor:           0,
+		conn:             conn,
+		client:           protobufs.NewNodeServiceClient(conn),
+		owned:            big.NewInt(-1),
+		unconfirmedOwned: big.NewInt(-1),
+		peerId:           id.String(),
+		grpcWarn:         grpcWarn,
 	}
 }
 

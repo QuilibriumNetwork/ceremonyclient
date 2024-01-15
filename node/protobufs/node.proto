@@ -68,6 +68,9 @@ message TokenInfoResponse {
   // The total number of tokens owned by the prover address associated with the
   // node.
   bytes owned_tokens = 3;
+  // The total number of tokens owned by the prover address associated with the
+  // node, including unconfirmed frame data.
+  bytes unconfirmed_owned_tokens = 4;
 }
 
 service NodeService {

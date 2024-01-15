@@ -262,6 +262,7 @@ func (r *RPCServer) GetTokenInfo(
 	confirmedTotal := new(big.Int)
 	unconfirmedTotal := new(big.Int)
 	ownedTotal := new(big.Int)
+	unconfirmedOwnedTotal := new(big.Int)
 	if confirmed.RewardTrie.Root == nil ||
 		(confirmed.RewardTrie.Root.External == nil &&
 			confirmed.RewardTrie.Root.Internal == nil) {
@@ -269,6 +270,7 @@ func (r *RPCServer) GetTokenInfo(
 			ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
 			UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
 			OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
+			UnconfirmedOwnedTokens: unconfirmedOwnedTotal.FillBytes(make([]byte, 32)),
 		}, nil
 	}
 
@@ -352,6 +354,15 @@ func (r *RPCServer) GetTokenInfo(
 			unconfirmedTotal,
 			new(big.Int).SetUint64(unconfirmed.RewardTrie.Root.External.Total),
 		)
+		if bytes.Equal(
+			unconfirmed.RewardTrie.Root.External.Key,
+			addrBytes,
+		) {
+			unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
+				unconfirmedOwnedTotal,
+				new(big.Int).SetUint64(unconfirmed.RewardTrie.Root.External.Total),
+			)
+		}
 	}
 
 	for len(limbs) != 0 {
@@ -366,6 +377,24 @@ func (r *RPCServer) GetTokenInfo(
 						unconfirmedTotal,
 						new(big.Int).SetUint64(child.External.Total),
 					)
+					if bytes.Equal(
+						child.External.Key,
+						addrBytes,
+					) {
+						unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
+							unconfirmedOwnedTotal,
+							new(big.Int).SetUint64(child.External.Total),
+						)
+					}
+					if bytes.Equal(
+						child.External.Key,
+						peerAddrBytes,
+					) {
+						unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
+							unconfirmedOwnedTotal,
+							new(big.Int).SetUint64(child.External.Total),
+						)
+					}
 				}
 			}
 		}
@@ -381,11 +410,16 @@ func (r *RPCServer) GetTokenInfo(
 	confirmedTotal = confirmedTotal.Mul(confirmedTotal, conversionFactor)
 	unconfirmedTotal = unconfirmedTotal.Mul(unconfirmedTotal, conversionFactor)
 	ownedTotal = ownedTotal.Mul(ownedTotal, conversionFactor)
+	unconfirmedOwnedTotal = unconfirmedOwnedTotal.Mul(
+		unconfirmedOwnedTotal,
+		conversionFactor,
+	)
 
 	return &protobufs.TokenInfoResponse{
 		ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
 		UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
 		OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
+		UnconfirmedOwnedTokens: unconfirmedOwnedTotal.FillBytes(make([]byte, 32)),
 	}, nil
 }
 
