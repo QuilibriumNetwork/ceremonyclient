@@ -425,6 +425,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 				err := e.connectToActivePeers(app, position)
 				if err != nil {
 					e.logger.Error("error while connecting to peers", zap.Error(err))
+					e.publishDroppedParticipant(e.proverPublicKey)
 					continue
 				}
 			}
@@ -703,6 +704,14 @@ func (e *CeremonyExecutionEngine) connectToActivePeers(
 				e.pubSub,
 			)
 			if err != nil {
+				e.logger.Error(
+					"could not establish p2p channel",
+					zap.Binary(
+						"proving_key",
+						p.PublicKeySignatureEd448.PublicKey.KeyValue,
+					),
+					zap.Error(err),
+				)
 				return errors.Wrap(err, "connect to active peers")
 			}
 		}

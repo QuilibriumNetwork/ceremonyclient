@@ -220,15 +220,15 @@ func (a *CeremonyApplication) applyTranscriptCommit(
 		}
 	}
 
+	if maxRounds < a.RoundCount-1 {
+		return errors.Wrap(
+			errors.New("round limit exceeded"),
+			"apply transcript commit",
+		)
+	}
+
 	if len(a.TranscriptRoundAdvanceCommits[a.RoundCount-1].Commits) ==
 		len(a.ActiveParticipants) {
-		if maxRounds ==
-			uint64(len(a.TranscriptRoundAdvanceCommits)) {
-			return errors.Wrap(
-				errors.New("round limit exceeded"),
-				"apply transcript commit",
-			)
-		}
 		a.TranscriptRoundAdvanceCommits = append(
 			a.TranscriptRoundAdvanceCommits,
 			&protobufs.CeremonyAdvanceRound{

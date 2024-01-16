@@ -884,10 +884,10 @@ func (a *CeremonyApplication) ApplyTransition(
 			maxRounds = maxRounds << 1
 		}
 
-		if a.RoundCount == maxRounds &&
+		if a.RoundCount >= maxRounds &&
 			uint64(len(a.TranscriptRoundAdvanceCommits)) == a.RoundCount &&
 			len(a.ActiveParticipants) ==
-				len(a.TranscriptRoundAdvanceCommits[a.RoundCount-1].Commits) {
+				len(a.TranscriptRoundAdvanceCommits[maxRounds-1].Commits) {
 			a.LobbyState = CEREMONY_APPLICATION_STATE_FINALIZING
 			a.FinalCommits = a.TranscriptRoundAdvanceCommits[a.RoundCount-1].Commits
 			a.RoundCount = 0
