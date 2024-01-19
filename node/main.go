@@ -60,6 +60,11 @@ func main() {
 			panic(err)
 		}
 
+		if config.ListenGRPCMultiaddr == "" {
+			_, _ = fmt.Fprintf(os.Stderr, "gRPC Not Enabled, Please Configure\n")
+			os.Exit(1)
+		}
+
 		conn, err := app.ConnectToNode(config)
 		if err != nil {
 			panic(err)
