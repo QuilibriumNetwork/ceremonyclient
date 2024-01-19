@@ -21,7 +21,7 @@ If you do not, or have already run the above, run:
 
 In order to find the peer id of a running node, execute the following command from the `node/` folder:
 
-    GOEXPERIMENT=arenas go run ./... --peer-id
+    GOEXPERIMENT=arenas go run ./... -peer-id
 
 The peer id will be printed to stdout.
 
@@ -40,7 +40,7 @@ access via firewall or only query via localhost.
 
 In order to query the token balance of a running node, execute the following command from the `node/` folder:
 
-    GOEXPERIMENT=arenas go run ./... --balance
+    GOEXPERIMENT=arenas go run ./... -balance
 
 The confirmed token balance will be printed to stdout in QUILs.
 
