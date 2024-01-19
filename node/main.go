@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -28,17 +29,21 @@ var (
 		filepath.Join(".", ".config"),
 		"the configuration directory",
 	)
-	importPrivKey = flag.String(
-		"import-priv-key",
-		"",
-		"creates a new config using a specific key from the phase one ceremony",
+	balance = flag.Bool(
+		"balance",
+		false,
+		"print the node's confirmed token balance to stdout and exit",
 	)
 	dbConsole = flag.Bool(
 		"db-console",
 		false,
 		"starts the node in database console mode",
 	)
-
+	importPrivKey = flag.String(
+		"import-priv-key",
+		"",
+		"creates a new config using a specific key from the phase one ceremony",
+	)
 	peerId = flag.Bool(
 		"peer-id",
 		false,
@@ -48,6 +53,30 @@ var (
 
 func main() {
 	flag.Parse()
+
+	if *balance {
+		config, err := config.LoadConfig(*configDirectory, "")
+		if err != nil {
+			panic(err)
+		}
+
+		conn, err := app.ConnectToNode(config)
+		if err != nil {
+			panic(err)
+		}
+		defer conn.Close()
+
+		client := protobufs.NewNodeServiceClient(conn)
+
+		balance, err := app.FetchTokenBalance(client)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println("Confirmed balance:", balance.Owned, "QUIL")
+
+		return
+	}
 
 	if *peerId {
 		config, err := config.LoadConfig(*configDirectory, "")
