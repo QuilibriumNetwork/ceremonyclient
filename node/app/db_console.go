@@ -841,7 +841,7 @@ func (c *DBConsole) Run() {
 	}
 	defer conn.Close()
 
-	grpcWarn := conn.Target() == defaultGrpcAddress
+	grpcWarn := c.nodeConfig.ListenGRPCMultiaddr == ""
 
 	p := tea.NewProgram(consoleModel(conn, c.nodeConfig, grpcWarn))
 	if _, err := p.Run(); err != nil {
