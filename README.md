@@ -36,6 +36,16 @@ Please note: this interface, while read-only, is unauthenticated and not rate-
 limited. It is recommended that you only enable if you are properly controlling
 access via firewall or only query via localhost.
 
+## Token Balance
+
+In order to query the token balance of a running node, execute the following command from the `node/` folder:
+
+    GOEXPERIMENT=arenas go run ./... --balance
+
+The confirmed token balance will be printed to stdout in QUILs.
+
+Note that this feature requires that [gRPC support](#experimental--grpcrest-support) is enabled.
+
 ## Purpose
 
 The ceremony application provides a secure reference string (SRS) from which
