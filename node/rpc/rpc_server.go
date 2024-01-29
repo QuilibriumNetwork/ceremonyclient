@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"math/big"
 	"net/http"
 
@@ -196,6 +197,18 @@ func (r *RPCServer) GetNetworkInfo(
 	req *protobufs.GetNetworkInfoRequest,
 ) (*protobufs.NetworkInfoResponse, error) {
 	return r.pubSub.GetNetworkInfo(), nil
+}
+
+// GetPeerID implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetPeerID(
+	ctx context.Context,
+	req *protobufs.GetPeerIDRequest,
+) (*protobufs.PeerIDResponse, error) {
+	peerID, err := peer.IDFromBytes(r.pubSub.GetPeerID())
+	if err != nil {
+		return nil, errors.Wrap(err, "getting id from bytes")
+	}
+	return &protobufs.PeerIDResponse{PeerId: peerID.String()}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.
