@@ -110,16 +110,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.conn.GetState() == connectivity.Ready {
 		if m.lastChecked < (time.Now().UnixMilli() - 10_000) {
 			m.lastChecked = time.Now().UnixMilli()
-			info, err := m.client.GetTokenInfo(
-				context.Background(),
-				&protobufs.GetTokenInfoRequest{},
-			)
+
+			tokenBalance, err := FetchTokenBalance(m.client)
 			if err == nil {
-				conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
-				m.owned = new(big.Int).SetBytes(info.OwnedTokens)
-				m.owned.Div(m.owned, conversionFactor)
-				m.unconfirmedOwned = new(big.Int).SetBytes(info.UnconfirmedOwnedTokens)
-				m.unconfirmedOwned.Div(m.unconfirmedOwned, conversionFactor)
+				m.owned = tokenBalance.Owned
+				m.unconfirmedOwned = tokenBalance.UnconfirmedOwned
 			}
 		}
 	}
@@ -781,12 +776,13 @@ func consoleModel(
 	}
 }
 
-// Runs the DB console
-func (c *DBConsole) Run() {
-	grpcWarn := true
-	addr := "localhost:8337"
-	if c.nodeConfig.ListenGRPCMultiaddr != "" {
-		ma, err := multiaddr.NewMultiaddr(c.nodeConfig.ListenGRPCMultiaddr)
+var defaultGrpcAddress = "localhost:8337"
+
+// Connect to the node via GRPC
+func ConnectToNode(nodeConfig *config.Config) (*grpc.ClientConn, error) {
+	addr := defaultGrpcAddress
+	if nodeConfig.ListenGRPCMultiaddr != "" {
+		ma, err := multiaddr.NewMultiaddr(nodeConfig.ListenGRPCMultiaddr)
 		if err != nil {
 			panic(err)
 		}
@@ -795,10 +791,9 @@ func (c *DBConsole) Run() {
 		if err != nil {
 			panic(err)
 		}
-		grpcWarn = false
 	}
 
-	conn, err := grpc.Dial(
+	return grpc.Dial(
 		addr,
 		grpc.WithTransportCredentials(
 			insecure.NewCredentials(),
@@ -808,11 +803,46 @@ func (c *DBConsole) Run() {
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		),
 	)
+}
+
+type TokenBalance struct {
+	Owned            *big.Int
+	UnconfirmedOwned *big.Int
+}
+
+func FetchTokenBalance(client protobufs.NodeServiceClient) (TokenBalance, error) {
+	info, err := client.GetTokenInfo(
+		context.Background(),
+		&protobufs.GetTokenInfoRequest{},
+	)
+	if err != nil {
+		return TokenBalance{}, errors.Wrap(err, "error getting token info")
+	}
+
+	conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
+
+	owned := new(big.Int).SetBytes(info.OwnedTokens)
+	owned.Div(owned, conversionFactor)
+
+	unconfirmedOwned := new(big.Int).SetBytes(info.UnconfirmedOwnedTokens)
+	unconfirmedOwned.Div(unconfirmedOwned, conversionFactor)
+
+	return TokenBalance{
+		Owned:            owned,
+		UnconfirmedOwned: unconfirmedOwned,
+	}, nil
+}
+
+// Runs the DB console
+func (c *DBConsole) Run() {
+	conn, err := ConnectToNode(c.nodeConfig)
 	if err != nil {
 		panic(err)
 	}
-
 	defer conn.Close()
+
+	grpcWarn := c.nodeConfig.ListenGRPCMultiaddr == ""
+
 	p := tea.NewProgram(consoleModel(conn, c.nodeConfig, grpcWarn))
 	if _, err := p.Run(); err != nil {
 		panic(err)
