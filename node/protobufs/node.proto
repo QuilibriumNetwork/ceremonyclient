@@ -57,6 +57,7 @@ message NetworkInfo {
 message NodeInfoResponse {
   string peer_id = 1;
   uint64 max_frame = 2;
+  uint64 peer_score = 3;
 }
 
 message NetworkInfoResponse {

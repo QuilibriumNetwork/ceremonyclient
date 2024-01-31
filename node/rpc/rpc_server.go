@@ -25,8 +25,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
-var filter = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-
 type RPCServer struct {
 	protobufs.UnimplementedNodeServiceServer
 	listenAddrGRPC   string
@@ -211,12 +209,18 @@ func (r *RPCServer) GetNodeInfo(
 		return nil, errors.Wrap(err, "getting id from bytes")
 	}
 
-	maxClockFrame, err := r.clockStore.GetLatestMasterClockFrame(filter)
-	if err != nil {
-		return nil, errors.Wrap(err, "getting latest frame")
+	maxFrame := &protobufs.ClockFrame{}
+	for _, e := range r.executionEngines {
+		if frame := e.GetFrame(); frame != nil {
+			if frameNr := frame.GetFrameNumber(); frameNr > maxFrame.GetFrameNumber() {
+				maxFrame = frame
+			}
+		}
 	}
 
-	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxClockFrame.FrameNumber}, nil
+	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
+
+	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxFrame.FrameNumber, PeerScore: uint64(peerScore)}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.
