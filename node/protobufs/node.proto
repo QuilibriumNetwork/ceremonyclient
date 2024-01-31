@@ -21,7 +21,7 @@ message GetFrameInfoRequest {
 
 message GetPeerInfoRequest {}
 
-message GetPeerIDRequest {}
+message GetNodeInfoRequest {}
 
 message GetNetworkInfoRequest {}
 
@@ -54,8 +54,9 @@ message NetworkInfo {
   double peer_score = 3;
 }
 
-message PeerIDResponse {
+message NodeInfoResponse {
   string peer_id = 1;
+  uint64 max_frame = 2;
 }
 
 message NetworkInfoResponse {
@@ -83,7 +84,7 @@ service NodeService {
   rpc GetFrames(GetFramesRequest) returns (FramesResponse);
   rpc GetFrameInfo(GetFrameInfoRequest) returns (FrameInfoResponse);
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
-  rpc GetPeerID(GetPeerIDRequest) returns (PeerIDResponse);
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
   rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
 }

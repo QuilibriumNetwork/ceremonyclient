@@ -25,6 +25,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
+var filter = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+
 type RPCServer struct {
 	protobufs.UnimplementedNodeServiceServer
 	listenAddrGRPC   string
@@ -199,16 +201,22 @@ func (r *RPCServer) GetNetworkInfo(
 	return r.pubSub.GetNetworkInfo(), nil
 }
 
-// GetPeerID implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetPeerID(
+// GetNodeInfo implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetNodeInfo(
 	ctx context.Context,
-	req *protobufs.GetPeerIDRequest,
-) (*protobufs.PeerIDResponse, error) {
+	req *protobufs.GetNodeInfoRequest,
+) (*protobufs.NodeInfoResponse, error) {
 	peerID, err := peer.IDFromBytes(r.pubSub.GetPeerID())
 	if err != nil {
 		return nil, errors.Wrap(err, "getting id from bytes")
 	}
-	return &protobufs.PeerIDResponse{PeerId: peerID.String()}, nil
+
+	maxClockFrame, err := r.clockStore.GetLatestMasterClockFrame(filter)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting latest frame")
+	}
+
+	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxClockFrame.FrameNumber}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.
