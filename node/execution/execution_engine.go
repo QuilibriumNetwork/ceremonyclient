@@ -14,4 +14,5 @@ type ExecutionEngine interface {
 		message *protobufs.Message,
 	) ([]*protobufs.Message, error)
 	GetPeerInfo() *protobufs.PeerInfoResponse
+	GetFrame() *protobufs.ClockFrame
 }

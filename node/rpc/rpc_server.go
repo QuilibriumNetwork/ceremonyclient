@@ -199,16 +199,28 @@ func (r *RPCServer) GetNetworkInfo(
 	return r.pubSub.GetNetworkInfo(), nil
 }
 
-// GetPeerID implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetPeerID(
+// GetNodeInfo implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetNodeInfo(
 	ctx context.Context,
-	req *protobufs.GetPeerIDRequest,
-) (*protobufs.PeerIDResponse, error) {
+	req *protobufs.GetNodeInfoRequest,
+) (*protobufs.NodeInfoResponse, error) {
 	peerID, err := peer.IDFromBytes(r.pubSub.GetPeerID())
 	if err != nil {
 		return nil, errors.Wrap(err, "getting id from bytes")
 	}
-	return &protobufs.PeerIDResponse{PeerId: peerID.String()}, nil
+
+	maxFrame := &protobufs.ClockFrame{}
+	for _, e := range r.executionEngines {
+		if frame := e.GetFrame(); frame != nil {
+			if frameNr := frame.GetFrameNumber(); frameNr > maxFrame.GetFrameNumber() {
+				maxFrame = frame
+			}
+		}
+	}
+
+	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
+
+	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxFrame.FrameNumber, PeerScore: uint64(peerScore)}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.

@@ -22,7 +22,7 @@ const (
 	NodeService_GetFrames_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetFrames"
 	NodeService_GetFrameInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
 	NodeService_GetPeerInfo_FullMethodName    = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
-	NodeService_GetPeerID_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetPeerID"
+	NodeService_GetNodeInfo_FullMethodName    = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
 	NodeService_GetNetworkInfo_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetNetworkInfo"
 	NodeService_GetTokenInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetTokenInfo"
 )
@@ -34,7 +34,7 @@ type NodeServiceClient interface {
 	GetFrames(ctx context.Context, in *GetFramesRequest, opts ...grpc.CallOption) (*FramesResponse, error)
 	GetFrameInfo(ctx context.Context, in *GetFrameInfoRequest, opts ...grpc.CallOption) (*FrameInfoResponse, error)
 	GetPeerInfo(ctx context.Context, in *GetPeerInfoRequest, opts ...grpc.CallOption) (*PeerInfoResponse, error)
-	GetPeerID(ctx context.Context, in *GetPeerIDRequest, opts ...grpc.CallOption) (*PeerIDResponse, error)
+	GetNodeInfo(ctx context.Context, in *GetNodeInfoRequest, opts ...grpc.CallOption) (*NodeInfoResponse, error)
 	GetNetworkInfo(ctx context.Context, in *GetNetworkInfoRequest, opts ...grpc.CallOption) (*NetworkInfoResponse, error)
 	GetTokenInfo(ctx context.Context, in *GetTokenInfoRequest, opts ...grpc.CallOption) (*TokenInfoResponse, error)
 }
@@ -74,9 +74,9 @@ func (c *nodeServiceClient) GetPeerInfo(ctx context.Context, in *GetPeerInfoRequ
 	return out, nil
 }
 
-func (c *nodeServiceClient) GetPeerID(ctx context.Context, in *GetPeerIDRequest, opts ...grpc.CallOption) (*PeerIDResponse, error) {
-	out := new(PeerIDResponse)
-	err := c.cc.Invoke(ctx, NodeService_GetPeerID_FullMethodName, in, out, opts...)
+func (c *nodeServiceClient) GetNodeInfo(ctx context.Context, in *GetNodeInfoRequest, opts ...grpc.CallOption) (*NodeInfoResponse, error) {
+	out := new(NodeInfoResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetNodeInfo_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +108,7 @@ type NodeServiceServer interface {
 	GetFrames(context.Context, *GetFramesRequest) (*FramesResponse, error)
 	GetFrameInfo(context.Context, *GetFrameInfoRequest) (*FrameInfoResponse, error)
 	GetPeerInfo(context.Context, *GetPeerInfoRequest) (*PeerInfoResponse, error)
-	GetPeerID(context.Context, *GetPeerIDRequest) (*PeerIDResponse, error)
+	GetNodeInfo(context.Context, *GetNodeInfoRequest) (*NodeInfoResponse, error)
 	GetNetworkInfo(context.Context, *GetNetworkInfoRequest) (*NetworkInfoResponse, error)
 	GetTokenInfo(context.Context, *GetTokenInfoRequest) (*TokenInfoResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
@@ -127,8 +127,8 @@ func (UnimplementedNodeServiceServer) GetFrameInfo(context.Context, *GetFrameInf
 func (UnimplementedNodeServiceServer) GetPeerInfo(context.Context, *GetPeerInfoRequest) (*PeerInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPeerInfo not implemented")
 }
-func (UnimplementedNodeServiceServer) GetPeerID(context.Context, *GetPeerIDRequest) (*PeerIDResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetPeerID not implemented")
+func (UnimplementedNodeServiceServer) GetNodeInfo(context.Context, *GetNodeInfoRequest) (*NodeInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetNodeInfo not implemented")
 }
 func (UnimplementedNodeServiceServer) GetNetworkInfo(context.Context, *GetNetworkInfoRequest) (*NetworkInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetNetworkInfo not implemented")
@@ -203,20 +203,20 @@ func _NodeService_GetPeerInfo_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _NodeService_GetPeerID_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetPeerIDRequest)
+func _NodeService_GetNodeInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNodeInfoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(NodeServiceServer).GetPeerID(ctx, in)
+		return srv.(NodeServiceServer).GetNodeInfo(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: NodeService_GetPeerID_FullMethodName,
+		FullMethod: NodeService_GetNodeInfo_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(NodeServiceServer).GetPeerID(ctx, req.(*GetPeerIDRequest))
+		return srv.(NodeServiceServer).GetNodeInfo(ctx, req.(*GetNodeInfoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -277,8 +277,8 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _NodeService_GetPeerInfo_Handler,
 		},
 		{
-			MethodName: "GetPeerID",
-			Handler:    _NodeService_GetPeerID_Handler,
+			MethodName: "GetNodeInfo",
+			Handler:    _NodeService_GetNodeInfo_Handler,
 		},
 		{
 			MethodName: "GetNetworkInfo",

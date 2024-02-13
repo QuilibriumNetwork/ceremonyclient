@@ -1210,3 +1210,7 @@ func (e *CeremonyExecutionEngine) ensureSecrets(
 func (e *CeremonyExecutionEngine) GetPeerInfo() *protobufs.PeerInfoResponse {
 	return e.clock.GetPeerInfo()
 }
+
+func (e *CeremonyExecutionEngine) GetFrame() *protobufs.ClockFrame {
+	return e.clock.GetFrame()
+}
