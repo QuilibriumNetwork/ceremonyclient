@@ -12,8 +12,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	bls48581 "source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/ot/base/simplest"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 )
 
 func TestPairings(t *testing.T) {
@@ -329,7 +329,7 @@ func TestCompositeConstructionOfBLS(t *testing.T) {
 	x448ReceivingIdentityKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingIdentityPrivateKey)
 	x448ReceivingSignedPreKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingSignedPrePrivateKey)
 
-	senderResult := crypto.SenderX3DH(
+	senderResult := channel.SenderX3DH(
 		x448SendingIdentityPrivateKey,
 		x448SendingEphemeralPrivateKey,
 		x448ReceivingIdentityKey,
@@ -337,7 +337,7 @@ func TestCompositeConstructionOfBLS(t *testing.T) {
 		96,
 	)
 
-	receiverResult := crypto.ReceiverX3DH(
+	receiverResult := channel.ReceiverX3DH(
 		x448ReceivingIdentityPrivateKey,
 		x448ReceivingSignedPrePrivateKey,
 		x448SendingIdentityKey,
@@ -345,7 +345,7 @@ func TestCompositeConstructionOfBLS(t *testing.T) {
 		96,
 	)
 
-	drSender, err := crypto.NewDoubleRatchetParticipant(
+	drSender, err := channel.NewDoubleRatchetParticipant(
 		senderResult[:32],
 		senderResult[32:64],
 		senderResult[64:],
@@ -357,7 +357,7 @@ func TestCompositeConstructionOfBLS(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	drReceiver, err := crypto.NewDoubleRatchetParticipant(
+	drReceiver, err := channel.NewDoubleRatchetParticipant(
 		receiverResult[:32],
 		receiverResult[32:64],
 		receiverResult[64:],

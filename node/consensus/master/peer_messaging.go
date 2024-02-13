@@ -96,7 +96,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
 
-		if err := frame.VerifyMasterClockFrame(); err != nil {
+		if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
 			e.logger.Error("could not verify clock frame", zap.Error(err))
 			return errors.Wrap(err, "handle clock frame response")
 		}
@@ -108,12 +108,7 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
 
-		if e.frame.FrameNumber < frame.FrameNumber {
-			if err := e.enqueueSeenFrame(frame); err != nil {
-				e.logger.Error("could not enqueue seen clock frame", zap.Error(err))
-				return errors.Wrap(err, "handle clock frame response")
-			}
-		}
+		e.masterTimeReel.Insert(frame)
 	}
 
 	return nil
@@ -145,7 +140,12 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 
 	from := request.FromFrameNumber
 
-	if e.frame.FrameNumber < from || len(e.historicFrames) == 0 {
+	masterFrame, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	if masterFrame.FrameNumber < from || len(e.historicFrames) == 0 {
 		e.logger.Debug(
 			"peer asked for undiscovered frame",
 			zap.Binary("peer_id", peerID),
@@ -169,8 +169,8 @@ func (e *MasterClockConsensusEngine) handleClockFramesRequest(
 		to = request.FromFrameNumber + 127
 	}
 
-	if int(to) > int(e.frame.FrameNumber) {
-		to = e.frame.FrameNumber
+	if int(to) > int(masterFrame.FrameNumber) {
+		to = masterFrame.FrameNumber
 	}
 
 	e.logger.Debug(

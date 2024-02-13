@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
@@ -886,11 +886,11 @@ func logoVersion(width int) string {
 		out += "                     #######################################        ########\n"
 		out += "                          #############################                ##\n"
 		out += " \n"
-		out += "                         Quilibrium Node - v1.2.3 – Dawn\n"
+		out += "                         Quilibrium Node - v1.2.4 – Dawn\n"
 		out += " \n"
 		out += "                                   DB Console\n"
 	} else {
-		out = "Quilibrium Node - v1.2.3 – Dawn - DB Console\n"
+		out = "Quilibrium Node - v1.2.4 – Dawn - DB Console\n"
 	}
 	return out
 }

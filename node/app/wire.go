@@ -9,7 +9,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -54,6 +56,11 @@ var pubSubSet = wire.NewSet(
 
 var engineSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "Engine"),
+	crypto.NewWesolowskiFrameProver,
+	wire.Bind(new(crypto.FrameProver), new(*crypto.WesolowskiFrameProver)),
+	crypto.NewKZGInclusionProver,
+	wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)),
+	time.NewMasterTimeReel,
 	ceremony.NewCeremonyExecutionEngine,
 )
 

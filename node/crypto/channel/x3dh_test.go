@@ -1,4 +1,4 @@
-package crypto_test
+package channel_test
 
 import (
 	"crypto/rand"
@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
 )
 
 func TestX3DHMatches(t *testing.T) {
@@ -20,7 +20,7 @@ func TestX3DHMatches(t *testing.T) {
 	x448ReceivingIdentityKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingIdentityPrivateKey)
 	x448ReceivingSignedPreKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingSignedPrePrivateKey)
 
-	result := crypto.SenderX3DH(
+	result := channel.SenderX3DH(
 		x448SendingIdentityPrivateKey,
 		x448SendingEphemeralPrivateKey,
 		x448ReceivingIdentityKey,
@@ -28,7 +28,7 @@ func TestX3DHMatches(t *testing.T) {
 		32,
 	)
 
-	compare := crypto.ReceiverX3DH(
+	compare := channel.ReceiverX3DH(
 		x448ReceivingIdentityPrivateKey,
 		x448ReceivingSignedPrePrivateKey,
 		x448SendingIdentityKey,

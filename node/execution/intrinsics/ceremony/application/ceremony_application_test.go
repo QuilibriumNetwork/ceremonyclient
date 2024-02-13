@@ -100,26 +100,26 @@ func TestCeremonyTransitions(t *testing.T) {
 	joinBytes, err := proto.Marshal(join)
 	require.NoError(t, err)
 
-	a, err = a.ApplyTransition(0, &protobufs.CeremonyLobbyStateTransition{
+	a, _, _, err = a.ApplyTransition(0, &protobufs.CeremonyLobbyStateTransition{
 		TypeUrls:         []string{protobufs.CeremonyLobbyJoinType},
 		TransitionInputs: [][]byte{joinBytes},
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_OPEN)
 
 	for i := uint64(0); i < 10; i++ {
-		a, err = a.ApplyTransition(i+1, &protobufs.CeremonyLobbyStateTransition{
+		a, _, _, err = a.ApplyTransition(i+1, &protobufs.CeremonyLobbyStateTransition{
 			TypeUrls:         []string{},
 			TransitionInputs: [][]byte{},
-		})
+		}, false)
 		require.NoError(t, err)
 		require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_OPEN)
 	}
 
-	a, err = a.ApplyTransition(12, &protobufs.CeremonyLobbyStateTransition{
+	a, _, _, err = a.ApplyTransition(12, &protobufs.CeremonyLobbyStateTransition{
 		TypeUrls:         []string{},
 		TransitionInputs: [][]byte{},
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_IN_PROGRESS)
 	require.True(t, bytes.Equal(
@@ -165,10 +165,10 @@ func TestCeremonyTransitions(t *testing.T) {
 	advanceRoundBytes, err := proto.Marshal(advanceRound)
 
 	require.NoError(t, err)
-	a, err = a.ApplyTransition(13, &protobufs.CeremonyLobbyStateTransition{
+	a, _, _, err = a.ApplyTransition(13, &protobufs.CeremonyLobbyStateTransition{
 		TypeUrls:         []string{protobufs.CeremonyTranscriptCommitType},
 		TransitionInputs: [][]byte{advanceRoundBytes},
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_FINALIZING)
 
@@ -209,10 +209,10 @@ func TestCeremonyTransitions(t *testing.T) {
 	shareBytes, err := proto.Marshal(transcriptShare)
 	require.NoError(t, err)
 
-	a, err = a.ApplyTransition(14, &protobufs.CeremonyLobbyStateTransition{
+	a, _, _, err = a.ApplyTransition(14, &protobufs.CeremonyLobbyStateTransition{
 		TypeUrls:         []string{protobufs.CeremonyTranscriptShareType},
 		TransitionInputs: [][]byte{shareBytes},
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_VALIDATING)
 
@@ -272,10 +272,10 @@ func TestCeremonyTransitions(t *testing.T) {
 	}
 	transcriptBytes, err := proto.Marshal(updatedTranscript)
 	require.NoError(t, err)
-	a, err = a.ApplyTransition(15, &protobufs.CeremonyLobbyStateTransition{
+	a, _, _, err = a.ApplyTransition(15, &protobufs.CeremonyLobbyStateTransition{
 		TypeUrls:         []string{protobufs.CeremonyTranscriptType},
 		TransitionInputs: [][]byte{transcriptBytes},
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, a.LobbyState, CEREMONY_APPLICATION_STATE_OPEN)
 	bi, err := poseidon.HashBytes(proverPubKey)

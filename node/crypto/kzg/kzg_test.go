@@ -1,4 +1,4 @@
-package crypto_test
+package kzg_test
 
 import (
 	"encoding/hex"
@@ -13,16 +13,16 @@ import (
 	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/kzg"
 )
 
 func TestMain(m *testing.M) {
-	csBytes, err := os.ReadFile("../ceremony.json")
+	csBytes, err := os.ReadFile("../../ceremony.json")
 	if err != nil {
 		panic(err)
 	}
 
-	cs := &crypto.CeremonyState{}
+	cs := &kzg.CeremonyState{}
 	if err := json.Unmarshal(csBytes, cs); err != nil {
 		panic(err)
 	}
@@ -75,8 +75,8 @@ func TestMain(m *testing.M) {
 
 	wg.Wait()
 
-	crypto.CeremonyBLS48581G1 = g1s
-	crypto.CeremonyBLS48581G2 = g2s
+	kzg.CeremonyBLS48581G1 = g1s
+	kzg.CeremonyBLS48581G2 = g2s
 
 	// Post-ceremony, precompute everything and put it in the finalized ceremony
 	// state
@@ -135,16 +135,16 @@ func TestMain(m *testing.M) {
 	wg.Add(len(sizes))
 	for i := range root {
 		i := i
-		crypto.RootOfUnityBLS48581[uint64(sizes[i])] = root[i]
-		crypto.RootsOfUnityBLS48581[uint64(sizes[i])] = roots[i]
-		crypto.ReverseRootsOfUnityBLS48581[uint64(sizes[i])] = reverseRoots[i]
+		kzg.RootOfUnityBLS48581[uint64(sizes[i])] = root[i]
+		kzg.RootsOfUnityBLS48581[uint64(sizes[i])] = roots[i]
+		kzg.ReverseRootsOfUnityBLS48581[uint64(sizes[i])] = reverseRoots[i]
 
 		go func() {
 			// We precomputed 65536, others are cheap and will be fully precomputed
 			// post-ceremony
 			if sizes[i] < 65536 {
-				fftG1, err := crypto.FFTG1(
-					crypto.CeremonyBLS48581G1[:sizes[i]],
+				fftG1, err := kzg.FFTG1(
+					kzg.CeremonyBLS48581G1[:sizes[i]],
 					*curves.BLS48581(
 						curves.BLS48581G1().NewGeneratorPoint(),
 					),
@@ -165,7 +165,7 @@ func TestMain(m *testing.M) {
 	wg.Wait()
 
 	for i := range root {
-		crypto.FFTBLS48581[uint64(sizes[i])] = ffts[i]
+		kzg.FFTBLS48581[uint64(sizes[i])] = ffts[i]
 	}
 	code := m.Run()
 	os.Exit(code)
@@ -175,7 +175,7 @@ func TestKzgBytesToPoly(t *testing.T) {
 	modulus := make([]byte, 73)
 	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
-	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
+	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
 	poly, err := p.BytesToPolynomial([]byte(
 		"Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not." +
@@ -217,7 +217,7 @@ func TestPolynomialCommitment(t *testing.T) {
 	modulus := make([]byte, 73)
 	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
-	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
+	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
 	poly, err := p.BytesToPolynomial([]byte(
 		"Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not." +
@@ -235,7 +235,7 @@ func TestPolynomialCommitment(t *testing.T) {
 		poly = append(poly, curves.BLS48581G1().NewScalar().(curves.PairingScalar))
 	}
 	require.NoError(t, err)
-	evalPoly, err := crypto.FFT(
+	evalPoly, err := kzg.FFT(
 		poly,
 		*curves.BLS48581(
 			curves.BLS48581G1().NewGeneratorPoint(),
@@ -247,12 +247,12 @@ func TestPolynomialCommitment(t *testing.T) {
 
 	require.NoError(t, err)
 	commitByCoeffs, err := p.PointLinearCombination(
-		crypto.CeremonyBLS48581G1[:16],
+		kzg.CeremonyBLS48581G1[:16],
 		poly,
 	)
 	require.NoError(t, err)
 	commitByEval, err := p.PointLinearCombination(
-		crypto.FFTBLS48581[16],
+		kzg.FFTBLS48581[16],
 		evalPoly,
 	)
 	require.NoError(t, err)
@@ -265,7 +265,7 @@ func TestKZGProof(t *testing.T) {
 	modulus := make([]byte, 73)
 	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
-	p := crypto.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
+	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
 	poly, err := p.BytesToPolynomial([]byte(
 		"Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not." +
@@ -284,7 +284,7 @@ func TestKZGProof(t *testing.T) {
 		poly = append(poly, curves.BLS48581G1().NewScalar().(curves.PairingScalar))
 	}
 
-	evalPoly, err := crypto.FFT(
+	evalPoly, err := kzg.FFT(
 		poly,
 		*curves.BLS48581(
 			curves.BLS48581G1().NewGeneratorPoint(),
@@ -297,7 +297,7 @@ func TestKZGProof(t *testing.T) {
 	commit, err := p.Commit(poly)
 	require.NoError(t, err)
 
-	z := crypto.RootsOfUnityBLS48581[16][2]
+	z := kzg.RootsOfUnityBLS48581[16][2]
 	require.NoError(t, err)
 
 	checky := evalPoly[len(poly)-1]
@@ -331,7 +331,7 @@ func TestKZGProof(t *testing.T) {
 		diff -= 1
 	}
 
-	proof, err := p.PointLinearCombination(crypto.CeremonyBLS48581G1[:15], out)
+	proof, err := p.PointLinearCombination(kzg.CeremonyBLS48581G1[:15], out)
 	// proof, err := p.Prove(evalPoly, commit, z.(curves.PairingScalar))
 	require.NoError(t, err)
 	require.True(t, p.Verify(commit, z, checky, proof))

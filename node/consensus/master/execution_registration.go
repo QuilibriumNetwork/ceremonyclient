@@ -15,11 +15,16 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 	errChan := make(chan error)
 
 	go func() {
+		masterFrame, err := e.masterTimeReel.Head()
+		if err != nil {
+			panic(err)
+		}
+
 		logger.Info(
 			"starting execution engine at frame",
-			zap.Uint64("current_frame", e.frame.FrameNumber),
+			zap.Uint64("current_frame", masterFrame.FrameNumber),
 		)
-		err := <-exec.Start()
+		err = <-exec.Start()
 		if err != nil {
 			logger.Error("could not start execution engine", zap.Error(err))
 			errChan <- err
@@ -27,13 +32,18 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 		}
 
 		for {
+			masterFrame, err = e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame.FrameNumber),
+				zap.Uint64("current_frame", masterFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame.FrameNumber
+			newFrame := masterFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"injecting execution engine at frame",
@@ -74,13 +84,18 @@ func (e *MasterClockConsensusEngine) UnregisterExecutor(
 
 	go func() {
 		for {
+			masterFrame, err := e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame.FrameNumber),
+				zap.Uint64("current_frame", masterFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame.FrameNumber
+			newFrame := masterFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"removing execution engine at frame",

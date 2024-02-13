@@ -1,9 +1,9 @@
 package ceremony
 
 import (
+	"bytes"
 	"crypto"
 	"encoding/binary"
-	"math/big"
 	"sync"
 	"time"
 
@@ -14,6 +14,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
+	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -53,7 +54,6 @@ type ChannelServer = protobufs.CeremonyService_GetPublicChannelServer
 
 type CeremonyDataClockConsensusEngine struct {
 	protobufs.UnimplementedCeremonyServiceServer
-	frame                       *protobufs.ClockFrame
 	difficulty                  uint32
 	logger                      *zap.Logger
 	state                       consensus.EngineState
@@ -61,6 +61,8 @@ type CeremonyDataClockConsensusEngine struct {
 	keyStore                    store.KeyStore
 	pubSub                      p2p.PubSub
 	keyManager                  keys.KeyManager
+	masterTimeReel              *qtime.MasterTimeReel
+	dataTimeReel                *qtime.DataTimeReel
 	provingKey                  crypto.Signer
 	provingKeyBytes             []byte
 	provingKeyType              keys.KeyType
@@ -68,13 +70,11 @@ type CeremonyDataClockConsensusEngine struct {
 	lastFrameReceivedAt         time.Time
 	latestFrameReceived         uint64
 	frameProverTrie             *tries.RollingFrecencyCritbitTrie
-	frameSeenProverTrie         *tries.RollingFrecencyCritbitTrie
 	dependencyMap               map[string]*anypb.Any
 	pendingCommits              chan *anypb.Any
 	pendingCommitWorkers        int64
-	prover                      *qcrypto.KZGProver
-	stagedKeyCommits            InclusionMap
-	stagedKeyPolynomials        PolynomialMap
+	inclusionProver             qcrypto.InclusionProver
+	frameProver                 qcrypto.FrameProver
 	stagedLobbyStateTransitions *protobufs.CeremonyLobbyStateTransition
 	minimumPeersRequired        int
 
@@ -86,10 +86,8 @@ type CeremonyDataClockConsensusEngine struct {
 	syncingStatus                  SyncStatusType
 	syncingTarget                  []byte
 	previousHead                   *protobufs.ClockFrame
-	currentDistance                *big.Int
 	engineMx                       sync.Mutex
 	dependencyMapMx                sync.Mutex
-	stagedKeyCommitsMx             sync.Mutex
 	stagedLobbyStateTransitionsMx  sync.Mutex
 	peerMapMx                      sync.Mutex
 	peerAnnounceMapMx              sync.Mutex
@@ -112,6 +110,10 @@ func NewCeremonyDataClockConsensusEngine(
 	clockStore store.ClockStore,
 	keyStore store.KeyStore,
 	pubSub p2p.PubSub,
+	frameProver qcrypto.FrameProver,
+	inclusionProver qcrypto.InclusionProver,
+	masterTimeReel *qtime.MasterTimeReel,
+	dataTimeReel *qtime.DataTimeReel,
 	filter []byte,
 	seed []byte,
 ) *CeremonyDataClockConsensusEngine {
@@ -139,6 +141,22 @@ func NewCeremonyDataClockConsensusEngine(
 		panic(errors.New("pubsub is nil"))
 	}
 
+	if frameProver == nil {
+		panic(errors.New("frame prover is nil"))
+	}
+
+	if inclusionProver == nil {
+		panic(errors.New("inclusion prover is nil"))
+	}
+
+	if masterTimeReel == nil {
+		panic(errors.New("master time reel is nil"))
+	}
+
+	if dataTimeReel == nil {
+		panic(errors.New("data time reel is nil"))
+	}
+
 	minimumPeersRequired := engineConfig.MinimumPeersRequired
 	if minimumPeersRequired == 0 {
 		minimumPeersRequired = 3
@@ -150,7 +168,6 @@ func NewCeremonyDataClockConsensusEngine(
 	}
 
 	e := &CeremonyDataClockConsensusEngine{
-		frame:            nil,
 		difficulty:       difficulty,
 		logger:           logger,
 		state:            consensus.EngineStateStopped,
@@ -169,17 +186,15 @@ func NewCeremonyDataClockConsensusEngine(
 		},
 		lastFrameReceivedAt:   time.Time{},
 		frameProverTrie:       &tries.RollingFrecencyCritbitTrie{},
-		frameSeenProverTrie:   &tries.RollingFrecencyCritbitTrie{},
-		pendingCommits:        make(chan *anypb.Any),
-		pendingCommitWorkers:  engineConfig.PendingCommitWorkers,
-		prover:                qcrypto.DefaultKZGProver(),
-		stagedKeyCommits:      make(InclusionMap),
-		stagedKeyPolynomials:  make(PolynomialMap),
+		inclusionProver:       inclusionProver,
 		syncingStatus:         SyncStatusNotSyncing,
 		peerAnnounceMap:       map[string]*protobufs.CeremonyPeerListAnnounce{},
 		peerMap:               map[string]*peerInfo{},
 		uncooperativePeersMap: map[string]*peerInfo{},
 		minimumPeersRequired:  minimumPeersRequired,
+		frameProver:           frameProver,
+		masterTimeReel:        masterTimeReel,
+		dataTimeReel:          dataTimeReel,
 	}
 
 	logger.Info("constructing consensus engine")
@@ -205,30 +220,12 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateLoading
 
 	e.logger.Info("loading last seen state")
-	latestFrame, err := e.clockStore.GetLatestDataClockFrame(
-		e.filter,
-		e.frameProverTrie,
-	)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	err := e.dataTimeReel.Start()
+	if err != nil {
 		panic(err)
 	}
 
-	candidateLatestFrame, err := e.clockStore.GetLatestCandidateDataClockFrame(
-		e.filter,
-	)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		panic(err)
-	}
-
-	if candidateLatestFrame != nil {
-		latestFrame = candidateLatestFrame
-	}
-
-	if latestFrame != nil {
-		e.setFrame(latestFrame)
-	} else {
-		latestFrame = e.CreateGenesisFrame(nil)
-	}
+	e.frameProverTrie = e.dataTimeReel.GetFrameProverTrie()
 
 	err = e.createCommunicationKeys()
 	if err != nil {
@@ -255,10 +252,6 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 
 	e.state = consensus.EngineStateCollecting
 
-	for i := int64(0); i < e.pendingCommitWorkers; i++ {
-		go e.handlePendingCommits(i)
-	}
-
 	go func() {
 		thresholdBeforeConfirming := 4
 
@@ -269,8 +262,13 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				PeerList: []*protobufs.CeremonyPeer{},
 			}
 
+			frame, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
 			timestamp := time.Now().UnixMilli()
-			msg := binary.BigEndian.AppendUint64([]byte{}, e.frame.FrameNumber)
+			msg := binary.BigEndian.AppendUint64([]byte{}, frame.FrameNumber)
 			msg = append(msg, consensus.GetVersion()...)
 			msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
 			sig, err := e.pubSub.SignMessage(msg)
@@ -282,7 +280,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
 				peerId:    e.pubSub.GetPeerID(),
 				multiaddr: "",
-				maxFrame:  e.frame.FrameNumber,
+				maxFrame:  frame.FrameNumber,
 				version:   consensus.GetVersion(),
 				signature: sig,
 				publicKey: e.pubSub.GetPublicKey(),
@@ -325,42 +323,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
-		e.logger.Info("waiting for peer list mappings")
-		// We need to re-tune this so that libp2p's peerstore activation threshold
-		// considers DHT peers to be correct:
-		time.Sleep(30 * time.Second)
-		for e.state < consensus.EngineStateStopping {
-			peerCount := e.pubSub.GetNetworkPeersCount()
-			if peerCount < e.minimumPeersRequired {
-				e.logger.Info(
-					"waiting for minimum peers",
-					zap.Int("peer_count", peerCount),
-				)
-				time.Sleep(1 * time.Second)
-			} else {
-				switch e.state {
-				case consensus.EngineStateCollecting:
-					currentFrame := latestFrame
-					if latestFrame, err = e.collect(latestFrame); err != nil {
-						e.logger.Error("could not collect", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-						latestFrame = currentFrame
-					}
-				case consensus.EngineStateProving:
-					currentFrame := latestFrame
-					if latestFrame, err = e.prove(latestFrame); err != nil {
-						e.logger.Error("could not prove", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-						latestFrame = currentFrame
-					}
-				case consensus.EngineStatePublishing:
-					if err = e.publishProof(latestFrame); err != nil {
-						e.logger.Error("could not publish", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-					}
-				}
-			}
-		}
+		e.runLoop()
 	}()
 
 	go func() {
@@ -368,6 +331,86 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	}()
 
 	return errChan
+}
+
+func (e *CeremonyDataClockConsensusEngine) runLoop() {
+	dataFrameCh := e.dataTimeReel.NewFrameCh()
+
+	e.logger.Info("waiting for peer list mappings")
+	// We need to re-tune this so that libp2p's peerstore activation threshold
+	// considers DHT peers to be correct:
+	time.Sleep(30 * time.Second)
+
+	for e.state < consensus.EngineStateStopping {
+		peerCount := e.pubSub.GetNetworkPeersCount()
+		if peerCount < e.minimumPeersRequired {
+			e.logger.Info(
+				"waiting for minimum peers",
+				zap.Int("peer_count", peerCount),
+			)
+			time.Sleep(1 * time.Second)
+		} else {
+			latestFrame, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+			select {
+			case dataFrame := <-dataFrameCh:
+				if latestFrame, err = e.collect(dataFrame); err != nil {
+					e.logger.Error("could not collect", zap.Error(err))
+					continue
+				}
+				go func() {
+					e.frameChan <- latestFrame
+				}()
+
+				var nextFrame *protobufs.ClockFrame
+				if nextFrame, err = e.prove(latestFrame); err != nil {
+					e.logger.Error("could not prove", zap.Error(err))
+					e.state = consensus.EngineStateCollecting
+					continue
+				}
+
+				if bytes.Equal(
+					e.frameProverTrie.FindNearest(e.provingKeyAddress).External.Key,
+					e.provingKeyAddress,
+				) {
+					if err = e.publishProof(nextFrame); err != nil {
+						e.logger.Error("could not publish", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+					}
+				}
+			case <-time.After(20 * time.Second):
+				e.logger.Info("no frames received, kicking off")
+				dataFrame, err := e.dataTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+
+				if latestFrame, err = e.collect(dataFrame); err != nil {
+					e.logger.Error("could not collect", zap.Error(err))
+					continue
+				}
+				go func() {
+					e.frameChan <- latestFrame
+				}()
+
+				var nextFrame *protobufs.ClockFrame
+				if nextFrame, err = e.prove(latestFrame); err != nil {
+					e.logger.Error("could not prove", zap.Error(err))
+					e.state = consensus.EngineStateCollecting
+					continue
+				}
+
+				if e.frameProverTrie.Contains(e.provingKeyAddress) {
+					if err = e.publishProof(nextFrame); err != nil {
+						e.logger.Error("could not publish", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+					}
+				}
+			}
+		}
+	}
 }
 
 func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
@@ -380,7 +423,12 @@ func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
 	for name := range e.executionEngines {
 		name := name
 		go func(name string) {
-			err := <-e.UnregisterExecutor(name, e.frame.FrameNumber, force)
+			frame, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
+			err = <-e.UnregisterExecutor(name, frame.FrameNumber, force)
 			if err != nil {
 				errChan <- err
 			}
@@ -402,133 +450,17 @@ func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
 	return errChan
 }
 
-func (e *CeremonyDataClockConsensusEngine) performSanityCheck(
-	frame *protobufs.ClockFrame,
-) *protobufs.ClockFrame {
-	e.logger.Info("performing sanity check")
-	start := uint64(0)
-	idx := start
-	end := frame.FrameNumber + 1
-	var prior *protobufs.ClockFrame
-	for start < end {
-		tail := end
-		if start+16 < tail {
-			tail = start + 16
-		}
-		iter, err := e.clockStore.RangeDataClockFrames(
-			e.filter,
-			start,
-			tail,
-		)
-		if err != nil {
-			panic(err)
-		}
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			v, err := iter.Value()
-			if err != nil {
-				panic(err)
-			}
-
-			if v.FrameNumber != idx {
-				e.logger.Warn(
-					"discontinuity found, attempting to fix",
-					zap.Uint64("expected_frame_number", idx),
-					zap.Uint64("found_frame_number", v.FrameNumber),
-				)
-
-				disc := v
-				for disc.FrameNumber-idx > 0 {
-					frames, err := e.clockStore.GetCandidateDataClockFrames(
-						e.filter,
-						disc.FrameNumber-1,
-					)
-					if err != nil {
-						panic(err)
-					}
-
-					found := false
-					for _, candidate := range frames {
-						selector, err := candidate.GetSelector()
-						if err != nil {
-							panic(err)
-						}
-
-						parentSelector, _, _, err := disc.GetParentSelectorAndDistance(nil)
-						if err != nil {
-							panic(err)
-						}
-
-						if selector.Cmp(parentSelector) == 0 {
-							found = true
-							_, priorTrie, err := e.clockStore.GetDataClockFrame(
-								e.filter,
-								prior.FrameNumber,
-							)
-							if err != nil {
-								panic(err)
-							}
-
-							txn, err := e.clockStore.NewTransaction()
-							if err != nil {
-								panic(err)
-							}
-
-							err = e.clockStore.PutDataClockFrame(
-								candidate,
-								priorTrie,
-								txn,
-								true,
-							)
-							if err != nil {
-								panic(err)
-							}
-
-							if err = txn.Commit(); err != nil {
-								panic(err)
-							}
-
-							disc = candidate
-						}
-					}
-
-					if !found {
-						e.logger.Error(
-							"could not resolve discontinuity, rewinding consensus head",
-						)
-
-						if err = iter.Close(); err != nil {
-							panic(err)
-						}
-
-						return prior
-					}
-				}
-
-				idx = v.FrameNumber
-			} else {
-				prior = v
-			}
-
-			idx++
-		}
-
-		if err = iter.Close(); err != nil {
-			panic(err)
-		}
-
-		start += 16
-	}
-
-	return frame
-}
-
 func (e *CeremonyDataClockConsensusEngine) GetDifficulty() uint32 {
 	return e.difficulty
 }
 
 func (e *CeremonyDataClockConsensusEngine) GetFrame() *protobufs.ClockFrame {
-	return e.frame
+	frame, err := e.dataTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	return frame
 }
 
 func (e *CeremonyDataClockConsensusEngine) GetState() consensus.EngineState {

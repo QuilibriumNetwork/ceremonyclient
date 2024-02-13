@@ -6,7 +6,7 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"

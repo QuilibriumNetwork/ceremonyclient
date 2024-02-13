@@ -667,7 +667,10 @@ func MaterializeApplicationFromFrame(
 			lastStateCount := frame.FrameNumber -
 				inProgress.ActiveParticipants[len(inProgress.ActiveParticipants)-1].FrameNumber
 			if !setCount || (lastStateCount < stateCount && lastStateCount > 20) {
-				stateCount = lastStateCount - 20
+				stateCount = lastStateCount
+				if stateCount >= 10 {
+					stateCount -= 10
+				}
 			}
 		}
 
@@ -760,9 +763,26 @@ func MaterializeApplicationFromFrame(
 func (a *CeremonyApplication) ApplyTransition(
 	currentFrameNumber uint64,
 	transition *protobufs.CeremonyLobbyStateTransition,
-) (*CeremonyApplication, error) {
+	skipFailures bool,
+) (
+	*CeremonyApplication,
+	*protobufs.CeremonyLobbyStateTransition,
+	*protobufs.CeremonyLobbyStateTransition,
+	error,
+) {
+	finalizedTransition := &protobufs.CeremonyLobbyStateTransition{
+		TypeUrls:         []string{},
+		TransitionInputs: [][]byte{},
+	}
+	skippedTransition := &protobufs.CeremonyLobbyStateTransition{
+		TypeUrls:         []string{},
+		TransitionInputs: [][]byte{},
+	}
 	switch a.LobbyState {
 	case CEREMONY_APPLICATION_STATE_OPEN:
+		if a.StateCount > currentFrameNumber {
+			a.StateCount = 0
+		}
 		a.StateCount++
 
 		for i, url := range transition.TypeUrls {
@@ -771,34 +791,75 @@ func (a *CeremonyApplication) ApplyTransition(
 				join := &protobufs.CeremonyLobbyJoin{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], join)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if currentFrameNumber < join.FrameNumber {
-					return nil, errors.Wrap(
-						errors.New("too recent join"), "apply transition",
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("too recent join"), "apply transition",
+						)
+					}
+					skippedTransition.TypeUrls = append(
+						skippedTransition.TypeUrls,
+						url,
 					)
+					skippedTransition.TransitionInputs = append(
+						skippedTransition.TransitionInputs,
+						transition.TransitionInputs[i],
+					)
+					continue
 				}
 
 				if currentFrameNumber-join.FrameNumber > 10 {
-					return nil, errors.Wrap(
-						errors.New("outdated join"), "apply transition",
-					)
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("outdated join"), "apply transition",
+						)
+					}
+					continue
 				}
 
 				if err = a.applyLobbyJoin(join); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
 
 				a.StateCount = 0
 			default:
-				return a, nil
+				if !skipFailures {
+					return a, nil, nil, nil
+				}
+
+				skippedTransition.TypeUrls = append(
+					skippedTransition.TypeUrls,
+					url,
+				)
+				skippedTransition.TransitionInputs = append(
+					skippedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+				continue
 			}
 		}
 
 		if a.StateCount > 10 {
 			if len(a.LobbyJoins) == 0 {
-				return a, nil
+				return a, finalizedTransition, skippedTransition, nil
 			}
 
 			a.LobbyState = CEREMONY_APPLICATION_STATE_IN_PROGRESS
@@ -806,14 +867,17 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.RoundCount = 1
 
 			if err := a.finalizeParticipantSet(); err != nil {
-				return nil, errors.Wrap(err, "apply transition")
+				return nil, nil, nil, errors.Wrap(err, "apply transition")
 			}
 
 			a.LobbyJoins = []*protobufs.CeremonyLobbyJoin{}
 		}
 
-		return a, nil
+		return a, finalizedTransition, skippedTransition, nil
 	case CEREMONY_APPLICATION_STATE_IN_PROGRESS:
+		if a.StateCount > currentFrameNumber {
+			a.StateCount = 0
+		}
 		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
@@ -821,61 +885,149 @@ func (a *CeremonyApplication) ApplyTransition(
 				seenProverAtt := &protobufs.CeremonySeenProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], seenProverAtt)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if currentFrameNumber < seenProverAtt.LastSeenFrame {
-					return nil, errors.Wrap(
-						errors.New("too recent attestation"), "apply transition",
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("too recent attestation"), "apply transition",
+						)
+					}
+					skippedTransition.TypeUrls = append(
+						skippedTransition.TypeUrls,
+						url,
 					)
+					skippedTransition.TransitionInputs = append(
+						skippedTransition.TransitionInputs,
+						transition.TransitionInputs[i],
+					)
+					continue
 				}
 
 				if currentFrameNumber-seenProverAtt.LastSeenFrame > 10 {
-					return nil, errors.Wrap(
-						errors.New("outdated attestation"), "apply transition",
-					)
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("outdated attestation"), "apply transition",
+						)
+					}
+					continue
 				}
 
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			case protobufs.CeremonyDroppedProverAttestationType:
 				droppedProverAtt := &protobufs.CeremonyDroppedProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if currentFrameNumber < droppedProverAtt.LastSeenFrame {
-					return nil, errors.Wrap(
-						errors.New("too recent attestation"), "apply transition",
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("too recent attestation"), "apply transition",
+						)
+					}
+					skippedTransition.TypeUrls = append(
+						skippedTransition.TypeUrls,
+						url,
 					)
+					skippedTransition.TransitionInputs = append(
+						skippedTransition.TransitionInputs,
+						transition.TransitionInputs[i],
+					)
+					continue
 				}
 
 				if currentFrameNumber-droppedProverAtt.LastSeenFrame > 10 {
-					return nil, errors.Wrap(
-						errors.New("outdated attestation"), "apply transition",
-					)
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("outdated attestation"), "apply transition",
+						)
+					}
+					continue
 				}
 
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			case protobufs.CeremonyTranscriptCommitType:
 				transcriptCommit := &protobufs.CeremonyTranscriptCommit{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], transcriptCommit)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if err = a.applyTranscriptCommit(transcriptCommit); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			default:
-				return a, nil
+				if !skipFailures {
+					return a, nil, nil, nil
+				}
+
+				skippedTransition.TypeUrls = append(
+					skippedTransition.TypeUrls,
+					url,
+				)
+				skippedTransition.TransitionInputs = append(
+					skippedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+				continue
 			}
 		}
 
@@ -898,7 +1050,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				[]*protobufs.CeremonySeenProverAttestation{}
 			a.TranscriptRoundAdvanceCommits =
 				[]*protobufs.CeremonyAdvanceRound{}
-			return a, nil
+			return a, finalizedTransition, skippedTransition, nil
 		}
 
 		attLimit := 1<<a.RoundCount - 1
@@ -949,8 +1101,11 @@ func (a *CeremonyApplication) ApplyTransition(
 				[]*protobufs.CeremonyAdvanceRound{}
 		}
 
-		return a, nil
+		return a, finalizedTransition, skippedTransition, nil
 	case CEREMONY_APPLICATION_STATE_FINALIZING:
+		if a.StateCount > currentFrameNumber {
+			a.StateCount = 0
+		}
 		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
@@ -958,67 +1113,155 @@ func (a *CeremonyApplication) ApplyTransition(
 				seenProverAtt := &protobufs.CeremonySeenProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], seenProverAtt)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if currentFrameNumber < seenProverAtt.LastSeenFrame {
-					return nil, errors.Wrap(
-						errors.New("too recent attestation"), "apply transition",
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("too recent attestation"), "apply transition",
+						)
+					}
+					skippedTransition.TypeUrls = append(
+						skippedTransition.TypeUrls,
+						url,
 					)
+					skippedTransition.TransitionInputs = append(
+						skippedTransition.TransitionInputs,
+						transition.TransitionInputs[i],
+					)
+					continue
 				}
 
 				if currentFrameNumber-seenProverAtt.LastSeenFrame > 10 {
-					return nil, errors.Wrap(
-						errors.New("outdated attestation"), "apply transition",
-					)
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("outdated attestation"), "apply transition",
+						)
+					}
+					continue
 				}
 
 				if err = a.applySeenProverAttestation(seenProverAtt); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			case protobufs.CeremonyDroppedProverAttestationType:
 				droppedProverAtt := &protobufs.CeremonyDroppedProverAttestation{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], droppedProverAtt)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if currentFrameNumber < droppedProverAtt.LastSeenFrame {
-					return nil, errors.Wrap(
-						errors.New("too recent attestation"), "apply transition",
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("too recent attestation"), "apply transition",
+						)
+					}
+					skippedTransition.TypeUrls = append(
+						skippedTransition.TypeUrls,
+						url,
 					)
+					skippedTransition.TransitionInputs = append(
+						skippedTransition.TransitionInputs,
+						transition.TransitionInputs[i],
+					)
+					continue
 				}
 
 				if currentFrameNumber-droppedProverAtt.LastSeenFrame > 10 {
-					return nil, errors.Wrap(
-						errors.New("outdated attestation"), "apply transition",
-					)
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("outdated attestation"), "apply transition",
+						)
+					}
+					continue
 				}
 
 				if err = a.applyDroppedProverAttestation(droppedProverAtt); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			case protobufs.CeremonyTranscriptShareType:
 				transcriptShare := &protobufs.CeremonyTranscriptShare{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], transcriptShare)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if err = a.applyTranscriptShare(transcriptShare); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			default:
-				return a, nil
+				if !skipFailures {
+					return a, nil, nil, nil
+				}
+
+				skippedTransition.TypeUrls = append(
+					skippedTransition.TypeUrls,
+					url,
+				)
+				skippedTransition.TransitionInputs = append(
+					skippedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+				continue
 			}
 		}
 
 		if len(a.TranscriptShares) == len(a.ActiveParticipants) {
 			if err := a.finalizeTranscript(); err != nil {
-				return nil, errors.Wrap(err, "apply transition")
+				return nil, nil, nil, errors.Wrap(err, "apply transition")
 			}
 
 			a.LobbyState = CEREMONY_APPLICATION_STATE_VALIDATING
@@ -1027,7 +1270,7 @@ func (a *CeremonyApplication) ApplyTransition(
 				[]*protobufs.CeremonyDroppedProverAttestation{}
 			a.LatestSeenProverAttestations =
 				[]*protobufs.CeremonySeenProverAttestation{}
-
+			return a, finalizedTransition, skippedTransition, nil
 		}
 
 		shouldReset := false
@@ -1048,7 +1291,7 @@ func (a *CeremonyApplication) ApplyTransition(
 			}
 		}
 
-		if a.StateCount > 10 {
+		if a.StateCount > 100 {
 			shouldReset = true
 		}
 
@@ -1081,8 +1324,11 @@ func (a *CeremonyApplication) ApplyTransition(
 				[]*protobufs.CeremonyTranscriptShare{}
 		}
 
-		return a, nil
+		return a, finalizedTransition, skippedTransition, nil
 	case CEREMONY_APPLICATION_STATE_VALIDATING:
+		if a.StateCount > currentFrameNumber {
+			a.StateCount = 0
+		}
 		a.StateCount++
 		for i, url := range transition.TypeUrls {
 			switch url {
@@ -1090,20 +1336,47 @@ func (a *CeremonyApplication) ApplyTransition(
 				transcript := &protobufs.CeremonyTranscript{}
 				err := proto.Unmarshal(transition.TransitionInputs[i], transcript)
 				if err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
 
 				if err = a.applyTranscript(transcript); err != nil {
-					return nil, errors.Wrap(err, "apply transition")
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(err, "apply transition")
+					}
+					continue
 				}
+
+				finalizedTransition.TypeUrls = append(
+					finalizedTransition.TypeUrls,
+					url,
+				)
+				finalizedTransition.TransitionInputs = append(
+					finalizedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+
 				a.StateCount = 0
 			default:
-				return a, nil
+				if !skipFailures {
+					return a, nil, nil, nil
+				}
+				skippedTransition.TypeUrls = append(
+					skippedTransition.TypeUrls,
+					url,
+				)
+				skippedTransition.TransitionInputs = append(
+					skippedTransition.TransitionInputs,
+					transition.TransitionInputs[i],
+				)
+				continue
 			}
 		}
 
 		shouldReset := false
-		if a.StateCount > 100 {
+		if a.StateCount > 300 {
 			shouldReset = true
 		}
 
@@ -1160,9 +1433,9 @@ func (a *CeremonyApplication) ApplyTransition(
 			a.FinalCommits = []*protobufs.CeremonyTranscriptCommit{}
 		}
 
-		return a, nil
+		return a, finalizedTransition, skippedTransition, nil
 	default:
-		return nil, errors.Wrap(ErrInvalidStateTransition, "apply transition")
+		return nil, nil, nil, errors.Wrap(ErrInvalidStateTransition, "apply transition")
 	}
 }
 

@@ -18,8 +18,8 @@ import (
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/app"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/kzg"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 )
 
@@ -131,7 +131,7 @@ func main() {
 	}
 
 	fmt.Println("Loading ceremony state and starting node...")
-	qcrypto.Init()
+	kzg.Init()
 
 	node, err := app.NewNode(nodeConfig)
 	if err != nil {
@@ -283,5 +283,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.2.3 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.2.4 – Dawn")
 }
