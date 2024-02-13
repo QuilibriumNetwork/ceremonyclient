@@ -1,4 +1,4 @@
-package crypto
+package shuffle
 
 import (
 	"crypto/rand"
@@ -7,10 +7,16 @@ import (
 	"filippo.io/edwards25519"
 )
 
-var lBE = []byte{16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 222, 249, 222, 162, 247, 156, 214, 88, 18, 99, 26, 92, 245, 211, 236}
+var lBE = []byte{
+	16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 222, 249, 222, 162, 247,
+	156, 214, 88, 18, 99, 26, 92, 245, 211, 236,
+}
 var lBigInt = big.NewInt(0).SetBytes(lBE)
 
-func genPolyFrags(secret *edwards25519.Scalar, total, threshold int) []*edwards25519.Scalar {
+func genPolyFrags(
+	secret *edwards25519.Scalar,
+	total, threshold int,
+) []*edwards25519.Scalar {
 	coeffs := []*edwards25519.Scalar{}
 	coeffs = append(coeffs, secret)
 
@@ -48,7 +54,10 @@ func genPolyFrags(secret *edwards25519.Scalar, total, threshold int) []*edwards2
 	return frags
 }
 
-func ShamirSplitMatrix(matrix [][]*edwards25519.Scalar, total, threshold int) [][][]*edwards25519.Scalar {
+func ShamirSplitMatrix(
+	matrix [][]*edwards25519.Scalar,
+	total, threshold int,
+) [][][]*edwards25519.Scalar {
 	shamirMatrix := make([][][]*edwards25519.Scalar, len(matrix))
 
 	for x := 0; x < len(matrix); x++ {
@@ -79,7 +88,9 @@ func AddMatrices(matrices ...[][]*edwards25519.Scalar) [][]*edwards25519.Scalar 
 	return result
 }
 
-func GenerateRandomVectorShares(length, total, threshold int) [][]*edwards25519.Scalar {
+func GenerateRandomVectorShares(
+	length, total, threshold int,
+) [][]*edwards25519.Scalar {
 	result := make([][]*edwards25519.Scalar, length)
 
 	for i := 0; i < length; i++ {
@@ -93,7 +104,10 @@ func GenerateRandomVectorShares(length, total, threshold int) [][]*edwards25519.
 	return result
 }
 
-func InterpolatePolynomialShares(shares []*edwards25519.Scalar, ids []int) *edwards25519.Scalar {
+func InterpolatePolynomialShares(
+	shares []*edwards25519.Scalar,
+	ids []int,
+) *edwards25519.Scalar {
 	var reconstructedSum *edwards25519.Scalar
 
 	for j := 0; j < len(ids); j++ {
@@ -116,7 +130,10 @@ func InterpolatePolynomialShares(shares []*edwards25519.Scalar, ids []int) *edwa
 
 		coeffDenom.Invert(coeffDenom)
 		coeffNum.Multiply(coeffNum, coeffDenom)
-		reconstructedFrag := edwards25519.NewScalar().Multiply(coeffNum, shares[ids[j]-1])
+		reconstructedFrag := edwards25519.NewScalar().Multiply(
+			coeffNum,
+			shares[ids[j]-1],
+		)
 
 		if reconstructedSum == nil {
 			reconstructedSum = reconstructedFrag
@@ -128,7 +145,9 @@ func InterpolatePolynomialShares(shares []*edwards25519.Scalar, ids []int) *edwa
 	return reconstructedSum
 }
 
-func LUDecompose(matrix [][]*edwards25519.Scalar) ([][]*edwards25519.Scalar, [][]*edwards25519.Scalar) {
+func LUDecompose(
+	matrix [][]*edwards25519.Scalar,
+) ([][]*edwards25519.Scalar, [][]*edwards25519.Scalar) {
 	imax := 0
 	maxA := edwards25519.NewScalar()
 	N := len(matrix)
@@ -141,18 +160,24 @@ func LUDecompose(matrix [][]*edwards25519.Scalar) ([][]*edwards25519.Scalar, [][
 		pm[i] = make([]*edwards25519.Scalar, N)
 		p[i] = i
 		for j := 0; j < N; j++ {
-			newA[i][j], _ = edwards25519.NewScalar().SetCanonicalBytes(matrix[i][j].Bytes())
+			newA[i][j], _ = edwards25519.NewScalar().SetCanonicalBytes(
+				matrix[i][j].Bytes(),
+			)
 		}
 	}
 
-	scalarOne, _ := edwards25519.NewScalar().SetCanonicalBytes(BigIntToLEBytes(big.NewInt(int64(1))))
+	scalarOne, _ := edwards25519.NewScalar().SetCanonicalBytes(
+		BigIntToLEBytes(big.NewInt(int64(1))),
+	)
 
 	for i := 0; i < N; i++ {
 		maxA = edwards25519.NewScalar()
 		imax = i
 
 		for k := i; k < N; k++ {
-			if LEBytesToBigInt(newA[k][i].Bytes()).Cmp(LEBytesToBigInt(maxA.Bytes())) > 0 {
+			if LEBytesToBigInt(newA[k][i].Bytes()).Cmp(
+				LEBytesToBigInt(maxA.Bytes()),
+			) > 0 {
 				maxA = newA[k][i]
 				imax = k
 			}
@@ -171,10 +196,16 @@ func LUDecompose(matrix [][]*edwards25519.Scalar) ([][]*edwards25519.Scalar, [][
 		}
 
 		for j := i + 1; j < N; j++ {
-			newA[j][i].Multiply(newA[j][i], edwards25519.NewScalar().Invert(newA[i][i]))
+			newA[j][i].Multiply(
+				newA[j][i],
+				edwards25519.NewScalar().Invert(newA[i][i]),
+			)
 
 			for k := i + 1; k < N; k++ {
-				newA[j][k].Subtract(newA[j][k], edwards25519.NewScalar().Multiply(newA[j][i], newA[i][k]))
+				newA[j][k].Subtract(newA[j][k], edwards25519.NewScalar().Multiply(
+					newA[j][i],
+					newA[i][k],
+				))
 			}
 		}
 	}
@@ -205,13 +236,19 @@ func Invert(matrix [][]*edwards25519.Scalar) [][]*edwards25519.Scalar {
 			ia[i][j] = edwards25519.NewScalar().Set(p[i][j])
 
 			for k := 0; k < i; k++ {
-				ia[i][j].Subtract(ia[i][j], edwards25519.NewScalar().Multiply(a[i][k], ia[k][j]))
+				ia[i][j].Subtract(ia[i][j], edwards25519.NewScalar().Multiply(
+					a[i][k],
+					ia[k][j],
+				))
 			}
 		}
 
 		for i := len(matrix) - 1; i >= 0; i-- {
 			for k := i + 1; k < len(matrix); k++ {
-				ia[i][j].Subtract(ia[i][j], edwards25519.NewScalar().Multiply(a[i][k], ia[k][j]))
+				ia[i][j].Subtract(ia[i][j], edwards25519.NewScalar().Multiply(
+					a[i][k],
+					ia[k][j],
+				))
 			}
 
 			ia[i][j].Multiply(ia[i][j], edwards25519.NewScalar().Invert(a[i][i]))
@@ -221,7 +258,10 @@ func Invert(matrix [][]*edwards25519.Scalar) [][]*edwards25519.Scalar {
 	return ia
 }
 
-func InterpolateMatrixShares(matrixShares [][][]*edwards25519.Scalar, ids []int) [][]*edwards25519.Scalar {
+func InterpolateMatrixShares(
+	matrixShares [][][]*edwards25519.Scalar,
+	ids []int,
+) [][]*edwards25519.Scalar {
 	matrix := make([][]*edwards25519.Scalar, len(matrixShares))
 
 	for x := 0; x < len(matrix); x++ {
@@ -241,10 +281,17 @@ func ScalarMult(a int, b [][]*edwards25519.Scalar) [][]*edwards25519.Scalar {
 
 		for y := 0; y < len(b[0]); y++ {
 			if a >= 0 {
-				prod[x][y], _ = edwards25519.NewScalar().SetCanonicalBytes(BigIntToLEBytes(big.NewInt(int64(a))))
+				prod[x][y], _ = edwards25519.NewScalar().SetCanonicalBytes(
+					BigIntToLEBytes(big.NewInt(int64(a))),
+				)
 			} else {
-				negA, _ := edwards25519.NewScalar().SetCanonicalBytes(BigIntToLEBytes(big.NewInt(int64(-a))))
-				prod[x][y] = edwards25519.NewScalar().Subtract(edwards25519.NewScalar(), negA)
+				negA, _ := edwards25519.NewScalar().SetCanonicalBytes(
+					BigIntToLEBytes(big.NewInt(int64(-a))),
+				)
+				prod[x][y] = edwards25519.NewScalar().Subtract(
+					edwards25519.NewScalar(),
+					negA,
+				)
 			}
 
 			prod[x][y] = prod[x][y].Multiply(prod[x][y], b[x][y])
@@ -254,7 +301,9 @@ func ScalarMult(a int, b [][]*edwards25519.Scalar) [][]*edwards25519.Scalar {
 	return prod
 }
 
-func GenerateDotProduct(a, b [][]*edwards25519.Scalar) [][]*edwards25519.Scalar {
+func GenerateDotProduct(
+	a, b [][]*edwards25519.Scalar,
+) [][]*edwards25519.Scalar {
 	if len(a[0]) != len(b) {
 		panic("cannot generate dot product of a and b - mismatched length")
 	}
@@ -276,7 +325,9 @@ func GenerateDotProduct(a, b [][]*edwards25519.Scalar) [][]*edwards25519.Scalar 
 	return abMatrix
 }
 
-func GenerateRandomMatrixAndInverseShares(size, total, threshold int) [2][][][]*edwards25519.Scalar {
+func GenerateRandomMatrixAndInverseShares(
+	size, total, threshold int,
+) [2][][][]*edwards25519.Scalar {
 	output := make([][]*edwards25519.Scalar, size)
 	for x := 0; x < size; x++ {
 		output[x] = make([]*edwards25519.Scalar, size)
@@ -294,7 +345,9 @@ func GenerateRandomMatrixAndInverseShares(size, total, threshold int) [2][][][]*
 	return [2][][][]*edwards25519.Scalar{splitOutput, splitInverse}
 }
 
-func GenerateRandomBeaverTripleMatrixShares(size, total, threshold int) [3][][][]*edwards25519.Scalar {
+func GenerateRandomBeaverTripleMatrixShares(
+	size, total, threshold int,
+) [3][][][]*edwards25519.Scalar {
 	uMatrix := make([][]*edwards25519.Scalar, size)
 	vMatrix := make([][]*edwards25519.Scalar, size)
 
@@ -321,7 +374,9 @@ func GenerateRandomBeaverTripleMatrixShares(size, total, threshold int) [3][][][
 	vMatrixShares := ShamirSplitMatrix(vMatrix, total, threshold)
 	uvMatrixShares := ShamirSplitMatrix(uvMatrix, total, threshold)
 
-	return [3][][][]*edwards25519.Scalar{uMatrixShares, vMatrixShares, uvMatrixShares}
+	return [3][][][]*edwards25519.Scalar{
+		uMatrixShares, vMatrixShares, uvMatrixShares,
+	}
 }
 
 func GeneratePermutationMatrix(size int) [][]*edwards25519.Scalar {

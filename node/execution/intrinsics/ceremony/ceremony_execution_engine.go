@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -18,15 +22,19 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
+	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/kzg"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 type CeremonyExecutionEngine struct {
@@ -41,6 +49,7 @@ type CeremonyExecutionEngine struct {
 	provingKey                 crypto.Signer
 	proverPublicKey            []byte
 	provingKeyAddress          []byte
+	inclusionProver            qcrypto.InclusionProver
 	participantMx              sync.Mutex
 	peerChannels               map[string]*p2p.PublicP2PChannel
 	activeSecrets              []curves.Scalar
@@ -50,6 +59,7 @@ type CeremonyExecutionEngine struct {
 	seenMessageMap             map[string]bool
 	seenMessageMx              sync.Mutex
 	intrinsicFilter            []byte
+	frameProver                qcrypto.FrameProver
 }
 
 func NewCeremonyExecutionEngine(
@@ -57,7 +67,10 @@ func NewCeremonyExecutionEngine(
 	engineConfig *config.EngineConfig,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
+	frameProver qcrypto.FrameProver,
+	inclusionProver qcrypto.InclusionProver,
 	clockStore store.ClockStore,
+	masterTimeReel *time.MasterTimeReel,
 	keyStore store.KeyStore,
 ) *CeremonyExecutionEngine {
 	if logger == nil {
@@ -74,6 +87,31 @@ func NewCeremonyExecutionEngine(
 		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
 	)
 
+	_, _, err = clockStore.GetDataClockFrame(intrinsicFilter, 0)
+	var origin []byte
+	var inclusionProof *qcrypto.InclusionAggregateProof
+	var proverKeys [][]byte
+
+	if err != nil && errors.Is(err, store.ErrNotFound) {
+		origin, inclusionProof, proverKeys = CreateGenesisState(
+			logger,
+			engineConfig,
+			nil,
+			inclusionProver,
+		)
+	}
+
+	dataTimeReel := time.NewDataTimeReel(
+		intrinsicFilter,
+		logger,
+		clockStore,
+		engineConfig,
+		frameProver,
+		origin,
+		inclusionProof,
+		proverKeys,
+	)
+
 	clock := ceremony.NewCeremonyDataClockConsensusEngine(
 		engineConfig,
 		logger,
@@ -81,6 +119,10 @@ func NewCeremonyExecutionEngine(
 		clockStore,
 		keyStore,
 		pubSub,
+		frameProver,
+		inclusionProver,
+		masterTimeReel,
+		dataTimeReel,
 		intrinsicFilter,
 		seed,
 	)
@@ -93,6 +135,8 @@ func NewCeremonyExecutionEngine(
 		clockStore:            clockStore,
 		keyStore:              keyStore,
 		pubSub:                pubSub,
+		inclusionProver:       inclusionProver,
+		frameProver:           frameProver,
 		participantMx:         sync.Mutex{},
 		peerChannels:          map[string]*p2p.PublicP2PChannel{},
 		alreadyPublishedShare: false,
@@ -139,13 +183,234 @@ func (
 	}
 }
 
+// Creates a genesis state for the intrinsic
+func CreateGenesisState(
+	logger *zap.Logger,
+	engineConfig *config.EngineConfig,
+	testProverKeys [][]byte,
+	inclusionProver qcrypto.InclusionProver,
+) (
+	[]byte,
+	*qcrypto.InclusionAggregateProof,
+	[][]byte,
+) {
+	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
+
+	if err != nil {
+		panic(errors.New("genesis seed is nil"))
+	}
+
+	logger.Info("creating genesis frame")
+	for _, l := range strings.Split(string(seed), "\n") {
+		logger.Info(l)
+	}
+
+	b := sha3.Sum256(seed)
+	v := vdf.New(engineConfig.Difficulty, b)
+
+	v.Execute()
+	o := v.GetOutput()
+	inputMessage := o[:]
+
+	// Signatories are special, they don't have an inclusion proof because they
+	// have not broadcasted communication keys, but they still get contribution
+	// rights prior to PoMW, because they did produce meaningful work in the
+	// first phase:
+	logger.Info("encoding signatories to prover trie")
+	proverKeys := [][]byte{}
+	if len(testProverKeys) != 0 {
+		logger.Warn(
+			"TEST PROVER ENTRIES BEING ADDED, YOUR NODE WILL BE KICKED IF IN" +
+				" PRODUCTION",
+		)
+		proverKeys = testProverKeys
+	} else {
+		for _, s := range kzg.CeremonySignatories {
+			pubkey := s.ToAffineCompressed()
+			logger.Info("0x" + hex.EncodeToString(pubkey))
+
+			proverKeys = append(proverKeys, pubkey)
+		}
+	}
+
+	logger.Info("encoding ceremony and phase one signatories")
+	transcript := &protobufs.CeremonyTranscript{}
+	for p, s := range kzg.CeremonyBLS48581G1 {
+		transcript.G1Powers = append(
+			transcript.G1Powers,
+			&protobufs.BLS48581G1PublicKey{
+				KeyValue: s.ToAffineCompressed(),
+			},
+		)
+		logger.Info(fmt.Sprintf("encoded G1 power %d", p))
+	}
+	for p, s := range kzg.CeremonyBLS48581G2 {
+		transcript.G2Powers = append(
+			transcript.G2Powers,
+			&protobufs.BLS48581G2PublicKey{
+				KeyValue: s.ToAffineCompressed(),
+			},
+		)
+		logger.Info(fmt.Sprintf("encoded G2 power %d", p))
+	}
+
+	transcript.RunningG1_256Witnesses = append(
+		transcript.RunningG1_256Witnesses,
+		&protobufs.BLS48581G1PublicKey{
+			KeyValue: kzg.CeremonyRunningProducts[0].ToAffineCompressed(),
+		},
+	)
+
+	transcript.RunningG2_256Powers = append(
+		transcript.RunningG2_256Powers,
+		&protobufs.BLS48581G2PublicKey{
+			KeyValue: kzg.CeremonyBLS48581G2[len(kzg.CeremonyBLS48581G2)-1].
+				ToAffineCompressed(),
+		},
+	)
+
+	outputProof := &protobufs.CeremonyLobbyStateTransition{
+		TypeUrls:         []string{},
+		TransitionInputs: [][]byte{},
+	}
+
+	proofBytes, err := proto.Marshal(outputProof)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("encoded transcript")
+	logger.Info("encoding ceremony signatories into application state")
+
+	rewardTrie := &tries.RewardCritbitTrie{}
+	for _, s := range kzg.CeremonySignatories {
+		pubkey := s.ToAffineCompressed()
+
+		addr, err := poseidon.HashBytes(pubkey)
+		if err != nil {
+			panic(err)
+		}
+
+		addrBytes := addr.Bytes()
+		addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+		rewardTrie.Add(addrBytes, 0, 50)
+	}
+
+	// 2024-01-03: 1.2.0
+	d, err := os.ReadFile("./retroactive_peers.json")
+	if err != nil {
+		panic(err)
+	}
+
+	type peerData struct {
+		PeerId       string `json:"peer_id"`
+		TokenBalance uint64 `json:"token_balance"`
+	}
+	type rewards struct {
+		Rewards []peerData `json:"rewards"`
+	}
+
+	retroEntries := &rewards{}
+	err = json.Unmarshal(d, retroEntries)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("adding retroactive peer reward info")
+	for _, s := range retroEntries.Rewards {
+		peerId := s.PeerId
+		peerBytes, err := base64.StdEncoding.DecodeString(peerId)
+		if err != nil {
+			panic(err)
+		}
+
+		addr, err := poseidon.HashBytes(peerBytes)
+		if err != nil {
+			panic(err)
+		}
+
+		addrBytes := addr.Bytes()
+		addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+		rewardTrie.Add(addrBytes, 0, s.TokenBalance)
+	}
+
+	trieBytes, err := rewardTrie.Serialize()
+	if err != nil {
+		panic(err)
+	}
+
+	ceremonyLobbyState := &protobufs.CeremonyLobbyState{
+		LobbyState: 0,
+		CeremonyState: &protobufs.CeremonyLobbyState_CeremonyOpenState{
+			CeremonyOpenState: &protobufs.CeremonyOpenState{
+				JoinedParticipants:    []*protobufs.CeremonyLobbyJoin{},
+				PreferredParticipants: []*protobufs.Ed448PublicKey{},
+			},
+		},
+		LatestTranscript: transcript,
+		RewardTrie:       trieBytes,
+	}
+	outputBytes, err := proto.Marshal(ceremonyLobbyState)
+	if err != nil {
+		panic(err)
+	}
+
+	executionOutput := &protobufs.IntrinsicExecutionOutput{
+		Address: application.CEREMONY_ADDRESS,
+		Output:  outputBytes,
+		Proof:   proofBytes,
+	}
+
+	data, err := proto.Marshal(executionOutput)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("encoded execution output")
+
+	digest := sha3.NewShake256()
+	_, err = digest.Write(data)
+	if err != nil {
+		panic(err)
+	}
+
+	expand := make([]byte, 1024)
+	_, err = digest.Read(expand)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("proving execution output for inclusion")
+	commitment, err := inclusionProver.Commit(
+		expand,
+		protobufs.IntrinsicExecutionOutputType,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("creating kzg proof")
+	proof, err := inclusionProver.ProveAggregate(
+		[]*qcrypto.InclusionCommitment{
+			commitment,
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("finalizing execution proof")
+
+	return inputMessage, proof, proverKeys
+}
+
 // Start implements ExecutionEngine
 func (e *CeremonyExecutionEngine) Start() <-chan error {
 	errChan := make(chan error)
 
 	e.logger.Info("ceremony data loaded", zap.Binary(
 		"g2_power",
-		qcrypto.CeremonyBLS48581G2[1].ToAffineCompressed(),
+		kzg.CeremonyBLS48581G2[1].ToAffineCompressed(),
 	))
 
 	go func() {
@@ -203,7 +468,7 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 				return nil, nil
 			}
 
-			if err := frame.VerifyDataClockFrame(); err != nil {
+			if err := e.frameProver.VerifyDataClockFrame(frame); err != nil {
 				return nil, errors.Wrap(err, "process message")
 			}
 
@@ -221,7 +486,6 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 		case protobufs.CeremonyTranscriptShareType:
 			fallthrough
 		case protobufs.CeremonyTranscriptType:
-			frame := e.activeClockFrame
 			hash := sha3.Sum256(any.Value)
 			if any.TypeUrl == protobufs.CeremonyTranscriptType {
 				e.seenMessageMx.Lock()
@@ -237,20 +501,11 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 				e.seenMessageMx.Unlock()
 			}
 			if e.clock.IsInProverTrie(e.proverPublicKey) {
-				app, err := application.MaterializeApplicationFromFrame(frame)
-				if err != nil {
-					return nil, errors.Wrap(err, "process message")
-				}
 				proposedTransition := &protobufs.CeremonyLobbyStateTransition{
 					TypeUrls: []string{any.TypeUrl},
 					TransitionInputs: [][]byte{
 						any.Value,
 					},
-				}
-
-				_, err = app.ApplyTransition(frame.FrameNumber, proposedTransition)
-				if err != nil {
-					return nil, errors.Wrap(err, "process message")
 				}
 
 				any := &anypb.Any{}
@@ -293,14 +548,13 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 func (e *CeremonyExecutionEngine) RunWorker() {
 	frameChan := e.clock.GetFrameChannel()
 	for {
-		frameFromBuffer := <-frameChan
-		frame := e.clock.GetFrame()
+		frame := <-frameChan
 		e.activeClockFrame = frame
 		e.logger.Info(
 			"evaluating next frame",
-			zap.Int(
-				"last_run_took_frames",
-				int(frame.FrameNumber)-int(frameFromBuffer.FrameNumber),
+			zap.Uint64(
+				"frame_number",
+				frame.FrameNumber,
 			),
 		)
 		app, err := application.MaterializeApplicationFromFrame(frame)
@@ -519,9 +773,7 @@ func (e *CeremonyExecutionEngine) RunWorker() {
 			}
 		case application.CEREMONY_APPLICATION_STATE_VALIDATING:
 			e.logger.Info("round contribution validating")
-			// Do a best effort to clear – Go's GC is noisy and unenforceable, but
-			// this should at least mark it as dead space
-			e.activeSecrets = []curves.Scalar{}
+			e.alreadyPublishedShare = false
 			for _, c := range e.peerChannels {
 				c.Close()
 			}
@@ -1134,7 +1386,7 @@ func (e *CeremonyExecutionEngine) VerifyExecution(
 						return errors.Wrap(err, "verify execution")
 					}
 
-					a, err = a.ApplyTransition(frame.FrameNumber, transition)
+					a, _, _, err = a.ApplyTransition(frame.FrameNumber, transition, false)
 					if err != nil {
 						return errors.Wrap(err, "verify execution")
 					}

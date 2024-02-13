@@ -1,4 +1,4 @@
-package crypto_test
+package shuffle_test
 
 import (
 	"fmt"
@@ -7,11 +7,11 @@ import (
 
 	"filippo.io/edwards25519"
 	"github.com/stretchr/testify/assert"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/shuffle"
 )
 
 func TestGeneratePermutationMatrix(t *testing.T) {
-	m := crypto.GeneratePermutationMatrix(6)
+	m := shuffle.GeneratePermutationMatrix(6)
 	for _, x := range m {
 		ySum := byte(0x00)
 		for _, y := range x {
@@ -39,14 +39,14 @@ func verifyLagrange(t *testing.T, shares []*edwards25519.Scalar, expected *edwar
 		var reconstructedSum *edwards25519.Scalar
 
 		for j := 0; j < threshold; j++ {
-			oneLENumBytes := crypto.BigIntToLEBytes(big.NewInt(1))
+			oneLENumBytes := shuffle.BigIntToLEBytes(big.NewInt(1))
 			coeffNum, _ := edwards25519.NewScalar().SetCanonicalBytes(oneLENumBytes)
 			coeffDenom, _ := edwards25519.NewScalar().SetCanonicalBytes(oneLENumBytes)
 
 			for k := 0; k < threshold; k++ {
 				if j != k {
-					ikBytes := crypto.BigIntToLEBytes(big.NewInt(int64(i + k)))
-					ijBytes := crypto.BigIntToLEBytes(big.NewInt(int64(i + j)))
+					ikBytes := shuffle.BigIntToLEBytes(big.NewInt(int64(i + k)))
+					ijBytes := shuffle.BigIntToLEBytes(big.NewInt(int64(i + j)))
 					ikScalar, _ := edwards25519.NewScalar().SetCanonicalBytes(ikBytes)
 					ijScalar, _ := edwards25519.NewScalar().SetCanonicalBytes(ijBytes)
 
@@ -78,8 +78,8 @@ func verifyLagrange(t *testing.T, shares []*edwards25519.Scalar, expected *edwar
 }
 
 func TestGenerateShamirMatrix(t *testing.T) {
-	m := crypto.GeneratePermutationMatrix(6)
-	sm := crypto.ShamirSplitMatrix(m, 10, 3)
+	m := shuffle.GeneratePermutationMatrix(6)
+	sm := shuffle.ShamirSplitMatrix(m, 10, 3)
 	for xi, x := range sm {
 		for yi, y := range x {
 			verifyLagrange(t, y, m[xi][yi], 10, 3)
@@ -88,11 +88,11 @@ func TestGenerateShamirMatrix(t *testing.T) {
 }
 
 func TestMatrixDotProduct(t *testing.T) {
-	zeroBytes := crypto.BigIntToLEBytes(big.NewInt(0))
-	oneBytes := crypto.BigIntToLEBytes(big.NewInt(1))
-	twoBytes := crypto.BigIntToLEBytes(big.NewInt(2))
-	threeBytes := crypto.BigIntToLEBytes(big.NewInt(3))
-	fourBytes := crypto.BigIntToLEBytes(big.NewInt(4))
+	zeroBytes := shuffle.BigIntToLEBytes(big.NewInt(0))
+	oneBytes := shuffle.BigIntToLEBytes(big.NewInt(1))
+	twoBytes := shuffle.BigIntToLEBytes(big.NewInt(2))
+	threeBytes := shuffle.BigIntToLEBytes(big.NewInt(3))
+	fourBytes := shuffle.BigIntToLEBytes(big.NewInt(4))
 
 	zero, _ := edwards25519.NewScalar().SetCanonicalBytes(zeroBytes)
 	one, _ := edwards25519.NewScalar().SetCanonicalBytes(oneBytes)
@@ -110,7 +110,7 @@ func TestMatrixDotProduct(t *testing.T) {
 		{three, two, four},
 	}
 
-	abMatrix := crypto.GenerateDotProduct(aMatrix, bMatrix)
+	abMatrix := shuffle.GenerateDotProduct(aMatrix, bMatrix)
 	assert.Equal(t, byte(0x0a), abMatrix[0][0].Bytes()[0])
 	assert.Equal(t, byte(0x06), abMatrix[0][1].Bytes()[0])
 	assert.Equal(t, byte(0x0c), abMatrix[0][2].Bytes()[0])
@@ -123,15 +123,15 @@ func TestMatrixDotProduct(t *testing.T) {
 }
 
 func TestGenerateRandomBeaverTripleMatrixShares(t *testing.T) {
-	beaverTripleShares := crypto.GenerateRandomBeaverTripleMatrixShares(6, 10, 3)
+	beaverTripleShares := shuffle.GenerateRandomBeaverTripleMatrixShares(6, 10, 3)
 
 	uMatrixShares := beaverTripleShares[0]
 	vMatrixShares := beaverTripleShares[1]
 	uvMatrixShares := beaverTripleShares[2]
 
-	uMatrix := crypto.InterpolateMatrixShares(uMatrixShares, []int{1, 2, 3})
-	vMatrix := crypto.InterpolateMatrixShares(vMatrixShares, []int{1, 2, 3})
-	uvMatrix := crypto.InterpolateMatrixShares(uvMatrixShares, []int{1, 2, 3})
+	uMatrix := shuffle.InterpolateMatrixShares(uMatrixShares, []int{1, 2, 3})
+	vMatrix := shuffle.InterpolateMatrixShares(vMatrixShares, []int{1, 2, 3})
+	uvMatrix := shuffle.InterpolateMatrixShares(uvMatrixShares, []int{1, 2, 3})
 
 	for x := 0; x < len(uMatrixShares); x++ {
 		for y := 0; y < len(uMatrixShares[0]); y++ {
@@ -141,21 +141,21 @@ func TestGenerateRandomBeaverTripleMatrixShares(t *testing.T) {
 		}
 	}
 
-	uvCheck := crypto.GenerateDotProduct(uMatrix, vMatrix)
+	uvCheck := shuffle.GenerateDotProduct(uMatrix, vMatrix)
 	assert.Equal(t, uvMatrix, uvCheck)
 }
 
 func TestPermutationMatrix(t *testing.T) {
-	permutationMatrix1 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix2 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix3 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix4 := crypto.GeneratePermutationMatrix(6)
+	permutationMatrix1 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix2 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix3 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix4 := shuffle.GeneratePermutationMatrix(6)
 
-	permutationMatrix := crypto.GenerateDotProduct(permutationMatrix1, permutationMatrix2)
-	permutationMatrix = crypto.GenerateDotProduct(permutationMatrix, permutationMatrix3)
-	permutationMatrix = crypto.GenerateDotProduct(permutationMatrix, permutationMatrix4)
+	permutationMatrix := shuffle.GenerateDotProduct(permutationMatrix1, permutationMatrix2)
+	permutationMatrix = shuffle.GenerateDotProduct(permutationMatrix, permutationMatrix3)
+	permutationMatrix = shuffle.GenerateDotProduct(permutationMatrix, permutationMatrix4)
 
-	one, _ := edwards25519.NewScalar().SetCanonicalBytes(crypto.BigIntToLEBytes(big.NewInt(1)))
+	one, _ := edwards25519.NewScalar().SetCanonicalBytes(shuffle.BigIntToLEBytes(big.NewInt(1)))
 	for x := 0; x < 6; x++ {
 		sumX := edwards25519.NewScalar()
 
@@ -178,14 +178,14 @@ func TestPermutationMatrix(t *testing.T) {
 }
 
 func TestPermutationSharing(t *testing.T) {
-	permutationMatrix1 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix2 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix3 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrix4 := crypto.GeneratePermutationMatrix(6)
-	permutationMatrixShares1 := crypto.ShamirSplitMatrix(permutationMatrix1, 4, 3)
-	permutationMatrixShares2 := crypto.ShamirSplitMatrix(permutationMatrix2, 4, 3)
-	permutationMatrixShares3 := crypto.ShamirSplitMatrix(permutationMatrix3, 4, 3)
-	permutationMatrixShares4 := crypto.ShamirSplitMatrix(permutationMatrix4, 4, 3)
+	permutationMatrix1 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix2 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix3 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrix4 := shuffle.GeneratePermutationMatrix(6)
+	permutationMatrixShares1 := shuffle.ShamirSplitMatrix(permutationMatrix1, 4, 3)
+	permutationMatrixShares2 := shuffle.ShamirSplitMatrix(permutationMatrix2, 4, 3)
+	permutationMatrixShares3 := shuffle.ShamirSplitMatrix(permutationMatrix3, 4, 3)
+	permutationMatrixShares4 := shuffle.ShamirSplitMatrix(permutationMatrix4, 4, 3)
 
 	inverseShareMatrix1 := make([][][]*edwards25519.Scalar, 4)
 	inverseShareMatrix2 := make([][][]*edwards25519.Scalar, 4)
@@ -213,9 +213,9 @@ func TestPermutationSharing(t *testing.T) {
 		}
 	}
 
-	beaverTripleShares1 := crypto.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
-	beaverTripleShares2 := crypto.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
-	beaverTripleShares3 := crypto.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
+	beaverTripleShares1 := shuffle.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
+	beaverTripleShares2 := shuffle.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
+	beaverTripleShares3 := shuffle.GenerateRandomBeaverTripleMatrixShares(6, 4, 3)
 
 	beaverTriplesAShares1 := beaverTripleShares1[0]
 	beaverTriplesBShares1 := beaverTripleShares1[1]
@@ -310,18 +310,18 @@ func TestPermutationSharing(t *testing.T) {
 	// f = b - v
 	// (a - u)(b - v) = -ab + ub + av - uv + (ab-av) + (ab - ub) + uv
 
-	e1 := crypto.InterpolateMatrixShares(es1, []int{1, 2, 3, 4})
-	f1 := crypto.InterpolateMatrixShares(fs1, []int{1, 2, 3, 4})
-	e2 := crypto.InterpolateMatrixShares(es2, []int{1, 2, 3, 4})
-	f2 := crypto.InterpolateMatrixShares(fs2, []int{1, 2, 3, 4})
-	e3 := crypto.InterpolateMatrixShares(es3, []int{1, 2, 3, 4})
-	f3 := crypto.InterpolateMatrixShares(fs3, []int{1, 2, 3, 4})
+	e1 := shuffle.InterpolateMatrixShares(es1, []int{1, 2, 3, 4})
+	f1 := shuffle.InterpolateMatrixShares(fs1, []int{1, 2, 3, 4})
+	e2 := shuffle.InterpolateMatrixShares(es2, []int{1, 2, 3, 4})
+	f2 := shuffle.InterpolateMatrixShares(fs2, []int{1, 2, 3, 4})
+	e3 := shuffle.InterpolateMatrixShares(es3, []int{1, 2, 3, 4})
+	f3 := shuffle.InterpolateMatrixShares(fs3, []int{1, 2, 3, 4})
 
 	// mul(a, b) => <e> = <a> - <u>, <f> = <b> - <v>, <c> = -i * e * f + f * <a> + e * <b> + <z>
 
-	ef1 := crypto.GenerateDotProduct(e1, f1)
-	ef2 := crypto.GenerateDotProduct(e2, f2)
-	ef3 := crypto.GenerateDotProduct(e3, f3)
+	ef1 := shuffle.GenerateDotProduct(e1, f1)
+	ef2 := shuffle.GenerateDotProduct(e2, f2)
+	ef3 := shuffle.GenerateDotProduct(e3, f3)
 	fa1 := make([][][]*edwards25519.Scalar, 4)
 	fa2 := make([][][]*edwards25519.Scalar, 4)
 	fa3 := make([][][]*edwards25519.Scalar, 4)
@@ -336,15 +336,15 @@ func TestPermutationSharing(t *testing.T) {
 	inverseCS3 := make([][][]*edwards25519.Scalar, 6)
 
 	for i := 0; i < 4; i++ {
-		fa1[i] = crypto.GenerateDotProduct(inverseShareMatrix1[i], f1)
-		eb1[i] = crypto.GenerateDotProduct(e1, inverseShareMatrix2[i])
-		fa2[i] = crypto.GenerateDotProduct(inverseShareMatrix2[i], f2)
-		eb2[i] = crypto.GenerateDotProduct(e2, inverseShareMatrix3[i])
-		fa3[i] = crypto.GenerateDotProduct(inverseShareMatrix3[i], f3)
-		eb3[i] = crypto.GenerateDotProduct(e3, inverseShareMatrix4[i])
-		cs1[i] = crypto.AddMatrices(crypto.ScalarMult(-1, ef1), fa1[i], eb1[i], inverseBeaverTriplesABShares1[i])
-		cs2[i] = crypto.AddMatrices(crypto.ScalarMult(-1, ef2), fa2[i], eb2[i], inverseBeaverTriplesABShares2[i])
-		cs3[i] = crypto.AddMatrices(crypto.ScalarMult(-1, ef3), fa3[i], eb3[i], inverseBeaverTriplesABShares3[i])
+		fa1[i] = shuffle.GenerateDotProduct(inverseShareMatrix1[i], f1)
+		eb1[i] = shuffle.GenerateDotProduct(e1, inverseShareMatrix2[i])
+		fa2[i] = shuffle.GenerateDotProduct(inverseShareMatrix2[i], f2)
+		eb2[i] = shuffle.GenerateDotProduct(e2, inverseShareMatrix3[i])
+		fa3[i] = shuffle.GenerateDotProduct(inverseShareMatrix3[i], f3)
+		eb3[i] = shuffle.GenerateDotProduct(e3, inverseShareMatrix4[i])
+		cs1[i] = shuffle.AddMatrices(shuffle.ScalarMult(-1, ef1), fa1[i], eb1[i], inverseBeaverTriplesABShares1[i])
+		cs2[i] = shuffle.AddMatrices(shuffle.ScalarMult(-1, ef2), fa2[i], eb2[i], inverseBeaverTriplesABShares2[i])
+		cs3[i] = shuffle.AddMatrices(shuffle.ScalarMult(-1, ef3), fa3[i], eb3[i], inverseBeaverTriplesABShares3[i])
 	}
 
 	for x := 0; x < 6; x++ {
@@ -360,12 +360,12 @@ func TestPermutationSharing(t *testing.T) {
 		}
 	}
 
-	c1 := crypto.InterpolateMatrixShares(inverseCS1, []int{1, 2, 3, 4})
-	c3 := crypto.InterpolateMatrixShares(inverseCS3, []int{1, 2, 3, 4})
-	c := crypto.GenerateDotProduct(c1, c3)
-	ab := crypto.GenerateDotProduct(permutationMatrix1, permutationMatrix2)
-	abc := crypto.GenerateDotProduct(ab, permutationMatrix3)
-	abcd := crypto.GenerateDotProduct(abc, permutationMatrix4)
+	c1 := shuffle.InterpolateMatrixShares(inverseCS1, []int{1, 2, 3, 4})
+	c3 := shuffle.InterpolateMatrixShares(inverseCS3, []int{1, 2, 3, 4})
+	c := shuffle.GenerateDotProduct(c1, c3)
+	ab := shuffle.GenerateDotProduct(permutationMatrix1, permutationMatrix2)
+	abc := shuffle.GenerateDotProduct(ab, permutationMatrix3)
+	abcd := shuffle.GenerateDotProduct(abc, permutationMatrix4)
 
 	for x := 0; x < 6; x++ {
 		for y := 0; y < 6; y++ {

@@ -1,9 +1,7 @@
 package master
 
 import (
-	"bytes"
 	"strings"
-	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
@@ -92,17 +90,6 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	if e.frame.FrameNumber > frame.FrameNumber {
-		e.logger.Debug(
-			"received anachronistic frame",
-			zap.Binary("sender", peerID),
-			zap.Binary("filter", frame.Filter),
-			zap.Uint64("frame_number", frame.FrameNumber),
-			zap.Int("proof_count", len(frame.AggregateProofs)),
-		)
-		return nil
-	}
-
 	if e.difficulty != frame.Difficulty {
 		e.logger.Debug(
 			"frame difficulty mismatched",
@@ -122,64 +109,34 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		zap.Int("proof_count", len(frame.AggregateProofs)),
 	)
 
-	if err := frame.VerifyMasterClockFrame(); err != nil {
+	if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
 		e.logger.Error("could not verify clock frame", zap.Error(err))
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	if e.frame.FrameNumber < frame.FrameNumber {
-		if err := e.enqueueSeenFrame(frame); err != nil {
-			e.logger.Error("could not enqueue seen clock frame", zap.Error(err))
-			return errors.Wrap(err, "handle clock frame data")
-		}
-	}
+	e.masterTimeReel.Insert(frame)
 
-	return nil
-}
-
-func (e *MasterClockConsensusEngine) enqueueSeenFrame(
-	frame *protobufs.ClockFrame,
-) error {
-	e.seenFramesMx.Lock()
-	found := false
-	for _, f := range e.seenFrames {
-		if f.FrameNumber == frame.FrameNumber &&
-			bytes.Equal(f.Input, frame.Input) &&
-			f.Difficulty == frame.Difficulty &&
-			bytes.Equal(f.Output, frame.Output) {
-			found = true
-		}
-	}
-	if !found {
-		e.logger.Debug(
-			"enqueuing frame for consensus",
-			zap.Uint64("frame_number", frame.FrameNumber),
-		)
-		e.seenFrames = append(e.seenFrames, frame)
-		e.lastFrameReceivedAt = time.Now().UTC()
-	}
-	e.seenFramesMx.Unlock()
 	return nil
 }
 
 func (e *MasterClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
-	if e.state == consensus.EngineStatePublishing {
-		e.logger.Debug(
-			"publishing frame",
-			zap.Uint64("frame_number", frame.FrameNumber),
-		)
-		e.enqueueSeenFrame(frame)
-		if err := e.publishMessage(e.filter, frame); err != nil {
-			return errors.Wrap(
-				err,
-				"publish proof",
-			)
-		}
+	e.logger.Debug(
+		"publishing frame",
+		zap.Uint64("frame_number", frame.FrameNumber),
+	)
 
-		e.state = consensus.EngineStateCollecting
+	e.masterTimeReel.Insert(frame)
+
+	if err := e.publishMessage(e.filter, frame); err != nil {
+		return errors.Wrap(
+			err,
+			"publish proof",
+		)
 	}
+
+	e.state = consensus.EngineStateCollecting
 
 	return nil
 }

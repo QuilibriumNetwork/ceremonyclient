@@ -11,17 +11,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
-	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 func (e *CeremonyDataClockConsensusEngine) handleMessage(
@@ -304,17 +300,8 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	earliestFrame, _, count := e.frameProverTrie.Get(addr.Bytes())
-	_, latestFrame, _ := e.frameSeenProverTrie.Get(addr.Bytes())
-	if !isSync && frame.FrameNumber == latestFrame {
-		e.logger.Info(
-			"already received frame from address",
-			zap.Binary("address", address),
-			zap.Binary("filter", frame.Filter),
-			zap.Uint64("frame_number", frame.FrameNumber),
-		)
-		return nil
-	} else if frame.FrameNumber <= earliestFrame || count == 0 {
+	prover := e.frameProverTrie.FindNearest(addr.Bytes())
+	if !bytes.Equal(prover.External.Key, addr.Bytes()) {
 		e.logger.Info(
 			"prover not in trie at frame, address may be in fork",
 			zap.Binary("address", address),
@@ -332,167 +319,14 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		zap.Int("proof_count", len(frame.AggregateProofs)),
 	)
 
-	if err := frame.VerifyDataClockFrame(); err != nil {
+	if err := e.frameProver.VerifyDataClockFrame(frame); err != nil {
 		e.logger.Error("could not verify clock frame", zap.Error(err))
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	aggregateCommitments := []curves.PairingPoint{}
-	for i := 0; i < (len(frame.Input)-516)/74; i++ {
-		c, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(
-			frame.Input[516+(i*74) : 516+(i*74)+74],
-		)
-		if err != nil {
-			e.logger.Error("could not verify clock frame", zap.Error(err))
-			return errors.Wrap(err, "handle clock frame data")
-		}
-		aggregateCommitments = append(aggregateCommitments, c.(curves.PairingPoint))
-	}
-
-	for i, proof := range frame.AggregateProofs {
-		aggregatePoly := [][]curves.PairingScalar{}
-		commitments := []curves.PairingPoint{}
-
-		for _, commit := range proof.GetInclusionCommitments() {
-			switch commit.TypeUrl {
-			case protobufs.IntrinsicExecutionOutputType:
-				e.logger.Debug("confirming inclusion in aggregate")
-				digest := sha3.NewShake256()
-				_, err := digest.Write(commit.Data)
-				if err != nil {
-					e.logger.Error(
-						"error converting key bundle to polynomial",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-
-				expand := make([]byte, 1024)
-				_, err = digest.Read(expand)
-				if err != nil {
-					e.logger.Error(
-						"error converting key bundle to polynomial",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-
-				poly, err := e.prover.BytesToPolynomial(expand)
-				if err != nil {
-					e.logger.Error(
-						"error converting key bundle to polynomial",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-
-				evalPoly, err := qcrypto.FFT(
-					poly,
-					*curves.BLS48581(
-						curves.BLS48581G1().NewGeneratorPoint(),
-					),
-					16,
-					false,
-				)
-				if err != nil {
-					e.logger.Error(
-						"error performing fast fourier transform on key bundle",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-				e.logger.Debug(
-					"created fft of polynomial",
-					zap.Int("poly_size", len(evalPoly)),
-				)
-
-				aggregatePoly = append(aggregatePoly, evalPoly)
-
-				c, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(
-					commit.Commitment,
-				)
-				if err != nil {
-					e.logger.Error("could not verify clock frame", zap.Error(err))
-					return errors.Wrap(err, "handle clock frame data")
-				}
-				commitments = append(commitments, c.(curves.PairingPoint))
-			default:
-				e.logger.Debug("confirming inclusion in aggregate")
-				poly, err := e.prover.BytesToPolynomial(commit.Data)
-				if err != nil {
-					e.logger.Error(
-						"error converting key bundle to polynomial",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-
-				for i := 0; i < 128-len(poly); i++ {
-					poly = append(
-						poly,
-						curves.BLS48581G1().Scalar.Zero().(curves.PairingScalar),
-					)
-				}
-
-				evalPoly, err := qcrypto.FFT(
-					poly,
-					*curves.BLS48581(
-						curves.BLS48581G1().NewGeneratorPoint(),
-					),
-					128,
-					false,
-				)
-				if err != nil {
-					e.logger.Error(
-						"error performing fast fourier transform on key bundle",
-						zap.Error(err),
-					)
-					return errors.Wrap(err, "handle clock frame data")
-				}
-				e.logger.Debug(
-					"created fft of polynomial",
-					zap.Int("poly_size", len(evalPoly)),
-				)
-
-				aggregatePoly = append(aggregatePoly, evalPoly)
-
-				c, err := curves.BLS48581G1().NewGeneratorPoint().FromAffineCompressed(
-					commit.Commitment,
-				)
-				if err != nil {
-					e.logger.Error("could not verify clock frame", zap.Error(err))
-					return errors.Wrap(err, "handle clock frame data")
-				}
-				commitments = append(commitments, c.(curves.PairingPoint))
-			}
-		}
-
-		p, err := curves.BLS48581G1().Point.FromAffineCompressed(
-			proof.Proof,
-		)
-		if err != nil {
-			e.logger.Error("could not verify clock frame", zap.Error(err))
-			return errors.Wrap(err, "handle clock frame data")
-		}
-
-		result, err := e.prover.VerifyAggregateProof(
-			aggregatePoly,
-			commitments,
-			aggregateCommitments[i],
-			p.(curves.PairingPoint),
-		)
-		if err != nil {
-			e.logger.Error("could not verify clock frame", zap.Error(err))
-			return errors.Wrap(err, "handle clock frame data")
-		}
-
-		if !result {
-			e.logger.Error("could not verify clock frame", zap.Error(err))
-			return errors.Wrap(
-				errors.New("invalid proof"),
-				"handle clock frame data",
-			)
-		}
+	if err := e.inclusionProver.VerifyFrame(frame); err != nil {
+		e.logger.Error("could not verify clock frame", zap.Error(err))
+		return errors.Wrap(err, "handle clock frame data")
 	}
 
 	e.logger.Info(
@@ -501,102 +335,23 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		zap.Binary("filter", frame.Filter),
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
-	masterFrame, err := e.clockStore.GetMasterClockFrame(
-		[]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		},
-		frame.FrameNumber-1,
-	)
-	if err != nil {
-		e.logger.Info("received frame with no known master, needs sync")
-		return nil
-	}
 
-	discriminator, err := masterFrame.GetSelector()
-	if err != nil {
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	parentSelector, distance, selector, err :=
-		frame.GetParentSelectorAndDistance(discriminator)
-	if err != nil {
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if _, err := e.clockStore.GetParentDataClockFrame(
-		frame.Filter,
-		frame.FrameNumber-1,
-		frame.ParentSelector,
-	); errors.Is(err, store.ErrNotFound) {
-		// If this is a frame number higher than what we're already caught up to,
-		// push a request to fill the gap, unless we're syncing or it's in step,
-		// then just lazily seek.
-		from := e.frame.FrameNumber
-		if from >= frame.FrameNumber-1 {
-			from = frame.FrameNumber - 1
-		}
-
-		if err := e.publishMessage(e.filter, &protobufs.ClockFramesRequest{
-			Filter:          e.filter,
-			FromFrameNumber: from,
-			ToFrameNumber:   frame.FrameNumber,
-		}); err != nil {
-			e.logger.Error(
-				"could not publish clock frame parent request, skipping",
-				zap.Error(err),
-			)
-		}
-	}
-
-	txn, err := e.clockStore.NewTransaction()
-	if err != nil {
-		e.logger.Error("could not save candidate clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if err := e.clockStore.PutCandidateDataClockFrame(
-		parentSelector.FillBytes(make([]byte, 32)),
-		distance.FillBytes(make([]byte, 32)),
-		selector.FillBytes(make([]byte, 32)),
-		frame,
-		txn,
-	); err != nil {
-		e.logger.Error("could not save candidate clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if err := txn.Commit(); err != nil {
-		e.logger.Error("could not save candidate clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if e.frame.FrameNumber < frame.FrameNumber {
-		e.latestFrameReceived = frame.FrameNumber
-		e.lastFrameReceivedAt = time.Now().UTC()
-	}
-	e.frameSeenProverTrie.Add(address, frame.FrameNumber)
+	e.dataTimeReel.Insert(frame)
 	return nil
 }
 
 func (e *CeremonyDataClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
-	if e.state == consensus.EngineStatePublishing {
-		e.logger.Debug(
-			"publishing frame and aggregations",
-			zap.Uint64("frame_number", frame.FrameNumber),
+	e.logger.Debug(
+		"publishing frame and aggregations",
+		zap.Uint64("frame_number", frame.FrameNumber),
+	)
+	if err := e.publishMessage(e.filter, frame); err != nil {
+		return errors.Wrap(
+			err,
+			"publish proof",
 		)
-		if err := e.publishMessage(e.filter, frame); err != nil {
-			return errors.Wrap(
-				err,
-				"publish proof",
-			)
-		}
-
-		e.state = consensus.EngineStateCollecting
 	}
 
 	return nil

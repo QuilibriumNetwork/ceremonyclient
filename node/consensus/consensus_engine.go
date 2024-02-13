@@ -51,13 +51,13 @@ type DataConsensusEngine interface {
 }
 
 func GetMinimumVersionCutoff() time.Time {
-	return time.Date(2024, time.January, 14, 7, 0, 0, 0, time.UTC)
+	return time.Date(2024, time.February, 12, 7, 0, 0, 0, time.UTC)
 }
 
 func GetMinimumVersion() []byte {
-	return []byte{0x01, 0x02, 0x03}
+	return []byte{0x01, 0x02, 0x04}
 }
 
 func GetVersion() []byte {
-	return []byte{0x01, 0x02, 0x03}
+	return []byte{0x01, 0x02, 0x04}
 }

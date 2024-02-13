@@ -1,4 +1,4 @@
-package crypto_test
+package channel_test
 
 import (
 	"crypto/rand"
@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
 )
 
 func TestRatchetEncrypt(t *testing.T) {
@@ -20,7 +20,7 @@ func TestRatchetEncrypt(t *testing.T) {
 	x448ReceivingIdentityKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingIdentityPrivateKey)
 	x448ReceivingSignedPreKey := curves.ED448().NewGeneratorPoint().Mul(x448ReceivingSignedPrePrivateKey)
 
-	senderResult := crypto.SenderX3DH(
+	senderResult := channel.SenderX3DH(
 		x448SendingIdentityPrivateKey,
 		x448SendingEphemeralPrivateKey,
 		x448ReceivingIdentityKey,
@@ -28,7 +28,7 @@ func TestRatchetEncrypt(t *testing.T) {
 		96,
 	)
 
-	receiverResult := crypto.ReceiverX3DH(
+	receiverResult := channel.ReceiverX3DH(
 		x448ReceivingIdentityPrivateKey,
 		x448ReceivingSignedPrePrivateKey,
 		x448SendingIdentityKey,
@@ -36,7 +36,7 @@ func TestRatchetEncrypt(t *testing.T) {
 		96,
 	)
 
-	sender, err := crypto.NewDoubleRatchetParticipant(
+	sender, err := channel.NewDoubleRatchetParticipant(
 		senderResult[:32],
 		senderResult[32:64],
 		senderResult[64:],
@@ -48,7 +48,7 @@ func TestRatchetEncrypt(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	receiver, err := crypto.NewDoubleRatchetParticipant(
+	receiver, err := channel.NewDoubleRatchetParticipant(
 		receiverResult[:32],
 		receiverResult[32:64],
 		receiverResult[64:],

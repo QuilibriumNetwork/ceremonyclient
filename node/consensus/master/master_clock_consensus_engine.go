@@ -9,6 +9,8 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
+	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
@@ -25,12 +27,12 @@ const (
 )
 
 type MasterClockConsensusEngine struct {
-	frame               *protobufs.ClockFrame
 	difficulty          uint32
 	logger              *zap.Logger
 	state               consensus.EngineState
 	pubSub              p2p.PubSub
 	keyManager          keys.KeyManager
+	frameProver         crypto.FrameProver
 	lastFrameReceivedAt time.Time
 
 	frameChan        chan *protobufs.ClockFrame
@@ -45,6 +47,7 @@ type MasterClockConsensusEngine struct {
 	seenFrames       []*protobufs.ClockFrame
 	historicFrames   []*protobufs.ClockFrame
 	clockStore       store.ClockStore
+	masterTimeReel   *qtime.MasterTimeReel
 }
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
@@ -55,6 +58,8 @@ func NewMasterClockConsensusEngine(
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
+	frameProver crypto.FrameProver,
+	masterTimeReel *qtime.MasterTimeReel,
 ) *MasterClockConsensusEngine {
 	if logger == nil {
 		panic(errors.New("logger is nil"))
@@ -72,13 +77,20 @@ func NewMasterClockConsensusEngine(
 		panic(errors.New("pubsub is nil"))
 	}
 
+	if frameProver == nil {
+		panic(errors.New("frame prover is nil"))
+	}
+
+	if masterTimeReel == nil {
+		panic(errors.New("master time reel is nil"))
+	}
+
 	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
 	if err != nil {
 		panic(errors.New("genesis seed is nil"))
 	}
 
 	e := &MasterClockConsensusEngine{
-		frame:               nil,
 		difficulty:          10000,
 		logger:              logger,
 		state:               consensus.EngineStateStopped,
@@ -90,15 +102,8 @@ func NewMasterClockConsensusEngine(
 		lastFrameReceivedAt: time.Time{},
 		syncingStatus:       SyncStatusNotSyncing,
 		clockStore:          clockStore,
-	}
-
-	latestFrame, err := e.clockStore.GetLatestMasterClockFrame(e.filter)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		panic(err)
-	}
-
-	if latestFrame != nil {
-		e.frame = latestFrame
+		frameProver:         frameProver,
+		masterTimeReel:      masterTimeReel,
 	}
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
@@ -118,28 +123,17 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateLoading
 	e.logger.Info("syncing last seen state")
 
-	latestFrame, err := e.clockStore.GetLatestMasterClockFrame(e.filter)
-	if err != nil && errors.Is(err, store.ErrNotFound) {
-		latestFrame = e.CreateGenesisFrame()
-		txn, err := e.clockStore.NewTransaction()
-		if err != nil {
-			panic(err)
-		}
-
-		if err = e.clockStore.PutMasterClockFrame(latestFrame, txn); err != nil {
-			panic(err)
-		}
-
-		if err = txn.Commit(); err != nil {
-			panic(err)
-		}
-	} else if err != nil {
+	err := e.masterTimeReel.Start()
+	if err != nil {
 		panic(err)
-	} else {
-		e.setFrame(latestFrame)
 	}
 
-	e.buildHistoricFrameCache(latestFrame)
+	frame, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	e.buildHistoricFrameCache(frame)
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
@@ -159,23 +153,37 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
+		newFrameCh := e.masterTimeReel.NewFrameCh()
+
 		for e.state < consensus.EngineStateStopping {
 			var err error
-			switch e.state {
-			case consensus.EngineStateCollecting:
-				currentFrame := latestFrame
-				if latestFrame, err = e.collect(latestFrame); err != nil {
+			select {
+			case frame := <-newFrameCh:
+				currentFrame := frame
+				latestFrame := frame
+				if latestFrame, err = e.collect(currentFrame); err != nil {
 					e.logger.Error("could not collect", zap.Error(err))
 					latestFrame = currentFrame
+					continue
 				}
-			case consensus.EngineStateProving:
-				currentFrame := latestFrame
 				if latestFrame, err = e.prove(latestFrame); err != nil {
 					e.logger.Error("could not prove", zap.Error(err))
 					latestFrame = currentFrame
 				}
-			case consensus.EngineStatePublishing:
 				if err = e.publishProof(latestFrame); err != nil {
+					e.logger.Error("could not publish", zap.Error(err))
+				}
+			case <-time.After(20 * time.Second):
+				frame, err := e.masterTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+
+				if frame, err = e.prove(frame); err != nil {
+					e.logger.Error("could not prove", zap.Error(err))
+					continue
+				}
+				if err = e.publishProof(frame); err != nil {
 					e.logger.Error("could not publish", zap.Error(err))
 				}
 			}
@@ -199,7 +207,13 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 	for name := range e.executionEngines {
 		name := name
 		go func(name string) {
-			err := <-e.UnregisterExecutor(name, e.frame.FrameNumber, force)
+			frame, err := e.masterTimeReel.Head()
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			err = <-e.UnregisterExecutor(name, frame.FrameNumber, force)
 			if err != nil {
 				errChan <- err
 			}
@@ -210,6 +224,7 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 	e.logger.Info("waiting for execution engines to stop")
 	wg.Wait()
 	e.logger.Info("execution engines stopped")
+	e.masterTimeReel.Stop()
 
 	e.state = consensus.EngineStateStopped
 	go func() {
@@ -223,7 +238,12 @@ func (e *MasterClockConsensusEngine) GetDifficulty() uint32 {
 }
 
 func (e *MasterClockConsensusEngine) GetFrame() *protobufs.ClockFrame {
-	return e.frame
+	frame, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	return frame
 }
 
 func (e *MasterClockConsensusEngine) GetState() consensus.EngineState {

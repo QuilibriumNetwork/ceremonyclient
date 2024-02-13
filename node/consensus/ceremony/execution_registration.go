@@ -15,13 +15,18 @@ func (e *CeremonyDataClockConsensusEngine) RegisterExecutor(
 
 	go func() {
 		for {
+			masterFrame, err := e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame.FrameNumber),
+				zap.Uint64("current_frame", masterFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame.FrameNumber
+			newFrame := masterFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"injecting execution engine at frame",
@@ -52,13 +57,18 @@ func (e *CeremonyDataClockConsensusEngine) UnregisterExecutor(
 
 	go func() {
 		for {
+			masterFrame, err := e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", e.frame.FrameNumber),
+				zap.Uint64("current_frame", masterFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := e.frame.FrameNumber
+			newFrame := masterFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"removing execution engine at frame",

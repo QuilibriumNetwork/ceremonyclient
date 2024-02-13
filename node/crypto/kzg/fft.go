@@ -1,4 +1,4 @@
-package crypto
+package kzg
 
 import (
 	"math/big"

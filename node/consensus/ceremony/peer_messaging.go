@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -106,7 +106,12 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 		}
 	}
 
-	max := e.frame.FrameNumber
+	head, err := e.dataTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	max := head.FrameNumber
 	to := request.ToFrameNumber
 
 	// We need to slightly rewind, to compensate for unconfirmed frame heads on a

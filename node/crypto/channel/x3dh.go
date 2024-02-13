@@ -1,4 +1,4 @@
-package crypto
+package channel
 
 import (
 	"crypto/sha512"

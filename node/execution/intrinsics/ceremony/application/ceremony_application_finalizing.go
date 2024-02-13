@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -79,43 +78,30 @@ func (a *CeremonyApplication) applyTranscriptShare(
 		return errors.Wrap(err, "apply transcript share")
 	}
 
-	eg := errgroup.Group{}
-	eg.SetLimit(100)
-
 	for i, g1 := range a.LatestTranscript.G1Powers {
 		i := i
 		g1 := g1
-		eg.Go(func() error {
-			if _, err := curves.BLS48581G1().Point.FromAffineCompressed(
-				g1.KeyValue,
-			); err != nil {
-				return errors.Wrap(
-					errors.Wrap(err, fmt.Sprintf("invalid g1 at position %d", i)),
-					"apply transcript share",
-				)
-			}
-			return nil
-		})
+		if _, err := curves.BLS48581G1().Point.FromAffineCompressed(
+			g1.KeyValue,
+		); err != nil {
+			return errors.Wrap(
+				errors.Wrap(err, fmt.Sprintf("invalid g1 at position %d", i)),
+				"apply transcript share",
+			)
+		}
 	}
 
 	for i, g2 := range a.LatestTranscript.G2Powers {
 		i := i
 		g2 := g2
-		eg.Go(func() error {
-			if _, err := curves.BLS48581G2().Point.FromAffineCompressed(
-				g2.KeyValue,
-			); err != nil {
-				return errors.Wrap(
-					errors.Wrap(err, fmt.Sprintf("invalid g2 at position %d", i)),
-					"apply transcript share",
-				)
-			}
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		return err
+		if _, err := curves.BLS48581G2().Point.FromAffineCompressed(
+			g2.KeyValue,
+		); err != nil {
+			return errors.Wrap(
+				errors.Wrap(err, fmt.Sprintf("invalid g2 at position %d", i)),
+				"apply transcript share",
+			)
+		}
 	}
 
 	exists := false

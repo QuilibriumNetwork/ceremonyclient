@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -18,7 +18,7 @@ import (
 // A simplified P2P channel – the pair of actors communicating is public
 // knowledge, even though the data itself is encrypted.
 type PublicP2PChannel struct {
-	participant         *crypto.DoubleRatchetParticipant
+	participant         *channel.DoubleRatchetParticipant
 	sendMap             map[uint64][]byte
 	receiveMap          map[uint64][]byte
 	pubSub              PubSub
@@ -58,7 +58,7 @@ func NewPublicP2PChannel(
 		senderIdentifier...,
 	)
 
-	channel := &PublicP2PChannel{
+	ch := &PublicP2PChannel{
 		publicChannelClient: publicChannelClient,
 		sendMap:             map[uint64][]byte{},
 		receiveMap:          map[uint64][]byte{},
@@ -72,19 +72,19 @@ func NewPublicP2PChannel(
 	}
 
 	var err error
-	var participant *crypto.DoubleRatchetParticipant
+	var participant *channel.DoubleRatchetParticipant
 	if initiator {
 		sendingEphemeralPrivateKey := curve.Scalar.Random(
 			rand.Reader,
 		)
-		x3dh := crypto.SenderX3DH(
+		x3dh := channel.SenderX3DH(
 			sendingIdentityPrivateKey,
 			sendingSignedPrePrivateKey,
 			receivingIdentityKey,
 			receivingSignedPreKey,
 			96,
 		)
-		participant, err = crypto.NewDoubleRatchetParticipant(
+		participant, err = channel.NewDoubleRatchetParticipant(
 			x3dh[:32],
 			x3dh[32:64],
 			x3dh[64:],
@@ -98,14 +98,14 @@ func NewPublicP2PChannel(
 			return nil, errors.Wrap(err, "new public p2p channel")
 		}
 	} else {
-		x3dh := crypto.SenderX3DH(
+		x3dh := channel.SenderX3DH(
 			sendingIdentityPrivateKey,
 			sendingSignedPrePrivateKey,
 			receivingIdentityKey,
 			receivingSignedPreKey,
 			96,
 		)
-		participant, err = crypto.NewDoubleRatchetParticipant(
+		participant, err = channel.NewDoubleRatchetParticipant(
 			x3dh[:32],
 			x3dh[32:64],
 			x3dh[64:],
@@ -120,7 +120,7 @@ func NewPublicP2PChannel(
 		}
 	}
 
-	channel.participant = participant
+	ch.participant = participant
 	if publicChannelClient == nil {
 		pubSub.Subscribe(
 			sendFilter,
@@ -130,12 +130,12 @@ func NewPublicP2PChannel(
 
 		pubSub.Subscribe(
 			receiveFilter,
-			channel.handleReceive,
+			ch.handleReceive,
 			true,
 		)
 	}
 
-	return channel, nil
+	return ch, nil
 }
 
 func (c *PublicP2PChannel) handleReceive(message *pb.Message) error {
