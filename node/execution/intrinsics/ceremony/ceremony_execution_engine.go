@@ -87,12 +87,25 @@ func NewCeremonyExecutionEngine(
 		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
 	)
 
-	_, _, err = clockStore.GetDataClockFrame(intrinsicFilter, 0)
+	frame, _, err := clockStore.GetDataClockFrame(intrinsicFilter, 0)
 	var origin []byte
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
 
-	if err != nil && errors.Is(err, store.ErrNotFound) {
+	rebuildGenesisFrame := false
+	if frame != nil &&
+		len(frame.AggregateProofs[0].InclusionCommitments[0].Data) < 2000 {
+		logger.Warn("corrupted genesis frame detected, rebuilding")
+
+		err = clockStore.ResetDataClockFrames(intrinsicFilter)
+		if err != nil {
+			panic(err)
+		}
+
+		rebuildGenesisFrame = true
+	}
+
+	if err != nil && errors.Is(err, store.ErrNotFound) || rebuildGenesisFrame {
 		origin, inclusionProof, proverKeys = CreateGenesisState(
 			logger,
 			engineConfig,
@@ -205,8 +218,13 @@ func CreateGenesisState(
 		logger.Info(l)
 	}
 
+	difficulty := engineConfig.Difficulty
+	if difficulty == 0 {
+		difficulty = 10000
+	}
+
 	b := sha3.Sum256(seed)
-	v := vdf.New(engineConfig.Difficulty, b)
+	v := vdf.New(difficulty, b)
 
 	v.Execute()
 	o := v.GetOutput()
@@ -355,8 +373,17 @@ func CreateGenesisState(
 		panic(err)
 	}
 
+	intrinsicFilter := append(
+		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	)
+
+	// Compat: there was a bug that went unnoticed in prior versions,
+	// the raw filter was used instead of the application address, which didn't
+	// affect execution because we forcibly stashed it. Preserving this to ensure
+	// no rebuilding of frame history is required.
 	executionOutput := &protobufs.IntrinsicExecutionOutput{
-		Address: application.CEREMONY_ADDRESS,
+		Address: intrinsicFilter,
 		Output:  outputBytes,
 		Proof:   proofBytes,
 	}
@@ -366,23 +393,9 @@ func CreateGenesisState(
 		panic(err)
 	}
 
-	logger.Info("encoded execution output")
-
-	digest := sha3.NewShake256()
-	_, err = digest.Write(data)
-	if err != nil {
-		panic(err)
-	}
-
-	expand := make([]byte, 1024)
-	_, err = digest.Read(expand)
-	if err != nil {
-		panic(err)
-	}
-
 	logger.Info("proving execution output for inclusion")
 	commitment, err := inclusionProver.Commit(
-		expand,
+		data,
 		protobufs.IntrinsicExecutionOutputType,
 	)
 	if err != nil {

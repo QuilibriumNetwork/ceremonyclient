@@ -78,7 +78,24 @@ func (m *MasterTimeReel) Start() error {
 		panic(err)
 	}
 
-	if frame == nil {
+	genesis, err := m.clockStore.GetMasterClockFrame(m.filter, 0)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		panic(err)
+	}
+
+	rebuildGenesisFrame := false
+	if genesis != nil && genesis.Difficulty == 0 {
+		m.logger.Warn("corrupted genesis frame detected, rebuilding")
+
+		err = m.clockStore.ResetMasterClockFrames(m.filter)
+		if err != nil {
+			panic(err)
+		}
+
+		rebuildGenesisFrame = true
+	}
+
+	if frame == nil || rebuildGenesisFrame {
 		m.head = m.createGenesisFrame()
 	} else {
 		m.head = frame
@@ -125,10 +142,15 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 		panic(errors.New("genesis seed is nil"))
 	}
 
+	difficulty := m.engineConfig.Difficulty
+	if difficulty == 0 {
+		difficulty = 10000
+	}
+
 	frame, err := m.frameProver.CreateMasterGenesisFrame(
 		m.filter,
 		seed,
-		m.engineConfig.Difficulty,
+		difficulty,
 	)
 	if err != nil {
 		panic(err)
