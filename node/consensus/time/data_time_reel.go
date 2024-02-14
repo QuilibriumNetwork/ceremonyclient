@@ -174,10 +174,15 @@ func (d *DataTimeReel) createGenesisFrame() (
 		panic("initial prover keys is nil")
 	}
 
+	difficulty := d.engineConfig.Difficulty
+	if difficulty == 0 {
+		difficulty = 10000
+	}
+
 	frame, trie, err := d.frameProver.CreateDataGenesisFrame(
 		d.filter,
 		d.origin,
-		d.engineConfig.Difficulty,
+		difficulty,
 		d.initialInclusionProof,
 		d.initialProverKeys,
 		true,

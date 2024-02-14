@@ -562,7 +562,6 @@ func GetOutputsFromClockFrame(
 ) {
 	var associatedProof []byte
 	var lobbyState *protobufs.CeremonyLobbyState
-
 	if len(frame.AggregateProofs) > 0 {
 		for _, proofs := range frame.AggregateProofs {
 			for _, inclusion := range proofs.InclusionCommitments {

@@ -10,8 +10,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"syscall"
+
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -283,5 +284,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.2.4 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.2.5 – Dawn")
 }

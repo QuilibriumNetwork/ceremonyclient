@@ -101,6 +101,8 @@ type ClockStore interface {
 	GetHighestCandidateDataClockFrame(
 		filter []byte,
 	) (*protobufs.ClockFrame, error)
+	ResetMasterClockFrames(filter []byte) error
+	ResetDataClockFrames(filter []byte) error
 }
 
 type PebbleClockStore struct {
@@ -1658,4 +1660,40 @@ func (p *PebbleClockStore) GetHighestCandidateDataClockFrame(
 	}
 
 	return frame, nil
+}
+func (p *PebbleClockStore) ResetMasterClockFrames(filter []byte) error {
+	if err := p.db.DeleteRange(
+		clockMasterFrameKey(filter, 0),
+		clockMasterFrameKey(filter, 200000),
+	); err != nil {
+		return errors.Wrap(err, "reset master clock frames")
+	}
+
+	if err := p.db.Delete(clockMasterEarliestIndex(filter)); err != nil {
+		return errors.Wrap(err, "reset master clock frames")
+	}
+
+	if err := p.db.Delete(clockMasterLatestIndex(filter)); err != nil {
+		return errors.Wrap(err, "reset master clock frames")
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) ResetDataClockFrames(filter []byte) error {
+	if err := p.db.DeleteRange(
+		clockDataFrameKey(filter, 0),
+		clockDataFrameKey(filter, 200000),
+	); err != nil {
+		return errors.Wrap(err, "reset data clock frames")
+	}
+
+	if err := p.db.Delete(clockDataEarliestIndex(filter)); err != nil {
+		return errors.Wrap(err, "reset data clock frames")
+	}
+	if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
+		return errors.Wrap(err, "reset data clock frames")
+	}
+
+	return nil
 }

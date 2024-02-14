@@ -60,6 +60,20 @@ message NodeInfoResponse {
   uint64 peer_score = 3;
 }
 
+message PutPeerInfoRequest {
+  repeated PeerInfo peer_info = 1;
+  repeated PeerInfo uncooperative_peer_info = 2;
+}
+
+message PutNodeInfoRequest {
+  string peer_id = 1;
+  uint64 max_frame = 2;
+  uint64 peer_score = 3;
+  bytes signature = 4;
+}
+
+message PutResponse {}
+
 message NetworkInfoResponse {
   repeated NetworkInfo network_info = 1;
 }
@@ -88,4 +102,9 @@ service NodeService {
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
   rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
+}
+
+service NodeStats {
+  rpc PutNodeInfo(PutNodeInfoRequest) returns (PutResponse);
+  rpc PutPeerInfo(PutPeerInfoRequest) returns (PutResponse);
 }

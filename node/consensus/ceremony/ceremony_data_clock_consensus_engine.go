@@ -2,14 +2,19 @@ package ceremony
 
 import (
 	"bytes"
+	"context"
 	"crypto"
+	"crypto/tls"
 	"encoding/binary"
 	"sync"
 	"time"
 
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -77,6 +82,7 @@ type CeremonyDataClockConsensusEngine struct {
 	frameProver                 qcrypto.FrameProver
 	stagedLobbyStateTransitions *protobufs.CeremonyLobbyStateTransition
 	minimumPeersRequired        int
+	statsClient                 protobufs.NodeStatsClient
 
 	frameChan                      chan *protobufs.ClockFrame
 	executionEngines               map[string]execution.ExecutionEngine
@@ -167,6 +173,35 @@ func NewCeremonyDataClockConsensusEngine(
 		difficulty = 10000
 	}
 
+	var statsClient protobufs.NodeStatsClient
+	if engineConfig.StatsMultiaddr != "" {
+		ma, err := multiaddr.NewMultiaddr(engineConfig.StatsMultiaddr)
+		if err != nil {
+			panic(err)
+		}
+
+		_, addr, err := mn.DialArgs(ma)
+		if err != nil {
+			panic(err)
+		}
+
+		cc, err := grpc.Dial(
+			addr,
+			grpc.WithTransportCredentials(
+				credentials.NewTLS(&tls.Config{InsecureSkipVerify: false}),
+			),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallSendMsgSize(600*1024*1024),
+				grpc.MaxCallRecvMsgSize(600*1024*1024),
+			),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		statsClient = protobufs.NewNodeStatsClient(cc)
+	}
+
 	e := &CeremonyDataClockConsensusEngine{
 		difficulty:       difficulty,
 		logger:           logger,
@@ -195,6 +230,7 @@ func NewCeremonyDataClockConsensusEngine(
 		frameProver:           frameProver,
 		masterTimeReel:        masterTimeReel,
 		dataTimeReel:          dataTimeReel,
+		statsClient:           statsClient,
 	}
 
 	logger.Info("constructing consensus engine")
@@ -311,6 +347,20 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				delete(e.uncooperativePeersMap, string(v.peerId))
 			}
 			e.peerMapMx.Unlock()
+
+			if e.statsClient != nil {
+				peerInfo := e.GetPeerInfo()
+				_, err := e.statsClient.PutPeerInfo(
+					context.Background(),
+					&protobufs.PutPeerInfoRequest{
+						PeerInfo:              peerInfo.PeerInfo,
+						UncooperativePeerInfo: peerInfo.UncooperativePeerInfo,
+					},
+				)
+				if err != nil {
+					e.logger.Error("could not emit stats", zap.Error(err))
+				}
+			}
 
 			if err := e.publishMessage(e.filter, list); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
