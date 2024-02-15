@@ -1,0 +1,14 @@
+version: "3.8"
+
+name: quilibrium
+
+volumes:
+  config:
+
+services:
+  node:
+    build: ./
+    image: quilibrium
+    restart: always
+    volumes:
+      - config:/opt/ceremonyclient/node/.config
