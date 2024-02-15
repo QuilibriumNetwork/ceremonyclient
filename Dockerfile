@@ -1,4 +1,4 @@
-FROM golang:1.20
+FROM golang:1.20-alpine
 
 ENV GOEXPERIMENT=arenas
 
@@ -9,6 +9,6 @@ COPY . .
 WORKDIR /opt/ceremonyclient/node
 
 RUN go mod download && go mod verify
+RUN go build ./...
 
-CMD ["go", "run", "./..."]
-
+ENTRYPOINT ["go", "run", "./..."]
