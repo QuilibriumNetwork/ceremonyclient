@@ -73,6 +73,9 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 
 	bootstrapPeers := []string{
 		"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/QmUhm9iZVruSxyavjoPLCfuoRG94SGQEkfxEEoukEZmD5B",
+		"/dns/quaalude.quilibrium.com/udp/8336/quic/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ",
+		"/dns/quecifer.quilibrium.com/udp/8336/quic/p2p/QmQkyqziNCycUDdeBypkikMZWH2bBmmxfK7cbJFJmyyQdQ",
+		"/dns/quantum.quilibrium.com/udp/8336/quic/p2p/QmXaSyf9Gaq5ddcHysefDpuE7SJqzdg1surQ5wac55ysJV",
 		"/ip4/204.186.74.47/udp/8317/quic/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
 		"/ip4/204.186.74.46/udp/8316/quic/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
 		"/ip4/186.233.184.181/udp/8336/quic/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
@@ -198,7 +201,11 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		config.Engine.GenesisSeed = genesisSeed
 	}
 
-	if len(config.P2P.BootstrapPeers) == 0 {
+	// Slight trick here to get people on the latest bootstrap list –
+	// if it's empty, always use latest, if it has the Q bootstrap node, always
+	// use latest.
+	if len(config.P2P.BootstrapPeers) == 0 ||
+		config.P2P.BootstrapPeers[0] == bootstrapPeers[0] {
 		config.P2P.BootstrapPeers = bootstrapPeers
 	}
 

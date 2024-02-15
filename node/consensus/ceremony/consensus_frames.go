@@ -1,6 +1,7 @@
 package ceremony
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"time"
@@ -155,7 +156,8 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	for _, v := range e.peerMap {
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
 		if v.maxFrame > max &&
-			v.timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() && !ok {
+			v.timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() &&
+			bytes.Compare(v.version, consensus.GetMinimumVersion()) >= 0 && !ok {
 			peer = v.peerId
 			max = v.maxFrame
 		}
@@ -330,14 +332,8 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 		e.syncingStatus = SyncStatusNotSyncing
 	}
 
-	// With large networks and slow syncing machines, this can lead to an
-	// infinite loop if the list is refreshing fast enough, so make the size
-	// of the map the maximum loop case:
-	e.peerMapMx.Lock()
-	size := len(e.peerMap)
-	e.peerMapMx.Unlock()
-
-	for i := 0; i < size; i++ {
+	// With the increase of network size, constrain down to top thirty
+	for i := 0; i < 30; i++ {
 		peerId, maxFrame, err := e.GetMostAheadPeer()
 		if err != nil {
 			e.logger.Warn("no peers available, skipping sync")

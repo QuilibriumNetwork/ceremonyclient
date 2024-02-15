@@ -344,7 +344,9 @@ func initDHT(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			if len(h.Network().Peers()) == 0 {
+			// try to assert some stability, never go below min peers for data
+			// consensus:
+			if len(h.Network().Peers()) < 3 {
 				logger.Info("reconnecting to peers")
 				reconnect()
 			}
