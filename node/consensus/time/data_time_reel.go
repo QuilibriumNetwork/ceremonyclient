@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"sync"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -35,6 +36,7 @@ type pendingFrame struct {
 
 type DataTimeReel struct {
 	rwMutex sync.RWMutex
+	running bool
 
 	filter         []byte
 	engineConfig   *config.EngineConfig
@@ -49,6 +51,7 @@ type DataTimeReel struct {
 	head                  *protobufs.ClockFrame
 	totalDistance         *big.Int
 	headDistance          *big.Int
+	lruFrames             *lru.Cache[string, string]
 	proverTrie            *tries.RollingFrecencyCritbitTrie
 	pending               map[uint64][]*pendingFrame
 	incompleteForks       map[uint64][]*pendingFrame
@@ -88,7 +91,13 @@ func NewDataTimeReel(
 		panic("frame prover is nil")
 	}
 
+	cache, err := lru.New[string, string](10000)
+	if err != nil {
+		panic(err)
+	}
+
 	return &DataTimeReel{
+		running:               false,
 		logger:                logger,
 		filter:                filter,
 		engineConfig:          engineConfig,
@@ -97,6 +106,7 @@ func NewDataTimeReel(
 		origin:                origin,
 		initialInclusionProof: initialInclusionProof,
 		initialProverKeys:     initialProverKeys,
+		lruFrames:             cache,
 		pending:               make(map[uint64][]*pendingFrame),
 		incompleteForks:       make(map[uint64][]*pendingFrame),
 		frames:                make(chan *protobufs.ClockFrame),
@@ -116,9 +126,14 @@ func (d *DataTimeReel) Start() error {
 	if frame == nil {
 		d.head, d.proverTrie = d.createGenesisFrame()
 		d.totalDistance = big.NewInt(0)
+		d.headDistance = big.NewInt(0)
 	} else {
 		d.head = frame
+		if err != nil {
+			panic(err)
+		}
 		d.proverTrie = trie
+		d.headDistance, err = d.GetDistance(frame)
 		d.totalDistance = d.getTotalDistance(frame)
 	}
 
@@ -135,6 +150,16 @@ func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
 func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame) error {
+	if !d.running {
+		return nil
+	}
+
+	if d.lruFrames.Contains(string(frame.Output[:64])) {
+		return nil
+	}
+
+	d.lruFrames.Add(string(frame.Output[:64]), string(frame.ParentSelector))
+
 	go func() {
 		d.frames <- frame
 	}()
@@ -214,6 +239,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 
 // Main data consensus loop
 func (d *DataTimeReel) runLoop() {
+	d.running = true
 	for {
 		select {
 		case frame := <-d.frames:
@@ -324,9 +350,11 @@ func (d *DataTimeReel) addPending(
 		d.pending[frame.FrameNumber] = []*pendingFrame{}
 	}
 
-	txn, err := d.clockStore.NewTransaction()
-	if err != nil {
-		panic(err)
+	// avoid heavy thrashing
+	for _, frame := range d.pending[frame.FrameNumber] {
+		if frame.parentSelector.Cmp(parent) == 0 {
+			return
+		}
 	}
 
 	if distance.Cmp(unknownDistance) == 0 {
@@ -334,20 +362,30 @@ func (d *DataTimeReel) addPending(
 		distance.Sub(distance, big.NewInt(int64(len(d.pending[frame.FrameNumber]))))
 	}
 
-	err = d.clockStore.PutCandidateDataClockFrame(
-		parent.FillBytes(make([]byte, 32)),
-		distance.FillBytes(make([]byte, 32)),
+	// avoid db thrashing
+	if existing, err := d.clockStore.GetParentDataClockFrame(
+		frame.Filter,
+		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
-		frame,
-		txn,
-	)
-	if err != nil {
-		txn.Abort()
-		panic(err)
-	}
-
-	if err = txn.Commit(); err != nil {
-		panic(err)
+	); err != nil && existing == nil {
+		txn, err := d.clockStore.NewTransaction()
+		if err != nil {
+			panic(err)
+		}
+		err = d.clockStore.PutCandidateDataClockFrame(
+			parent.FillBytes(make([]byte, 32)),
+			distance.FillBytes(make([]byte, 32)),
+			selector.FillBytes(make([]byte, 32)),
+			frame,
+			txn,
+		)
+		if err != nil {
+			txn.Abort()
+			panic(err)
+		}
+		if err = txn.Commit(); err != nil {
+			panic(err)
+		}
 	}
 
 	d.pending[frame.FrameNumber] = append(
