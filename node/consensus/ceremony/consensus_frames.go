@@ -346,6 +346,10 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 		}
 	}
 
+	if latest.FrameNumber < currentFramePublished.FrameNumber {
+		latest = currentFramePublished
+	}
+
 	e.logger.Info(
 		"returning leader frame",
 		zap.Uint64("frame_number", latest.FrameNumber),

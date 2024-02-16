@@ -97,7 +97,7 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.2 // indirect
+	github.com/hashicorp/golang-lru/v2 v2.0.2
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/iden3/go-iden3-crypto v0.0.15
 	github.com/ipfs/boxo v0.8.0 // indirect
