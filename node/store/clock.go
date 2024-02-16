@@ -869,16 +869,33 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 	frameNumber uint64,
 	parentSelector []byte,
 ) (*protobufs.ClockFrame, error) {
+	check := false
 	data, closer, err := p.db.Get(
 		clockDataParentIndexKey(filter, frameNumber, parentSelector),
 	)
-	if err != nil {
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
 		return nil, errors.Wrap(err, "get parent data clock frame")
+	} else if err != nil && errors.Is(err, pebble.ErrNotFound) {
+		data, closer, err = p.db.Get(clockDataFrameKey(filter, frameNumber))
+		if err != nil {
+			return nil, errors.Wrap(err, "get parent data clock frame")
+		}
+		check = true
 	}
 
 	parent := &protobufs.ClockFrame{}
 	if err := proto.Unmarshal(data, parent); err != nil {
 		return nil, errors.Wrap(err, "get parent data clock frame")
+	}
+
+	if check {
+		selector, err := parent.GetSelector()
+		if err != nil {
+			return nil, errors.Wrap(err, "get parent data clock frame")
+		}
+		if !bytes.Equal(selector.FillBytes(make([]byte, 32)), parentSelector) {
+			return nil, errors.Wrap(ErrNotFound, "get parent data clock frame")
+		}
 	}
 
 	if err := p.fillAggregateProofs(parent); err != nil {
@@ -1014,6 +1031,22 @@ func (p *PebbleClockStore) PutDataClockFrame(
 
 	if err = txn.Set(
 		clockDataFrameKey(frame.Filter, frame.FrameNumber),
+		data,
+	); err != nil {
+		return errors.Wrap(err, "put data clock frame")
+	}
+
+	selector, err := frame.GetSelector()
+	if err != nil {
+		return errors.Wrap(err, "put data clock frame")
+	}
+
+	if err = txn.Set(
+		clockDataParentIndexKey(
+			frame.Filter,
+			frame.FrameNumber,
+			selector.FillBytes(make([]byte, 32)),
+		),
 		data,
 	); err != nil {
 		return errors.Wrap(err, "put data clock frame")

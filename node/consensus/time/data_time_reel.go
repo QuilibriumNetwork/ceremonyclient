@@ -238,8 +238,15 @@ func (d *DataTimeReel) runLoop() {
 					continue
 				}
 
-				// If the frame has a gap from the head, mark it as pending:
-				if frame.FrameNumber-d.head.FrameNumber != 1 {
+				headSelector, err := d.head.GetSelector()
+				if err != nil {
+					panic(err)
+				}
+
+				// If the frame has a gap from the head or is not descendent, mark it as
+				// pending:
+				if frame.FrameNumber-d.head.FrameNumber != 1 ||
+					parent.Cmp(headSelector) != 0 {
 					d.addPending(selector, parent, distance, frame)
 					continue
 				}
@@ -264,10 +271,13 @@ func (d *DataTimeReel) runLoop() {
 					distance.Cmp(d.headDistance) < 0 {
 					d.totalDistance.Sub(d.totalDistance, d.headDistance)
 					d.setHead(frame, distance)
+					d.processPending(d.head)
+					continue
 				}
 
 				// Choose fork
 				d.forkChoice(frame, distance)
+				d.processPending(d.head)
 			} else {
 				// tag: dusk – we should have some kind of check here to avoid brutal
 				// thrashing
@@ -359,7 +369,6 @@ func (d *DataTimeReel) processPending(frame *protobufs.ClockFrame) {
 			d.pending[frame.FrameNumber][1:]
 		if len(d.pending[frame.FrameNumber]) == 0 {
 			delete(d.pending, frame.FrameNumber)
-			break
 		}
 
 		nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
@@ -380,6 +389,7 @@ func (d *DataTimeReel) processPending(frame *protobufs.ClockFrame) {
 		neighborPending, ok = d.pending[frame.FrameNumber]
 	}
 
+	above := false
 	if !neighbors {
 		// Pull the next
 		nextPending, ok := d.pending[frame.FrameNumber+1]
@@ -394,6 +404,44 @@ func (d *DataTimeReel) processPending(frame *protobufs.ClockFrame) {
 			nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
 				d.filter,
 				frame.FrameNumber+1,
+				next.parentSelector.FillBytes(make([]byte, 32)),
+				next.distance.FillBytes(make([]byte, 32)),
+			)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				panic(err)
+			}
+			if nextFrame != nil {
+				above = true
+				go func() {
+					d.frames <- nextFrame
+				}()
+			}
+		}
+	}
+
+	if !above {
+		// Pull below
+		min := frame.FrameNumber
+		for k := range d.pending {
+			if k < min {
+				min = k
+			}
+		}
+		if min == frame.FrameNumber {
+			return
+		}
+		nextPending, ok := d.pending[min]
+		if ok {
+			next := nextPending[0]
+			d.pending[min] =
+				d.pending[min][1:]
+			if len(d.pending[min]) == 0 {
+				delete(d.pending, min)
+			}
+
+			nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
+				d.filter,
+				min,
 				next.parentSelector.FillBytes(make([]byte, 32)),
 				next.distance.FillBytes(make([]byte, 32)),
 			)
@@ -509,7 +557,7 @@ func (d *DataTimeReel) forkChoice(
 	left := d.head.ParentSelector
 	right := frame.ParentSelector
 
-	rightReplaySelectors := [][]byte{selector.FillBytes(make([]byte, 32))}
+	rightReplaySelectors := [][]byte{}
 
 	// Walk backwards through the parents, until we find a matching parent
 	// selector:
@@ -561,6 +609,8 @@ func (d *DataTimeReel) forkChoice(
 		rightTotal.Add(rightTotal, rightIndexDistance)
 	}
 
+	frameNumber := rightIndex.FrameNumber
+
 	// Choose new fork based on lightest distance sub-tree
 	if rightTotal.Cmp(leftTotal) < 0 {
 		for {
@@ -568,12 +618,12 @@ func (d *DataTimeReel) forkChoice(
 				break
 			}
 			next := rightReplaySelectors[0]
-			rightReplaySelectors[frame.FrameNumber] =
-				rightReplaySelectors[frame.FrameNumber][1:]
+			rightReplaySelectors =
+				rightReplaySelectors[1:]
 
 			rightIndex, err = d.clockStore.GetParentDataClockFrame(
 				d.filter,
-				rightIndex.FrameNumber+1,
+				frameNumber,
 				next,
 			)
 			if err != nil {
@@ -597,6 +647,26 @@ func (d *DataTimeReel) forkChoice(
 			if err = txn.Commit(); err != nil {
 				panic(err)
 			}
+
+			frameNumber++
+		}
+
+		txn, err := d.clockStore.NewTransaction()
+		if err != nil {
+			panic(err)
+		}
+
+		if err := d.clockStore.PutDataClockFrame(
+			frame,
+			d.proverTrie,
+			txn,
+			false,
+		); err != nil {
+			panic(err)
+		}
+
+		if err = txn.Commit(); err != nil {
+			panic(err)
 		}
 
 		d.head = frame

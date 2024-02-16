@@ -201,15 +201,12 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		from = 1
 	}
 
-	if maxFrame > from && maxFrame > 3 {
-		from = maxFrame - 2
-	}
-
 	s, err := client.GetCompressedSyncFrames(
 		context.Background(),
 		&protobufs.ClockFramesRequest{
 			Filter:          e.filter,
 			FromFrameNumber: from,
+			ToFrameNumber:   from + 8,
 		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
