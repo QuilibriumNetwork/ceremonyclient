@@ -1,11 +1,11 @@
 package time_test
 
 import (
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	gotime "time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -118,7 +118,7 @@ func TestDataTimeReel(t *testing.T) {
 		addrMap,
 		proverTrie := generateTestProvers()
 
-	// We're going to set this up by churning 100 master frames so we don't
+	// We're going to set this up by churning 40 master frames so we don't
 	// have to zig zag on master and data frames to confirm data time reel
 	// behaviors
 	m := time.NewMasterTimeReel(
@@ -143,14 +143,14 @@ func TestDataTimeReel(t *testing.T) {
 	wg.Add(1)
 	frameCh := m.NewFrameCh()
 	go func() {
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 40; i++ {
 			frames = append(frames, <-frameCh)
 		}
 		wg.Done()
 	}()
 
 	// in order
-	for i := int64(0); i < 100; i++ {
+	for i := int64(0); i < 40; i++ {
 		frame, err = prover.ProveMasterClockFrame(frame, i+1, 10)
 		assert.NoError(t, err)
 
@@ -160,12 +160,23 @@ func TestDataTimeReel(t *testing.T) {
 
 	wg.Wait()
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 40; i++ {
 		assert.NotNil(t, frames[i])
 		assert.Equal(t, frames[i].FrameNumber, uint64(i+1))
 	}
 
-	filterBytes, _ := hex.DecodeString(filter)
+	filterBytes := []byte{
+		0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff,
+	}
 
 	// Ok, now onto the data time reel. We're going to test the following
 	// scenarios:
@@ -203,7 +214,7 @@ func TestDataTimeReel(t *testing.T) {
 	datawg.Add(1)
 	dataFrameCh := d.NewFrameCh()
 	go func() {
-		for i := 0; i < 40; i++ {
+		for i := 0; i < 41; i++ {
 			dataFrames = append(dataFrames, <-dataFrameCh)
 		}
 		datawg.Done()
@@ -211,7 +222,7 @@ func TestDataTimeReel(t *testing.T) {
 
 	// 1. z-dist optimal – proof submission is strictly master-frame evoked leader
 	for i := int64(0); i < 10; i++ {
-		masterSelector, err := frames[i+1].GetSelector()
+		masterSelector, err := frames[i].GetSelector()
 		assert.NoError(t, err)
 
 		proverSelection := proverTrie.FindNearest(
@@ -236,7 +247,7 @@ func TestDataTimeReel(t *testing.T) {
 	insertFrames := []*protobufs.ClockFrame{}
 
 	for i := int64(10); i < 20; i++ {
-		masterSelector, err := frames[i+1].GetSelector()
+		masterSelector, err := frames[i].GetSelector()
 		assert.NoError(t, err)
 
 		proverSelection := proverTrie.FindNearest(
@@ -265,7 +276,7 @@ func TestDataTimeReel(t *testing.T) {
 	insertFrames = []*protobufs.ClockFrame{}
 
 	for i := int64(20); i < 25; i++ {
-		masterSelector, err := frames[i+1].GetSelector()
+		masterSelector, err := frames[i].GetSelector()
 		assert.NoError(t, err)
 
 		proverSelection := proverTrie.FindNearest(
@@ -285,7 +296,7 @@ func TestDataTimeReel(t *testing.T) {
 		d.Insert(frame)
 	}
 
-	masterSelector, err := frames[26].GetSelector()
+	masterSelector, err := frames[25].GetSelector()
 	assert.NoError(t, err)
 
 	proverSelections := proverTrie.FindNearestAndApproximateNeighbors(
@@ -307,7 +318,7 @@ func TestDataTimeReel(t *testing.T) {
 	insertFrames = append(insertFrames, frame)
 
 	for i := int64(26); i < 30; i++ {
-		masterSelector, err := frames[i+1].GetSelector()
+		masterSelector, err := frames[i].GetSelector()
 		assert.NoError(t, err)
 
 		proverSelection := proverTrie.FindNearest(
@@ -339,7 +350,7 @@ func TestDataTimeReel(t *testing.T) {
 	optimalKeySet := [][]byte{}
 	suppressedFrame := frame
 	for i := int64(30); i < 40; i++ {
-		masterSelector, err := frames[i+1].GetSelector()
+		masterSelector, err := frames[i].GetSelector()
 		assert.NoError(t, err)
 
 		proverSelections := proverTrie.FindNearestAndApproximateNeighbors(
@@ -357,7 +368,7 @@ func TestDataTimeReel(t *testing.T) {
 
 		// What we're trying to simulate: the majority is intentionally ignoring
 		// the most optimal signer
-		suppressedFrame, err := prover.ProveDataClockFrame(
+		suppressedFrame, err = prover.ProveDataClockFrame(
 			suppressedFrame,
 			[][]byte{},
 			[]*protobufs.InclusionAggregateProof{},
@@ -379,26 +390,29 @@ func TestDataTimeReel(t *testing.T) {
 
 	for i := 9; i >= 0; i-- {
 		err := d.Insert(conflictFrames[i])
+		// force linear ordering
+		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
 	}
 
-	// Someone is honest, but clumsy:
+	// Someone is honest, but running backwards:
 	for i := 9; i >= 0; i-- {
 		err := d.Insert(insertFrames[i])
+		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
 	}
 
 	datawg.Wait()
 
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 41; i++ {
 		assert.NotNil(t, dataFrames[i])
 
 		if i >= 40 {
 			assert.Equal(t, uint64(i), dataFrames[i].FrameNumber)
 			assert.Equal(
 				t,
+				optimalKeySet[i-31],
 				dataFrames[i].GetPublicKeySignatureEd448().PublicKey.KeyValue,
-				optimalKeySet[i-30],
 			)
 		} else {
 			assert.Equal(t, uint64(i+1), dataFrames[i].FrameNumber)

@@ -166,7 +166,6 @@ func (t *InMemKVDBTransaction) Set(key []byte, value []byte) error {
 	if !t.db.open {
 		return errors.New("inmem db closed")
 	}
-
 	t.changes = append(t.changes, InMemKVDBOperation{
 		op:    SetOperation,
 		key:   key,
@@ -205,7 +204,6 @@ func (t *InMemKVDBTransaction) Delete(key []byte) error {
 	if !t.db.open {
 		return errors.New("inmem db closed")
 	}
-
 	t.changes = append(t.changes, InMemKVDBOperation{
 		op:  DeleteOperation,
 		key: key,
