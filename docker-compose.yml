@@ -2,9 +2,6 @@ version: "3.8"
 
 name: quilibrium
 
-volumes:
-  config:
-
 services:
   node:
     build: ./
@@ -15,7 +12,7 @@ services:
       - '127.0.0.1:8337:8337/tcp' # gRPC
       - '127.0.0.1:8338:8338/tcp' # REST
     volumes:
-      - config:/opt/ceremonyclient/node/.config
+      - ./.config:/opt/ceremonyclient/node/.config
     logging:
       driver: "json-file"
       options:
