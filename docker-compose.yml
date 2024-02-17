@@ -16,3 +16,8 @@ services:
       - '127.0.0.1:8338:8338/tcp' # REST
     volumes:
       - config:/opt/ceremonyclient/node/.config
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: 2048m
