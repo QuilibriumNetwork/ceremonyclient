@@ -137,6 +137,11 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 
 		config.Key.KeyStoreFile.EncryptionKey = hex.EncodeToString(keystoreKey)
 
+		if multiAddr := os.Getenv("DEFAULT_LISTEN_GRPC_MULTIADDR"); multiAddr != "" {
+			config.ListenGRPCMultiaddr = multiAddr
+			config.ListenRestMultiaddr = os.Getenv("DEFAULT_LISTEN_REST_MULTIADDR")
+		}
+
 		fmt.Println("Saving config...")
 		if err = SaveConfig(configPath, config); err != nil {
 			panic(err)
