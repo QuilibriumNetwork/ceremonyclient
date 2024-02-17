@@ -1,4 +1,4 @@
-FROM golang:1.20-alpine
+FROM golang:1.20.14-alpine3.19
 
 LABEL org.opencontainers.image.title="Quilibrium Network Node"
 LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
