@@ -2,6 +2,7 @@ package time
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math/big"
 	"sync"
 
@@ -30,8 +31,8 @@ var unknownDistance = new(big.Int).SetBytes([]byte{
 })
 
 type pendingFrame struct {
+	selector       *big.Int
 	parentSelector *big.Int
-	distance       *big.Int
 }
 
 type DataTimeReel struct {
@@ -154,6 +155,12 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame) error {
 		return nil
 	}
 
+	d.logger.Debug(
+		"insert frame",
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.String("output_tag", hex.EncodeToString(frame.Output[:64])),
+	)
+
 	if d.lruFrames.Contains(string(frame.Output[:64])) {
 		return nil
 	}
@@ -243,8 +250,17 @@ func (d *DataTimeReel) runLoop() {
 	for {
 		select {
 		case frame := <-d.frames:
+			d.logger.Debug(
+				"processing frame",
+				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.String("output_tag", hex.EncodeToString(frame.Output[:64])),
+				zap.Uint64("head_number", d.head.FrameNumber),
+				zap.String("head_output_tag", hex.EncodeToString(d.head.Output[:64])),
+			)
 			// Most common scenario: in order – new frame is higher number
 			if d.head.FrameNumber < frame.FrameNumber {
+				d.logger.Debug("frame is higher")
+
 				parent := new(big.Int).SetBytes(frame.ParentSelector)
 				selector, err := frame.GetSelector()
 				if err != nil {
@@ -253,6 +269,8 @@ func (d *DataTimeReel) runLoop() {
 
 				distance, err := d.GetDistance(frame)
 				if err != nil {
+					d.logger.Debug("no master, add pending")
+
 					// If the frame arrived ahead of a master, e.g. the master data is not
 					// synced, we'll go ahead and mark it as pending and process it when
 					// we can, but if we had a general fault, panic:
@@ -260,7 +278,7 @@ func (d *DataTimeReel) runLoop() {
 						panic(err)
 					}
 
-					d.addPending(selector, parent, unknownDistance, frame)
+					d.addPending(selector, parent, distance, frame)
 					continue
 				}
 
@@ -273,16 +291,25 @@ func (d *DataTimeReel) runLoop() {
 				// pending:
 				if frame.FrameNumber-d.head.FrameNumber != 1 ||
 					parent.Cmp(headSelector) != 0 {
+					d.logger.Debug(
+						"frame has has gap or is non-descendent, add pending",
+						zap.Bool("has_gap", frame.FrameNumber-d.head.FrameNumber != 1),
+						zap.String("parent_selector", parent.Text(16)),
+						zap.String("head_selector", headSelector.Text(16)),
+					)
+
 					d.addPending(selector, parent, distance, frame)
 					continue
 				}
 
 				// Otherwise set it as the next and process all pending
 				d.setHead(frame, distance)
-				d.processPending(frame)
+				d.processPending(d.head)
 			} else if d.head.FrameNumber == frame.FrameNumber {
 				// frames are equivalent, no need to act
 				if bytes.Equal(d.head.Output, frame.Output) {
+					d.logger.Debug("equivalent frame")
+					d.processPending(d.head)
 					continue
 				}
 
@@ -290,11 +317,19 @@ func (d *DataTimeReel) runLoop() {
 				if err != nil {
 					panic(err)
 				}
+				d.logger.Debug(
+					"frame is same height",
+					zap.String("head_distance", d.headDistance.Text(16)),
+					zap.String("distance", distance.Text(16)),
+				)
 
 				// Optimization: if competing frames share a parent we can short-circuit
 				// fork choice
 				if bytes.Equal(d.head.ParentSelector, frame.ParentSelector) &&
 					distance.Cmp(d.headDistance) < 0 {
+					d.logger.Debug(
+						"frame shares parent, has shorter distance, short circuit",
+					)
 					d.totalDistance.Sub(d.totalDistance, d.headDistance)
 					d.setHead(frame, distance)
 					d.processPending(d.head)
@@ -305,6 +340,8 @@ func (d *DataTimeReel) runLoop() {
 				d.forkChoice(frame, distance)
 				d.processPending(d.head)
 			} else {
+				d.logger.Debug("frame is lower height")
+
 				// tag: dusk – we should have some kind of check here to avoid brutal
 				// thrashing
 				existing, _, err := d.clockStore.GetDataClockFrame(
@@ -320,6 +357,8 @@ func (d *DataTimeReel) runLoop() {
 				// It's a fork, but it's behind. We need to stash it until it catches
 				// up (or dies off)
 				if !bytes.Equal(existing.Output, frame.Output) {
+					d.logger.Debug("is fork, add pending")
+
 					distance, err := d.GetDistance(frame)
 					if err != nil {
 						panic(err)
@@ -346,20 +385,27 @@ func (d *DataTimeReel) addPending(
 	distance *big.Int,
 	frame *protobufs.ClockFrame,
 ) {
-	if _, ok := d.pending[frame.FrameNumber]; !ok {
-		d.pending[frame.FrameNumber] = []*pendingFrame{}
-	}
+	d.logger.Debug(
+		"add pending",
+		zap.Uint64("head_frame_number", d.head.FrameNumber),
+		zap.Uint64("add_frame_number", frame.FrameNumber),
+		zap.String("selector", selector.Text(16)),
+		zap.String("parent", parent.Text(16)),
+		zap.String("distance", distance.Text(16)),
+	)
 
-	// avoid heavy thrashing
-	for _, frame := range d.pending[frame.FrameNumber] {
-		if frame.parentSelector.Cmp(parent) == 0 {
-			return
+	if d.head.FrameNumber <= frame.FrameNumber {
+		if _, ok := d.pending[frame.FrameNumber]; !ok {
+			d.pending[frame.FrameNumber] = []*pendingFrame{}
 		}
-	}
 
-	if distance.Cmp(unknownDistance) == 0 {
-		distance = new(big.Int).Set(unknownDistance)
-		distance.Sub(distance, big.NewInt(int64(len(d.pending[frame.FrameNumber]))))
+		// avoid heavy thrashing
+		for _, frame := range d.pending[frame.FrameNumber] {
+			if frame.selector.Cmp(selector) == 0 {
+				d.logger.Debug("exists in pending already")
+				return
+			}
+		}
 	}
 
 	// avoid db thrashing
@@ -368,6 +414,14 @@ func (d *DataTimeReel) addPending(
 		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
 	); err != nil && existing == nil {
+		d.logger.Debug(
+			"not stored yet, save data candidate",
+			zap.Uint64("frame_number", frame.FrameNumber),
+			zap.String("selector", selector.Text(16)),
+			zap.String("parent", parent.Text(16)),
+			zap.String("distance", distance.Text(16)),
+		)
+
 		txn, err := d.clockStore.NewTransaction()
 		if err != nil {
 			panic(err)
@@ -388,118 +442,89 @@ func (d *DataTimeReel) addPending(
 		}
 	}
 
-	d.pending[frame.FrameNumber] = append(
-		d.pending[frame.FrameNumber],
-		&pendingFrame{
-			parentSelector: parent,
-			distance:       distance,
-		},
-	)
+	if d.head.FrameNumber <= frame.FrameNumber {
+		d.logger.Debug(
+			"accumulate in pending",
+			zap.Int("pending_neighbors", len(d.pending[frame.FrameNumber])),
+		)
+
+		d.pending[frame.FrameNumber] = append(
+			d.pending[frame.FrameNumber],
+			&pendingFrame{
+				selector:       selector,
+				parentSelector: parent,
+			},
+		)
+	}
 }
 
-func (d *DataTimeReel) processPending(frame *protobufs.ClockFrame) {
-	neighbors := false
-	// Flush the current pending frames
-	neighborPending, ok := d.pending[frame.FrameNumber]
-	for ok && neighborPending != nil {
-		next := neighborPending[0]
-		d.pending[frame.FrameNumber] =
-			d.pending[frame.FrameNumber][1:]
-		if len(d.pending[frame.FrameNumber]) == 0 {
-			delete(d.pending, frame.FrameNumber)
-		}
-
-		nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
-			d.filter,
-			frame.FrameNumber,
-			next.parentSelector.FillBytes(make([]byte, 32)),
-			next.distance.FillBytes(make([]byte, 32)),
+func (d *DataTimeReel) processPending(
+	frame *protobufs.ClockFrame,
+) {
+	d.logger.Debug("process pending")
+	for f, nextPending := range d.pending {
+		d.logger.Debug(
+			"checking frame set",
+			zap.Uint64("pending_frame_number", f),
+			zap.Uint64("frame_number", frame.FrameNumber),
 		)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			panic(err)
+		if f < frame.FrameNumber {
+			d.logger.Debug(
+				"purging frame set",
+				zap.Uint64("pending_frame_number", f),
+				zap.Uint64("frame_number", frame.FrameNumber),
+			)
+			delete(d.pending, f)
+			continue
 		}
-		if nextFrame != nil {
-			neighbors = true
-			go func() {
-				d.frames <- nextFrame
-			}()
-		}
-		neighborPending, ok = d.pending[frame.FrameNumber]
-	}
-
-	above := false
-	if !neighbors {
 		// Pull the next
-		nextPending, ok := d.pending[frame.FrameNumber+1]
-		if ok {
+		if nextPending != nil {
+			d.logger.Debug("try process next")
 			next := nextPending[0]
-			d.pending[frame.FrameNumber+1] =
-				d.pending[frame.FrameNumber+1][1:]
-			if len(d.pending[frame.FrameNumber+1]) == 0 {
-				delete(d.pending, frame.FrameNumber+1)
-			}
+			d.pending[f] =
+				d.pending[f][1:]
 
-			nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
+			nextFrame, err := d.clockStore.GetParentDataClockFrame(
 				d.filter,
-				frame.FrameNumber+1,
-				next.parentSelector.FillBytes(make([]byte, 32)),
-				next.distance.FillBytes(make([]byte, 32)),
+				f,
+				next.selector.FillBytes(make([]byte, 32)),
 			)
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				panic(err)
 			}
 			if nextFrame != nil {
-				above = true
+				d.pending[f] = append(d.pending[f], next)
+				d.logger.Debug("next found, send frame back in")
 				go func() {
 					d.frames <- nextFrame
 				}()
 			}
-		}
-	}
-
-	if !above {
-		// Pull below
-		min := frame.FrameNumber
-		for k := range d.pending {
-			if k < min {
-				min = k
-			}
-		}
-		if min == frame.FrameNumber {
-			return
-		}
-		nextPending, ok := d.pending[min]
-		if ok {
-			next := nextPending[0]
-			d.pending[min] =
-				d.pending[min][1:]
-			if len(d.pending[min]) == 0 {
-				delete(d.pending, min)
-			}
-
-			nextFrame, err := d.clockStore.GetCandidateDataClockFrame(
-				d.filter,
-				min,
-				next.parentSelector.FillBytes(make([]byte, 32)),
-				next.distance.FillBytes(make([]byte, 32)),
-			)
-			if err != nil && !errors.Is(err, store.ErrNotFound) {
-				panic(err)
-			}
-			if nextFrame != nil {
-				go func() {
-					d.frames <- nextFrame
-				}()
+			if len(d.pending[f]) == 0 {
+				d.logger.Debug("last next processing, clear list")
+				delete(d.pending, f)
 			}
 		}
 	}
 }
 
 func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
+	d.logger.Debug(
+		"set frame to head",
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.String("output_tag", hex.EncodeToString(frame.Output[:64])),
+		zap.Uint64("head_number", d.head.FrameNumber),
+		zap.String("head_output_tag", hex.EncodeToString(d.head.Output[:64])),
+	)
 	txn, err := d.clockStore.NewTransaction()
 	if err != nil {
 		panic(err)
 	}
+
+	d.logger.Debug(
+		"save data",
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.String("distance", distance.Text(16)),
+	)
 
 	if err := d.clockStore.PutDataClockFrame(
 		frame,
@@ -555,12 +580,12 @@ func (d *DataTimeReel) GetDistance(frame *protobufs.ClockFrame) (
 		allBitmaskFilter,
 		frame.FrameNumber)
 	if err != nil {
-		return nil, errors.Wrap(err, "get distance")
+		return unknownDistance, errors.Wrap(err, "get distance")
 	}
 
 	masterSelector, err := master.GetSelector()
 	if err != nil {
-		return nil, errors.Wrap(err, "get distance")
+		return unknownDistance, errors.Wrap(err, "get distance")
 	}
 
 	discriminatorNode :=
@@ -568,7 +593,7 @@ func (d *DataTimeReel) GetDistance(frame *protobufs.ClockFrame) (
 	discriminator := discriminatorNode.External.Key
 	addr, err := frame.GetAddress()
 	if err != nil {
-		return nil, errors.Wrap(err, "get distance")
+		return unknownDistance, errors.Wrap(err, "get distance")
 	}
 	distance := new(big.Int).Sub(
 		new(big.Int).SetBytes(discriminator),
@@ -583,6 +608,13 @@ func (d *DataTimeReel) forkChoice(
 	frame *protobufs.ClockFrame,
 	distance *big.Int,
 ) {
+	d.logger.Debug(
+		"fork choice",
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.String("output_tag", hex.EncodeToString(frame.Output[:64])),
+		zap.Uint64("head_number", d.head.FrameNumber),
+		zap.String("head_output_tag", hex.EncodeToString(d.head.Output[:64])),
+	)
 	parentSelector, selector, err := frame.GetParentAndSelector()
 	if err != nil {
 		panic(err)
@@ -600,6 +632,8 @@ func (d *DataTimeReel) forkChoice(
 	// Walk backwards through the parents, until we find a matching parent
 	// selector:
 	for !bytes.Equal(left, right) {
+		d.logger.Debug("scan backwards")
+
 		rightReplaySelectors = append(
 			append(
 				[][]byte{},
@@ -646,47 +680,35 @@ func (d *DataTimeReel) forkChoice(
 		leftTotal.Add(leftTotal, leftIndexDistance)
 		rightTotal.Add(rightTotal, rightIndexDistance)
 	}
+	d.logger.Debug("found mutual root")
 
 	frameNumber := rightIndex.FrameNumber
 
 	// Choose new fork based on lightest distance sub-tree
-	if rightTotal.Cmp(leftTotal) < 0 {
-		for {
-			if len(rightReplaySelectors) == 0 {
-				break
-			}
-			next := rightReplaySelectors[0]
-			rightReplaySelectors =
-				rightReplaySelectors[1:]
+	if rightTotal.Cmp(leftTotal) > 0 {
+		d.logger.Debug("proposed fork has greater distance",
+			zap.String("right_total", rightTotal.Text(16)),
+			zap.String("left_total", leftTotal.Text(16)),
+		)
+		d.addPending(selector, parentSelector, distance, frame)
+		return
+	}
 
-			rightIndex, err = d.clockStore.GetParentDataClockFrame(
-				d.filter,
-				frameNumber,
-				next,
-			)
-			if err != nil {
-				panic(err)
-			}
+	for {
+		if len(rightReplaySelectors) == 0 {
+			break
+		}
+		next := rightReplaySelectors[0]
+		rightReplaySelectors =
+			rightReplaySelectors[1:]
 
-			txn, err := d.clockStore.NewTransaction()
-			if err != nil {
-				panic(err)
-			}
-
-			if err := d.clockStore.PutDataClockFrame(
-				rightIndex,
-				d.proverTrie,
-				txn,
-				false,
-			); err != nil {
-				panic(err)
-			}
-
-			if err = txn.Commit(); err != nil {
-				panic(err)
-			}
-
-			frameNumber++
+		rightIndex, err = d.clockStore.GetParentDataClockFrame(
+			d.filter,
+			frameNumber,
+			next,
+		)
+		if err != nil {
+			panic(err)
 		}
 
 		txn, err := d.clockStore.NewTransaction()
@@ -695,7 +717,7 @@ func (d *DataTimeReel) forkChoice(
 		}
 
 		if err := d.clockStore.PutDataClockFrame(
-			frame,
+			rightIndex,
 			d.proverTrie,
 			txn,
 			false,
@@ -707,14 +729,38 @@ func (d *DataTimeReel) forkChoice(
 			panic(err)
 		}
 
-		d.head = frame
-		d.totalDistance.Sub(d.totalDistance, leftTotal)
-		d.totalDistance.Add(d.totalDistance, rightTotal)
-		d.headDistance = distance
-		go func() {
-			d.newFrameCh <- frame
-		}()
+		frameNumber++
 	}
+
+	txn, err := d.clockStore.NewTransaction()
+	if err != nil {
+		panic(err)
+	}
+
+	if err := d.clockStore.PutDataClockFrame(
+		frame,
+		d.proverTrie,
+		txn,
+		false,
+	); err != nil {
+		panic(err)
+	}
+
+	if err = txn.Commit(); err != nil {
+		panic(err)
+	}
+
+	d.head = frame
+	d.totalDistance.Sub(d.totalDistance, leftTotal)
+	d.totalDistance.Add(d.totalDistance, rightTotal)
+	d.headDistance = distance
+	d.logger.Debug(
+		"set total distance",
+		zap.String("total_distance", d.totalDistance.Text(16)),
+	)
+	go func() {
+		d.newFrameCh <- frame
+	}()
 }
 
 var _ TimeReel = (*DataTimeReel)(nil)

@@ -169,7 +169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						)
 						if err != nil {
 							m.errorMsg = hex.EncodeToString(
-								selector.Bytes(),
+								selector.FillBytes(make([]byte, 32)),
 							) + ":" + err.Error()
 							break
 						}
@@ -286,7 +286,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						)
 						if err != nil {
 							m.errorMsg = hex.EncodeToString(
-								selector.Bytes(),
+								selector.FillBytes(make([]byte, 32)),
 							) + ":" + err.Error()
 							break
 						}
@@ -522,7 +522,7 @@ func (m model) View() string {
 		explorerContent = fmt.Sprintf(
 			"Frame %d (Selector: %x, %s):\n\tParent: %x\n\tVDF Proof: %x\n",
 			m.frame.FrameNumber,
-			selector.Bytes(),
+			selector.FillBytes(make([]byte, 32)),
 			committed,
 			m.frame.ParentSelector,
 			m.frame.Input[:516],
@@ -886,11 +886,11 @@ func logoVersion(width int) string {
 		out += "                     #######################################        ########\n"
 		out += "                          #############################                ##\n"
 		out += " \n"
-		out += "                         Quilibrium Node - v1.2.7 – Dawn\n"
+		out += "                         Quilibrium Node - v1.2.8 – Dawn\n"
 		out += " \n"
 		out += "                                   DB Console\n"
 	} else {
-		out = "Quilibrium Node - v1.2.7 – Dawn - DB Console\n"
+		out = "Quilibrium Node - v1.2.8 – Dawn - DB Console\n"
 	}
 	return out
 }
