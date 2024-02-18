@@ -271,7 +271,7 @@ func (w *WesolowskiFrameProver) ProveDataClockFrame(
 		FrameNumber:    previousFrame.FrameNumber + 1,
 		Timestamp:      timestamp,
 		Difficulty:     difficulty,
-		ParentSelector: parent.Bytes(),
+		ParentSelector: parent.FillBytes(make([]byte, 32)),
 		Input: append(
 			append([]byte{}, previousFrame.Output...),
 			commitmentInput...,
