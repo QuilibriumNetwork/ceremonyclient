@@ -414,17 +414,17 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.frameChan <- latestFrame
 				}()
 
-				var nextFrame *protobufs.ClockFrame
-				if nextFrame, err = e.prove(latestFrame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					continue
-				}
-
 				if bytes.Equal(
 					e.frameProverTrie.FindNearest(e.provingKeyAddress).External.Key,
 					e.provingKeyAddress,
 				) {
+					var nextFrame *protobufs.ClockFrame
+					if nextFrame, err = e.prove(latestFrame); err != nil {
+						e.logger.Error("could not prove", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						continue
+					}
+
 					e.dataTimeReel.Insert(nextFrame)
 
 					if err = e.publishProof(nextFrame); err != nil {
@@ -447,14 +447,14 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.frameChan <- latestFrame
 				}()
 
-				var nextFrame *protobufs.ClockFrame
-				if nextFrame, err = e.prove(latestFrame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					continue
-				}
-
 				if e.frameProverTrie.Contains(e.provingKeyAddress) {
+					var nextFrame *protobufs.ClockFrame
+					if nextFrame, err = e.prove(latestFrame); err != nil {
+						e.logger.Error("could not prove", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						continue
+					}
+
 					e.dataTimeReel.Insert(nextFrame)
 
 					if err = e.publishProof(nextFrame); err != nil {
