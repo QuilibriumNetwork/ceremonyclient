@@ -2,14 +2,13 @@
 
 start_process() {
     GOEXPERIMENT=arenas go run ./... &
-    local process_pid=$!
-    local child_process_pid=$(pgrep -P $process_pid)
-    echo "Process started with PID $process_pid and child PID $child_process_pid"
+    main_process_id=$!
+    local child_process_pid=$(pgrep -P $main_process_id)
+    echo "process started with PID $main_process_id and child PID $child_process_pid"
 }
 
 is_process_running() {
-    local process_pid=$(ps -ef | grep "exe/node" | grep -v grep | awk '{print $2}')
-    ps -p $process_pid > /dev/null 2>&1
+    ps -p $main_process_id > /dev/null 2>&1
     return $?
 }
 
@@ -40,7 +39,7 @@ start_process
 
 while true; do
     if ! is_process_running; then
-        echo "Process crashed or stopped. Restarting..."
+        echo "process crashed or stopped. restarting..."
         start_process
     fi
 
