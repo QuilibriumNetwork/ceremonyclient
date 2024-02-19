@@ -75,7 +75,6 @@ func (e *MasterClockConsensusEngine) handleClockFramesResponse(
 			zap.Binary("peer_id", peerID),
 			zap.Binary("expected_peer_id", e.syncingTarget),
 		)
-		return nil
 	}
 
 	e.syncingStatus = SyncStatusSynchronizing

@@ -7,10 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"syscall"
+	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 
@@ -50,10 +53,29 @@ var (
 		false,
 		"print the peer id to stdout from the config and exit",
 	)
+	memprofile = flag.String(
+		"memprofile",
+		"",
+		"write memory profile after 20m to this file",
+	)
 )
 
 func main() {
 	flag.Parse()
+
+	if *memprofile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Minute)
+				f, err := os.Create(*memprofile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				pprof.WriteHeapProfile(f)
+				f.Close()
+			}
+		}()
+	}
 
 	if *balance {
 		config, err := config.LoadConfig(*configDirectory, "")
@@ -284,5 +306,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.2.8 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.2.9 – Dawn")
 }

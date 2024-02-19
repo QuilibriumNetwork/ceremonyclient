@@ -206,7 +206,8 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		&protobufs.ClockFramesRequest{
 			Filter:          e.filter,
 			FromFrameNumber: from,
-			ToFrameNumber:   from + 8,
+			ToFrameNumber:   maxFrame,
+			ParentSelector:  latest.ParentSelector,
 		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
