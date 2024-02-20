@@ -6,7 +6,7 @@ services:
   node:
     build: ./
     image: quilibrium
-    restart: always
+    restart: unless-stopped
     environment:
       - DEFAULT_LISTEN_GRPC_MULTIADDR=/ip4/0.0.0.0/tcp/8337
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
