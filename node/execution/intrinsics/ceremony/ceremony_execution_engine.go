@@ -62,6 +62,8 @@ type CeremonyExecutionEngine struct {
 	frameProver                qcrypto.FrameProver
 }
 
+const validCeremonySelector = "253f3a6383dcfe91cf49abd20204b3e6ef5afd4c70c1968bb1f0b827a72af53b"
+
 func NewCeremonyExecutionEngine(
 	logger *zap.Logger,
 	engineConfig *config.EngineConfig,
@@ -93,16 +95,22 @@ func NewCeremonyExecutionEngine(
 	var proverKeys [][]byte
 
 	rebuildGenesisFrame := false
-	if frame != nil &&
-		len(frame.AggregateProofs[0].InclusionCommitments[0].Data) < 2000 {
-		logger.Warn("corrupted genesis frame detected, rebuilding")
-
-		err = clockStore.ResetDataClockFrames(intrinsicFilter)
+	if frame != nil {
+		selector, err := frame.GetSelector()
 		if err != nil {
 			panic(err)
 		}
 
-		rebuildGenesisFrame = true
+		if selector.Text(16) != validCeremonySelector {
+			logger.Warn("corrupted genesis frame detected, rebuilding")
+
+			err = clockStore.ResetDataClockFrames(intrinsicFilter)
+			if err != nil {
+				panic(err)
+			}
+
+			rebuildGenesisFrame = true
+		}
 	}
 
 	if err != nil && errors.Is(err, store.ErrNotFound) || rebuildGenesisFrame {
