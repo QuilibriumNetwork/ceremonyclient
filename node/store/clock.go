@@ -678,24 +678,6 @@ func (p *PebbleClockStore) fillAggregateProofs(
 			frame.Filter,
 			commit,
 			frame.FrameNumber,
-			func(typeUrl string, data [][]byte) ([]byte, error) {
-				if typeUrl == protobufs.IntrinsicExecutionOutputType {
-					o := &protobufs.IntrinsicExecutionOutput{}
-					copiedLeft := make([]byte, len(data[0]))
-					copiedRight := make([]byte, len(data[1]))
-					copy(copiedLeft, data[0])
-					copy(copiedRight, data[1])
-
-					o.Address = copiedLeft[:32]
-					o.Output = copiedLeft[32:]
-					o.Proof = copiedRight
-					return proto.Marshal(o)
-				}
-
-				copied := make([]byte, len(data[0]))
-				copy(copied, data[0])
-				return copied, nil
-			},
 		)
 		if err != nil {
 			return err
