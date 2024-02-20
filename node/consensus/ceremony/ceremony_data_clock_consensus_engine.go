@@ -30,7 +30,7 @@ import (
 )
 
 const PEER_INFO_TTL = 60 * 60 * 1000
-const UNCOOPERATIVE_PEER_INFO_TTL = 60 * 60 * 1000
+const UNCOOPERATIVE_PEER_INFO_TTL = 5 * 60 * 1000
 
 type InclusionMap = map[curves.PairingPoint]*protobufs.InclusionCommitment
 type PolynomialMap = map[curves.PairingPoint][]curves.PairingScalar
