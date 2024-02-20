@@ -1,0 +1,6 @@
+.config
+**/.idea
+**/.vscode
+github.env
+Taskfile.yaml
+
