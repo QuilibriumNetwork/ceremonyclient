@@ -66,7 +66,7 @@ func main() {
 	if *memprofile != "" {
 		go func() {
 			for {
-				time.Sleep(20 * time.Minute)
+				time.Sleep(5 * time.Minute)
 				f, err := os.Create(*memprofile)
 				if err != nil {
 					log.Fatal(err)
@@ -306,5 +306,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                         Quilibrium Node - v1.2.9 – Dawn")
+	fmt.Println("                         Quilibrium Node - v1.2.10 – Dawn")
 }

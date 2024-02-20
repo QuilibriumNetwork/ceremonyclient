@@ -128,10 +128,6 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
 	announce := &protobufs.CeremonyPeerListAnnounce{}
 	if err := any.UnmarshalTo(announce); err != nil {
 		return errors.Wrap(err, "handle ceremony peer list announce")
@@ -284,10 +280,6 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 	any *anypb.Any,
 	isSync bool,
 ) error {
-	if isSync && bytes.Equal(peerID, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
 	frame := &protobufs.ClockFrame{}
 	if err := any.UnmarshalTo(frame); err != nil {
 		return errors.Wrap(err, "handle clock frame data")

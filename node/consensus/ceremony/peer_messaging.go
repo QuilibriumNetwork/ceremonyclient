@@ -72,7 +72,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 
 	if parent != nil {
 		if !bytes.Equal(frame.ParentSelector, parent) {
-			e.logger.Info(
+			e.logger.Debug(
 				"peer specified out of consensus head, seeking backwards for fork",
 			)
 		}
@@ -95,7 +95,11 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				parent,
 			)
 			if err != nil {
-				from = frame.FrameNumber - 16
+				if frame.FrameNumber > 18 {
+					from = frame.FrameNumber - 16
+				} else {
+					from = 2
+				}
 				e.logger.Debug("peer fully out of sync, rewinding sync head to min")
 				break
 			}
@@ -121,9 +125,9 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	}
 
 	for {
-		if to == 0 || to-from > 32 {
-			if max > from+31 {
-				to = from + 32
+		if to == 0 || to-from > 16 {
+			if max > from+15 {
+				to = from + 16
 			} else {
 				to = max + 1
 			}

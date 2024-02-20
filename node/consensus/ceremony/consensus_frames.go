@@ -151,6 +151,13 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 		panic(err)
 	}
 
+	e.logger.Info(
+		"checking peer list",
+		zap.Int("peers", len(e.peerMap)),
+		zap.Int("uncooperative_peers", len(e.uncooperativePeersMap)),
+		zap.Uint64("current_head_frame", frame.FrameNumber),
+	)
+
 	max := frame.FrameNumber
 	var peer []byte = nil
 	for _, v := range e.peerMap {
