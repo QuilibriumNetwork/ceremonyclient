@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -89,7 +90,6 @@ func internalGetAggregateProof(
 	filter []byte,
 	commitment []byte,
 	frameNumber uint64,
-	inclusionReassembler func(typeUrl string, data [][]byte) ([]byte, error),
 ) (*protobufs.InclusionAggregateProof, error) {
 	value, closer, err := db.Get(dataProofMetadataKey(filter, commitment))
 	if err != nil {
@@ -169,9 +169,24 @@ func internalGetAggregateProof(
 			}
 		}
 
-		inclusionCommitment.Data, err = inclusionReassembler(string(url), chunks)
-		if err != nil {
-			return nil, errors.Wrap(err, "get aggregate proof")
+		if string(url) == protobufs.IntrinsicExecutionOutputType {
+			o := &protobufs.IntrinsicExecutionOutput{}
+			copiedLeft := make([]byte, len(chunks[0]))
+			copiedRight := make([]byte, len(chunks[1]))
+			copy(copiedLeft, chunks[0])
+			copy(copiedRight, chunks[1])
+
+			o.Address = copiedLeft[:32]
+			o.Output = copiedLeft[32:]
+			o.Proof = copiedRight
+			inclusionCommitment.Data, err = proto.Marshal(o)
+			if err != nil {
+				return nil, errors.Wrap(err, "get aggregate proof")
+			}
+		} else {
+			copied := make([]byte, len(chunks[0]))
+			copy(copied, chunks[0])
+			inclusionCommitment.Data = copied
 		}
 
 		aggregate.InclusionCommitments = append(
@@ -192,14 +207,12 @@ func (p *PebbleDataProofStore) GetAggregateProof(
 	filter []byte,
 	commitment []byte,
 	frameNumber uint64,
-	inclusionReassembler func(typeUrl string, data [][]byte) ([]byte, error),
 ) (*protobufs.InclusionAggregateProof, error) {
 	return internalGetAggregateProof(
 		p.db,
 		filter,
 		commitment,
 		frameNumber,
-		inclusionReassembler,
 	)
 }
 
