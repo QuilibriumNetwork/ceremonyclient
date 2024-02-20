@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"math/big"
+	"sort"
 	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -462,7 +463,23 @@ func (d *DataTimeReel) processPending(
 	frame *protobufs.ClockFrame,
 ) {
 	d.logger.Debug("process pending")
-	for f, nextPending := range d.pending {
+	frameNumbers := []uint64{}
+	for f := range d.pending {
+		frameNumbers = append(frameNumbers, f)
+	}
+	sort.Slice(frameNumbers, func(i, j int) bool {
+		return frameNumbers[i] < frameNumbers[j]
+	})
+	limit := 8
+	for _, f := range frameNumbers {
+		if f < d.head.FrameNumber {
+			delete(d.pending, f)
+		}
+		if limit <= 0 {
+			return
+		}
+
+		nextPending := d.pending[f]
 		d.logger.Debug(
 			"checking frame set",
 			zap.Uint64("pending_frame_number", f),
@@ -498,7 +515,9 @@ func (d *DataTimeReel) processPending(
 				go func() {
 					d.frames <- nextFrame
 				}()
+				limit--
 			}
+
 			if len(d.pending[f]) == 0 {
 				d.logger.Debug("last next processing, clear list")
 				delete(d.pending, f)
