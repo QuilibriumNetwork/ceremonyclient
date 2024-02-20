@@ -83,6 +83,7 @@ type CeremonyDataClockConsensusEngine struct {
 	stagedLobbyStateTransitions *protobufs.CeremonyLobbyStateTransition
 	minimumPeersRequired        int
 	statsClient                 protobufs.NodeStatsClient
+	currentReceivingSyncPeers   int
 
 	frameChan                      chan *protobufs.ClockFrame
 	executionEngines               map[string]execution.ExecutionEngine
@@ -219,18 +220,19 @@ func NewCeremonyDataClockConsensusEngine(
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		},
-		lastFrameReceivedAt:   time.Time{},
-		frameProverTrie:       &tries.RollingFrecencyCritbitTrie{},
-		inclusionProver:       inclusionProver,
-		syncingStatus:         SyncStatusNotSyncing,
-		peerAnnounceMap:       map[string]*protobufs.CeremonyPeerListAnnounce{},
-		peerMap:               map[string]*peerInfo{},
-		uncooperativePeersMap: map[string]*peerInfo{},
-		minimumPeersRequired:  minimumPeersRequired,
-		frameProver:           frameProver,
-		masterTimeReel:        masterTimeReel,
-		dataTimeReel:          dataTimeReel,
-		statsClient:           statsClient,
+		currentReceivingSyncPeers: 0,
+		lastFrameReceivedAt:       time.Time{},
+		frameProverTrie:           &tries.RollingFrecencyCritbitTrie{},
+		inclusionProver:           inclusionProver,
+		syncingStatus:             SyncStatusNotSyncing,
+		peerAnnounceMap:           map[string]*protobufs.CeremonyPeerListAnnounce{},
+		peerMap:                   map[string]*peerInfo{},
+		uncooperativePeersMap:     map[string]*peerInfo{},
+		minimumPeersRequired:      minimumPeersRequired,
+		frameProver:               frameProver,
+		masterTimeReel:            masterTimeReel,
+		dataTimeReel:              dataTimeReel,
+		statsClient:               statsClient,
 	}
 
 	logger.Info("constructing consensus engine")

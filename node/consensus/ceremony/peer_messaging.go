@@ -30,6 +30,28 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 		zap.Uint64("to_frame_number", request.ToFrameNumber),
 	)
 
+	if e.currentReceivingSyncPeers > 4 {
+		e.logger.Info(
+			"currently processing maximum sync requests, returning",
+		)
+
+		if err := server.SendMsg(
+			&protobufs.ClockFramesResponse{
+				Filter:          request.Filter,
+				FromFrameNumber: 0,
+				ToFrameNumber:   0,
+				ClockFrames:     []*protobufs.ClockFrame{},
+			},
+		); err != nil {
+			return errors.Wrap(err, "get compressed sync frames")
+		}
+
+		return nil
+	}
+
+	e.currentReceivingSyncPeers++
+	defer func() { e.currentReceivingSyncPeers-- }()
+
 	from := request.FromFrameNumber
 	parent := request.ParentSelector
 
