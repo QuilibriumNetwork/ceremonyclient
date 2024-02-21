@@ -860,7 +860,7 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 	} else if err != nil && errors.Is(err, pebble.ErrNotFound) {
 		data, closer, err = p.db.Get(clockDataFrameKey(filter, frameNumber))
 		if err != nil {
-			return nil, errors.Wrap(err, "get parent data clock frame")
+			return nil, errors.Wrap(ErrNotFound, "get parent data clock frame")
 		}
 		check = true
 	}
