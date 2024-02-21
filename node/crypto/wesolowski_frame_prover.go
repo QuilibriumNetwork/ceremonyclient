@@ -103,6 +103,13 @@ func (w *WesolowskiFrameProver) VerifyMasterClockFrame(
 		)
 	}
 
+	if len(frame.Output) != 516 {
+		return errors.Wrap(
+			errors.New("invalid output"),
+			"verify clock frame",
+		)
+	}
+
 	b := sha3.Sum256(input)
 	v := vdf.New(frame.Difficulty, b)
 	proof := [516]byte{}
@@ -417,6 +424,13 @@ func (w *WesolowskiFrameProver) VerifyDataClockFrame(
 	if len(frame.Input) < 516 {
 		return errors.Wrap(
 			errors.New("invalid input"),
+			"verify clock frame",
+		)
+	}
+
+	if len(frame.Output) != 516 {
+		return errors.Wrap(
+			errors.New("invalid output"),
 			"verify clock frame",
 		)
 	}
