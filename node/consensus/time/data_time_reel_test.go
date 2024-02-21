@@ -1,6 +1,7 @@
 package time_test
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"sync"
@@ -213,9 +214,18 @@ func TestDataTimeReel(t *testing.T) {
 	datawg := sync.WaitGroup{}
 	datawg.Add(1)
 	dataFrameCh := d.NewFrameCh()
+	targetFrameParentSelector := []byte{}
 	go func() {
-		for i := 0; i < 41; i++ {
-			dataFrames = append(dataFrames, <-dataFrameCh)
+		for {
+			frame := <-dataFrameCh
+			dataFrames = append(dataFrames, frame)
+			if frame.FrameNumber == 40 && bytes.Equal(
+				frame.ParentSelector,
+				targetFrameParentSelector,
+			) {
+				break
+			}
+
 		}
 		datawg.Done()
 	}()
@@ -377,6 +387,9 @@ func TestDataTimeReel(t *testing.T) {
 			10,
 		)
 		insertFrames = append(insertFrames, suppressedFrame)
+		if i == 39 {
+			targetFrameParentSelector = suppressedFrame.ParentSelector
+		}
 		frame, err = prover.ProveDataClockFrame(
 			frame,
 			[][]byte{},
@@ -404,18 +417,10 @@ func TestDataTimeReel(t *testing.T) {
 
 	datawg.Wait()
 
-	for i := 0; i < 41; i++ {
-		assert.NotNil(t, dataFrames[i])
-
-		if i >= 40 {
-			assert.Equal(t, uint64(i), dataFrames[i].FrameNumber)
-			assert.Equal(
-				t,
-				optimalKeySet[i-31],
-				dataFrames[i].GetPublicKeySignatureEd448().PublicKey.KeyValue,
-			)
-		} else {
-			assert.Equal(t, uint64(i+1), dataFrames[i].FrameNumber)
-		}
-	}
+	assert.Equal(t, uint64(40), dataFrames[len(dataFrames)-1].FrameNumber)
+	assert.Equal(
+		t,
+		optimalKeySet[len(optimalKeySet)-1],
+		dataFrames[len(dataFrames)-1].GetPublicKeySignatureEd448().PublicKey.KeyValue,
+	)
 }

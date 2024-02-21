@@ -280,6 +280,7 @@ func (d *DataTimeReel) runLoop() {
 					}
 
 					d.addPending(selector, parent, distance, frame)
+					d.processPending(d.head, frame)
 					continue
 				}
 
@@ -293,24 +294,25 @@ func (d *DataTimeReel) runLoop() {
 				if frame.FrameNumber-d.head.FrameNumber != 1 ||
 					parent.Cmp(headSelector) != 0 {
 					d.logger.Debug(
-						"frame has has gap or is non-descendent, add pending",
+						"frame has has gap or is non-descendent, fork choice",
 						zap.Bool("has_gap", frame.FrameNumber-d.head.FrameNumber != 1),
 						zap.String("parent_selector", parent.Text(16)),
 						zap.String("head_selector", headSelector.Text(16)),
 					)
 
-					d.addPending(selector, parent, distance, frame)
+					d.forkChoice(frame, distance)
+					d.processPending(d.head, frame)
 					continue
 				}
 
 				// Otherwise set it as the next and process all pending
 				d.setHead(frame, distance)
-				d.processPending(d.head)
+				d.processPending(d.head, frame)
 			} else if d.head.FrameNumber == frame.FrameNumber {
 				// frames are equivalent, no need to act
 				if bytes.Equal(d.head.Output, frame.Output) {
 					d.logger.Debug("equivalent frame")
-					d.processPending(d.head)
+					d.processPending(d.head, frame)
 					continue
 				}
 
@@ -333,13 +335,13 @@ func (d *DataTimeReel) runLoop() {
 					)
 					d.totalDistance.Sub(d.totalDistance, d.headDistance)
 					d.setHead(frame, distance)
-					d.processPending(d.head)
+					d.processPending(d.head, frame)
 					continue
 				}
 
 				// Choose fork
 				d.forkChoice(frame, distance)
-				d.processPending(d.head)
+				d.processPending(d.head, frame)
 			} else {
 				d.logger.Debug("frame is lower height")
 
@@ -371,7 +373,7 @@ func (d *DataTimeReel) runLoop() {
 					}
 
 					d.addPending(selector, parent, distance, frame)
-					d.processPending(d.head)
+					d.processPending(d.head, frame)
 				}
 			}
 		case <-d.done:
@@ -461,22 +463,33 @@ func (d *DataTimeReel) addPending(
 
 func (d *DataTimeReel) processPending(
 	frame *protobufs.ClockFrame,
+	lastReceived *protobufs.ClockFrame,
 ) {
-	d.logger.Debug("process pending")
+	d.logger.Debug(
+		"process pending",
+		zap.Int("pending_frame_numbers", len(d.pending)),
+	)
 	frameNumbers := []uint64{}
 	for f := range d.pending {
 		frameNumbers = append(frameNumbers, f)
+		d.logger.Debug(
+			"pending per frame number",
+			zap.Uint64("pending_frame_number", f),
+			zap.Int("pending_frames", len(d.pending[f])),
+		)
 	}
 	sort.Slice(frameNumbers, func(i, j int) bool {
-		return frameNumbers[i] < frameNumbers[j]
+		return frameNumbers[i] > frameNumbers[j]
 	})
-	limit := 8
+
+	lastSelector, err := lastReceived.GetSelector()
+	if err != nil {
+		panic(err)
+	}
+
 	for _, f := range frameNumbers {
 		if f < d.head.FrameNumber {
 			delete(d.pending, f)
-		}
-		if limit <= 0 {
-			return
 		}
 
 		nextPending := d.pending[f]
@@ -495,11 +508,17 @@ func (d *DataTimeReel) processPending(
 			continue
 		}
 		// Pull the next
-		if nextPending != nil {
+		for len(nextPending) != 0 {
 			d.logger.Debug("try process next")
 			next := nextPending[0]
-			d.pending[f] =
-				d.pending[f][1:]
+			d.pending[f] = d.pending[f][1:]
+			if f == lastReceived.FrameNumber && next.selector.Cmp(lastSelector) == 0 {
+				d.pending[f] = append(d.pending[f], next)
+				if len(d.pending[f]) == 1 {
+					nextPending = nil
+				}
+				continue
+			}
 
 			nextFrame, err := d.clockStore.GetParentDataClockFrame(
 				d.filter,
@@ -510,17 +529,17 @@ func (d *DataTimeReel) processPending(
 				panic(err)
 			}
 			if nextFrame != nil {
-				d.pending[f] = append(d.pending[f], next)
 				d.logger.Debug("next found, send frame back in")
 				go func() {
 					d.frames <- nextFrame
 				}()
-				limit--
+				return
 			}
 
 			if len(d.pending[f]) == 0 {
 				d.logger.Debug("last next processing, clear list")
 				delete(d.pending, f)
+				nextPending = nil
 			}
 		}
 	}
@@ -642,16 +661,58 @@ func (d *DataTimeReel) forkChoice(
 	leftIndex := d.head
 	rightIndex := frame
 	leftTotal := new(big.Int).Set(d.headDistance)
+	overweight := big.NewInt(0)
 	rightTotal := new(big.Int).Set(distance)
 	left := d.head.ParentSelector
 	right := frame.ParentSelector
 
 	rightReplaySelectors := [][]byte{}
 
+	for rightIndex.FrameNumber > leftIndex.FrameNumber {
+		rightReplaySelectors = append(
+			append(
+				[][]byte{},
+				right,
+			),
+			rightReplaySelectors...,
+		)
+
+		rightIndex, err = d.clockStore.GetParentDataClockFrame(
+			d.filter,
+			rightIndex.FrameNumber-1,
+			rightIndex.ParentSelector,
+		)
+		if err != nil {
+			// If lineage cannot be verified, set it for later
+			if errors.Is(err, store.ErrNotFound) {
+				d.addPending(selector, parentSelector, distance, frame)
+				return
+			} else {
+				panic(err)
+			}
+		}
+
+		right = rightIndex.ParentSelector
+
+		rightIndexDistance, err := d.GetDistance(rightIndex)
+		if err != nil {
+			panic(err)
+		}
+
+		// We accumulate right on left when right is longer because we cannot know
+		// where the left will lead and don't want it to disadvantage our comparison
+		overweight.Add(overweight, rightIndexDistance)
+		rightTotal.Add(rightTotal, rightIndexDistance)
+	}
+
 	// Walk backwards through the parents, until we find a matching parent
 	// selector:
 	for !bytes.Equal(left, right) {
-		d.logger.Debug("scan backwards")
+		d.logger.Debug(
+			"scan backwards",
+			zap.String("left_parent", hex.EncodeToString(leftIndex.ParentSelector)),
+			zap.String("right_parent", hex.EncodeToString(rightIndex.ParentSelector)),
+		)
 
 		rightReplaySelectors = append(
 			append(
@@ -703,11 +764,13 @@ func (d *DataTimeReel) forkChoice(
 
 	frameNumber := rightIndex.FrameNumber
 
+	overweight.Add(overweight, leftTotal)
+
 	// Choose new fork based on lightest distance sub-tree
-	if rightTotal.Cmp(leftTotal) > 0 {
+	if rightTotal.Cmp(overweight) > 0 {
 		d.logger.Debug("proposed fork has greater distance",
 			zap.String("right_total", rightTotal.Text(16)),
-			zap.String("left_total", leftTotal.Text(16)),
+			zap.String("left_total", overweight.Text(16)),
 		)
 		d.addPending(selector, parentSelector, distance, frame)
 		return
