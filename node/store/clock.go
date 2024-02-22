@@ -72,6 +72,7 @@ type ClockStore interface {
 		filter []byte,
 		frameNumber uint64,
 		parentSelector []byte,
+		truncate bool,
 	) (*protobufs.ClockFrame, error)
 	RangeCandidateDataClockFrames(
 		filter []byte,
@@ -850,6 +851,7 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 	filter []byte,
 	frameNumber uint64,
 	parentSelector []byte,
+	truncate bool,
 ) (*protobufs.ClockFrame, error) {
 	check := false
 	data, closer, err := p.db.Get(
@@ -880,11 +882,13 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 		}
 	}
 
-	if err := p.fillAggregateProofs(parent); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get clock frame iterator value",
-		)
+	if !truncate {
+		if err := p.fillAggregateProofs(parent); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get clock frame iterator value",
+			)
+		}
 	}
 
 	if closer != nil {

@@ -1390,6 +1390,7 @@ func (e *CeremonyExecutionEngine) VerifyExecution(
 						),
 						frame.FrameNumber-1,
 						frame.ParentSelector,
+						false,
 					)
 					if err != nil && !errors.Is(err, store.ErrNotFound) {
 						return errors.Wrap(err, "verify execution")

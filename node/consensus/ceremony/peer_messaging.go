@@ -104,6 +104,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				e.filter,
 				frame.FrameNumber-1,
 				frame.ParentSelector,
+				true,
 			)
 			if err != nil {
 				from = 1
@@ -115,14 +116,11 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				e.filter,
 				frame.FrameNumber-1,
 				parent,
+				true,
 			)
 			if err != nil {
-				if frame.FrameNumber > 18 {
-					from = frame.FrameNumber - 16
-				} else {
-					from = 2
-				}
-				e.logger.Debug("peer fully out of sync, rewinding sync head to min")
+				from = 1
+				e.logger.Debug("peer fully out of sync, rewinding sync head to start")
 				break
 			}
 
