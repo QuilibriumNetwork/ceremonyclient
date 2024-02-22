@@ -416,6 +416,7 @@ func (d *DataTimeReel) addPending(
 		frame.Filter,
 		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
+		true,
 	); err != nil && existing == nil {
 		d.logger.Debug(
 			"not stored yet, save data candidate",
@@ -524,6 +525,7 @@ func (d *DataTimeReel) processPending(
 				d.filter,
 				f,
 				next.selector.FillBytes(make([]byte, 32)),
+				false,
 			)
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				panic(err)
@@ -597,6 +599,7 @@ func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
 		d.filter,
 		index.FrameNumber-1,
 		index.ParentSelector,
+		true,
 	) {
 		distance, err := d.GetDistance(index)
 		if err != nil {
@@ -681,6 +684,7 @@ func (d *DataTimeReel) forkChoice(
 			d.filter,
 			rightIndex.FrameNumber-1,
 			rightIndex.ParentSelector,
+			true,
 		)
 		if err != nil {
 			// If lineage cannot be verified, set it for later
@@ -725,6 +729,7 @@ func (d *DataTimeReel) forkChoice(
 			d.filter,
 			leftIndex.FrameNumber-1,
 			leftIndex.ParentSelector,
+			true,
 		)
 		if err != nil {
 			panic(err)
@@ -734,6 +739,7 @@ func (d *DataTimeReel) forkChoice(
 			d.filter,
 			rightIndex.FrameNumber-1,
 			rightIndex.ParentSelector,
+			true,
 		)
 		if err != nil {
 			// If lineage cannot be verified, set it for later
@@ -788,6 +794,7 @@ func (d *DataTimeReel) forkChoice(
 			d.filter,
 			frameNumber,
 			next,
+			false,
 		)
 		if err != nil {
 			panic(err)
