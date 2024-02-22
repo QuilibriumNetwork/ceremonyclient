@@ -2,6 +2,9 @@ version: "3.8"
 
 name: quilibrium
 
+# See sysctl related warning in DOCKER-README.md.
+# Currently Docker cannot be used to run Quilibrium.
+
 services:
   node:
     build: ./
