@@ -101,7 +101,8 @@ func main() {
 			panic(err)
 		}
 
-		fmt.Println("Confirmed balance:", balance.Owned, "QUIL")
+		fmt.Println("Owned balance:", balance.Owned, "QUIL")
+		fmt.Println("Unconfirmed balance:", balance.UnconfirmedOwned, "QUIL")
 
 		return
 	}

@@ -42,7 +42,7 @@ docker compose up -d
 ```
 
 A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
-Make sure you backup `config.ym` and `keys.yml`.
+Make sure you backup `config.yml` and `keys.yml`.
 
 
 ## Intereact with a running cotainer
