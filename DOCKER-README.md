@@ -72,3 +72,18 @@ Run the DB console:
 docker compose exec node go run ./... -db-console
 ```
 
+## Resource management (Optional)
+To ensure that your client performs optimally within a specific resource configuration, you can specify resource limits and reservations in the node configuration as illustrated below. This configuration helps in deploying the client with controlled resource usage, such as CPU and memory, to avoid overconsumption of resources in your environment.
+```yaml
+services:
+  node:
+    # Some other configuration sections here
+    deploy:
+      resources:
+        limits:
+          cpus: '4'  # Maximum CPU count that the container can use
+          memory: 16G  # Maximum memory that the container can use
+        reservations:
+          cpus: '2'  # CPU count that the container initially requests
+          memory: 8G  # Memory that the container initially requests
+```
