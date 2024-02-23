@@ -233,8 +233,6 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		return latest, errors.Wrap(err, "sync")
 	}
 
-	firstPass := true
-
 	var syncMsg *protobufs.CeremonyCompressedSync
 	for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
 		e.logger.Info(
@@ -251,20 +249,10 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		// so let's not penalize their score and make everyone else suffer,
 		// let's just move on:
 		if syncMsg.FromFrameNumber == 0 &&
-			syncMsg.ToFrameNumber == 0 &&
-			firstPass {
+			syncMsg.ToFrameNumber == 0 {
 			if err := cc.Close(); err != nil {
 				e.logger.Error("error while closing connection", zap.Error(err))
 			}
-
-			e.peerMapMx.Lock()
-			if _, ok := e.peerMap[string(peerId)]; ok {
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().
-					UnixMilli()
-				delete(e.peerMap, string(peerId))
-			}
-			e.peerMapMx.Unlock()
 
 			return currentLatest, errors.Wrap(ErrNoNewFrames, "sync")
 		}
@@ -273,7 +261,6 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		if next, err = e.decompressAndStoreCandidates(
 			peerId,
 			syncMsg,
-			e.logger.Info,
 		); err != nil && !errors.Is(err, ErrNoNewFrames) {
 			e.logger.Error(
 				"could not decompress and store candidate",

@@ -7,7 +7,6 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -184,7 +183,6 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 	peerId []byte,
 	syncMsg *protobufs.CeremonyCompressedSync,
-	loggerFunc func(msg string, fields ...zapcore.Field),
 ) (*protobufs.ClockFrame, error) {
 	if len(syncMsg.TruncatedClockFrames) == 0 {
 		return nil, ErrNoNewFrames
@@ -207,13 +205,13 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 	for _, frame := range syncMsg.TruncatedClockFrames {
 		frame := frame
 		commits := (len(frame.Input) - 516) / 74
-		loggerFunc(
+		e.logger.Info(
 			"processing frame",
 			zap.Uint64("frame_number", frame.FrameNumber),
 			zap.Int("aggregate_commits", commits),
 		)
 		for j := 0; j < commits; j++ {
-			loggerFunc(
+			e.logger.Info(
 				"processing commit",
 				zap.Uint64("frame_number", frame.FrameNumber),
 				zap.Int("commit_index", j),
@@ -223,7 +221,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			for _, a := range syncMsg.Proofs {
 				a := a
 				if bytes.Equal(a.FrameCommit, commit) {
-					loggerFunc(
+					e.logger.Info(
 						"found matching proof",
 						zap.Uint64("frame_number", frame.FrameNumber),
 						zap.Int("commit_index", j),
@@ -254,7 +252,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			for k, c := range aggregateProof.Commitments {
 				k := k
 				c := c
-				loggerFunc(
+				e.logger.Info(
 					"adding inclusion commitment",
 					zap.Uint64("frame_number", frame.FrameNumber),
 					zap.Int("commit_index", j),
@@ -283,7 +281,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 						if bytes.Equal(s.Hash, h) {
 							if output != nil {
 								if l == 0 {
-									loggerFunc(
+									e.logger.Info(
 										"found first half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -293,7 +291,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									output.Address = s.Data[:32]
 									output.Output = s.Data[32:]
 								} else {
-									loggerFunc(
+									e.logger.Info(
 										"found second half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -312,7 +310,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									break
 								}
 							} else {
-								loggerFunc(
+								e.logger.Info(
 									"found matching segment data",
 									zap.Uint64("frame_number", frame.FrameNumber),
 									zap.Int("commit_index", j),
@@ -357,10 +355,11 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 		); err != nil {
 			return nil, errors.Wrap(err, "decompress and store candidates")
 		}
+
 		final = frame
 	}
 
-	loggerFunc(
+	e.logger.Info(
 		"decompressed and stored sync for range",
 		zap.Uint64("from", syncMsg.FromFrameNumber),
 		zap.Uint64("to", syncMsg.ToFrameNumber),

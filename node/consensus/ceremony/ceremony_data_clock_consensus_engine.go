@@ -410,10 +410,15 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 			case dataFrame := <-dataFrameCh:
 				if latestFrame, err = e.collect(dataFrame); err != nil {
 					e.logger.Error("could not collect", zap.Error(err))
-					continue
 				}
+
+				dataFrame, err := e.dataTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+
 				go func() {
-					e.frameChan <- latestFrame
+					e.frameChan <- dataFrame
 				}()
 
 				if bytes.Equal(
@@ -421,7 +426,7 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.provingKeyAddress,
 				) {
 					var nextFrame *protobufs.ClockFrame
-					if nextFrame, err = e.prove(latestFrame); err != nil {
+					if nextFrame, err = e.prove(dataFrame); err != nil {
 						e.logger.Error("could not prove", zap.Error(err))
 						e.state = consensus.EngineStateCollecting
 						continue
@@ -445,6 +450,15 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.logger.Error("could not collect", zap.Error(err))
 					continue
 				}
+
+				if latestFrame == nil ||
+					latestFrame.FrameNumber < dataFrame.FrameNumber {
+					latestFrame, err = e.dataTimeReel.Head()
+					if err != nil {
+						panic(err)
+					}
+				}
+
 				go func() {
 					e.frameChan <- latestFrame
 				}()

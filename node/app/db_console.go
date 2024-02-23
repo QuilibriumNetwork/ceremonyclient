@@ -886,11 +886,11 @@ func logoVersion(width int) string {
 		out += "                     #######################################        ########\n"
 		out += "                          #############################                ##\n"
 		out += " \n"
-		out += "                        Quilibrium Node - v1.2.13 – Dawn\n"
+		out += "                        Quilibrium Node - v1.2.14 – Dawn\n"
 		out += " \n"
 		out += "                                   DB Console\n"
 	} else {
-		out = "Quilibrium Node - v1.2.13 – Dawn - DB Console\n"
+		out = "Quilibrium Node - v1.2.14 – Dawn - DB Console\n"
 	}
 	return out
 }
