@@ -732,6 +732,14 @@ func (d *DataTimeReel) forkChoice(
 			true,
 		)
 		if err != nil {
+			d.logger.Error(
+				"store corruption: a discontinuity has been found in your time reel",
+				zap.String(
+					"selector",
+					hex.EncodeToString(leftIndex.ParentSelector),
+				),
+				zap.Uint64("frame_number", leftIndex.FrameNumber-1),
+			)
 			panic(err)
 		}
 
