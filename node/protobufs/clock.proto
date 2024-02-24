@@ -61,6 +61,11 @@ message ClockFrame {
   }
 }
 
+message ClockFrameParentSelectors {
+  uint64 frame_number = 1;
+  bytes parent_selector = 2;
+}
+
 // Represents a request for a range of clock frames. Used to stay synchronized
 // to the latest state.
 message ClockFramesRequest {
@@ -74,6 +79,9 @@ message ClockFramesRequest {
   // The optional parent selector. If provided, will perform a check to confirm
   // continuity, otherwise, will rewind the sync head to the beginning.
   bytes parent_selector = 4;
+  // The optional range selectors. If provided, will perform a check against
+  // them to optimize the provided deltas.
+  repeated ClockFrameParentSelectors range_parent_selectors = 5;
 }
 
 // Represents a response for a range of clock frames. Used to stay synchronized

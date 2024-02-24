@@ -39,6 +39,7 @@ type ClockStore interface {
 	GetDataClockFrame(
 		filter []byte,
 		frameNumber uint64,
+		truncate bool,
 	) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error)
 	RangeDataClockFrames(
 		filter []byte,
@@ -623,6 +624,7 @@ func (p *PebbleClockStore) PutMasterClockFrame(
 func (p *PebbleClockStore) GetDataClockFrame(
 	filter []byte,
 	frameNumber uint64,
+	truncate bool,
 ) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error) {
 	value, closer, err := p.db.Get(clockDataFrameKey(filter, frameNumber))
 	if err != nil {
@@ -642,27 +644,31 @@ func (p *PebbleClockStore) GetDataClockFrame(
 		)
 	}
 
-	if err = p.fillAggregateProofs(frame); err != nil {
-		return nil, nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get data clock frame",
-		)
+	if !truncate {
+		if err = p.fillAggregateProofs(frame); err != nil {
+			return nil, nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get data clock frame",
+			)
+		}
+
+		proverTrie := &tries.RollingFrecencyCritbitTrie{}
+
+		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "get latest data clock frame")
+		}
+
+		defer closer.Close()
+
+		if err := proverTrie.Deserialize(trieData); err != nil {
+			return nil, nil, errors.Wrap(err, "get latest data clock frame")
+		}
+
+		return frame, proverTrie, nil
 	}
 
-	proverTrie := &tries.RollingFrecencyCritbitTrie{}
-
-	trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "get latest data clock frame")
-	}
-
-	defer closer.Close()
-
-	if err := proverTrie.Deserialize(trieData); err != nil {
-		return nil, nil, errors.Wrap(err, "get latest data clock frame")
-	}
-
-	return frame, proverTrie, nil
+	return frame, nil, nil
 }
 
 func (p *PebbleClockStore) fillAggregateProofs(
@@ -754,7 +760,7 @@ func (p *PebbleClockStore) GetEarliestDataClockFrame(
 
 	defer closer.Close()
 	frameNumber := binary.BigEndian.Uint64(idxValue)
-	frame, _, err := p.GetDataClockFrame(filter, frameNumber)
+	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "get earliest data clock frame")
 	}
@@ -777,7 +783,7 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	}
 
 	frameNumber := binary.BigEndian.Uint64(idxValue)
-	frame, _, err := p.GetDataClockFrame(filter, frameNumber)
+	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "get latest data clock frame")
 	}

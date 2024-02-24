@@ -3,9 +3,10 @@ package rpc
 import (
 	"bytes"
 	"context"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"math/big"
 	"net/http"
+
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -57,6 +58,7 @@ func (r *RPCServer) GetFrameInfo(
 		frame, _, err := r.clockStore.GetDataClockFrame(
 			req.Filter,
 			req.FrameNumber,
+			false,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "get frame info")

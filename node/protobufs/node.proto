@@ -41,6 +41,7 @@ message PeerInfo {
   bytes version = 5;
   bytes signature = 6;
   bytes public_key = 7;
+  bytes total_distance = 8;
 }
 
 message PeerInfoResponse {

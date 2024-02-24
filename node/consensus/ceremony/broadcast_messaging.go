@@ -137,11 +137,13 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 	e.peerAnnounceMap[string(peerID)] = announce
 	e.peerAnnounceMapMx.Unlock()
 
-	e.peerMapMx.Lock()
 	for _, p := range announce.PeerList {
+		e.peerMapMx.Lock()
 		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
+			e.peerMapMx.Unlock()
 			continue
 		}
+		e.peerMapMx.Unlock()
 
 		if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
 			continue
@@ -198,7 +200,11 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 		multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
 
 		e.pubSub.SetPeerScore(p.PeerId, 10)
+
+		e.peerMapMx.Lock()
 		existing, ok := e.peerMap[string(p.PeerId)]
+		e.peerMapMx.Unlock()
+
 		if ok {
 			if existing.signature != nil && p.Signature == nil {
 				continue
@@ -217,19 +223,21 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			}
 		}
 
+		e.peerMapMx.Lock()
 		e.peerMap[string(p.PeerId)] = &peerInfo{
-			peerId:    p.PeerId,
-			multiaddr: multiaddr,
-			maxFrame:  p.MaxFrame,
-			direct:    bytes.Equal(p.PeerId, peerID),
-			lastSeen:  time.Now().Unix(),
-			timestamp: p.Timestamp,
-			version:   p.Version,
-			signature: p.Signature,
-			publicKey: p.PublicKey,
+			peerId:        p.PeerId,
+			multiaddr:     multiaddr,
+			maxFrame:      p.MaxFrame,
+			direct:        bytes.Equal(p.PeerId, peerID),
+			lastSeen:      time.Now().Unix(),
+			timestamp:     p.Timestamp,
+			version:       p.Version,
+			signature:     p.Signature,
+			publicKey:     p.PublicKey,
+			totalDistance: p.TotalDistance,
 		}
+		e.peerMapMx.Unlock()
 	}
-	e.peerMapMx.Unlock()
 
 	return nil
 }

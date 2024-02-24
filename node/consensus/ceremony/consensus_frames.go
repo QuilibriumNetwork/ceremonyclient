@@ -145,7 +145,6 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	uint64,
 	error,
 ) {
-	e.peerMapMx.Lock()
 	frame, err := e.dataTimeReel.Head()
 	if err != nil {
 		panic(err)
@@ -160,6 +159,7 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 
 	max := frame.FrameNumber
 	var peer []byte = nil
+	e.peerMapMx.Lock()
 	for _, v := range e.peerMap {
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
 		if v.maxFrame > max &&
@@ -208,13 +208,48 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		from = 1
 	}
 
+	rangeParentSelectors := []*protobufs.ClockFrameParentSelectors{}
+	if from > 128 {
+		rangeSubtract := uint64(16)
+		for {
+			if from <= rangeSubtract {
+				break
+			}
+
+			parentNumber := from - uint64(rangeSubtract)
+			rangeSubtract *= 2
+			parent, _, err := e.clockStore.GetDataClockFrame(
+				e.filter,
+				parentNumber,
+				true,
+			)
+			if err != nil {
+				break
+			}
+
+			parentSelector, err := parent.GetSelector()
+			if err != nil {
+				panic(err)
+			}
+
+			rangeParentSelectors = append(
+				rangeParentSelectors,
+				&protobufs.ClockFrameParentSelectors{
+					FrameNumber:    parentNumber,
+					ParentSelector: parentSelector.FillBytes(make([]byte, 32)),
+				},
+			)
+		}
+	}
+
 	s, err := client.GetCompressedSyncFrames(
 		context.Background(),
 		&protobufs.ClockFramesRequest{
-			Filter:          e.filter,
-			FromFrameNumber: from,
-			ToFrameNumber:   maxFrame,
-			ParentSelector:  latest.ParentSelector,
+			Filter:               e.filter,
+			FromFrameNumber:      from,
+			ToFrameNumber:        maxFrame,
+			ParentSelector:       latest.ParentSelector,
+			RangeParentSelectors: rangeParentSelectors,
 		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
