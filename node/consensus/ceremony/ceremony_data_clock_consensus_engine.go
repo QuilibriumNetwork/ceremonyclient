@@ -44,15 +44,16 @@ const (
 )
 
 type peerInfo struct {
-	peerId    []byte
-	multiaddr string
-	maxFrame  uint64
-	timestamp int64
-	lastSeen  int64
-	version   []byte
-	signature []byte
-	publicKey []byte
-	direct    bool
+	peerId        []byte
+	multiaddr     string
+	maxFrame      uint64
+	timestamp     int64
+	lastSeen      int64
+	version       []byte
+	signature     []byte
+	publicKey     []byte
+	direct        bool
+	totalDistance []byte
 }
 
 type ChannelServer = protobufs.CeremonyService_GetPublicChannelServer
@@ -83,6 +84,7 @@ type CeremonyDataClockConsensusEngine struct {
 	stagedLobbyStateTransitions *protobufs.CeremonyLobbyStateTransition
 	minimumPeersRequired        int
 	statsClient                 protobufs.NodeStatsClient
+	currentReceivingSyncPeersMx sync.Mutex
 	currentReceivingSyncPeers   int
 
 	frameChan                      chan *protobufs.ClockFrame
@@ -323,6 +325,9 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				signature: sig,
 				publicKey: e.pubSub.GetPublicKey(),
 				timestamp: timestamp,
+				totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+					make([]byte, 256),
+				),
 			}
 			deletes := []*peerInfo{}
 			for _, v := range e.peerMap {
@@ -334,6 +339,9 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 					Version:   v.version,
 					Signature: v.signature,
 					PublicKey: v.publicKey,
+					TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+						make([]byte, 256),
+					),
 				})
 			}
 			for _, v := range e.uncooperativePeersMap {
@@ -363,6 +371,11 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 					e.logger.Error("could not emit stats", zap.Error(err))
 				}
 			}
+
+			e.logger.Info(
+				"broadcasting peer info",
+				zap.Uint64("frame_number", frame.FrameNumber),
+			)
 
 			if err := e.publishMessage(e.filter, list); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
@@ -550,26 +563,28 @@ func (
 	e.peerMapMx.Lock()
 	for _, v := range e.peerMap {
 		resp.PeerInfo = append(resp.PeerInfo, &protobufs.PeerInfo{
-			PeerId:     v.peerId,
-			Multiaddrs: []string{v.multiaddr},
-			MaxFrame:   v.maxFrame,
-			Timestamp:  v.timestamp,
-			Version:    v.version,
-			Signature:  v.signature,
-			PublicKey:  v.publicKey,
+			PeerId:        v.peerId,
+			Multiaddrs:    []string{v.multiaddr},
+			MaxFrame:      v.maxFrame,
+			Timestamp:     v.timestamp,
+			Version:       v.version,
+			Signature:     v.signature,
+			PublicKey:     v.publicKey,
+			TotalDistance: v.totalDistance,
 		})
 	}
 	for _, v := range e.uncooperativePeersMap {
 		resp.UncooperativePeerInfo = append(
 			resp.UncooperativePeerInfo,
 			&protobufs.PeerInfo{
-				PeerId:     v.peerId,
-				Multiaddrs: []string{v.multiaddr},
-				MaxFrame:   v.maxFrame,
-				Timestamp:  v.timestamp,
-				Version:    v.version,
-				Signature:  v.signature,
-				PublicKey:  v.publicKey,
+				PeerId:        v.peerId,
+				Multiaddrs:    []string{v.multiaddr},
+				MaxFrame:      v.maxFrame,
+				Timestamp:     v.timestamp,
+				Version:       v.version,
+				Signature:     v.signature,
+				PublicKey:     v.publicKey,
+				TotalDistance: v.totalDistance,
 			},
 		)
 	}

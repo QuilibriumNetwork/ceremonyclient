@@ -29,7 +29,10 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 		zap.Uint64("to_frame_number", request.ToFrameNumber),
 	)
 
+	e.currentReceivingSyncPeersMx.Lock()
 	if e.currentReceivingSyncPeers > 4 {
+		e.currentReceivingSyncPeersMx.Unlock()
+
 		e.logger.Info(
 			"currently processing maximum sync requests, returning",
 		)
@@ -49,7 +52,13 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	}
 
 	e.currentReceivingSyncPeers++
-	defer func() { e.currentReceivingSyncPeers-- }()
+	e.currentReceivingSyncPeersMx.Unlock()
+
+	defer func() {
+		e.currentReceivingSyncPeersMx.Lock()
+		e.currentReceivingSyncPeers--
+		e.currentReceivingSyncPeersMx.Unlock()
+	}()
 
 	from := request.FromFrameNumber
 	parent := request.ParentSelector
@@ -57,6 +66,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	frame, _, err := e.clockStore.GetDataClockFrame(
 		request.Filter,
 		from,
+		true,
 	)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
@@ -64,6 +74,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				"peer asked for frame that returned error",
 				zap.Uint64("frame_number", request.FromFrameNumber),
 			)
+
 			return errors.Wrap(err, "get compressed sync frames")
 		} else {
 			frames, err := e.clockStore.GetCandidateDataClockFrames(e.filter, from)
@@ -126,6 +137,21 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 			from--
 			frame = ours
 			parent = theirs.ParentSelector
+		}
+	}
+
+	if request.RangeParentSelectors != nil {
+		for _, selector := range request.RangeParentSelectors {
+			frame, err := e.clockStore.GetParentDataClockFrame(
+				e.filter,
+				selector.FrameNumber,
+				selector.ParentSelector,
+				true,
+			)
+			if err == nil && frame != nil {
+				from = selector.FrameNumber
+				break
+			}
 		}
 	}
 

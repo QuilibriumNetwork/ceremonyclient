@@ -350,6 +350,7 @@ func (d *DataTimeReel) runLoop() {
 				existing, _, err := d.clockStore.GetDataClockFrame(
 					d.filter,
 					frame.FrameNumber,
+					true,
 				)
 				if err != nil {
 					// if this returns an error it's either not found (which shouldn't
@@ -858,6 +859,10 @@ func (d *DataTimeReel) forkChoice(
 	go func() {
 		d.newFrameCh <- frame
 	}()
+}
+
+func (d *DataTimeReel) GetTotalDistance() *big.Int {
+	return new(big.Int).Set(d.totalDistance)
 }
 
 var _ TimeReel = (*DataTimeReel)(nil)

@@ -89,7 +89,7 @@ func NewCeremonyExecutionEngine(
 		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
 	)
 
-	frame, _, err := clockStore.GetDataClockFrame(intrinsicFilter, 0)
+	frame, _, err := clockStore.GetDataClockFrame(intrinsicFilter, 0, false)
 	var origin []byte
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
