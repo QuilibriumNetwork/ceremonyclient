@@ -46,6 +46,17 @@ The confirmed token balance will be printed to stdout in QUILs.
 
 Note that this feature requires that [gRPC support](#experimental--grpcrest-support) is enabled.
 
+## Stats Collection
+
+In order to opt-in to stats collection about the health of the network, edit your `config.yml` in the `node/.config` directory to have a new section under `engine`:
+
+```yml
+<earlier parts of config>
+engine:
+  statsMultiaddr: "/dns/stats.quilibrium.com/tcp/443"
+  <rest of config continues below>
+```
+
 ## Purpose
 
 The ceremony application provides a secure reference string (SRS) from which
