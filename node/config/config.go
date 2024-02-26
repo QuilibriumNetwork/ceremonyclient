@@ -142,6 +142,10 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			config.ListenRestMultiaddr = os.Getenv("DEFAULT_LISTEN_REST_MULTIADDR")
 		}
 
+		if multiAddr := os.Getenv("DEFAULT_STATS_MULTIADDR"); multiAddr != "" {
+			config.Engine.StatsMultiaddr = multiAddr
+		}
+
 		fmt.Println("Saving config...")
 		if err = SaveConfig(configPath, config); err != nil {
 			panic(err)

@@ -20,6 +20,7 @@ services:
     environment:
       - DEFAULT_LISTEN_GRPC_MULTIADDR=/ip4/0.0.0.0/tcp/8337
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
+      - DEFAULT_STATS_MULTIADDR=/dns/stats.quilibrium.com/tcp/443
     ports:
       - '8336:8336/udp' # p2p
       - '127.0.0.1:8337:8337/tcp' # gRPC
