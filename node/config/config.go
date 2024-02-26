@@ -154,7 +154,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		keyfile, err := os.OpenFile(
 			filepath.Join(configPath, "keys.yml"),
 			os.O_CREATE|os.O_RDWR,
-			fs.FileMode(0700),
+			fs.FileMode(0600),
 		)
 		if err != nil {
 			panic(err)

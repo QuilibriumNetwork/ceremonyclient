@@ -202,7 +202,7 @@ func clearIfTestData(configDir string, nodeConfig *config.Config) {
 		versionFile, err := os.OpenFile(
 			filepath.Join(configDir, "RELEASE_VERSION"),
 			os.O_CREATE|os.O_RDWR,
-			fs.FileMode(0700),
+			fs.FileMode(0600),
 		)
 		if err != nil {
 			panic(err)
@@ -232,7 +232,7 @@ func migrate(configDir string, nodeConfig *config.Config) {
 		migrationFile, err := os.OpenFile(
 			filepath.Join(configDir, "MIGRATIONS"),
 			os.O_CREATE|os.O_RDWR,
-			fs.FileMode(0700),
+			fs.FileMode(0600),
 		)
 		if err != nil {
 			panic(err)
