@@ -10,6 +10,13 @@ services:
     build: ./
     image: quilibrium
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          cpus: 12
+          memory: 16G
     environment:
       - DEFAULT_LISTEN_GRPC_MULTIADDR=/ip4/0.0.0.0/tcp/8337
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
