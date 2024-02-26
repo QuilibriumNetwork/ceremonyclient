@@ -28,7 +28,7 @@ sudo sysctl -w net.core.wmem_max=600000000
 
 Build the docker image:
 ```shell
-docker build -t quilibrium -t quilibrium:1.2.9 .
+docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.2.9 .
 ```
 
 Use latest version instead of `1.2.9`.
