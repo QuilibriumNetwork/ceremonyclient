@@ -133,10 +133,6 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 		return errors.Wrap(err, "handle ceremony peer list announce")
 	}
 
-	e.peerAnnounceMapMx.Lock()
-	e.peerAnnounceMap[string(peerID)] = announce
-	e.peerAnnounceMapMx.Unlock()
-
 	for _, p := range announce.PeerList {
 		e.peerMapMx.Lock()
 		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {

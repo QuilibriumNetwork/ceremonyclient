@@ -101,7 +101,6 @@ type CeremonyDataClockConsensusEngine struct {
 	peerMapMx                      sync.Mutex
 	peerAnnounceMapMx              sync.Mutex
 	lastKeyBundleAnnouncementFrame uint64
-	peerAnnounceMap                map[string]*protobufs.CeremonyPeerListAnnounce
 	peerMap                        map[string]*peerInfo
 	uncooperativePeersMap          map[string]*peerInfo
 }
@@ -227,7 +226,6 @@ func NewCeremonyDataClockConsensusEngine(
 		frameProverTrie:           &tries.RollingFrecencyCritbitTrie{},
 		inclusionProver:           inclusionProver,
 		syncingStatus:             SyncStatusNotSyncing,
-		peerAnnounceMap:           map[string]*protobufs.CeremonyPeerListAnnounce{},
 		peerMap:                   map[string]*peerInfo{},
 		uncooperativePeersMap:     map[string]*peerInfo{},
 		minimumPeersRequired:      minimumPeersRequired,
@@ -330,20 +328,18 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				),
 			}
 			deletes := []*peerInfo{}
-			for _, v := range e.peerMap {
-				list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
-					PeerId:    v.peerId,
-					Multiaddr: v.multiaddr,
-					MaxFrame:  v.maxFrame,
-					Timestamp: v.timestamp,
-					Version:   v.version,
-					Signature: v.signature,
-					PublicKey: v.publicKey,
-					TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
-						make([]byte, 256),
-					),
-				})
-			}
+			list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
+				PeerId:    e.pubSub.GetPeerID(),
+				Multiaddr: "",
+				MaxFrame:  frame.FrameNumber,
+				Version:   consensus.GetVersion(),
+				Signature: sig,
+				PublicKey: e.pubSub.GetPublicKey(),
+				Timestamp: timestamp,
+				TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+					make([]byte, 256),
+				),
+			})
 			for _, v := range e.uncooperativePeersMap {
 				if v == nil {
 					continue
@@ -359,12 +355,24 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 			e.peerMapMx.Unlock()
 
 			if e.statsClient != nil {
-				peerInfo := e.GetPeerInfo()
 				_, err := e.statsClient.PutPeerInfo(
 					context.Background(),
 					&protobufs.PutPeerInfoRequest{
-						PeerInfo:              peerInfo.PeerInfo,
-						UncooperativePeerInfo: peerInfo.UncooperativePeerInfo,
+						PeerInfo: []*protobufs.PeerInfo{
+							{
+								PeerId:     e.pubSub.GetPeerID(),
+								Multiaddrs: []string{""},
+								MaxFrame:   frame.FrameNumber,
+								Version:    consensus.GetVersion(),
+								Signature:  sig,
+								PublicKey:  e.pubSub.GetPublicKey(),
+								Timestamp:  timestamp,
+								TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+									make([]byte, 256),
+								),
+							},
+						},
+						UncooperativePeerInfo: []*protobufs.PeerInfo{},
 					},
 				)
 				if err != nil {
