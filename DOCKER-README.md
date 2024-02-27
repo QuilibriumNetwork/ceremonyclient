@@ -61,7 +61,7 @@ A `.config/` subfolder will be created under the current folder, this is mapped 
 Make sure you backup `config.yml` and `keys.yml`.
 
 
-## Intereact with a running cotainer
+## Interact with a running container
 
 Drop into a shell inside a running container:
 ```shell
@@ -78,7 +78,7 @@ Get the Peer ID:
 docker compose exec node go run ./... -peer-id
 ```
 
-Get the token ballance:
+Get the token balance:
 ```shell
 docker compose exec node go run ./... -balance
 ```
