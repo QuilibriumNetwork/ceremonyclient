@@ -40,17 +40,27 @@ net.core.rmem_max = 600000000
 net.core.wmem_max = 600000000
 ```
 
+
 ## Build
 
-Build the docker image:
+In the repository root folder, where the [Dockerfile](Dockerfile) file is, build the docker image:
 ```shell
-docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.2.9 .
+docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.2.15 .
 ```
 
-Use latest version instead of `1.2.9`.
+Use latest version instead of `1.2.15`.
 
 
 ## Run
+
+You can run Quilibrium on the same machine where you built the image, from the same repository root
+folder where [docker-compose.yml](docker-compose.yml) is.
+
+You can also copy `docker-compose.yml` to a new folder on a server and run it there. In this case you
+have to have a way to push your image to a Docker image repo and then pull that image on the server.
+Github offers such an image repo and a way to push and pull images using special authentication
+tokens. See
+[Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
 Run Quilibrium in a container:
 ```shell
@@ -59,6 +69,56 @@ docker compose up -d
 
 A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
 Make sure you backup `config.yml` and `keys.yml`.
+
+
+### Resource management
+To ensure that your client performs optimally within a specific resource configuration, you can specify
+resource limits and reservations in the node configuration as illustrated below. 
+
+This configuration helps in deploying the client with controlled resource usage, such as CPU and memory,
+to avoid overconsumption of resources in your environment.
+
+The [docker-compose.yml](docker-compose.yml) file already specifies resources following the currently
+recommended hardware requirements.
+
+```yaml
+services:
+  node:
+    # Some other configuration sections here
+    deploy:
+      resources:
+        limits:
+          cpus: '4'  # Maximum CPU count that the container can use
+          memory: 16G  # Maximum memory that the container can use
+        reservations:
+          cpus: '2'  # CPU count that the container initially requests
+          memory: 8G  # Memory that the container initially request
+```
+
+
+### Customizing docker-compose.yml
+
+If you want to change certain parameters in [docker-compose.yml](docker-compose.yml) it is better not
+to edit the file directly as new versions pushed through git would overwrite your changes. A more
+flexible solution is to create another file called `docker-compose.override.yml` right next to it
+and specifying the necessary overriding changes there.
+
+For example:
+```yaml
+services:
+  node:
+    image: ghcr.io/mscurtescu/ceremonyclient
+    restart: on-failure:7
+```
+
+The above will override the image name and also the restart policy.
+
+To check if your overrides are being picked up run the following command:
+```shell
+docker compose config
+```
+
+This will output the merged and canonical compose file that will be used to run the container(s).
 
 
 ## Interact with a running container
