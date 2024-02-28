@@ -1201,6 +1201,172 @@ func (x *CeremonyCompressedSync) GetSegments() []*InclusionSegmentsMap {
 	return nil
 }
 
+type CeremonyCompressedSyncRequestMessage struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Types that are assignable to SyncMessage:
+	//
+	//	*CeremonyCompressedSyncRequestMessage_Preflight
+	//	*CeremonyCompressedSyncRequestMessage_Request
+	SyncMessage isCeremonyCompressedSyncRequestMessage_SyncMessage `protobuf_oneof:"sync_message"`
+}
+
+func (x *CeremonyCompressedSyncRequestMessage) Reset() {
+	*x = CeremonyCompressedSyncRequestMessage{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_ceremony_proto_msgTypes[16]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CeremonyCompressedSyncRequestMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CeremonyCompressedSyncRequestMessage) ProtoMessage() {}
+
+func (x *CeremonyCompressedSyncRequestMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_ceremony_proto_msgTypes[16]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CeremonyCompressedSyncRequestMessage.ProtoReflect.Descriptor instead.
+func (*CeremonyCompressedSyncRequestMessage) Descriptor() ([]byte, []int) {
+	return file_ceremony_proto_rawDescGZIP(), []int{16}
+}
+
+func (m *CeremonyCompressedSyncRequestMessage) GetSyncMessage() isCeremonyCompressedSyncRequestMessage_SyncMessage {
+	if m != nil {
+		return m.SyncMessage
+	}
+	return nil
+}
+
+func (x *CeremonyCompressedSyncRequestMessage) GetPreflight() *ClockFramesPreflight {
+	if x, ok := x.GetSyncMessage().(*CeremonyCompressedSyncRequestMessage_Preflight); ok {
+		return x.Preflight
+	}
+	return nil
+}
+
+func (x *CeremonyCompressedSyncRequestMessage) GetRequest() *ClockFramesRequest {
+	if x, ok := x.GetSyncMessage().(*CeremonyCompressedSyncRequestMessage_Request); ok {
+		return x.Request
+	}
+	return nil
+}
+
+type isCeremonyCompressedSyncRequestMessage_SyncMessage interface {
+	isCeremonyCompressedSyncRequestMessage_SyncMessage()
+}
+
+type CeremonyCompressedSyncRequestMessage_Preflight struct {
+	Preflight *ClockFramesPreflight `protobuf:"bytes,1,opt,name=preflight,proto3,oneof"`
+}
+
+type CeremonyCompressedSyncRequestMessage_Request struct {
+	Request *ClockFramesRequest `protobuf:"bytes,2,opt,name=request,proto3,oneof"`
+}
+
+func (*CeremonyCompressedSyncRequestMessage_Preflight) isCeremonyCompressedSyncRequestMessage_SyncMessage() {
+}
+
+func (*CeremonyCompressedSyncRequestMessage_Request) isCeremonyCompressedSyncRequestMessage_SyncMessage() {
+}
+
+type CeremonyCompressedSyncResponseMessage struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Types that are assignable to SyncMessage:
+	//
+	//	*CeremonyCompressedSyncResponseMessage_Preflight
+	//	*CeremonyCompressedSyncResponseMessage_Response
+	SyncMessage isCeremonyCompressedSyncResponseMessage_SyncMessage `protobuf_oneof:"sync_message"`
+}
+
+func (x *CeremonyCompressedSyncResponseMessage) Reset() {
+	*x = CeremonyCompressedSyncResponseMessage{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_ceremony_proto_msgTypes[17]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CeremonyCompressedSyncResponseMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CeremonyCompressedSyncResponseMessage) ProtoMessage() {}
+
+func (x *CeremonyCompressedSyncResponseMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_ceremony_proto_msgTypes[17]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CeremonyCompressedSyncResponseMessage.ProtoReflect.Descriptor instead.
+func (*CeremonyCompressedSyncResponseMessage) Descriptor() ([]byte, []int) {
+	return file_ceremony_proto_rawDescGZIP(), []int{17}
+}
+
+func (m *CeremonyCompressedSyncResponseMessage) GetSyncMessage() isCeremonyCompressedSyncResponseMessage_SyncMessage {
+	if m != nil {
+		return m.SyncMessage
+	}
+	return nil
+}
+
+func (x *CeremonyCompressedSyncResponseMessage) GetPreflight() *ClockFramesPreflight {
+	if x, ok := x.GetSyncMessage().(*CeremonyCompressedSyncResponseMessage_Preflight); ok {
+		return x.Preflight
+	}
+	return nil
+}
+
+func (x *CeremonyCompressedSyncResponseMessage) GetResponse() *CeremonyCompressedSync {
+	if x, ok := x.GetSyncMessage().(*CeremonyCompressedSyncResponseMessage_Response); ok {
+		return x.Response
+	}
+	return nil
+}
+
+type isCeremonyCompressedSyncResponseMessage_SyncMessage interface {
+	isCeremonyCompressedSyncResponseMessage_SyncMessage()
+}
+
+type CeremonyCompressedSyncResponseMessage_Preflight struct {
+	Preflight *ClockFramesPreflight `protobuf:"bytes,1,opt,name=preflight,proto3,oneof"`
+}
+
+type CeremonyCompressedSyncResponseMessage_Response struct {
+	Response *CeremonyCompressedSync `protobuf:"bytes,2,opt,name=response,proto3,oneof"`
+}
+
+func (*CeremonyCompressedSyncResponseMessage_Preflight) isCeremonyCompressedSyncResponseMessage_SyncMessage() {
+}
+
+func (*CeremonyCompressedSyncResponseMessage_Response) isCeremonyCompressedSyncResponseMessage_SyncMessage() {
+}
+
 type InclusionProofsMap struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -1214,7 +1380,7 @@ type InclusionProofsMap struct {
 func (x *InclusionProofsMap) Reset() {
 	*x = InclusionProofsMap{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_ceremony_proto_msgTypes[16]
+		mi := &file_ceremony_proto_msgTypes[18]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1227,7 +1393,7 @@ func (x *InclusionProofsMap) String() string {
 func (*InclusionProofsMap) ProtoMessage() {}
 
 func (x *InclusionProofsMap) ProtoReflect() protoreflect.Message {
-	mi := &file_ceremony_proto_msgTypes[16]
+	mi := &file_ceremony_proto_msgTypes[18]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1240,7 +1406,7 @@ func (x *InclusionProofsMap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InclusionProofsMap.ProtoReflect.Descriptor instead.
 func (*InclusionProofsMap) Descriptor() ([]byte, []int) {
-	return file_ceremony_proto_rawDescGZIP(), []int{16}
+	return file_ceremony_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *InclusionProofsMap) GetFrameCommit() []byte {
@@ -1276,7 +1442,7 @@ type InclusionSegmentsMap struct {
 func (x *InclusionSegmentsMap) Reset() {
 	*x = InclusionSegmentsMap{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_ceremony_proto_msgTypes[17]
+		mi := &file_ceremony_proto_msgTypes[19]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1289,7 +1455,7 @@ func (x *InclusionSegmentsMap) String() string {
 func (*InclusionSegmentsMap) ProtoMessage() {}
 
 func (x *InclusionSegmentsMap) ProtoReflect() protoreflect.Message {
-	mi := &file_ceremony_proto_msgTypes[17]
+	mi := &file_ceremony_proto_msgTypes[19]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1302,7 +1468,7 @@ func (x *InclusionSegmentsMap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InclusionSegmentsMap.ProtoReflect.Descriptor instead.
 func (*InclusionSegmentsMap) Descriptor() ([]byte, []int) {
-	return file_ceremony_proto_rawDescGZIP(), []int{17}
+	return file_ceremony_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *InclusionSegmentsMap) GetHash() []byte {
@@ -1332,7 +1498,7 @@ type InclusionCommitmentsMap struct {
 func (x *InclusionCommitmentsMap) Reset() {
 	*x = InclusionCommitmentsMap{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_ceremony_proto_msgTypes[18]
+		mi := &file_ceremony_proto_msgTypes[20]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1345,7 +1511,7 @@ func (x *InclusionCommitmentsMap) String() string {
 func (*InclusionCommitmentsMap) ProtoMessage() {}
 
 func (x *InclusionCommitmentsMap) ProtoReflect() protoreflect.Message {
-	mi := &file_ceremony_proto_msgTypes[18]
+	mi := &file_ceremony_proto_msgTypes[20]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1358,7 +1524,7 @@ func (x *InclusionCommitmentsMap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InclusionCommitmentsMap.ProtoReflect.Descriptor instead.
 func (*InclusionCommitmentsMap) Descriptor() ([]byte, []int) {
-	return file_ceremony_proto_rawDescGZIP(), []int{18}
+	return file_ceremony_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *InclusionCommitmentsMap) GetCommitment() []byte {
@@ -1717,7 +1883,34 @@ var file_ceremony_proto_rawDesc = []byte{
 	0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e,
 	0x63, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x2e, 0x70, 0x62, 0x2e, 0x49, 0x6e, 0x63, 0x6c,
 	0x75, 0x73, 0x69, 0x6f, 0x6e, 0x53, 0x65, 0x67, 0x6d, 0x65, 0x6e, 0x74, 0x73, 0x4d, 0x61, 0x70,
-	0x52, 0x08, 0x73, 0x65, 0x67, 0x6d, 0x65, 0x6e, 0x74, 0x73, 0x22, 0xa5, 0x01, 0x0a, 0x12, 0x49,
+	0x52, 0x08, 0x73, 0x65, 0x67, 0x6d, 0x65, 0x6e, 0x74, 0x73, 0x22, 0xd0, 0x01, 0x0a, 0x24, 0x43,
+	0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65,
+	0x64, 0x53, 0x79, 0x6e, 0x63, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x4d, 0x65, 0x73, 0x73,
+	0x61, 0x67, 0x65, 0x12, 0x4e, 0x0a, 0x09, 0x70, 0x72, 0x65, 0x66, 0x6c, 0x69, 0x67, 0x68, 0x74,
+	0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72,
+	0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6c, 0x6f, 0x63, 0x6b, 0x2e, 0x70,
+	0x62, 0x2e, 0x43, 0x6c, 0x6f, 0x63, 0x6b, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x73, 0x50, 0x72, 0x65,
+	0x66, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x48, 0x00, 0x52, 0x09, 0x70, 0x72, 0x65, 0x66, 0x6c, 0x69,
+	0x67, 0x68, 0x74, 0x12, 0x48, 0x0a, 0x07, 0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x18, 0x02,
+	0x20, 0x01, 0x28, 0x0b, 0x32, 0x2c, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6c, 0x6f, 0x63, 0x6b, 0x2e, 0x70, 0x62, 0x2e,
+	0x43, 0x6c, 0x6f, 0x63, 0x6b, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65,
+	0x73, 0x74, 0x48, 0x00, 0x52, 0x07, 0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x42, 0x0e, 0x0a,
+	0x0c, 0x73, 0x79, 0x6e, 0x63, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x22, 0xda, 0x01,
+	0x0a, 0x25, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65,
+	0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+	0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x12, 0x4e, 0x0a, 0x09, 0x70, 0x72, 0x65, 0x66, 0x6c,
+	0x69, 0x67, 0x68, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2e, 0x2e, 0x71, 0x75, 0x69,
+	0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6c, 0x6f,
+	0x63, 0x6b, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x6c, 0x6f, 0x63, 0x6b, 0x46, 0x72, 0x61, 0x6d, 0x65,
+	0x73, 0x50, 0x72, 0x65, 0x66, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x48, 0x00, 0x52, 0x09, 0x70, 0x72,
+	0x65, 0x66, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x12, 0x51, 0x0a, 0x08, 0x72, 0x65, 0x73, 0x70, 0x6f,
+	0x6e, 0x73, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x33, 0x2e, 0x71, 0x75, 0x69, 0x6c,
+	0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x65, 0x72, 0x65,
+	0x6d, 0x6f, 0x6e, 0x79, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79,
+	0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x48, 0x00,
+	0x52, 0x08, 0x72, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0x0e, 0x0a, 0x0c, 0x73, 0x79,
+	0x6e, 0x63, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x22, 0xa5, 0x01, 0x0a, 0x12, 0x49,
 	0x6e, 0x63, 0x6c, 0x75, 0x73, 0x69, 0x6f, 0x6e, 0x50, 0x72, 0x6f, 0x6f, 0x66, 0x73, 0x4d, 0x61,
 	0x70, 0x12, 0x21, 0x0a, 0x0c, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x5f, 0x63, 0x6f, 0x6d, 0x6d, 0x69,
 	0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0b, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x43, 0x6f,
@@ -1740,7 +1933,7 @@ var file_ceremony_proto_rawDesc = []byte{
 	0x07, 0x74, 0x79, 0x70, 0x65, 0x55, 0x72, 0x6c, 0x12, 0x25, 0x0a, 0x0e, 0x73, 0x65, 0x67, 0x6d,
 	0x65, 0x6e, 0x74, 0x5f, 0x68, 0x61, 0x73, 0x68, 0x65, 0x73, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0c,
 	0x52, 0x0d, 0x73, 0x65, 0x67, 0x6d, 0x65, 0x6e, 0x74, 0x48, 0x61, 0x73, 0x68, 0x65, 0x73, 0x32,
-	0x89, 0x02, 0x0a, 0x0f, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x53, 0x65, 0x72, 0x76,
+	0xb6, 0x03, 0x0a, 0x0f, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x53, 0x65, 0x72, 0x76,
 	0x69, 0x63, 0x65, 0x12, 0x7e, 0x0a, 0x17, 0x47, 0x65, 0x74, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65,
 	0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x73, 0x12, 0x2c,
 	0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65,
@@ -1749,18 +1942,29 @@ var file_ceremony_proto_rawDesc = []byte{
 	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63,
 	0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x65, 0x72, 0x65, 0x6d,
 	0x6f, 0x6e, 0x79, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e,
-	0x63, 0x30, 0x01, 0x12, 0x76, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63,
-	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x12, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62,
-	0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65,
-	0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x32, 0x50, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45,
-	0x6e, 0x76, 0x65, 0x6c, 0x6f, 0x70, 0x65, 0x1a, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62,
-	0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65,
-	0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x32, 0x50, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45,
-	0x6e, 0x76, 0x65, 0x6c, 0x6f, 0x70, 0x65, 0x28, 0x01, 0x30, 0x01, 0x42, 0x3a, 0x5a, 0x38, 0x73,
-	0x6f, 0x75, 0x72, 0x63, 0x65, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d,
-	0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2f,
-	0x6d, 0x6f, 0x6e, 0x6f, 0x72, 0x65, 0x70, 0x6f, 0x2f, 0x6e, 0x6f, 0x64, 0x65, 0x2f, 0x70, 0x72,
-	0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x63, 0x30, 0x01, 0x12, 0xaa, 0x01, 0x0a, 0x1d, 0x4e, 0x65, 0x67, 0x6f, 0x74, 0x69, 0x61, 0x74,
+	0x65, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x46,
+	0x72, 0x61, 0x6d, 0x65, 0x73, 0x12, 0x41, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
+	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79,
+	0x2e, 0x70, 0x62, 0x2e, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x43, 0x6f, 0x6d, 0x70,
+	0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
+	0x74, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x1a, 0x42, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69,
+	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x65, 0x72, 0x65, 0x6d,
+	0x6f, 0x6e, 0x79, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x65, 0x72, 0x65, 0x6d, 0x6f, 0x6e, 0x79, 0x43,
+	0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x79, 0x6e, 0x63, 0x52, 0x65, 0x73,
+	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x28, 0x01, 0x30, 0x01,
+	0x12, 0x76, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x43, 0x68, 0x61,
+	0x6e, 0x6e, 0x65, 0x6c, 0x12, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x2e, 0x70,
+	0x62, 0x2e, 0x50, 0x32, 0x50, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45, 0x6e, 0x76, 0x65,
+	0x6c, 0x6f, 0x70, 0x65, 0x1a, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x2e, 0x70,
+	0x62, 0x2e, 0x50, 0x32, 0x50, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45, 0x6e, 0x76, 0x65,
+	0x6c, 0x6f, 0x70, 0x65, 0x28, 0x01, 0x30, 0x01, 0x42, 0x3a, 0x5a, 0x38, 0x73, 0x6f, 0x75, 0x72,
+	0x63, 0x65, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x63, 0x6f,
+	0x6d, 0x2f, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2f, 0x6d, 0x6f, 0x6e,
+	0x6f, 0x72, 0x65, 0x70, 0x6f, 0x2f, 0x6e, 0x6f, 0x64, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f,
+	0x62, 0x75, 0x66, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -1775,92 +1979,101 @@ func file_ceremony_proto_rawDescGZIP() []byte {
 	return file_ceremony_proto_rawDescData
 }
 
-var file_ceremony_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_ceremony_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_ceremony_proto_goTypes = []interface{}{
-	(*CeremonyTranscript)(nil),               // 0: quilibrium.node.ceremony.pb.CeremonyTranscript
-	(*CeremonyLobbyState)(nil),               // 1: quilibrium.node.ceremony.pb.CeremonyLobbyState
-	(*CeremonySeenProverAttestation)(nil),    // 2: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
-	(*CeremonyDroppedProverAttestation)(nil), // 3: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
-	(*CeremonyTranscriptShare)(nil),          // 4: quilibrium.node.ceremony.pb.CeremonyTranscriptShare
-	(*CeremonyTranscriptCommit)(nil),         // 5: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
-	(*CeremonyAdvanceRound)(nil),             // 6: quilibrium.node.ceremony.pb.CeremonyAdvanceRound
-	(*CeremonyLobbyJoin)(nil),                // 7: quilibrium.node.ceremony.pb.CeremonyLobbyJoin
-	(*CeremonyLobbyStateTransition)(nil),     // 8: quilibrium.node.ceremony.pb.CeremonyLobbyStateTransition
-	(*CeremonyOpenState)(nil),                // 9: quilibrium.node.ceremony.pb.CeremonyOpenState
-	(*CeremonyInProgressState)(nil),          // 10: quilibrium.node.ceremony.pb.CeremonyInProgressState
-	(*CeremonyFinalizingState)(nil),          // 11: quilibrium.node.ceremony.pb.CeremonyFinalizingState
-	(*CeremonyValidatingState)(nil),          // 12: quilibrium.node.ceremony.pb.CeremonyValidatingState
-	(*CeremonyPeerListAnnounce)(nil),         // 13: quilibrium.node.ceremony.pb.CeremonyPeerListAnnounce
-	(*CeremonyPeer)(nil),                     // 14: quilibrium.node.ceremony.pb.CeremonyPeer
-	(*CeremonyCompressedSync)(nil),           // 15: quilibrium.node.ceremony.pb.CeremonyCompressedSync
-	(*InclusionProofsMap)(nil),               // 16: quilibrium.node.ceremony.pb.InclusionProofsMap
-	(*InclusionSegmentsMap)(nil),             // 17: quilibrium.node.ceremony.pb.InclusionSegmentsMap
-	(*InclusionCommitmentsMap)(nil),          // 18: quilibrium.node.ceremony.pb.InclusionCommitmentsMap
-	(*BLS48581G1PublicKey)(nil),              // 19: quilibrium.node.keys.pb.BLS48581G1PublicKey
-	(*BLS48581G2PublicKey)(nil),              // 20: quilibrium.node.keys.pb.BLS48581G2PublicKey
-	(*Ed448PublicKey)(nil),                   // 21: quilibrium.node.keys.pb.Ed448PublicKey
-	(*Ed448Signature)(nil),                   // 22: quilibrium.node.keys.pb.Ed448Signature
-	(*BLS48581Signature)(nil),                // 23: quilibrium.node.keys.pb.BLS48581Signature
-	(*X448PublicKey)(nil),                    // 24: quilibrium.node.keys.pb.X448PublicKey
-	(*ClockFrame)(nil),                       // 25: quilibrium.node.clock.pb.ClockFrame
-	(*ClockFramesRequest)(nil),               // 26: quilibrium.node.clock.pb.ClockFramesRequest
-	(*P2PChannelEnvelope)(nil),               // 27: quilibrium.node.channel.pb.P2PChannelEnvelope
+	(*CeremonyTranscript)(nil),                    // 0: quilibrium.node.ceremony.pb.CeremonyTranscript
+	(*CeremonyLobbyState)(nil),                    // 1: quilibrium.node.ceremony.pb.CeremonyLobbyState
+	(*CeremonySeenProverAttestation)(nil),         // 2: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
+	(*CeremonyDroppedProverAttestation)(nil),      // 3: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
+	(*CeremonyTranscriptShare)(nil),               // 4: quilibrium.node.ceremony.pb.CeremonyTranscriptShare
+	(*CeremonyTranscriptCommit)(nil),              // 5: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
+	(*CeremonyAdvanceRound)(nil),                  // 6: quilibrium.node.ceremony.pb.CeremonyAdvanceRound
+	(*CeremonyLobbyJoin)(nil),                     // 7: quilibrium.node.ceremony.pb.CeremonyLobbyJoin
+	(*CeremonyLobbyStateTransition)(nil),          // 8: quilibrium.node.ceremony.pb.CeremonyLobbyStateTransition
+	(*CeremonyOpenState)(nil),                     // 9: quilibrium.node.ceremony.pb.CeremonyOpenState
+	(*CeremonyInProgressState)(nil),               // 10: quilibrium.node.ceremony.pb.CeremonyInProgressState
+	(*CeremonyFinalizingState)(nil),               // 11: quilibrium.node.ceremony.pb.CeremonyFinalizingState
+	(*CeremonyValidatingState)(nil),               // 12: quilibrium.node.ceremony.pb.CeremonyValidatingState
+	(*CeremonyPeerListAnnounce)(nil),              // 13: quilibrium.node.ceremony.pb.CeremonyPeerListAnnounce
+	(*CeremonyPeer)(nil),                          // 14: quilibrium.node.ceremony.pb.CeremonyPeer
+	(*CeremonyCompressedSync)(nil),                // 15: quilibrium.node.ceremony.pb.CeremonyCompressedSync
+	(*CeremonyCompressedSyncRequestMessage)(nil),  // 16: quilibrium.node.ceremony.pb.CeremonyCompressedSyncRequestMessage
+	(*CeremonyCompressedSyncResponseMessage)(nil), // 17: quilibrium.node.ceremony.pb.CeremonyCompressedSyncResponseMessage
+	(*InclusionProofsMap)(nil),                    // 18: quilibrium.node.ceremony.pb.InclusionProofsMap
+	(*InclusionSegmentsMap)(nil),                  // 19: quilibrium.node.ceremony.pb.InclusionSegmentsMap
+	(*InclusionCommitmentsMap)(nil),               // 20: quilibrium.node.ceremony.pb.InclusionCommitmentsMap
+	(*BLS48581G1PublicKey)(nil),                   // 21: quilibrium.node.keys.pb.BLS48581G1PublicKey
+	(*BLS48581G2PublicKey)(nil),                   // 22: quilibrium.node.keys.pb.BLS48581G2PublicKey
+	(*Ed448PublicKey)(nil),                        // 23: quilibrium.node.keys.pb.Ed448PublicKey
+	(*Ed448Signature)(nil),                        // 24: quilibrium.node.keys.pb.Ed448Signature
+	(*BLS48581Signature)(nil),                     // 25: quilibrium.node.keys.pb.BLS48581Signature
+	(*X448PublicKey)(nil),                         // 26: quilibrium.node.keys.pb.X448PublicKey
+	(*ClockFrame)(nil),                            // 27: quilibrium.node.clock.pb.ClockFrame
+	(*ClockFramesPreflight)(nil),                  // 28: quilibrium.node.clock.pb.ClockFramesPreflight
+	(*ClockFramesRequest)(nil),                    // 29: quilibrium.node.clock.pb.ClockFramesRequest
+	(*P2PChannelEnvelope)(nil),                    // 30: quilibrium.node.channel.pb.P2PChannelEnvelope
 }
 var file_ceremony_proto_depIdxs = []int32{
-	19, // 0: quilibrium.node.ceremony.pb.CeremonyTranscript.g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	20, // 1: quilibrium.node.ceremony.pb.CeremonyTranscript.g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	19, // 2: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g1_256_witnesses:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	20, // 3: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g2_256_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	21, // 0: quilibrium.node.ceremony.pb.CeremonyTranscript.g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	22, // 1: quilibrium.node.ceremony.pb.CeremonyTranscript.g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	21, // 2: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g1_256_witnesses:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	22, // 3: quilibrium.node.ceremony.pb.CeremonyTranscript.running_g2_256_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
 	9,  // 4: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_open_state:type_name -> quilibrium.node.ceremony.pb.CeremonyOpenState
 	10, // 5: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_in_progress_state:type_name -> quilibrium.node.ceremony.pb.CeremonyInProgressState
 	11, // 6: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_finalizing_state:type_name -> quilibrium.node.ceremony.pb.CeremonyFinalizingState
 	12, // 7: quilibrium.node.ceremony.pb.CeremonyLobbyState.ceremony_validating_state:type_name -> quilibrium.node.ceremony.pb.CeremonyValidatingState
 	0,  // 8: quilibrium.node.ceremony.pb.CeremonyLobbyState.latest_transcript:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscript
-	21, // 9: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.seen_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	22, // 10: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	21, // 11: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.dropped_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	22, // 12: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	19, // 13: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	20, // 14: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	19, // 15: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
-	20, // 16: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
-	22, // 17: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	22, // 18: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	23, // 19: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.contribution_signature:type_name -> quilibrium.node.keys.pb.BLS48581Signature
+	23, // 9: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.seen_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	24, // 10: quilibrium.node.ceremony.pb.CeremonySeenProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	23, // 11: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.dropped_prover_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	24, // 12: quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	21, // 13: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_powers:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	22, // 14: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_powers:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	21, // 15: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g1_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G1PublicKey
+	22, // 16: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.additive_g2_256_witness:type_name -> quilibrium.node.keys.pb.BLS48581G2PublicKey
+	24, // 17: quilibrium.node.ceremony.pb.CeremonyTranscriptShare.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	24, // 18: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.prover_signature:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	25, // 19: quilibrium.node.ceremony.pb.CeremonyTranscriptCommit.contribution_signature:type_name -> quilibrium.node.keys.pb.BLS48581Signature
 	5,  // 20: quilibrium.node.ceremony.pb.CeremonyAdvanceRound.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
-	24, // 21: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.identity_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
-	24, // 22: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.signed_pre_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
-	22, // 23: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.public_key_signature_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	26, // 21: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.identity_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
+	26, // 22: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.signed_pre_key:type_name -> quilibrium.node.keys.pb.X448PublicKey
+	24, // 23: quilibrium.node.ceremony.pb.CeremonyLobbyJoin.public_key_signature_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
 	7,  // 24: quilibrium.node.ceremony.pb.CeremonyOpenState.joined_participants:type_name -> quilibrium.node.ceremony.pb.CeremonyLobbyJoin
-	21, // 25: quilibrium.node.ceremony.pb.CeremonyOpenState.preferred_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	23, // 25: quilibrium.node.ceremony.pb.CeremonyOpenState.preferred_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	7,  // 26: quilibrium.node.ceremony.pb.CeremonyInProgressState.active_participants:type_name -> quilibrium.node.ceremony.pb.CeremonyLobbyJoin
 	2,  // 27: quilibrium.node.ceremony.pb.CeremonyInProgressState.latest_seen_prover_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
 	3,  // 28: quilibrium.node.ceremony.pb.CeremonyInProgressState.dropped_participant_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
 	6,  // 29: quilibrium.node.ceremony.pb.CeremonyInProgressState.transcript_round_advance_commits:type_name -> quilibrium.node.ceremony.pb.CeremonyAdvanceRound
-	21, // 30: quilibrium.node.ceremony.pb.CeremonyInProgressState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	23, // 30: quilibrium.node.ceremony.pb.CeremonyInProgressState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	7,  // 31: quilibrium.node.ceremony.pb.CeremonyFinalizingState.active_participants:type_name -> quilibrium.node.ceremony.pb.CeremonyLobbyJoin
 	2,  // 32: quilibrium.node.ceremony.pb.CeremonyFinalizingState.latest_seen_prover_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonySeenProverAttestation
 	3,  // 33: quilibrium.node.ceremony.pb.CeremonyFinalizingState.dropped_participant_attestations:type_name -> quilibrium.node.ceremony.pb.CeremonyDroppedProverAttestation
 	5,  // 34: quilibrium.node.ceremony.pb.CeremonyFinalizingState.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
 	4,  // 35: quilibrium.node.ceremony.pb.CeremonyFinalizingState.shares:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptShare
-	21, // 36: quilibrium.node.ceremony.pb.CeremonyFinalizingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	23, // 36: quilibrium.node.ceremony.pb.CeremonyFinalizingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	5,  // 37: quilibrium.node.ceremony.pb.CeremonyValidatingState.commits:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscriptCommit
 	0,  // 38: quilibrium.node.ceremony.pb.CeremonyValidatingState.updated_transcript:type_name -> quilibrium.node.ceremony.pb.CeremonyTranscript
-	21, // 39: quilibrium.node.ceremony.pb.CeremonyValidatingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	23, // 39: quilibrium.node.ceremony.pb.CeremonyValidatingState.next_round_participants:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
 	14, // 40: quilibrium.node.ceremony.pb.CeremonyPeerListAnnounce.peer_list:type_name -> quilibrium.node.ceremony.pb.CeremonyPeer
-	25, // 41: quilibrium.node.ceremony.pb.CeremonyCompressedSync.truncated_clock_frames:type_name -> quilibrium.node.clock.pb.ClockFrame
-	16, // 42: quilibrium.node.ceremony.pb.CeremonyCompressedSync.proofs:type_name -> quilibrium.node.ceremony.pb.InclusionProofsMap
-	17, // 43: quilibrium.node.ceremony.pb.CeremonyCompressedSync.segments:type_name -> quilibrium.node.ceremony.pb.InclusionSegmentsMap
-	18, // 44: quilibrium.node.ceremony.pb.InclusionProofsMap.commitments:type_name -> quilibrium.node.ceremony.pb.InclusionCommitmentsMap
-	26, // 45: quilibrium.node.ceremony.pb.CeremonyService.GetCompressedSyncFrames:input_type -> quilibrium.node.clock.pb.ClockFramesRequest
-	27, // 46: quilibrium.node.ceremony.pb.CeremonyService.GetPublicChannel:input_type -> quilibrium.node.channel.pb.P2PChannelEnvelope
-	15, // 47: quilibrium.node.ceremony.pb.CeremonyService.GetCompressedSyncFrames:output_type -> quilibrium.node.ceremony.pb.CeremonyCompressedSync
-	27, // 48: quilibrium.node.ceremony.pb.CeremonyService.GetPublicChannel:output_type -> quilibrium.node.channel.pb.P2PChannelEnvelope
-	47, // [47:49] is the sub-list for method output_type
-	45, // [45:47] is the sub-list for method input_type
-	45, // [45:45] is the sub-list for extension type_name
-	45, // [45:45] is the sub-list for extension extendee
-	0,  // [0:45] is the sub-list for field type_name
+	27, // 41: quilibrium.node.ceremony.pb.CeremonyCompressedSync.truncated_clock_frames:type_name -> quilibrium.node.clock.pb.ClockFrame
+	18, // 42: quilibrium.node.ceremony.pb.CeremonyCompressedSync.proofs:type_name -> quilibrium.node.ceremony.pb.InclusionProofsMap
+	19, // 43: quilibrium.node.ceremony.pb.CeremonyCompressedSync.segments:type_name -> quilibrium.node.ceremony.pb.InclusionSegmentsMap
+	28, // 44: quilibrium.node.ceremony.pb.CeremonyCompressedSyncRequestMessage.preflight:type_name -> quilibrium.node.clock.pb.ClockFramesPreflight
+	29, // 45: quilibrium.node.ceremony.pb.CeremonyCompressedSyncRequestMessage.request:type_name -> quilibrium.node.clock.pb.ClockFramesRequest
+	28, // 46: quilibrium.node.ceremony.pb.CeremonyCompressedSyncResponseMessage.preflight:type_name -> quilibrium.node.clock.pb.ClockFramesPreflight
+	15, // 47: quilibrium.node.ceremony.pb.CeremonyCompressedSyncResponseMessage.response:type_name -> quilibrium.node.ceremony.pb.CeremonyCompressedSync
+	20, // 48: quilibrium.node.ceremony.pb.InclusionProofsMap.commitments:type_name -> quilibrium.node.ceremony.pb.InclusionCommitmentsMap
+	29, // 49: quilibrium.node.ceremony.pb.CeremonyService.GetCompressedSyncFrames:input_type -> quilibrium.node.clock.pb.ClockFramesRequest
+	16, // 50: quilibrium.node.ceremony.pb.CeremonyService.NegotiateCompressedSyncFrames:input_type -> quilibrium.node.ceremony.pb.CeremonyCompressedSyncRequestMessage
+	30, // 51: quilibrium.node.ceremony.pb.CeremonyService.GetPublicChannel:input_type -> quilibrium.node.channel.pb.P2PChannelEnvelope
+	15, // 52: quilibrium.node.ceremony.pb.CeremonyService.GetCompressedSyncFrames:output_type -> quilibrium.node.ceremony.pb.CeremonyCompressedSync
+	17, // 53: quilibrium.node.ceremony.pb.CeremonyService.NegotiateCompressedSyncFrames:output_type -> quilibrium.node.ceremony.pb.CeremonyCompressedSyncResponseMessage
+	30, // 54: quilibrium.node.ceremony.pb.CeremonyService.GetPublicChannel:output_type -> quilibrium.node.channel.pb.P2PChannelEnvelope
+	52, // [52:55] is the sub-list for method output_type
+	49, // [49:52] is the sub-list for method input_type
+	49, // [49:49] is the sub-list for extension type_name
+	49, // [49:49] is the sub-list for extension extendee
+	0,  // [0:49] is the sub-list for field type_name
 }
 
 func init() { file_ceremony_proto_init() }
@@ -2065,7 +2278,7 @@ func file_ceremony_proto_init() {
 			}
 		}
 		file_ceremony_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*InclusionProofsMap); i {
+			switch v := v.(*CeremonyCompressedSyncRequestMessage); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2077,7 +2290,7 @@ func file_ceremony_proto_init() {
 			}
 		}
 		file_ceremony_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*InclusionSegmentsMap); i {
+			switch v := v.(*CeremonyCompressedSyncResponseMessage); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2089,6 +2302,30 @@ func file_ceremony_proto_init() {
 			}
 		}
 		file_ceremony_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*InclusionProofsMap); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_ceremony_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*InclusionSegmentsMap); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_ceremony_proto_msgTypes[20].Exporter = func(v interface{}, i int) interface{} {
 			switch v := v.(*InclusionCommitmentsMap); i {
 			case 0:
 				return &v.state
@@ -2107,13 +2344,21 @@ func file_ceremony_proto_init() {
 		(*CeremonyLobbyState_CeremonyFinalizingState)(nil),
 		(*CeremonyLobbyState_CeremonyValidatingState)(nil),
 	}
+	file_ceremony_proto_msgTypes[16].OneofWrappers = []interface{}{
+		(*CeremonyCompressedSyncRequestMessage_Preflight)(nil),
+		(*CeremonyCompressedSyncRequestMessage_Request)(nil),
+	}
+	file_ceremony_proto_msgTypes[17].OneofWrappers = []interface{}{
+		(*CeremonyCompressedSyncResponseMessage_Preflight)(nil),
+		(*CeremonyCompressedSyncResponseMessage_Response)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_ceremony_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -19,8 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	CeremonyService_GetCompressedSyncFrames_FullMethodName = "/quilibrium.node.ceremony.pb.CeremonyService/GetCompressedSyncFrames"
-	CeremonyService_GetPublicChannel_FullMethodName        = "/quilibrium.node.ceremony.pb.CeremonyService/GetPublicChannel"
+	CeremonyService_GetCompressedSyncFrames_FullMethodName       = "/quilibrium.node.ceremony.pb.CeremonyService/GetCompressedSyncFrames"
+	CeremonyService_NegotiateCompressedSyncFrames_FullMethodName = "/quilibrium.node.ceremony.pb.CeremonyService/NegotiateCompressedSyncFrames"
+	CeremonyService_GetPublicChannel_FullMethodName              = "/quilibrium.node.ceremony.pb.CeremonyService/GetPublicChannel"
 )
 
 // CeremonyServiceClient is the client API for CeremonyService service.
@@ -28,6 +29,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type CeremonyServiceClient interface {
 	GetCompressedSyncFrames(ctx context.Context, in *ClockFramesRequest, opts ...grpc.CallOption) (CeremonyService_GetCompressedSyncFramesClient, error)
+	NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_NegotiateCompressedSyncFramesClient, error)
 	GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_GetPublicChannelClient, error)
 }
 
@@ -71,8 +73,39 @@ func (x *ceremonyServiceGetCompressedSyncFramesClient) Recv() (*CeremonyCompress
 	return m, nil
 }
 
+func (c *ceremonyServiceClient) NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_NegotiateCompressedSyncFramesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &CeremonyService_ServiceDesc.Streams[1], CeremonyService_NegotiateCompressedSyncFrames_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &ceremonyServiceNegotiateCompressedSyncFramesClient{stream}
+	return x, nil
+}
+
+type CeremonyService_NegotiateCompressedSyncFramesClient interface {
+	Send(*CeremonyCompressedSyncRequestMessage) error
+	Recv() (*CeremonyCompressedSyncResponseMessage, error)
+	grpc.ClientStream
+}
+
+type ceremonyServiceNegotiateCompressedSyncFramesClient struct {
+	grpc.ClientStream
+}
+
+func (x *ceremonyServiceNegotiateCompressedSyncFramesClient) Send(m *CeremonyCompressedSyncRequestMessage) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *ceremonyServiceNegotiateCompressedSyncFramesClient) Recv() (*CeremonyCompressedSyncResponseMessage, error) {
+	m := new(CeremonyCompressedSyncResponseMessage)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *ceremonyServiceClient) GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_GetPublicChannelClient, error) {
-	stream, err := c.cc.NewStream(ctx, &CeremonyService_ServiceDesc.Streams[1], CeremonyService_GetPublicChannel_FullMethodName, opts...)
+	stream, err := c.cc.NewStream(ctx, &CeremonyService_ServiceDesc.Streams[2], CeremonyService_GetPublicChannel_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +140,7 @@ func (x *ceremonyServiceGetPublicChannelClient) Recv() (*P2PChannelEnvelope, err
 // for forward compatibility
 type CeremonyServiceServer interface {
 	GetCompressedSyncFrames(*ClockFramesRequest, CeremonyService_GetCompressedSyncFramesServer) error
+	NegotiateCompressedSyncFrames(CeremonyService_NegotiateCompressedSyncFramesServer) error
 	GetPublicChannel(CeremonyService_GetPublicChannelServer) error
 	mustEmbedUnimplementedCeremonyServiceServer()
 }
@@ -117,6 +151,9 @@ type UnimplementedCeremonyServiceServer struct {
 
 func (UnimplementedCeremonyServiceServer) GetCompressedSyncFrames(*ClockFramesRequest, CeremonyService_GetCompressedSyncFramesServer) error {
 	return status.Errorf(codes.Unimplemented, "method GetCompressedSyncFrames not implemented")
+}
+func (UnimplementedCeremonyServiceServer) NegotiateCompressedSyncFrames(CeremonyService_NegotiateCompressedSyncFramesServer) error {
+	return status.Errorf(codes.Unimplemented, "method NegotiateCompressedSyncFrames not implemented")
 }
 func (UnimplementedCeremonyServiceServer) GetPublicChannel(CeremonyService_GetPublicChannelServer) error {
 	return status.Errorf(codes.Unimplemented, "method GetPublicChannel not implemented")
@@ -153,6 +190,32 @@ type ceremonyServiceGetCompressedSyncFramesServer struct {
 
 func (x *ceremonyServiceGetCompressedSyncFramesServer) Send(m *CeremonyCompressedSync) error {
 	return x.ServerStream.SendMsg(m)
+}
+
+func _CeremonyService_NegotiateCompressedSyncFrames_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(CeremonyServiceServer).NegotiateCompressedSyncFrames(&ceremonyServiceNegotiateCompressedSyncFramesServer{stream})
+}
+
+type CeremonyService_NegotiateCompressedSyncFramesServer interface {
+	Send(*CeremonyCompressedSyncResponseMessage) error
+	Recv() (*CeremonyCompressedSyncRequestMessage, error)
+	grpc.ServerStream
+}
+
+type ceremonyServiceNegotiateCompressedSyncFramesServer struct {
+	grpc.ServerStream
+}
+
+func (x *ceremonyServiceNegotiateCompressedSyncFramesServer) Send(m *CeremonyCompressedSyncResponseMessage) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *ceremonyServiceNegotiateCompressedSyncFramesServer) Recv() (*CeremonyCompressedSyncRequestMessage, error) {
+	m := new(CeremonyCompressedSyncRequestMessage)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func _CeremonyService_GetPublicChannel_Handler(srv interface{}, stream grpc.ServerStream) error {
@@ -193,6 +256,12 @@ var CeremonyService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "GetCompressedSyncFrames",
 			Handler:       _CeremonyService_GetCompressedSyncFrames_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "NegotiateCompressedSyncFrames",
+			Handler:       _CeremonyService_NegotiateCompressedSyncFrames_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "GetPublicChannel",

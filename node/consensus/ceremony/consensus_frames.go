@@ -242,15 +242,8 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		}
 	}
 
-	s, err := client.GetCompressedSyncFrames(
+	s, err := client.NegotiateCompressedSyncFrames(
 		context.Background(),
-		&protobufs.ClockFramesRequest{
-			Filter:               e.filter,
-			FromFrameNumber:      from,
-			ToFrameNumber:        maxFrame,
-			ParentSelector:       latest.ParentSelector,
-			RangeParentSelectors: rangeParentSelectors,
-		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
 	if err != nil {
@@ -268,14 +261,92 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		return latest, errors.Wrap(err, "sync")
 	}
 
-	var syncMsg *protobufs.CeremonyCompressedSync
+	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
+		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Preflight{
+			Preflight: &protobufs.ClockFramesPreflight{
+				RangeParentSelectors: rangeParentSelectors,
+			},
+		},
+	})
+	if err != nil {
+		return latest, errors.Wrap(err, "sync")
+	}
+
+	syncMsg, err := s.Recv()
+	if err != nil {
+		return latest, errors.Wrap(err, "sync")
+	}
+	preflight, ok := syncMsg.
+		SyncMessage.(*protobufs.CeremonyCompressedSyncResponseMessage_Preflight)
+	if !ok {
+		s.CloseSend()
+		return latest, errors.Wrap(
+			errors.New("preflight message invalid"),
+			"sync",
+		)
+	}
+
+	// loop through parent selectors, set found to first match, and if subsequent
+	// matches fail to be found, cancel the search, start from 1.
+	found := uint64(0)
+	parentSelector := make([]byte, 32)
+
+	for _, selector := range preflight.Preflight.RangeParentSelectors {
+		match, err := e.clockStore.GetParentDataClockFrame(
+			e.filter,
+			selector.FrameNumber,
+			selector.ParentSelector,
+			true,
+		)
+		if err != nil && found == 0 {
+			continue
+		}
+		if err != nil && found != 0 {
+			found = 1
+			e.logger.Info("could not find interstitial frame, setting search to 1")
+			break
+		}
+		if match != nil && found == 0 {
+			found = match.FrameNumber
+			parentSelector = match.ParentSelector
+		}
+	}
+	if found != 0 {
+		from = found
+	}
+
+	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
+		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Request{
+			Request: &protobufs.ClockFramesRequest{
+				Filter:          e.filter,
+				FromFrameNumber: from,
+				ToFrameNumber:   0,
+				ParentSelector:  parentSelector,
+			},
+		},
+	})
+	if err != nil {
+		return latest, errors.Wrap(err, "sync")
+	}
+
 	for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
+		sync, ok := syncMsg.
+			SyncMessage.(*protobufs.CeremonyCompressedSyncResponseMessage_Response)
+		if !ok {
+			return latest, errors.Wrap(
+				errors.New("response message invalid"),
+				"sync",
+			)
+		}
+
+		response := sync.Response
+
 		e.logger.Info(
 			"received compressed sync frame",
-			zap.Uint64("from", syncMsg.FromFrameNumber),
-			zap.Uint64("to", syncMsg.ToFrameNumber),
-			zap.Int("frames", len(syncMsg.TruncatedClockFrames)),
-			zap.Int("proofs", len(syncMsg.Proofs)),
+			zap.Uint64("from", response.FromFrameNumber),
+			zap.Uint64("to", response.ToFrameNumber),
+			zap.Int("frames", len(response.TruncatedClockFrames)),
+			zap.Int("proofs", len(response.Proofs)),
 		)
 
 		// This can only happen if we get a peer with state that was initially
@@ -283,8 +354,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		// effect that doesn't go away for them until they're caught up again,
 		// so let's not penalize their score and make everyone else suffer,
 		// let's just move on:
-		if syncMsg.FromFrameNumber == 0 &&
-			syncMsg.ToFrameNumber == 0 {
+		if response.FromFrameNumber == 0 && response.ToFrameNumber == 0 {
 			if err := cc.Close(); err != nil {
 				e.logger.Error("error while closing connection", zap.Error(err))
 			}
@@ -295,7 +365,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		var next *protobufs.ClockFrame
 		if next, err = e.decompressAndStoreCandidates(
 			peerId,
-			syncMsg,
+			response,
 		); err != nil && !errors.Is(err, ErrNoNewFrames) {
 			e.logger.Error(
 				"could not decompress and store candidate",
