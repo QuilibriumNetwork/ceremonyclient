@@ -150,6 +150,20 @@ message CeremonyCompressedSync {
   repeated InclusionSegmentsMap segments = 5;
 }
 
+message CeremonyCompressedSyncRequestMessage {
+  oneof sync_message {
+    quilibrium.node.clock.pb.ClockFramesPreflight preflight = 1;
+    quilibrium.node.clock.pb.ClockFramesRequest request = 2;
+  }
+}
+
+message CeremonyCompressedSyncResponseMessage {
+  oneof sync_message {
+    quilibrium.node.clock.pb.ClockFramesPreflight preflight = 1;
+    CeremonyCompressedSync response = 2;
+  }
+}
+
 message InclusionProofsMap {
   bytes frame_commit = 1;
   bytes proof = 2;
@@ -169,5 +183,6 @@ message InclusionCommitmentsMap {
 
 service CeremonyService {
   rpc GetCompressedSyncFrames (quilibrium.node.clock.pb.ClockFramesRequest) returns (stream CeremonyCompressedSync);
+  rpc NegotiateCompressedSyncFrames (stream CeremonyCompressedSyncRequestMessage) returns (stream CeremonyCompressedSyncResponseMessage);
   rpc GetPublicChannel (stream quilibrium.node.channel.pb.P2PChannelEnvelope) returns (stream quilibrium.node.channel.pb.P2PChannelEnvelope);
 }

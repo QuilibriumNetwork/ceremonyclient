@@ -84,6 +84,10 @@ message ClockFramesRequest {
   repeated ClockFrameParentSelectors range_parent_selectors = 5;
 }
 
+message ClockFramesPreflight {
+  repeated ClockFrameParentSelectors range_parent_selectors = 1;
+}
+
 // Represents a response for a range of clock frames. Used to stay synchronized
 // to the latest state.
 message ClockFramesResponse {

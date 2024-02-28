@@ -3,6 +3,7 @@ package ceremony
 import (
 	"bytes"
 	"context"
+	"io"
 	"time"
 
 	"github.com/pkg/errors"
@@ -18,6 +19,227 @@ import (
 
 var ErrNoNewFrames = errors.New("peer reported no frames")
 
+// Compressed sync negotiation:
+// Recipients of the sync                                 Servers providing sync
+// |                                                                           |
+// |---------[Preflight{HEAD, HEAD-16, HEAD-32, HEAD-64, ..., 1}]------------->|
+// |<--------[Preflight{HEAD, HEAD-16, HEAD-32, HEAD-64, ..., M}]--------------|
+// |                    M = matching selector or 1                             |
+// |------------------------------[Request{N}]-------------------------------->|
+// |                    N = matching higher selector or M                      |
+// |<-------------------------[Response{N...N+16}]-----------------------------|
+// |<--------------------------[Response{N+17...}]-----------------------------|
+// |<--------------------------[Response{...HEAD}]-----------------------------|
+func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
+	server protobufs.CeremonyService_NegotiateCompressedSyncFramesServer,
+) error {
+	e.currentReceivingSyncPeersMx.Lock()
+	if e.currentReceivingSyncPeers > 4 {
+		e.currentReceivingSyncPeersMx.Unlock()
+
+		e.logger.Debug(
+			"currently processing maximum sync requests, returning",
+		)
+
+		if err := server.SendMsg(
+			&protobufs.CeremonyCompressedSyncResponseMessage{
+				SyncMessage: &protobufs.CeremonyCompressedSyncResponseMessage_Response{
+					Response: &protobufs.CeremonyCompressedSync{
+						FromFrameNumber: 0,
+						ToFrameNumber:   0,
+					},
+				},
+			},
+		); err != nil {
+			return errors.Wrap(err, "negotiate compressed sync frames")
+		}
+
+		return nil
+	}
+	e.currentReceivingSyncPeers++
+	e.currentReceivingSyncPeersMx.Unlock()
+
+	defer func() {
+		e.currentReceivingSyncPeersMx.Lock()
+		e.currentReceivingSyncPeers--
+		e.currentReceivingSyncPeersMx.Unlock()
+	}()
+
+	for {
+		request, err := server.Recv()
+		if err == io.EOF {
+			return nil
+		}
+
+		if err != nil {
+			return errors.Wrap(err, "negotiate compressed sync frames")
+		}
+
+		switch msg := request.SyncMessage.(type) {
+		case *protobufs.CeremonyCompressedSyncRequestMessage_Preflight:
+			e.logger.Debug(
+				"received clock frame preflight",
+				zap.Int("selector_count", len(msg.Preflight.RangeParentSelectors)),
+			)
+
+			from := uint64(1)
+
+			preflightResponse := []*protobufs.ClockFrameParentSelectors{}
+			for _, selector := range msg.Preflight.RangeParentSelectors {
+				frame, _, err := e.clockStore.GetDataClockFrame(
+					e.filter,
+					selector.FrameNumber,
+					true,
+				)
+				if err == nil && frame != nil {
+					from = selector.FrameNumber
+					break
+				}
+			}
+
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				return errors.Wrap(err, "negotiate compressed sync frames")
+			}
+
+			to := head.FrameNumber
+			selector, err := head.GetSelector()
+			if err != nil {
+				return errors.Wrap(err, "negotiate compressed sync frames")
+			}
+
+			preflightResponse = append(
+				preflightResponse,
+				&protobufs.ClockFrameParentSelectors{
+					FrameNumber:    to,
+					ParentSelector: selector.FillBytes(make([]byte, 32)),
+				},
+			)
+			rangeSubtract := uint64(16)
+			for {
+				parentNumber := to - uint64(rangeSubtract)
+
+				if parentNumber < from {
+					break
+				}
+				rangeSubtract *= 2
+				parent, _, err := e.clockStore.GetDataClockFrame(
+					e.filter,
+					parentNumber,
+					true,
+				)
+				if err != nil {
+					break
+				}
+
+				parentSelector, err := parent.GetSelector()
+				if err != nil {
+					return errors.Wrap(err, "negotiate compressed sync frames")
+				}
+
+				preflightResponse = append(
+					preflightResponse,
+					&protobufs.ClockFrameParentSelectors{
+						FrameNumber:    parent.FrameNumber,
+						ParentSelector: parentSelector.FillBytes(make([]byte, 32)),
+					},
+				)
+			}
+			err = server.Send(&protobufs.CeremonyCompressedSyncResponseMessage{
+				SyncMessage: &protobufs.CeremonyCompressedSyncResponseMessage_Preflight{
+					Preflight: &protobufs.ClockFramesPreflight{
+						RangeParentSelectors: preflightResponse,
+					},
+				},
+			})
+			if err != nil {
+				return errors.Wrap(err, "negotiate compressed sync frames")
+			}
+		case *protobufs.CeremonyCompressedSyncRequestMessage_Request:
+			e.logger.Info(
+				"received clock frame request",
+				zap.Uint64("from_frame_number", msg.Request.FromFrameNumber),
+				zap.Uint64("to_frame_number", msg.Request.ToFrameNumber),
+			)
+			from := msg.Request.FromFrameNumber
+			_, _, err := e.clockStore.GetDataClockFrame(
+				e.filter,
+				from,
+				true,
+			)
+			if err != nil {
+				if !errors.Is(err, store.ErrNotFound) {
+					e.logger.Error(
+						"peer asked for frame that returned error",
+						zap.Uint64("frame_number", msg.Request.FromFrameNumber),
+					)
+
+					return errors.Wrap(err, "negotiate compressed sync frames")
+				} else {
+					from = 1
+				}
+			}
+
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
+			max := head.FrameNumber
+			to := msg.Request.ToFrameNumber
+
+			// We need to slightly rewind, to compensate for unconfirmed frame heads
+			// on a given branch
+			if from >= 2 {
+				from--
+			}
+
+			for {
+				if to == 0 || to-from > 16 {
+					if max > from+15 {
+						to = from + 16
+					} else {
+						to = max + 1
+					}
+				}
+
+				syncMsg, err := e.clockStore.GetCompressedDataClockFrames(
+					e.filter,
+					from,
+					to,
+				)
+				if err != nil {
+					return errors.Wrap(err, "negotiate compressed sync frames")
+				}
+
+				if err := server.Send(&protobufs.CeremonyCompressedSyncResponseMessage{
+					SyncMessage: &protobufs.
+						CeremonyCompressedSyncResponseMessage_Response{
+						Response: syncMsg,
+					},
+				}); err != nil {
+					return errors.Wrap(err, "negotiate compressed sync frames")
+				}
+
+				if (msg.Request.ToFrameNumber == 0 || msg.Request.ToFrameNumber > to) &&
+					max > to {
+					from = to + 1
+					if msg.Request.ToFrameNumber > to {
+						to = msg.Request.ToFrameNumber
+					} else {
+						to = 0
+					}
+				} else {
+					break
+				}
+			}
+
+			return nil
+		}
+	}
+}
+
+// Deprecated: Use NegotiateCompressedSyncFrames.
 // GetCompressedSyncFrames implements protobufs.CeremonyServiceServer.
 func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	request *protobufs.ClockFramesRequest,
@@ -237,7 +459,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			zap.Int("aggregate_commits", commits),
 		)
 		for j := 0; j < commits; j++ {
-			e.logger.Info(
+			e.logger.Debug(
 				"processing commit",
 				zap.Uint64("frame_number", frame.FrameNumber),
 				zap.Int("commit_index", j),
@@ -278,7 +500,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 			for k, c := range aggregateProof.Commitments {
 				k := k
 				c := c
-				e.logger.Info(
+				e.logger.Debug(
 					"adding inclusion commitment",
 					zap.Uint64("frame_number", frame.FrameNumber),
 					zap.Int("commit_index", j),
@@ -307,7 +529,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 						if bytes.Equal(s.Hash, h) {
 							if output != nil {
 								if l == 0 {
-									e.logger.Info(
+									e.logger.Debug(
 										"found first half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -317,7 +539,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									output.Address = s.Data[:32]
 									output.Output = s.Data[32:]
 								} else {
-									e.logger.Info(
+									e.logger.Debug(
 										"found second half of matching segment data",
 										zap.Uint64("frame_number", frame.FrameNumber),
 										zap.Int("commit_index", j),
@@ -336,7 +558,7 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 									break
 								}
 							} else {
-								e.logger.Info(
+								e.logger.Debug(
 									"found matching segment data",
 									zap.Uint64("frame_number", frame.FrameNumber),
 									zap.Int("commit_index", j),
@@ -401,6 +623,12 @@ type svr struct {
 func (e *svr) GetCompressedSyncFrames(
 	request *protobufs.ClockFramesRequest,
 	server protobufs.CeremonyService_GetCompressedSyncFramesServer,
+) error {
+	return errors.New("not supported")
+}
+
+func (e *svr) NegotiateCompressedSyncFrames(
+	server protobufs.CeremonyService_NegotiateCompressedSyncFramesServer,
 ) error {
 	return errors.New("not supported")
 }
