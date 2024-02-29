@@ -3,16 +3,24 @@ version: "3.8"
 name: quilibrium
 
 # See sysctl related warning in DOCKER-README.md.
-# Currently Docker cannot be used to run Quilibrium.
+# Host configuration changes are required.
 
 services:
   node:
     build: ./
     image: quilibrium
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          cpus: 12
+          memory: 16G
     environment:
       - DEFAULT_LISTEN_GRPC_MULTIADDR=/ip4/0.0.0.0/tcp/8337
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
+      - DEFAULT_STATS_MULTIADDR=/dns/stats.quilibrium.com/tcp/443
     ports:
       - '8336:8336/udp' # p2p
       - '127.0.0.1:8337:8337/tcp' # gRPC

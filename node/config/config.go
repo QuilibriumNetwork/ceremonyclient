@@ -142,6 +142,10 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			config.ListenRestMultiaddr = os.Getenv("DEFAULT_LISTEN_REST_MULTIADDR")
 		}
 
+		if multiAddr := os.Getenv("DEFAULT_STATS_MULTIADDR"); multiAddr != "" {
+			config.Engine.StatsMultiaddr = multiAddr
+		}
+
 		fmt.Println("Saving config...")
 		if err = SaveConfig(configPath, config); err != nil {
 			panic(err)
@@ -150,7 +154,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		keyfile, err := os.OpenFile(
 			filepath.Join(configPath, "keys.yml"),
 			os.O_CREATE|os.O_RDWR,
-			fs.FileMode(0700),
+			fs.FileMode(0600),
 		)
 		if err != nil {
 			panic(err)
