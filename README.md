@@ -111,7 +111,7 @@ With Dusk, these minimum requirements will reduce significantly.
 
 Significant portions of Quilibrium's codebase depends on GPL-licensed code,
 mandating a minimum license of GPL, however Quilibrium is licensed as AGPL to
-accomodate the scenario in which a cloud provider may wish to coopt the network
+accommodate the scenario in which a cloud provider may wish to coopt the network
 software. The AGPL allows such providers to do so, provided they are willing
 to contribute back the management code that interacts with the protocol and node
 software. To provide clarity, our interpretation is with respect to node
