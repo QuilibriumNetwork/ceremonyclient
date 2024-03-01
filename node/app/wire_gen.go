@@ -17,12 +17,13 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 // Injectors from wire.go:
 
-func NewNode(configConfig *config.Config) (*Node, error) {
+func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestReport) (*Node, error) {
 	zapLogger := logger()
 	dbConfig := configConfig.DB
 	pebbleDB := store.NewPebbleDB(dbConfig)
@@ -37,7 +38,7 @@ func NewNode(configConfig *config.Config) (*Node, error) {
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
 	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
 	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, pebbleKeyStore)
-	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, selfTestReport)
 	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err

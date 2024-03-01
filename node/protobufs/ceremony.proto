@@ -92,6 +92,7 @@ message CeremonyLobbyJoin {
   quilibrium.node.keys.pb.X448PublicKey identity_key = 2;
   quilibrium.node.keys.pb.X448PublicKey signed_pre_key = 3;
   quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 4;
+  bytes peer_id = 5;
 }
 
 message CeremonyLobbyStateTransition {

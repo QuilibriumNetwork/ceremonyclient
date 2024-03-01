@@ -8,6 +8,7 @@ const (
 	ClockPrefix                          = NamespacePrefix + "clock.pb."
 	KeysPrefix                           = NamespacePrefix + "keys.pb."
 	CeremonyPrefix                       = NamespacePrefix + "ceremony.pb."
+	NodePrefix                           = NamespacePrefix + "node.pb"
 	CeremonyTranscriptType               = CeremonyPrefix + "CeremonyTranscript"
 	CeremonyLobbyStateType               = CeremonyPrefix + "CeremonyLobbyState"
 	CeremonySeenProverAttestationType    = CeremonyPrefix + "CeremonySeenProverAttestation"
@@ -54,4 +55,5 @@ const (
 	BLS48581G1PrivateKeyType             = KeysPrefix + "BLS48581G1PrivateKey"
 	BLS48581G2PublicKeyType              = KeysPrefix + "BLS48581G2PublicKey"
 	BLS48581G2PrivateKeyType             = KeysPrefix + "BLS48581G2PrivateKey"
+	SelfTestReportType                   = NodePrefix + "SelfTestReport"
 )

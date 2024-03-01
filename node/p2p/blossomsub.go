@@ -297,7 +297,7 @@ func initDHT(
 	logger.Info("establishing dht")
 	var kademliaDHT *dht.IpfsDHT
 	var err error
-	if isBootstrapPeer {
+	if !isBootstrapPeer {
 		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
 	} else {
 		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeAuto))
@@ -328,12 +328,13 @@ func initDHT(
 			go func() {
 				defer wg.Done()
 				if err := h.Connect(ctx, *peerinfo); err != nil {
-					logger.Debug("error while connecting to dht peer", zap.Error(err))
+					logger.Info("error while connecting to dht peer", zap.Error(err))
+				} else {
+					logger.Info(
+						"connected to peer",
+						zap.String("peer_id", peerinfo.ID.String()),
+					)
 				}
-				logger.Info(
-					"connected to peer",
-					zap.String("peer_id", peerinfo.ID.String()),
-				)
 			}()
 		}
 		wg.Wait()
@@ -422,12 +423,13 @@ func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {
 
 func (b *BlossomSub) StartDirectChannelListener(
 	key []byte,
+	purpose string,
 	server *grpc.Server,
 ) error {
 	bind, err := gostream.Listen(
 		b.h,
 		protocol.ID(
-			"/p2p/direct-channel/"+base58.Encode(key),
+			"/p2p/direct-channel/"+base58.Encode(key)+purpose,
 		),
 	)
 	if err != nil {
@@ -437,7 +439,7 @@ func (b *BlossomSub) StartDirectChannelListener(
 	return errors.Wrap(server.Serve(bind), "start direct channel listener")
 }
 
-func (b *BlossomSub) GetDirectChannel(key []byte) (
+func (b *BlossomSub) GetDirectChannel(key []byte, purpose string) (
 	dialCtx *grpc.ClientConn,
 	err error,
 ) {
@@ -468,7 +470,7 @@ func (b *BlossomSub) GetDirectChannel(key []byte) (
 					b.h,
 					peer.ID(key),
 					protocol.ID(
-						"/p2p/direct-channel/"+peer.ID(id).String(),
+						"/p2p/direct-channel/"+peer.ID(id).String()+purpose,
 					),
 				)
 

@@ -14,6 +14,7 @@ func (j *CeremonyLobbyJoin) VerifySignature() error {
 	b := binary.BigEndian.AppendUint64([]byte("join"), j.FrameNumber)
 	b = append(b, j.IdentityKey.KeyValue...)
 	b = append(b, j.SignedPreKey.KeyValue...)
+	b = append(b, j.PeerId...)
 
 	if !ed448.Verify(
 		j.PublicKeySignatureEd448.PublicKey.KeyValue,
@@ -33,6 +34,7 @@ func (j *CeremonyLobbyJoin) SignWithProverKey(
 	b := binary.BigEndian.AppendUint64([]byte("join"), j.FrameNumber)
 	b = append(b, j.IdentityKey.KeyValue...)
 	b = append(b, j.SignedPreKey.KeyValue...)
+	b = append(b, j.PeerId...)
 
 	// Non edwards signing variants need support to specify hash, edwards variants
 	// demand Hash(0) because it does SHA512 under the hood.

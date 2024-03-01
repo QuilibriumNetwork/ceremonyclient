@@ -282,6 +282,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 
 		if err := e.pubSub.StartDirectChannelListener(
 			e.pubSub.GetPeerID(),
+			"",
 			server,
 		); err != nil {
 			panic(err)

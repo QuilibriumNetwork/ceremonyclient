@@ -185,7 +185,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 ) (*protobufs.ClockFrame, error) {
 	latest := currentLatest
 	e.logger.Info("polling peer for new frames", zap.Binary("peer_id", peerId))
-	cc, err := e.pubSub.GetDirectChannel(peerId)
+	cc, err := e.pubSub.GetDirectChannel(peerId, "")
 	if err != nil {
 		e.logger.Error(
 			"could not establish direct channel",
