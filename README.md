@@ -7,6 +7,22 @@ underlying technology can be found at https://www.quilibrium.com/
 
 ## Quick Start
 
+Install golang 1.20 first 
+
+```
+wget https://go.dev/dl/go1.20.14.linux-amd64.tar.gz
+sudo tar -xvf go1.20.14.linux-amd64.tar.gz
+sudo mv go /usr/local
+
+echo "export GOROOT=/usr/local" >> ~/.profile
+echo "export GOPATH=$HOME/go" >> ~/.profile
+echo "export PATH=$PATH:/usr/local/go/bin" >> ~/.profile
+
+
+source ~/.profile 
+
+```
+
 All commands are to be run in the `node/` folder.
 
 If you have a voucher from the offline ceremony, first run:
