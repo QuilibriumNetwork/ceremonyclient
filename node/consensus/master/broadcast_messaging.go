@@ -1,9 +1,15 @@
 package master
 
 import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"strings"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -76,6 +82,13 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+	case protobufs.SelfTestReportType:
+		if err := e.handleSelfTestReport(
+			message.From,
+			any,
+		); err != nil {
+			return errors.Wrap(err, "handle message")
+		}
 	}
 
 	return nil
@@ -115,6 +128,154 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 	}
 
 	e.masterTimeReel.Insert(frame)
+
+	return nil
+}
+
+func (e *MasterClockConsensusEngine) handleSelfTestReport(
+	peerID []byte,
+	any *anypb.Any,
+) error {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
+	report := &protobufs.SelfTestReport{}
+	if err := any.UnmarshalTo(report); err != nil {
+		return errors.Wrap(err, "handle self test report")
+	}
+
+	e.peerMapMx.Lock()
+	if _, ok := e.peerMap[string(peerID)]; !ok {
+		e.peerMapMx.Unlock()
+		return nil
+	}
+	e.peerMap[string(peerID)] = report
+	e.peerMapMx.Unlock()
+
+	memory := binary.BigEndian.Uint64(report.Memory)
+	e.logger.Info(
+		"received self test report",
+		zap.String("peer_id", base58.Encode(peerID)),
+		zap.Uint32("difficulty", report.Difficulty),
+		zap.Int64("difficulty_metric", report.DifficultyMetric),
+		zap.Int64("commit_16_metric", report.Commit_16Metric),
+		zap.Int64("commit_128_metric", report.Commit_128Metric),
+		zap.Int64("commit_1024_metric", report.Commit_1024Metric),
+		zap.Int64("commit_65536_metric", report.Commit_65536Metric),
+		zap.Int64("proof_16_metric", report.Proof_16Metric),
+		zap.Int64("proof_128_metric", report.Proof_128Metric),
+		zap.Int64("proof_1024_metric", report.Proof_1024Metric),
+		zap.Int64("proof_65536_metric", report.Proof_65536Metric),
+		zap.Uint32("cores", report.Cores),
+		zap.Uint64("memory", memory),
+		zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
+	)
+
+	if report.Cores < 3 || memory < 16000000000 {
+		e.logger.Info(
+			"peer reported invalid configuration",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Uint32("difficulty", report.Difficulty),
+			zap.Int64("difficulty_metric", report.DifficultyMetric),
+			zap.Int64("commit_16_metric", report.Commit_16Metric),
+			zap.Int64("commit_128_metric", report.Commit_128Metric),
+			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
+			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
+			zap.Int64("proof_16_metric", report.Proof_16Metric),
+			zap.Int64("proof_128_metric", report.Proof_128Metric),
+			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
+			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
+			zap.Uint32("cores", report.Cores),
+			zap.Uint64("memory", memory),
+			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
+		)
+
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return nil
+	}
+
+	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
+	if err != nil {
+		e.logger.Error(
+			"could not connect for validation",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Uint32("difficulty", report.Difficulty),
+			zap.Int64("difficulty_metric", report.DifficultyMetric),
+			zap.Int64("commit_16_metric", report.Commit_16Metric),
+			zap.Int64("commit_128_metric", report.Commit_128Metric),
+			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
+			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
+			zap.Int64("proof_16_metric", report.Proof_16Metric),
+			zap.Int64("proof_128_metric", report.Proof_128Metric),
+			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
+			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
+			zap.Uint32("cores", report.Cores),
+			zap.Uint64("memory", memory),
+			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
+		)
+		return errors.Wrap(err, "handle self test report")
+	}
+	client := protobufs.NewValidationServiceClient(cc)
+	verification := make([]byte, 1048576)
+	rand.Read(verification)
+	start := time.Now().UnixMilli()
+	validation, err := client.PerformValidation(
+		context.Background(),
+		&protobufs.ValidationMessage{
+			Validation: verification,
+		},
+	)
+	end := time.Now().UnixMilli()
+	if err != nil {
+		cc.Close()
+		return errors.Wrap(err, "handle self test report")
+	}
+	cc.Close()
+
+	if !bytes.Equal(verification, validation.Validation) {
+		e.logger.Error(
+			"provided invalid verification",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Uint32("difficulty", report.Difficulty),
+			zap.Int64("difficulty_metric", report.DifficultyMetric),
+			zap.Int64("commit_16_metric", report.Commit_16Metric),
+			zap.Int64("commit_128_metric", report.Commit_128Metric),
+			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
+			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
+			zap.Int64("proof_16_metric", report.Proof_16Metric),
+			zap.Int64("proof_128_metric", report.Proof_128Metric),
+			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
+			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
+			zap.Uint32("cores", report.Cores),
+			zap.Uint64("memory", memory),
+			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
+		)
+		return nil
+	}
+
+	if end-start > 2000 {
+		e.logger.Error(
+			"slow bandwidth, scoring out",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Uint32("difficulty", report.Difficulty),
+			zap.Int64("difficulty_metric", report.DifficultyMetric),
+			zap.Int64("commit_16_metric", report.Commit_16Metric),
+			zap.Int64("commit_128_metric", report.Commit_128Metric),
+			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
+			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
+			zap.Int64("proof_16_metric", report.Proof_16Metric),
+			zap.Int64("proof_128_metric", report.Proof_128Metric),
+			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
+			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
+			zap.Uint32("cores", report.Cores),
+			zap.Uint64("memory", memory),
+			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+	}
 
 	return nil
 }

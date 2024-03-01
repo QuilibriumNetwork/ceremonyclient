@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -645,6 +646,7 @@ func (e *svr) GetPublicChannel(
 
 func (e *CeremonyDataClockConsensusEngine) GetPublicChannelForProvingKey(
 	initiator bool,
+	peerID []byte,
 	provingKey []byte,
 ) (p2p.PublicChannelClient, error) {
 	if initiator {
@@ -664,7 +666,8 @@ func (e *CeremonyDataClockConsensusEngine) GetPublicChannelForProvingKey(
 			protobufs.RegisterCeremonyServiceServer(server, s)
 
 			if err := e.pubSub.StartDirectChannelListener(
-				provingKey,
+				peerID,
+				base58.Encode(provingKey),
 				server,
 			); err != nil {
 				e.logger.Error(
@@ -684,7 +687,7 @@ func (e *CeremonyDataClockConsensusEngine) GetPublicChannelForProvingKey(
 			)
 		}
 	} else {
-		cc, err := e.pubSub.GetDirectChannel(provingKey)
+		cc, err := e.pubSub.GetDirectChannel(peerID, base58.Encode(provingKey))
 		if err != nil {
 			e.logger.Error(
 				"could not get public channel for proving key",

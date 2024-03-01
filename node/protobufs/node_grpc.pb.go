@@ -19,6 +19,96 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
+	ValidationService_PerformValidation_FullMethodName = "/quilibrium.node.node.pb.ValidationService/PerformValidation"
+)
+
+// ValidationServiceClient is the client API for ValidationService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type ValidationServiceClient interface {
+	PerformValidation(ctx context.Context, in *ValidationMessage, opts ...grpc.CallOption) (*ValidationMessage, error)
+}
+
+type validationServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewValidationServiceClient(cc grpc.ClientConnInterface) ValidationServiceClient {
+	return &validationServiceClient{cc}
+}
+
+func (c *validationServiceClient) PerformValidation(ctx context.Context, in *ValidationMessage, opts ...grpc.CallOption) (*ValidationMessage, error) {
+	out := new(ValidationMessage)
+	err := c.cc.Invoke(ctx, ValidationService_PerformValidation_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ValidationServiceServer is the server API for ValidationService service.
+// All implementations must embed UnimplementedValidationServiceServer
+// for forward compatibility
+type ValidationServiceServer interface {
+	PerformValidation(context.Context, *ValidationMessage) (*ValidationMessage, error)
+	mustEmbedUnimplementedValidationServiceServer()
+}
+
+// UnimplementedValidationServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedValidationServiceServer struct {
+}
+
+func (UnimplementedValidationServiceServer) PerformValidation(context.Context, *ValidationMessage) (*ValidationMessage, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PerformValidation not implemented")
+}
+func (UnimplementedValidationServiceServer) mustEmbedUnimplementedValidationServiceServer() {}
+
+// UnsafeValidationServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ValidationServiceServer will
+// result in compilation errors.
+type UnsafeValidationServiceServer interface {
+	mustEmbedUnimplementedValidationServiceServer()
+}
+
+func RegisterValidationServiceServer(s grpc.ServiceRegistrar, srv ValidationServiceServer) {
+	s.RegisterService(&ValidationService_ServiceDesc, srv)
+}
+
+func _ValidationService_PerformValidation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ValidationMessage)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ValidationServiceServer).PerformValidation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ValidationService_PerformValidation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ValidationServiceServer).PerformValidation(ctx, req.(*ValidationMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ValidationService_ServiceDesc is the grpc.ServiceDesc for ValidationService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ValidationService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.node.pb.ValidationService",
+	HandlerType: (*ValidationServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PerformValidation",
+			Handler:    _ValidationService_PerformValidation_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "node.proto",
+}
+
+const (
 	NodeService_GetFrames_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetFrames"
 	NodeService_GetFrameInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
 	NodeService_GetPeerInfo_FullMethodName    = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"

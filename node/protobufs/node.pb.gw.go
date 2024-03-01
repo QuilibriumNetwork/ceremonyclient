@@ -31,6 +31,40 @@ var _ = runtime.String
 var _ = utilities.NewDoubleArray
 var _ = metadata.Join
 
+func request_ValidationService_PerformValidation_0(ctx context.Context, marshaler runtime.Marshaler, client ValidationServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq ValidationMessage
+	var metadata runtime.ServerMetadata
+
+	newReader, berr := utilities.IOReaderFactory(req.Body)
+	if berr != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", berr)
+	}
+	if err := marshaler.NewDecoder(newReader()).Decode(&protoReq); err != nil && err != io.EOF {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	msg, err := client.PerformValidation(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+
+}
+
+func local_request_ValidationService_PerformValidation_0(ctx context.Context, marshaler runtime.Marshaler, server ValidationServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq ValidationMessage
+	var metadata runtime.ServerMetadata
+
+	newReader, berr := utilities.IOReaderFactory(req.Body)
+	if berr != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", berr)
+	}
+	if err := marshaler.NewDecoder(newReader()).Decode(&protoReq); err != nil && err != io.EOF {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	msg, err := server.PerformValidation(ctx, &protoReq)
+	return msg, metadata, err
+
+}
+
 func request_NodeService_GetFrames_0(ctx context.Context, marshaler runtime.Marshaler, client NodeServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq GetFramesRequest
 	var metadata runtime.ServerMetadata
@@ -303,6 +337,40 @@ func local_request_NodeStats_PutPeerInfo_0(ctx context.Context, marshaler runtim
 
 }
 
+// RegisterValidationServiceHandlerServer registers the http handlers for service ValidationService to "mux".
+// UnaryRPC     :call ValidationServiceServer directly.
+// StreamingRPC :currently unsupported pending https://github.com/grpc/grpc-go/issues/906.
+// Note that using this registration option will cause many gRPC library features to stop working. Consider using RegisterValidationServiceHandlerFromEndpoint instead.
+func RegisterValidationServiceHandlerServer(ctx context.Context, mux *runtime.ServeMux, server ValidationServiceServer) error {
+
+	mux.Handle("POST", pattern_ValidationService_PerformValidation_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		var err error
+		var annotatedContext context.Context
+		annotatedContext, err = runtime.AnnotateIncomingContext(ctx, mux, req, "/quilibrium.node.node.pb.ValidationService/PerformValidation", runtime.WithHTTPPathPattern("/quilibrium.node.node.pb.ValidationService/PerformValidation"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_ValidationService_PerformValidation_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_ValidationService_PerformValidation_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	return nil
+}
+
 // RegisterNodeServiceHandlerServer registers the http handlers for service NodeService to "mux".
 // UnaryRPC     :call NodeServiceServer directly.
 // StreamingRPC :currently unsupported pending https://github.com/grpc/grpc-go/issues/906.
@@ -520,6 +588,77 @@ func RegisterNodeStatsHandlerServer(ctx context.Context, mux *runtime.ServeMux, 
 
 	return nil
 }
+
+// RegisterValidationServiceHandlerFromEndpoint is same as RegisterValidationServiceHandler but
+// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+func RegisterValidationServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+	conn, err := grpc.DialContext(ctx, endpoint, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Infof("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Infof("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+		}()
+	}()
+
+	return RegisterValidationServiceHandler(ctx, mux, conn)
+}
+
+// RegisterValidationServiceHandler registers the http handlers for service ValidationService to "mux".
+// The handlers forward requests to the grpc endpoint over "conn".
+func RegisterValidationServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
+	return RegisterValidationServiceHandlerClient(ctx, mux, NewValidationServiceClient(conn))
+}
+
+// RegisterValidationServiceHandlerClient registers the http handlers for service ValidationService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "ValidationServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "ValidationServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "ValidationServiceClient" to call the correct interceptors.
+func RegisterValidationServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client ValidationServiceClient) error {
+
+	mux.Handle("POST", pattern_ValidationService_PerformValidation_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		var err error
+		var annotatedContext context.Context
+		annotatedContext, err = runtime.AnnotateContext(ctx, mux, req, "/quilibrium.node.node.pb.ValidationService/PerformValidation", runtime.WithHTTPPathPattern("/quilibrium.node.node.pb.ValidationService/PerformValidation"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ValidationService_PerformValidation_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_ValidationService_PerformValidation_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	return nil
+}
+
+var (
+	pattern_ValidationService_PerformValidation_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"quilibrium.node.node.pb.ValidationService", "PerformValidation"}, ""))
+)
+
+var (
+	forward_ValidationService_PerformValidation_0 = runtime.ForwardResponseMessage
+)
 
 // RegisterNodeServiceHandlerFromEndpoint is same as RegisterNodeServiceHandler but
 // automatically dials to "endpoint" and closes the connection when "ctx" gets done.

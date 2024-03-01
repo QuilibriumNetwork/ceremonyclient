@@ -893,6 +893,7 @@ func (e *CeremonyExecutionEngine) announceJoin(
 		SignedPreKey: &protobufs.X448PublicKey{
 			KeyValue: g.Mul(spk).ToAffineCompressed(),
 		},
+		PeerId: e.pubSub.GetPeerID(),
 	}
 	sig, err := join.SignWithProverKey(e.provingKey)
 	if err != nil {
@@ -949,6 +950,7 @@ func (e *CeremonyExecutionEngine) connectToActivePeers(
 
 			client, err := e.clock.GetPublicChannelForProvingKey(
 				i > position,
+				p.PeerId,
 				p.PublicKeySignatureEd448.PublicKey.KeyValue,
 			)
 			if err != nil {
@@ -1052,6 +1054,7 @@ func (e *CeremonyExecutionEngine) participateRound(
 			)]; !ok {
 				client, err := e.clock.GetPublicChannelForProvingKey(
 					initiator,
+					p.PeerId,
 					p.PublicKeySignatureEd448.PublicKey.KeyValue,
 				)
 				if err != nil {

@@ -1,12 +1,14 @@
 package master
 
 import (
+	"context"
 	"encoding/hex"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -27,6 +29,8 @@ const (
 )
 
 type MasterClockConsensusEngine struct {
+	*protobufs.UnimplementedValidationServiceServer
+
 	difficulty          uint32
 	logger              *zap.Logger
 	state               consensus.EngineState
@@ -48,6 +52,9 @@ type MasterClockConsensusEngine struct {
 	historicFrames   []*protobufs.ClockFrame
 	clockStore       store.ClockStore
 	masterTimeReel   *qtime.MasterTimeReel
+	report           *protobufs.SelfTestReport
+	peerMapMx        sync.Mutex
+	peerMap          map[string]*protobufs.SelfTestReport
 }
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
@@ -60,6 +67,7 @@ func NewMasterClockConsensusEngine(
 	pubSub p2p.PubSub,
 	frameProver crypto.FrameProver,
 	masterTimeReel *qtime.MasterTimeReel,
+	report *protobufs.SelfTestReport,
 ) *MasterClockConsensusEngine {
 	if logger == nil {
 		panic(errors.New("logger is nil"))
@@ -104,7 +112,11 @@ func NewMasterClockConsensusEngine(
 		clockStore:          clockStore,
 		frameProver:         frameProver,
 		masterTimeReel:      masterTimeReel,
+		report:              report,
+		peerMap:             map[string]*protobufs.SelfTestReport{},
 	}
+
+	e.peerMap[string(e.pubSub.GetPeerID())] = report
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
 		panic(errors.Wrap(err, "could not parse filter value"))
@@ -142,6 +154,22 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateCollecting
 
 	go func() {
+		server := grpc.NewServer(
+			grpc.MaxSendMsgSize(600*1024*1024),
+			grpc.MaxRecvMsgSize(600*1024*1024),
+		)
+		protobufs.RegisterValidationServiceServer(server, e)
+
+		if err := e.pubSub.StartDirectChannelListener(
+			e.pubSub.GetPeerID(),
+			"validation",
+			server,
+		); err != nil {
+			panic(err)
+		}
+	}()
+
+	go func() {
 		for {
 			e.logger.Info(
 				"peers in store",
@@ -149,6 +177,18 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				zap.Int("network_peer_count", e.pubSub.GetNetworkPeersCount()),
 			)
 			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+
+			e.logger.Info("broadcasting self-test info")
+
+			if err := e.publishMessage(e.filter, e.report); err != nil {
+				e.logger.Debug("error publishing message", zap.Error(err))
+			}
 		}
 	}()
 
@@ -195,6 +235,13 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	return errChan
+}
+
+func (e *MasterClockConsensusEngine) PerformValidation(
+	ctx context.Context,
+	msg *protobufs.ValidationMessage,
+) (*protobufs.ValidationMessage, error) {
+	return msg, nil
 }
 
 func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {

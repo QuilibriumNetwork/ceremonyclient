@@ -17,7 +17,6 @@ type DataProofStore interface {
 		filter []byte,
 		commitment []byte,
 		frameNumber uint64,
-		inclusionReassembler func(typeUrl string, data [][]byte) ([]byte, error),
 	) (
 		*protobufs.InclusionAggregateProof,
 		error,

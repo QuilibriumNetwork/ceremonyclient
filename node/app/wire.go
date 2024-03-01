@@ -14,6 +14,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
@@ -72,7 +73,7 @@ var consensusSet = wire.NewSet(
 	),
 )
 
-func NewNode(*config.Config) (*Node, error) {
+func NewNode(*config.Config, *protobufs.SelfTestReport) (*Node, error) {
 	panic(wire.Build(
 		loggerSet,
 		keyManagerSet,

@@ -88,6 +88,7 @@ func TestCeremonyTransitions(t *testing.T) {
 		SignedPreKey: &protobufs.X448PublicKey{
 			KeyValue: spkPub,
 		},
+		PeerId: []byte{},
 	}
 	sig, err := join.SignWithProverKey(proverKey)
 	require.NoError(t, err)

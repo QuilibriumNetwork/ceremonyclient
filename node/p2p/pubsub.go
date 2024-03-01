@@ -19,9 +19,10 @@ type PubSub interface {
 	GetMultiaddrOfPeer(peerId []byte) string
 	StartDirectChannelListener(
 		key []byte,
+		purpose string,
 		server *grpc.Server,
 	) error
-	GetDirectChannel(peerId []byte) (*grpc.ClientConn, error)
+	GetDirectChannel(peerId []byte, purpose string) (*grpc.ClientConn, error)
 	GetNetworkInfo() *protobufs.NetworkInfoResponse
 	SignMessage(msg []byte) ([]byte, error)
 	GetPublicKey() []byte
