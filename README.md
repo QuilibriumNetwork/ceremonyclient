@@ -139,15 +139,19 @@ Write the code below
 Save and exit
 
 To start service run
+
     service ceremonyclient start
 
 To stop service run
+
     service ceremonyclient stop
 
 To view service logs run
+
     sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
 
 ## Upgrading Node
+
     service ceremonyclient stop
     git fetch origin
     git merge origin
@@ -159,7 +163,8 @@ Go to ceremonyclient/node folder and run
     GOEXPERIMENT=arenas go install ./...
     service ceremonyclient start
 
-If everything is okay you would see logs when you run 
+If everything is okay you would see logs when you run
+
     sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
 
 Ensure that your service running correctly.
