@@ -7,6 +7,48 @@ underlying technology can be found at https://www.quilibrium.com/
 
 ## Quick Start
 
+### Prerequisites
+
+- Linux X64 or ARM64
+- Git & Tar
+```
+sudo apt-get update && sudo apt-get install -y git tar
+```
+- Go 1.20.14
+```
+cd /tmp
+# Get current system architecture
+archi=$(dpkg --print-architecture)
+
+# Download correct Go version
+wget https://go.dev/dl/go1.20.14.linux-${archi}.tar.gz
+
+# Untar 
+tar -xvf go1.20.14.linux-${archi}.tar.gz
+
+# Move binaries
+sudo mv go /usr/local
+
+# Cleanup
+rm go1.20.14.linux-${archi}.tar.gz
+
+# Export variables to profile
+echo "export GOROOT=/usr/local" >> ~/.profile
+echo "export GOPATH=$HOME/go" >> ~/.profile
+echo "export PATH=$PATH:/usr/local/go/bin" >> ~/.profile
+
+# Apply variables to current session
+source ~/.profile 
+```
+
+### Pull repository
+```
+git clone https://github.com/QuilibriumNetwork/ceremonyclient.git
+cd ceremonyclient/node/
+```
+
+### Start node
+
 All commands are to be run in the `node/` folder.
 
 If you have a voucher from the offline ceremony, first run:
@@ -56,6 +98,9 @@ engine:
   statsMultiaddr: "/dns/stats.quilibrium.com/tcp/443"
   <rest of config continues below>
 ```
+
+## Updating
+Simply run a ```git pull``` inside the ceremonyclient folder.
 
 ## Purpose
 
