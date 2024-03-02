@@ -44,7 +44,7 @@ Save and exit then
 
 Then reboot.
 
-## Clonde the Repo
+## Clone the Repo
 
     git clone https://github.com/QuilibriumNetwork/ceremonyclient.git
     cd ceremonyclient/node
