@@ -42,7 +42,6 @@ Copy and paste the 3 lines below into the file. The values below are six hundred
 Save and exit then
     sudo sysctl -p
 
-Then reboot.
 
 ## Clone the Repo
 
@@ -82,10 +81,9 @@ edit these lines below
 
 Save and exit
 
-Ensure that port 8337 among other neeeded ports are enabled via firewal.
+Ensure that port 8337 among other neeeded ports are enabled via firewall.
 
     sudo ufw enable
-    sudo ufw allow 22
     sudo ufw allow 8336
     sudo ufw allow 8337
     sudo ufw allow 8338
