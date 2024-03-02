@@ -5,6 +5,50 @@ This release, mirrored to GitHub, is the Dawn release, which contains the
 initial application, the MPC Powers-of-Tau Ceremony. Documentation for the
 underlying technology can be found at https://www.quilibrium.com/
 
+## Install Requirements
+
+    wget https://:go.dev/dl/go1.20.14.linux-amd64.tar.gz
+    sudo tar -xvf go1.20.14.linux-amd64.tar.gz
+    sudo mv go /usr/local
+    sudo rm go1.20.14.linux-amd64.tar.gz
+    sudo nano ~/.bashrc
+
+At the end of the file, add these lines and save the file.
+
+    GOROOT=/usr/local/go
+    GOPATH=$HOME/go
+    PATH=$GOPATH/bin:$GOROOT/bin:$PATH
+
+On command line, run 
+    ~/.bashrc
+
+Check GO Version
+    go version
+
+It must show "go version go.1.20.13 linux/amd64"
+
+## Configure Linux Network Device Settings
+
+To optimize throughput and latency for large parallel job typcal of network like Q
+
+    nano /etc/sysctl.conf
+
+Copy and paste the 3 lines below into the file. The values below are six hundred million.
+
+    #Increase buffer sizes for better network performance
+    net.core.rmem_max=600000000
+    net.core.wmem_max=600000000
+
+Save and exit then
+    sudo sysctl -p
+
+Then reboot.
+
+## Clonde the Repo
+
+    git clone https://github.com/QuilibriumNetwork/ceremonyclient.git
+    cd ceremonyclient/node
+    
 ## Quick Start
 
 All commands are to be run in the `node/` folder.
@@ -29,8 +73,24 @@ The peer id will be printed to stdout.
 
 If you want to enable gRPC/REST, add the following entries to your config.yml:
 
-    listenGrpcMultiaddr: <multiaddr> 
-    listenRESTMultiaddr: <multiaddr>
+    sudo nano .config/config.yml
+
+edit these lines below
+
+    listenGrpcMultiaddr: /ip4/127.0.0.1/tcp/8337
+    listenRESTMultiaddr: /ip4/127.0.0.1/tcp/8338
+
+Save and exit
+
+Ensure that port 8337 among other neeeded ports are enabled via firewal.
+
+    sudo ufw enable
+    sudo ufw allow 22
+    sudo ufw allow 8336
+    sudo ufw allow 8337
+    sudo ufw allow 8338
+    sudo ufw status
+
 
 Please note: this interface, while read-only, is unauthenticated and not rate-
 limited. It is recommended that you only enable if you are properly controlling
