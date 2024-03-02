@@ -102,9 +102,67 @@ In order to query the token balance of a running node, execute the following com
 
     GOEXPERIMENT=arenas go run ./... -balance
 
+Or
+
+    GOEXPERIMENT=arenas /root/go/bin/node -balance
+
 The confirmed token balance will be printed to stdout in QUILs.
 
 Note that this feature requires that [gRPC support](#experimental--grpcrest-support) is enabled.
+
+## Build the node binary file 
+
+    GOEXPERIMENT=arenas go install ./...
+
+Thiw will build binary file in /root/go/bin folder
+
+## Start the Quilibrium Node as a Service
+
+    nano /lib/systemd/system/ceremonyclient.service
+
+Write the code below
+
+    [Unit]
+    Description=Ceremony Client Go App Service
+
+    [Service]
+    Type=simple
+    Restart=always
+    RestartSec=5s
+    WorkingDirectory=/root/ceremonyclient/node
+    Environment=GOEXPERIMENT=arenas
+    ExecStart=/root/go/bin/node ./...
+
+    [Install]
+    WantedBy=multi-user.target
+
+Save and exit
+
+To start service run
+    service ceremonyclient start
+
+To stop service run
+    service ceremonyclient stop
+
+To view service logs run
+    sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
+
+## Upgrading Node
+    service ceremonyclient stop
+    git fetch origin
+    git merge origin
+
+Go to ceremonyclient/node folder and run
+
+    GOEXPERIMENT=arenas go clean -v -n -a ./...
+    rm /root/go/bin
+    GOEXPERIMENT=arenas go install ./...
+    service ceremonyclient start
+
+If everything is okay you would see logs when you run 
+    sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
+
+Ensure that your service running correctly.
 
 ## Stats Collection
 
