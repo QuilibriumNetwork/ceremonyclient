@@ -17,6 +17,10 @@ If you do not, or have already run the above, run:
 
     GOEXPERIMENT=arenas go run ./...
 
+## Beginners' Guide to Setup
+
+Here is a detailed guide for non-technical folks who want to setup a node: [link](https://demipoet.github.io/)
+
 ## Peer ID
 
 In order to find the peer id of a running node, execute the following command from the `node/` folder:
