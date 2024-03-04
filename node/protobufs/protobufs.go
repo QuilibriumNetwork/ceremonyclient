@@ -8,7 +8,7 @@ const (
 	ClockPrefix                          = NamespacePrefix + "clock.pb."
 	KeysPrefix                           = NamespacePrefix + "keys.pb."
 	CeremonyPrefix                       = NamespacePrefix + "ceremony.pb."
-	NodePrefix                           = NamespacePrefix + "node.pb"
+	NodePrefix                           = NamespacePrefix + "node.pb."
 	CeremonyTranscriptType               = CeremonyPrefix + "CeremonyTranscript"
 	CeremonyLobbyStateType               = CeremonyPrefix + "CeremonyLobbyState"
 	CeremonySeenProverAttestationType    = CeremonyPrefix + "CeremonySeenProverAttestation"

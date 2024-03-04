@@ -3,6 +3,7 @@ package master
 import (
 	"context"
 	"encoding/hex"
+	"math/big"
 	"sync"
 	"time"
 
@@ -278,6 +279,54 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+func (
+	e *MasterClockConsensusEngine,
+) GetPeerManifests() *protobufs.PeerManifestsResponse {
+	response := &protobufs.PeerManifestsResponse{
+		PeerManifests: []*protobufs.PeerManifest{},
+	}
+	e.peerMapMx.Lock()
+	for peerId, peerManifest := range e.peerMap {
+		peerId := peerId
+		peerManifest := peerManifest
+		manifest := &protobufs.PeerManifest{
+			PeerId:             []byte(peerId),
+			Difficulty:         peerManifest.Difficulty,
+			DifficultyMetric:   peerManifest.DifficultyMetric,
+			Commit_16Metric:    peerManifest.Commit_16Metric,
+			Commit_128Metric:   peerManifest.Commit_128Metric,
+			Commit_1024Metric:  peerManifest.Commit_1024Metric,
+			Commit_65536Metric: peerManifest.Commit_65536Metric,
+			Proof_16Metric:     peerManifest.Proof_16Metric,
+			Proof_128Metric:    peerManifest.Proof_128Metric,
+			Proof_1024Metric:   peerManifest.Proof_1024Metric,
+			Proof_65536Metric:  peerManifest.Proof_65536Metric,
+			Cores:              peerManifest.Cores,
+			Memory:             new(big.Int).SetBytes(peerManifest.Memory).Bytes(),
+			Storage:            new(big.Int).SetBytes(peerManifest.Storage).Bytes(),
+		}
+
+		for _, capability := range peerManifest.Capabilities {
+			metadata := make([]byte, len(capability.AdditionalMetadata))
+			copy(metadata[:], capability.AdditionalMetadata[:])
+			manifest.Capabilities = append(
+				manifest.Capabilities,
+				&protobufs.Capability{
+					ProtocolIdentifier: capability.ProtocolIdentifier,
+					AdditionalMetadata: metadata,
+				},
+			)
+		}
+
+		response.PeerManifests = append(
+			response.PeerManifests,
+			manifest,
+		)
+	}
+	e.peerMapMx.Unlock()
+	return response
 }
 
 func (e *MasterClockConsensusEngine) GetDifficulty() uint32 {

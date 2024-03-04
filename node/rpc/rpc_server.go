@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -34,6 +35,7 @@ type RPCServer struct {
 	clockStore       store.ClockStore
 	keyManager       keys.KeyManager
 	pubSub           p2p.PubSub
+	masterClock      *master.MasterClockConsensusEngine
 	executionEngines []execution.ExecutionEngine
 }
 
@@ -450,6 +452,13 @@ func (r *RPCServer) GetTokenInfo(
 	}, nil
 }
 
+func (r *RPCServer) GetPeerManifest(
+	ctx context.Context,
+	req *protobufs.GetPeerManifestsRequest,
+) (*protobufs.PeerManifestsResponse, error) {
+	return r.masterClock.GetPeerManifests(), nil
+}
+
 func NewRPCServer(
 	listenAddrGRPC string,
 	listenAddrHTTP string,
@@ -457,6 +466,7 @@ func NewRPCServer(
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
+	masterClock *master.MasterClockConsensusEngine,
 	executionEngines []execution.ExecutionEngine,
 ) (*RPCServer, error) {
 	return &RPCServer{
@@ -466,6 +476,7 @@ func NewRPCServer(
 		clockStore:       clockStore,
 		keyManager:       keyManager,
 		pubSub:           pubSub,
+		masterClock:      masterClock,
 		executionEngines: executionEngines,
 	}, nil
 }
