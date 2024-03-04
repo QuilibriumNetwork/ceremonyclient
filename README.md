@@ -25,7 +25,7 @@ On command line, run
 Check GO Version
     go version
 
-It must show "go version go.1.20.13 linux/amd64"
+As we use linux distro in this setup it shoud show "go version go.1.20.13 linux/amd64" The result can be different based on your platform
 
 ## Configure Linux Network Device Settings
 
