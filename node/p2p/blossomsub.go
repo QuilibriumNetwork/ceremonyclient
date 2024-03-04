@@ -226,7 +226,7 @@ func (b *BlossomSub) Subscribe(
 				}
 
 				if err = handler(m.Message); err != nil {
-					b.logger.Error("message handler returned error", zap.Error(err))
+					b.logger.Debug("message handler returned error", zap.Error(err))
 				}
 			}
 		}()
