@@ -107,7 +107,7 @@ func generateTestProvers() (
 }
 
 func TestDataTimeReel(t *testing.T) {
-	logger, _ := zap.NewProduction()
+	logger, _ := zap.NewDevelopment()
 	db := store.NewInMemKVDB()
 	clockStore := store.NewPebbleClockStore(db, logger)
 	prover := qcrypto.NewWesolowskiFrameProver(logger)

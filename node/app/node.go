@@ -5,6 +5,7 @@ import (
 
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -81,6 +82,10 @@ func (n *Node) GetKeyManager() keys.KeyManager {
 
 func (n *Node) GetPubSub() p2p.PubSub {
 	return n.pubSub
+}
+
+func (n *Node) GetMasterClock() *master.MasterClockConsensusEngine {
+	return n.engine.(*master.MasterClockConsensusEngine)
 }
 
 func (n *Node) GetExecutionEngines() []execution.ExecutionEngine {

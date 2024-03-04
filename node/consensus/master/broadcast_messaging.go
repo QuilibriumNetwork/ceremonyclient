@@ -146,7 +146,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	}
 
 	e.peerMapMx.Lock()
-	if _, ok := e.peerMap[string(peerID)]; !ok {
+	if _, ok := e.peerMap[string(peerID)]; ok {
 		e.peerMapMx.Unlock()
 		return nil
 	}

@@ -226,7 +226,7 @@ func (b *BlossomSub) Subscribe(
 				}
 
 				if err = handler(m.Message); err != nil {
-					b.logger.Error("message handler returned error", zap.Error(err))
+					b.logger.Debug("message handler returned error", zap.Error(err))
 				}
 			}
 		}()
@@ -297,7 +297,7 @@ func initDHT(
 	logger.Info("establishing dht")
 	var kademliaDHT *dht.IpfsDHT
 	var err error
-	if !isBootstrapPeer {
+	if isBootstrapPeer {
 		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
 	} else {
 		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeAuto))
@@ -327,6 +327,11 @@ func initDHT(
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				if peerinfo.ID == h.ID() ||
+					h.Network().Connectedness(peerinfo.ID) == network.Connected {
+					return
+				}
+
 				if err := h.Connect(ctx, *peerinfo); err != nil {
 					logger.Info("error while connecting to dht peer", zap.Error(err))
 				} else {
