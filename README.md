@@ -17,10 +17,6 @@ If you do not, or have already run the above, run:
 
     GOEXPERIMENT=arenas go run ./...
 
-## Beginners' Guide to Setup
-
-Here is a detailed guide for non-technical folks who want to setup a node: [link](https://demipoet.github.io/)
-
 ## Peer ID
 
 In order to find the peer id of a running node, execute the following command from the `node/` folder:
@@ -91,6 +87,16 @@ producing a singular ceremony transcript contribution.
 predecessor, and is confirmed to be the new state, issuing rewards to the
 participant set. The next round can begin.
 
+## Community Section
+
+This section contains community-built clients, applications, guides, etc <br /><br />
+<b>Disclaimer</b>: Because some of these may contain external links, do note that these are unofficial – every dependency added imparts risk, so if another project's github account were compromised, for example, it could lead people down a dangerous or costly path. Proceed with caution as always and refer to reliable members of the community for verification of links before clicking or connecting your wallets
+
+### 1. The Q Guide - Beginners’ Guide
+
+- A detailed beginners' guide for how to setup a Quilibrium Node (on VPS, Ubuntu 22.04) - [link](https://github.com/demipoet/demipoet.github.io)<br/>
+
+  
 ## Pull Requests
 
 Contributions are welcome – a new network is rife with opportunities. We are
