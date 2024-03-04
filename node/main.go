@@ -180,6 +180,7 @@ func main() {
 			node.GetClockStore(),
 			node.GetKeyManager(),
 			node.GetPubSub(),
+			node.GetMasterClock(),
 			node.GetExecutionEngines(),
 		)
 		if err != nil {
@@ -494,5 +495,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                       Quilibrium Node - v1.4.0 – Sunset")
+	fmt.Println("                       Quilibrium Node - v1.4.1 – Sunset")
 }

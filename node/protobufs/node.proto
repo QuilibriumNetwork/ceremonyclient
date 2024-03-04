@@ -162,6 +162,52 @@ service ValidationService {
   rpc PerformValidation(ValidationMessage) returns (ValidationMessage);
 }
 
+message GetPeerManifestsRequest {}
+
+message PeerManifest {
+  bytes peer_id = 1;
+  // The difficulty the self test was conducted under
+  uint32 difficulty = 2;
+  // The resulting local time of computing the VDF test under the difficulty
+  int64 difficulty_metric = 3;
+  // The resulting local time of computing a KZG commitment for a 16 degree
+  // polynomial
+  int64 commit_16_metric = 4;
+  // The resulting local time of computing a KZG commitment for a 128 degree
+  // polynomial
+  int64 commit_128_metric = 5;
+  // The resulting local time of computing a KZG commitment for a 1024 degree
+  // polynomial
+  int64 commit_1024_metric = 6;
+  // The resulting local time of computing a KZG commitment for a 65536 degree
+  // polynomial
+  int64 commit_65536_metric = 7;
+  // The resulting local time of computing a KZG proof for a 16 degree
+  // polynomial
+  int64 proof_16_metric = 8;
+  // The resulting local time of computing a KZG proof for a 128 degree
+  // polynomial
+  int64 proof_128_metric = 9;
+  // The resulting local time of computing a KZG proof for a 1024 degree
+  // polynomial
+  int64 proof_1024_metric = 10;
+  // The resulting local time of computing a KZG proof for a 65536 degree
+  // polynomial
+  int64 proof_65536_metric = 11;
+  // The number of reported accessible cores
+  uint32 cores = 12;
+  // The total available memory
+  bytes memory = 13;
+  // The total available storage
+  bytes storage = 14;
+  // The list of supported capabilities
+  repeated Capability capabilities = 15;
+}
+
+message PeerManifestsResponse {
+  repeated PeerManifest peer_manifests = 1;
+}
+
 service NodeService {
   rpc GetFrames(GetFramesRequest) returns (FramesResponse);
   rpc GetFrameInfo(GetFrameInfoRequest) returns (FrameInfoResponse);
@@ -169,6 +215,7 @@ service NodeService {
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
   rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
+  rpc GetPeerManifests(GetPeerManifestsRequest) returns (PeerManifestsResponse);
 }
 
 service NodeStats {

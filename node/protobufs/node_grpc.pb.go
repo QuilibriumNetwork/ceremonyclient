@@ -109,12 +109,13 @@ var ValidationService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	NodeService_GetFrames_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetFrames"
-	NodeService_GetFrameInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
-	NodeService_GetPeerInfo_FullMethodName    = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
-	NodeService_GetNodeInfo_FullMethodName    = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
-	NodeService_GetNetworkInfo_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetNetworkInfo"
-	NodeService_GetTokenInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetTokenInfo"
+	NodeService_GetFrames_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetFrames"
+	NodeService_GetFrameInfo_FullMethodName     = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
+	NodeService_GetPeerInfo_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
+	NodeService_GetNodeInfo_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
+	NodeService_GetNetworkInfo_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetNetworkInfo"
+	NodeService_GetTokenInfo_FullMethodName     = "/quilibrium.node.node.pb.NodeService/GetTokenInfo"
+	NodeService_GetPeerManifests_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetPeerManifests"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -127,6 +128,7 @@ type NodeServiceClient interface {
 	GetNodeInfo(ctx context.Context, in *GetNodeInfoRequest, opts ...grpc.CallOption) (*NodeInfoResponse, error)
 	GetNetworkInfo(ctx context.Context, in *GetNetworkInfoRequest, opts ...grpc.CallOption) (*NetworkInfoResponse, error)
 	GetTokenInfo(ctx context.Context, in *GetTokenInfoRequest, opts ...grpc.CallOption) (*TokenInfoResponse, error)
+	GetPeerManifests(ctx context.Context, in *GetPeerManifestsRequest, opts ...grpc.CallOption) (*PeerManifestsResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -191,6 +193,15 @@ func (c *nodeServiceClient) GetTokenInfo(ctx context.Context, in *GetTokenInfoRe
 	return out, nil
 }
 
+func (c *nodeServiceClient) GetPeerManifests(ctx context.Context, in *GetPeerManifestsRequest, opts ...grpc.CallOption) (*PeerManifestsResponse, error) {
+	out := new(PeerManifestsResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetPeerManifests_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -201,6 +212,7 @@ type NodeServiceServer interface {
 	GetNodeInfo(context.Context, *GetNodeInfoRequest) (*NodeInfoResponse, error)
 	GetNetworkInfo(context.Context, *GetNetworkInfoRequest) (*NetworkInfoResponse, error)
 	GetTokenInfo(context.Context, *GetTokenInfoRequest) (*TokenInfoResponse, error)
+	GetPeerManifests(context.Context, *GetPeerManifestsRequest) (*PeerManifestsResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -225,6 +237,9 @@ func (UnimplementedNodeServiceServer) GetNetworkInfo(context.Context, *GetNetwor
 }
 func (UnimplementedNodeServiceServer) GetTokenInfo(context.Context, *GetTokenInfoRequest) (*TokenInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTokenInfo not implemented")
+}
+func (UnimplementedNodeServiceServer) GetPeerManifests(context.Context, *GetPeerManifestsRequest) (*PeerManifestsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPeerManifests not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -347,6 +362,24 @@ func _NodeService_GetTokenInfo_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_GetPeerManifests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPeerManifestsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetPeerManifests(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetPeerManifests_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetPeerManifests(ctx, req.(*GetPeerManifestsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -377,6 +410,10 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTokenInfo",
 			Handler:    _NodeService_GetTokenInfo_Handler,
+		},
+		{
+			MethodName: "GetPeerManifests",
+			Handler:    _NodeService_GetPeerManifests_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
