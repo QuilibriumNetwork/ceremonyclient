@@ -11,25 +11,28 @@ vars:
   IMAGE_NAME:
     sh: grep -Po '^LOCAL_IMAGE_NAME=\K.*' .env || echo "quilibrium"
   SERVICE_NAME: node
-  GIT_COMMIT:
-    sh: git log -1 --format=%h
+  GIT_REPO:
+    sh: git config --get remote.origin.url
   GIT_BRANCH:
     sh: git rev-parse --abbrev-ref HEAD
+  GIT_COMMIT:
+    sh: git log -1 --format=%h
 
 tasks:
   info:
     desc: Display configuration info.
     cmds:
-      - echo Version {{.VERSION}}
-      - echo Commit {{.GIT_COMMIT}}
-      - echo Branch {{.GIT_BRANCH}}
-      - echo Image name {{.IMAGE_NAME}}
+      - echo -n "Version   :" && echo " {{.VERSION}}"
+      - echo -n "Repo      :" && echo " {{.GIT_REPO}}"
+      - echo -n "Branch    :" && echo " {{.GIT_BRANCH}}"
+      - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
+      - echo -n "Image name:" && echo " {{.IMAGE_NAME}}"
     silent: true
 
   build:
     desc: Build the Quilibrium docker image, unless it is already built.
     cmds:
-      - docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t {{.IMAGE_NAME}}:{{.VERSION}} -t {{.IMAGE_NAME}}:latest -t quilibrium:latest -t quilibrium:{{.VERSION}} .
+      - docker build --build-arg GIT_REPO={{.GIT_REPO}} --build-arg GIT_BRANCH={{.GIT_BRANCH}} --build-arg GIT_COMMIT={{.GIT_COMMIT}} -t {{.IMAGE_NAME}}:{{.VERSION}} -t {{.IMAGE_NAME}}:latest -t quilibrium:latest -t quilibrium:{{.VERSION}} .
     status:
       - docker image inspect {{.IMAGE_NAME}}:{{.VERSION}} >/dev/null 2>/dev/null
 
