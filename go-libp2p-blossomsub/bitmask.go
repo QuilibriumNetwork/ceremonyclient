@@ -161,7 +161,7 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 
 	if sub.ch == nil {
 		// apply the default size
-		sub.ch = make(chan *Message, 32)
+		sub.ch = make(chan *Message, 1000)
 	}
 
 	out := make(chan *Subscription, 1)
