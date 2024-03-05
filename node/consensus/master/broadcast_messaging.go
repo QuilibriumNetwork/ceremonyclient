@@ -103,6 +103,15 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
+	head, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	if frame.FrameNumber < head.FrameNumber {
+		return nil
+	}
+
 	if e.difficulty != frame.Difficulty {
 		e.logger.Debug(
 			"frame difficulty mismatched",
