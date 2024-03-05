@@ -1,0 +1,65 @@
+# https://taskfile.dev
+
+version: '3'
+
+dotenv:
+  - '.env'
+
+vars:
+  VERSION:
+    sh: cat node/main.go | grep "Quilibrium Node - v" |  grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'
+  IMAGE_NAME:
+    sh: grep -Po '^LOCAL_IMAGE_NAME=\K.*' .env || echo "quilibrium"
+  SERVICE_NAME: node
+  GIT_COMMIT:
+    sh: git log -1 --format=%h
+  GIT_BRANCH:
+    sh: git rev-parse --abbrev-ref HEAD
+
+tasks:
+  info:
+    desc: Display configuration info.
+    cmds:
+      - echo Version {{.VERSION}}
+      - echo Commit {{.GIT_COMMIT}}
+      - echo Branch {{.GIT_BRANCH}}
+      - echo Image name {{.IMAGE_NAME}}
+    silent: true
+
+  build:
+    desc: Build the Quilibrium docker image, unless it is already built.
+    cmds:
+      - docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t {{.IMAGE_NAME}}:{{.VERSION}} -t {{.IMAGE_NAME}}:latest -t quilibrium:latest -t quilibrium:{{.VERSION}} .
+    status:
+      - docker image inspect {{.IMAGE_NAME}}:{{.VERSION}} >/dev/null 2>/dev/null
+
+  up:
+    desc: Run a new Quilibrium container, through docker compose.
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Take down the Quilibrium container, through docker compose.
+    cmds:
+      - docker compose down
+
+  shell:
+    desc: Drop into a shell inside the running container.
+    cmds:
+      - docker compose exec -it {{.SERVICE_NAME}} sh
+
+  logs:
+    desc: Print the logs of the running Quilibrium container.
+    cmds:
+      - docker compose logs
+
+  github:login:
+    desc: Login to GitHub container registry.
+    cmds:
+      - echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
+
+  github:push:
+    desc: Push Quilibrium docker image to GitHub container registry.
+    cmds:
+      - docker push {{.IMAGE_NAME}}:{{.VERSION}}
+      - docker push {{.IMAGE_NAME}}:latest
