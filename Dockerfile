@@ -1,7 +1,3 @@
-ARG GIT_REPO=https://github.com/QuilibriumNetwork/ceremonyclient
-ARG GIT_BRANCH=main
-ARG GIT_COMMIT=HEAD
-
 FROM golang:1.20.14-alpine3.19 as build
 
 ENV GOEXPERIMENT=arenas
