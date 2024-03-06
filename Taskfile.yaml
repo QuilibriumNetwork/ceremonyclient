@@ -72,21 +72,26 @@ tasks:
 
   backup:
     desc: Create a backup file with the critical configuration files.
+    prompt: You will be prompted for root access. Make sure you verify the generated backup file. Continue?
     sources:
       - '.config/config.yml'
       - '.config/keys.yml'
+    outputs:
+      - 'backup.tar.gz'
     cmds:
       - |
         export TMP_DIR=$(mktemp -d)
         export TASK_DIR=$(pwd)
-        echo $TMP_DIR
         sudo cp .config/config.yml $TMP_DIR
         sudo cp .config/keys.yml $TMP_DIR
         sudo chown $(whoami):$(id -gn) $TMP_DIR/*
         cd $TMP_DIR
-        tar -cvzf $TASK_DIR/backup.tar.gz *
+        tar -czf $TASK_DIR/backup.tar.gz *
         cd $TASK_DIR
         sudo rm -rf $TMP_DIR
+        echo "Backup saved to: backup.tar.gz"
+        echo "Do not assume you have a backup unless you verify it!!!"
+    silent: true
 
   github:login:
     desc: Login to GitHub container registry.
