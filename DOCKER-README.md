@@ -43,13 +43,47 @@ net.core.wmem_max = 600000000
 
 ## Build
 
+The only requirements are `git` (to checkout the repository) and docker (to build the image and run the container).
+Golang does not have to be installed, the docker image build process uses a build stage that provides the
+correct Go environment and compiles the node down to one command.
+
 In the repository root folder, where the [Dockerfile](Dockerfile) file is, build the docker image:
 ```shell
-docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.2.15 .
+docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.4.2 .
 ```
 
-Use latest version instead of `1.2.15`.
+Use latest version instead of `1.4.2`.
 
+### Task
+
+You can also use the [Task](https://taskfile.dev/) tool, it a simple build tool that takes care of extracting
+parameters, building the image and running the container. The tasks are all defined in [Taskfile.yaml](Taskfile.yaml).
+
+You can optionally create an `.env` file, in the same repository root folder to override specific parameters. Right now
+only one optional env var is supported and that is `QUILIBRIUM_IMAGE_NAME`, if you want to change the default
+image name from `quilibrium` to something else. If you are pushing your images to Github then you have to follow the
+Github naming convention and use a name like `ghcr.io/mscurtescu/ceremonyclient`.
+
+Bellow there are example interaction with `Task`.
+
+The node version is extracted from [node/main.go](node/main.go). This version string is used to tag the image. The git
+repo, branch and commit are read throught the `git` command and depend on the current state of your working
+directory (one what branch and at what commit you are). These last three values are used to label the image.
+
+List tasks:
+```shell
+task -l
+```
+
+Show what parameters, like image name, version etc, will be used:
+```shell
+task status
+```
+
+Build the image (aka run the `build` task):
+```shell
+task build
+```
 
 ## Run
 
@@ -70,6 +104,29 @@ docker compose up -d
 A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
 Make sure you backup `config.yml` and `keys.yml`.
 
+### Task
+
+Similarly to building the image you can also use `Task`.
+
+Start the container through docker compose:
+```shell
+task up
+```
+
+Show the logs through docker compose:
+```shell
+task logs
+```
+
+Drop into a shell inside the running container:
+```shell
+task shell
+```
+
+Stop the running container(s):
+```shell
+task down
+```
 
 ### Resource management
 To ensure that your client performs optimally within a specific resource configuration, you can specify
