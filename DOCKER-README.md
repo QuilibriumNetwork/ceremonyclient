@@ -54,6 +54,10 @@ docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t q
 
 Use latest version instead of `1.4.2`.
 
+The image that is built is light and safe. It is based on Alpine Linux with the Quilibrium node binary, not the
+source code, nor the Go development environment. The image also has the `grpcurl` tool that can be used to
+query the gRPC interface.
+
 ### Task
 
 You can also use the [Task](https://taskfile.dev/) tool, it a simple build tool that takes care of extracting
