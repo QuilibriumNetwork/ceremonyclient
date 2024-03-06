@@ -25,6 +25,12 @@ services:
       - '8336:8336/udp' # p2p
       - '127.0.0.1:8337:8337/tcp' # gRPC
       - '127.0.0.1:8338:8338/tcp' # REST
+    healthcheck:
+      test: ["CMD", "node", "--peer-id"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
     volumes:
       - ./.config:/opt/ceremonyclient/node/.config
     logging:
