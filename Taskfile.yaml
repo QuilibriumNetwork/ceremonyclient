@@ -64,6 +64,24 @@ tasks:
     cmds:
       - docker compose logs
 
+  backup:
+    desc: Create a backup file with the critical configuration files.
+    sources:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    cmds:
+      - |
+        export TMP_DIR=$(mktemp -d)
+        export TASK_DIR=$(pwd)
+        echo $TMP_DIR
+        sudo cp .config/config.yml $TMP_DIR
+        sudo cp .config/keys.yml $TMP_DIR
+        sudo chown $(whoami):$(id -gn) $TMP_DIR/*
+        cd $TMP_DIR
+        tar -cvzf $TASK_DIR/backup.tar.gz *
+        cd $TASK_DIR
+        sudo rm -rf $TMP_DIR
+
   github:login:
     desc: Login to GitHub container registry.
     cmds:

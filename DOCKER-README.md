@@ -132,6 +132,15 @@ Stop the running container(s):
 task down
 ```
 
+Backup the critical configuration:
+```shell
+task backup
+```
+
+The above command will create a `backup.tar.gz` archive in the current folder, you still have to copy this
+file from the server into a safe location. The command adds the `config.yml` and `keys.yml` files from
+the `.config/` subfolder to the archive, with the ownership of the current user.
+
 ### Resource management
 To ensure that your client performs optimally within a specific resource configuration, you can specify
 resource limits and reservations in the node configuration as illustrated below. 
