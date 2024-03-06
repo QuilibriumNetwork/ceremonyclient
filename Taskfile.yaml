@@ -8,8 +8,6 @@ dotenv:
 vars:
   VERSION:
     sh: cat node/main.go | grep "Quilibrium Node - v" |  grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'
-  IMAGE_NAME:
-    sh: grep -Po '^LOCAL_IMAGE_NAME=\K.*' .env || echo "quilibrium"
   SERVICE_NAME: node
   GIT_REPO:
     sh: git config --get remote.origin.url
@@ -19,22 +17,32 @@ vars:
     sh: git log -1 --format=%h
 
 tasks:
-  info:
+  status:
     desc: Display configuration info.
     cmds:
+      - echo -n "Image name:" && echo " ${QUILIBRIUM_IMAGE_NAME:-quilibrium}"
       - echo -n "Version   :" && echo " {{.VERSION}}"
       - echo -n "Repo      :" && echo " {{.GIT_REPO}}"
       - echo -n "Branch    :" && echo " {{.GIT_BRANCH}}"
       - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
-      - echo -n "Image name:" && echo " {{.IMAGE_NAME}}"
     silent: true
 
   build:
     desc: Build the Quilibrium docker image, unless it is already built.
     cmds:
-      - docker build --build-arg GIT_REPO={{.GIT_REPO}} --build-arg GIT_BRANCH={{.GIT_BRANCH}} --build-arg GIT_COMMIT={{.GIT_COMMIT}} -t {{.IMAGE_NAME}}:{{.VERSION}} -t {{.IMAGE_NAME}}:latest -t quilibrium:latest -t quilibrium:{{.VERSION}} .
+      - |
+        docker build \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest \
+        .
     status:
-      - docker image inspect {{.IMAGE_NAME}}:{{.VERSION}} >/dev/null 2>/dev/null
+      - |
+        docker image inspect \
+        ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}} \
+        >/dev/null 2>/dev/null
 
   up:
     desc: Run a new Quilibrium container, through docker compose.
@@ -61,8 +69,8 @@ tasks:
     cmds:
       - echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
 
-  github:push:
-    desc: Push Quilibrium docker image to GitHub container registry.
+  push:
+    desc: Push Quilibrium docker image to the container registry.
     cmds:
-      - docker push {{.IMAGE_NAME}}:{{.VERSION}}
-      - docker push {{.IMAGE_NAME}}:latest
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
