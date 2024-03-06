@@ -8,6 +8,7 @@ dotenv:
 vars:
   VERSION:
     sh: cat node/main.go | grep "Quilibrium Node - v" |  grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'
+  PROJECT_NAME: quilibrium
   SERVICE_NAME: node
   GIT_REPO:
     sh: git config --get remote.origin.url
@@ -63,6 +64,11 @@ tasks:
     desc: Print the logs of the running Quilibrium container.
     cmds:
       - docker compose logs
+
+  logs-folder:
+    desc: Show where Docker stores the logs for the Quilibrium node. You need root permissions to access the folder.
+    cmds:
+      - "docker container inspect {{.PROJECT_NAME}}-{{.SERVICE_NAME}}-1 | grep LogPath | cut -d : -f 2 | cut -d '\"' -f 2 | xargs dirname"
 
   backup:
     desc: Create a backup file with the critical configuration files.
