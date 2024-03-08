@@ -102,6 +102,10 @@ func (e *MasterClockConsensusEngine) collect(
 				},
 			},
 		)
+		if err != nil {
+			cc.Close()
+			continue
+		}
 
 		for msg, err := syncClient.Recv(); msg != nil &&
 			err == nil; msg, err = syncClient.Recv() {
