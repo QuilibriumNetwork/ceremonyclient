@@ -172,6 +172,8 @@ func main() {
 		panic(err)
 	}
 
+	repair(*configDirectory, node)
+
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
 			nodeConfig.ListenGRPCMultiaddr,
@@ -407,6 +409,32 @@ func clearIfTestData(configDir string, nodeConfig *config.Config) {
 	}
 }
 
+func repair(configDir string, node *app.Node) {
+	_, err := os.Stat(filepath.Join(configDir, "REPAIR"))
+	if os.IsNotExist(err) {
+		node.RunRepair()
+
+		repairFile, err := os.OpenFile(
+			filepath.Join(configDir, "REPAIR"),
+			os.O_CREATE|os.O_RDWR,
+			fs.FileMode(0600),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = repairFile.Write([]byte{0x00, 0x00, 0x01})
+		if err != nil {
+			panic(err)
+		}
+
+		err = repairFile.Close()
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
 func migrate(configDir string, nodeConfig *config.Config) {
 	_, err := os.Stat(filepath.Join(configDir, "MIGRATIONS"))
 	if os.IsNotExist(err) {
@@ -495,5 +523,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                       Quilibrium Node - v1.4.2 – Sunset")
+	fmt.Println("                       Quilibrium Node - v1.4.3 – Sunset")
 }

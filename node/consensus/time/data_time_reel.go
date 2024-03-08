@@ -829,7 +829,7 @@ func (d *DataTimeReel) forkChoice(
 			rightIndex,
 			d.proverTrie,
 			txn,
-			false,
+			rightIndex.FrameNumber < d.head.FrameNumber,
 		); err != nil {
 			panic(err)
 		}

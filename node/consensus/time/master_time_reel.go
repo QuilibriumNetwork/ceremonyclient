@@ -23,7 +23,7 @@ type MasterTimeReel struct {
 	frameProver  crypto.FrameProver
 
 	head       *protobufs.ClockFrame
-	pending    map[uint64][]*big.Int
+	pending    map[uint64][]*protobufs.ClockFrame
 	frames     chan *protobufs.ClockFrame
 	newFrameCh chan *protobufs.ClockFrame
 	badFrameCh chan *protobufs.ClockFrame
@@ -63,7 +63,7 @@ func NewMasterTimeReel(
 		engineConfig: engineConfig,
 		clockStore:   clockStore,
 		frameProver:  frameProver,
-		pending:      make(map[uint64][]*big.Int),
+		pending:      make(map[uint64][]*protobufs.ClockFrame),
 		frames:       make(chan *protobufs.ClockFrame),
 		newFrameCh:   make(chan *protobufs.ClockFrame),
 		badFrameCh:   make(chan *protobufs.ClockFrame),
@@ -222,10 +222,15 @@ func (m *MasterTimeReel) runLoop() {
 						m.newFrameCh <- frame
 					}()
 				} else {
-					go func() {
-						m.frames <- frame
-					}()
+					if _, ok := m.pending[frame.FrameNumber]; !ok {
+						m.pending[frame.FrameNumber] = []*protobufs.ClockFrame{}
+					}
+					m.pending[frame.FrameNumber] = append(
+						m.pending[frame.FrameNumber],
+						frame,
+					)
 				}
+				m.processPending()
 			} else {
 				m.logger.Debug(
 					"new frame has same or lower frame number",
@@ -237,6 +242,66 @@ func (m *MasterTimeReel) runLoop() {
 		case <-m.done:
 			return
 		}
+	}
+}
+
+func (m *MasterTimeReel) processPending() {
+	for pending, ok := m.pending[m.head.FrameNumber+1]; ok; pending,
+		ok = m.pending[m.head.FrameNumber+1] {
+
+		for _, frame := range pending {
+			frame := frame
+			parent := new(big.Int).SetBytes(frame.ParentSelector)
+			selector, err := m.head.GetSelector()
+			if err != nil {
+				panic(err)
+			}
+
+			// master frames cannot fork, this is invalid
+			if parent.Cmp(selector) != 0 {
+				m.logger.Debug(
+					"invalid parent selector for frame",
+					zap.Binary("frame_parent_selector", frame.ParentSelector),
+					zap.Binary("actual_parent_selector", selector.FillBytes(
+						make([]byte, 32),
+					)),
+				)
+				go func() {
+					m.badFrameCh <- frame
+				}()
+				continue
+			}
+
+			txn, err := m.clockStore.NewTransaction()
+			if err != nil {
+				panic(err)
+			}
+
+			if err := m.clockStore.PutMasterClockFrame(frame, txn); err != nil {
+				panic(err)
+			}
+
+			if err = txn.Commit(); err != nil {
+				panic(err)
+			}
+
+			m.head = frame
+			go func() {
+				m.newFrameCh <- frame
+			}()
+			break
+		}
+
+		delete(m.pending, m.head.FrameNumber+1)
+	}
+	deletes := []uint64{}
+	for number := range m.pending {
+		if number < m.head.FrameNumber {
+			deletes = append(deletes, number)
+		}
+	}
+	for _, number := range deletes {
+		delete(m.pending, number)
 	}
 }
 

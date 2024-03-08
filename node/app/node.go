@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"errors"
 
 	"go.uber.org/zap"
@@ -8,9 +9,11 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 type Node struct {
@@ -39,6 +42,20 @@ func newNode(
 		execEngines[ceremonyExecutionEngine.GetName()] = ceremonyExecutionEngine
 	}
 
+	intrinsicFilter := append(
+		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	)
+	logger.Info("running compaction")
+
+	if err := clockStore.Compact(
+		bytes.Repeat([]byte{0xff}, 32),
+		intrinsicFilter,
+	); err != nil {
+		panic(err)
+	}
+	logger.Info("compaction complete")
+
 	return &Node{
 		logger,
 		clockStore,
@@ -47,6 +64,68 @@ func newNode(
 		execEngines,
 		engine,
 	}, nil
+}
+
+func (n *Node) RunRepair() {
+	intrinsicFilter := append(
+		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	)
+	n.logger.Info("check store and repair if needed, this may take a few minutes")
+	proverTrie := &tries.RollingFrecencyCritbitTrie{}
+	head, err := n.clockStore.GetLatestDataClockFrame(intrinsicFilter, proverTrie)
+	if err == nil && head != nil {
+		for head != nil && head.FrameNumber != 0 {
+			prev := head
+			head, err = n.clockStore.GetParentDataClockFrame(
+				intrinsicFilter,
+				head.FrameNumber-1,
+				head.ParentSelector,
+				true,
+			)
+			if err != nil {
+				panic(err)
+			}
+			compare, _, err := n.clockStore.GetDataClockFrame(
+				intrinsicFilter,
+				prev.FrameNumber-1,
+				true,
+			)
+			if err != nil {
+				panic(err)
+			}
+			if !bytes.Equal(head.Output, compare.Output) {
+				n.logger.Warn(
+					"repairing frame",
+					zap.Uint64("frame_number", head.FrameNumber),
+				)
+				head, err = n.clockStore.GetParentDataClockFrame(
+					intrinsicFilter,
+					prev.FrameNumber-1,
+					prev.ParentSelector,
+					false,
+				)
+				if err != nil {
+					panic(err)
+				}
+
+				txn, err := n.clockStore.NewTransaction()
+				if err != nil {
+					panic(err)
+				}
+
+				err = n.clockStore.PutDataClockFrame(head, proverTrie, txn, true)
+				if err != nil {
+					panic(err)
+				}
+
+				if err = txn.Commit(); err != nil {
+					panic(err)
+				}
+			}
+		}
+	}
+	n.logger.Info("check complete")
 }
 
 func (n *Node) Start() {

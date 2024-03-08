@@ -452,7 +452,7 @@ func (r *RPCServer) GetTokenInfo(
 	}, nil
 }
 
-func (r *RPCServer) GetPeerManifest(
+func (r *RPCServer) GetPeerManifests(
 	ctx context.Context,
 	req *protobufs.GetPeerManifestsRequest,
 ) (*protobufs.PeerManifestsResponse, error) {

@@ -105,6 +105,10 @@ type ClockStore interface {
 	) (*protobufs.ClockFrame, error)
 	ResetMasterClockFrames(filter []byte) error
 	ResetDataClockFrames(filter []byte) error
+	Compact(
+		masterFilter []byte,
+		dataFilter []byte,
+	) error
 }
 
 type PebbleClockStore struct {
@@ -1718,6 +1722,51 @@ func (p *PebbleClockStore) ResetDataClockFrames(filter []byte) error {
 	}
 	if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
 		return errors.Wrap(err, "reset data clock frames")
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) Compact(
+	masterFilter []byte,
+	dataFilter []byte,
+) error {
+	if masterFilter != nil {
+		if err := p.db.Compact(
+			clockMasterFrameKey(masterFilter, 0),
+			clockMasterFrameKey(masterFilter, 1000000),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+	}
+
+	if dataFilter != nil {
+		if err := p.db.Compact(
+			clockDataFrameKey(dataFilter, 0),
+			clockDataFrameKey(dataFilter, 1000000),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+
+		if err := p.db.Compact(
+			clockDataCandidateFrameKey(
+				dataFilter,
+				0,
+				make([]byte, 32),
+				make([]byte, 32),
+			),
+			clockDataCandidateFrameKey(
+				dataFilter,
+				1000000,
+				bytes.Repeat([]byte{0xff}, 32),
+				bytes.Repeat([]byte{0xff}, 32),
+			),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
 	}
 
 	return nil

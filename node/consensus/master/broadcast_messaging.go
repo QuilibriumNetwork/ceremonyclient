@@ -156,6 +156,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 
 	e.peerMapMx.Lock()
 	if _, ok := e.peerMap[string(peerID)]; ok {
+		e.peerMap[string(peerID)].MasterHeadFrame = report.MasterHeadFrame
 		e.peerMapMx.Unlock()
 		return nil
 	}
@@ -163,7 +164,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	e.peerMapMx.Unlock()
 
 	memory := binary.BigEndian.Uint64(report.Memory)
-	e.logger.Info(
+	e.logger.Debug(
 		"received self test report",
 		zap.String("peer_id", base58.Encode(peerID)),
 		zap.Uint32("difficulty", report.Difficulty),
