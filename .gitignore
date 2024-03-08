@@ -4,3 +4,4 @@ ceremony-client
 .config*
 .DS_Store
 *.mprof
+.env

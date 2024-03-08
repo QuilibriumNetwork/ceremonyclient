@@ -1,0 +1,105 @@
+# https://taskfile.dev
+
+version: '3'
+
+dotenv:
+  - '.env'
+
+vars:
+  VERSION:
+    sh: cat node/main.go | grep "Quilibrium Node - v" |  grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'
+  PROJECT_NAME: quilibrium
+  SERVICE_NAME: node
+  GIT_REPO:
+    sh: git config --get remote.origin.url
+  GIT_BRANCH:
+    sh: git rev-parse --abbrev-ref HEAD
+  GIT_COMMIT:
+    sh: git log -1 --format=%h
+
+tasks:
+  status:
+    desc: Display configuration info.
+    cmds:
+      - echo -n "Image name:" && echo " ${QUILIBRIUM_IMAGE_NAME:-quilibrium}"
+      - echo -n "Version   :" && echo " {{.VERSION}}"
+      - echo -n "Repo      :" && echo " {{.GIT_REPO}}"
+      - echo -n "Branch    :" && echo " {{.GIT_BRANCH}}"
+      - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
+    silent: true
+
+  build:
+    desc: Build the Quilibrium docker image, unless it is already built.
+    cmds:
+      - |
+        docker build \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest \
+        .
+    status:
+      - |
+        docker image inspect \
+        ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}} \
+        >/dev/null 2>/dev/null
+
+  up:
+    desc: Run a new Quilibrium container, through docker compose.
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Take down the Quilibrium container, through docker compose.
+    cmds:
+      - docker compose down
+
+  shell:
+    desc: Drop into a shell inside the running container.
+    cmds:
+      - docker compose exec -it {{.SERVICE_NAME}} sh
+
+  logs:
+    desc: Print the logs of the running Quilibrium container.
+    cmds:
+      - docker compose logs
+
+  logs-folder:
+    desc: Show where Docker stores the logs for the Quilibrium node. You need root permissions to access the folder.
+    cmds:
+      - "docker container inspect {{.PROJECT_NAME}}-{{.SERVICE_NAME}}-1 | grep LogPath | cut -d : -f 2 | cut -d '\"' -f 2 | xargs dirname"
+
+  backup:
+    desc: Create a backup file with the critical configuration files.
+    prompt: You will be prompted for root access. Make sure you verify the generated backup file. Continue?
+    sources:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    outputs:
+      - 'backup.tar.gz'
+    cmds:
+      - |
+        export TMP_DIR=$(mktemp -d)
+        export TASK_DIR=$(pwd)
+        sudo cp .config/config.yml $TMP_DIR
+        sudo cp .config/keys.yml $TMP_DIR
+        sudo chown $(whoami):$(id -gn) $TMP_DIR/*
+        cd $TMP_DIR
+        tar -czf $TASK_DIR/backup.tar.gz *
+        cd $TASK_DIR
+        sudo rm -rf $TMP_DIR
+        echo "Backup saved to: backup.tar.gz"
+        echo "Do not assume you have a backup unless you verify it!!!"
+    silent: true
+
+  github:login:
+    desc: Login to GitHub container registry.
+    cmds:
+      - echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
+
+  push:
+    desc: Push Quilibrium docker image to the container registry.
+    cmds:
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest

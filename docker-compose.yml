@@ -7,8 +7,7 @@ name: quilibrium
 
 services:
   node:
-    build: ./
-    image: quilibrium
+    image: ${QUILIBRIUM_IMAGE_NAME:-quilibrium}
     restart: unless-stopped
     deploy:
       resources:
@@ -22,9 +21,15 @@ services:
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
       - DEFAULT_STATS_MULTIADDR=/dns/stats.quilibrium.com/tcp/443
     ports:
-      - '8336:8336/udp' # p2p
-      - '127.0.0.1:8337:8337/tcp' # gRPC
-      - '127.0.0.1:8338:8338/tcp' # REST
+      - '${QUILIBRIUM_P2P_PORT:-8336}:8336/udp' # p2p
+      - '127.0.0.1:${QUILIBRIUM_GRPC_PORT:-8337}:8337/tcp' # gRPC
+      - '127.0.0.1:${QUILIBRIUM_REST_PORT:-8338}:8338/tcp' # REST
+    healthcheck:
+      test: ["CMD", "node", "--peer-id"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
     volumes:
       - ./.config:/opt/ceremonyclient/node/.config
     logging:
