@@ -152,14 +152,25 @@ message SelfTestReport {
   bytes storage = 13;
   // The list of supported capabilities
   repeated Capability capabilities = 14;
+  // The highest master frame the node has
+  uint64 master_head_frame = 15;
 }
 
 message ValidationMessage {
   bytes validation = 1;
 }
 
+message SyncRequest {
+  quilibrium.node.clock.pb.ClockFramesRequest frames_request = 1;
+}
+
+message SyncResponse {
+  quilibrium.node.clock.pb.ClockFramesResponse frames_response = 1;
+}
+
 service ValidationService {
   rpc PerformValidation(ValidationMessage) returns (ValidationMessage);
+  rpc Sync(SyncRequest) returns (stream SyncResponse);
 }
 
 message GetPeerManifestsRequest {}
@@ -202,6 +213,8 @@ message PeerManifest {
   bytes storage = 14;
   // The list of supported capabilities
   repeated Capability capabilities = 15;
+  // The highest master frame the node has
+  uint64 master_head_frame = 16;
 }
 
 message PeerManifestsResponse {

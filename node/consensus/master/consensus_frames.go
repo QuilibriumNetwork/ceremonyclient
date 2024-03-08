@@ -1,11 +1,12 @@
 package master
 
 import (
+	"context"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -30,6 +31,38 @@ func (e *MasterClockConsensusEngine) prove(
 	return frame, nil
 }
 
+func (e *MasterClockConsensusEngine) GetMostAheadPeers() (
+	[][]byte,
+	error,
+) {
+	frame, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	// Needs to be enough to make the sync worthwhile:
+	max := frame.FrameNumber + 10
+
+	var peers [][]byte = [][]byte{}
+	e.peerMapMx.Lock()
+	for peerId, v := range e.peerMap {
+		if v.MasterHeadFrame > max {
+			peers = append(peers, []byte(peerId))
+		}
+
+		if len(peers) >= 30 {
+			break
+		}
+	}
+	e.peerMapMx.Unlock()
+
+	if len(peers) == 0 {
+		return nil, p2p.ErrNoPeersAvailable
+	}
+
+	return peers, nil
+}
+
 func (e *MasterClockConsensusEngine) collect(
 	currentFramePublished *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
@@ -40,65 +73,75 @@ func (e *MasterClockConsensusEngine) collect(
 		panic(err)
 	}
 
-	if e.syncingStatus == SyncStatusNotSyncing {
-		peer, err := e.pubSub.GetRandomPeer(e.filter)
-		if err != nil {
-			if errors.Is(err, p2p.ErrNoPeersAvailable) {
-				e.logger.Debug("no peers available, skipping sync")
-			} else {
-				e.logger.Error("error while fetching random peer", zap.Error(err))
-			}
-		} else {
-			e.syncingStatus = SyncStatusAwaitingResponse
-			e.logger.Debug("setting syncing target", zap.Binary("peer_id", peer))
-			e.syncingTarget = peer
-
-			channel := e.createPeerReceiveChannel(peer)
-			e.logger.Debug(
-				"listening on peer receive channel",
-				zap.Binary("channel", channel),
-			)
-			e.pubSub.Subscribe(channel, e.handleSync, true)
-			e.pubSub.Subscribe(
-				peer,
-				func(message *pb.Message) error { return nil },
-				true,
-			)
-
-			go func() {
-				time.Sleep(2 * time.Second)
-				if err := e.publishMessage(peer, &protobufs.ClockFramesRequest{
-					Filter:          e.filter,
-					FromFrameNumber: latest.FrameNumber + 1,
-				}); err != nil {
-					e.logger.Error(
-						"could not publish clock frame request",
-						zap.Error(err),
-					)
-				}
-			}()
-		}
+	// With the increase of network size, constrain down to top thirty
+	peers, err := e.GetMostAheadPeers()
+	if err != nil {
+		return latest, nil
 	}
 
-	waitDecay := time.Duration(2000)
-	for e.syncingStatus != SyncStatusNotSyncing {
-		e.logger.Debug(
-			"waiting for sync to complete...",
-			zap.Duration("wait_decay", waitDecay),
+	for i := 0; i < len(peers); i++ {
+		peer := peers[i]
+		e.logger.Debug("setting syncing target", zap.Binary("peer_id", peer))
+
+		cc, err := e.pubSub.GetDirectChannel(peer, "validation")
+		if err != nil {
+			e.logger.Error(
+				"could not connect for sync",
+				zap.String("peer_id", base58.Encode(peer)),
+			)
+			continue
+		}
+		client := protobufs.NewValidationServiceClient(cc)
+		syncClient, err := client.Sync(
+			context.Background(),
+			&protobufs.SyncRequest{
+				FramesRequest: &protobufs.ClockFramesRequest{
+					Filter:          e.filter,
+					FromFrameNumber: latest.FrameNumber,
+					ToFrameNumber:   0,
+				},
+			},
 		)
 
-		time.Sleep(waitDecay * time.Millisecond)
-
-		waitDecay = waitDecay * 2
-		if waitDecay >= (100 * (2 << 6)) {
-			if e.syncingStatus == SyncStatusAwaitingResponse {
-				e.logger.Debug("maximum wait for sync response, skipping sync")
-				e.syncingStatus = SyncStatusNotSyncing
+		for msg, err := syncClient.Recv(); msg != nil &&
+			err == nil; msg, err = syncClient.Recv() {
+			if msg.FramesResponse == nil {
 				break
-			} else {
-				waitDecay = 100 * (2 << 6)
+			}
+
+			for _, frame := range msg.FramesResponse.ClockFrames {
+				frame := frame
+
+				if frame.FrameNumber < latest.FrameNumber {
+					continue
+				}
+
+				if e.difficulty != frame.Difficulty {
+					e.logger.Debug(
+						"frame difficulty mismatched",
+						zap.Uint32("difficulty", frame.Difficulty),
+					)
+					break
+				}
+
+				if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
+					e.logger.Error(
+						"peer returned invalid frame",
+						zap.String("peer_id", base58.Encode(peer)))
+					e.pubSub.SetPeerScore(peer, -1000)
+					break
+				}
+
+				e.masterTimeReel.Insert(frame)
+				latest = frame
 			}
 		}
+		if err != nil {
+			cc.Close()
+			break
+		}
+		cc.Close()
+		break
 	}
 
 	return latest, nil

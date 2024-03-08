@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion7
 
 const (
 	ValidationService_PerformValidation_FullMethodName = "/quilibrium.node.node.pb.ValidationService/PerformValidation"
+	ValidationService_Sync_FullMethodName              = "/quilibrium.node.node.pb.ValidationService/Sync"
 )
 
 // ValidationServiceClient is the client API for ValidationService service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ValidationServiceClient interface {
 	PerformValidation(ctx context.Context, in *ValidationMessage, opts ...grpc.CallOption) (*ValidationMessage, error)
+	Sync(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (ValidationService_SyncClient, error)
 }
 
 type validationServiceClient struct {
@@ -46,11 +48,44 @@ func (c *validationServiceClient) PerformValidation(ctx context.Context, in *Val
 	return out, nil
 }
 
+func (c *validationServiceClient) Sync(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (ValidationService_SyncClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ValidationService_ServiceDesc.Streams[0], ValidationService_Sync_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &validationServiceSyncClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type ValidationService_SyncClient interface {
+	Recv() (*SyncResponse, error)
+	grpc.ClientStream
+}
+
+type validationServiceSyncClient struct {
+	grpc.ClientStream
+}
+
+func (x *validationServiceSyncClient) Recv() (*SyncResponse, error) {
+	m := new(SyncResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // ValidationServiceServer is the server API for ValidationService service.
 // All implementations must embed UnimplementedValidationServiceServer
 // for forward compatibility
 type ValidationServiceServer interface {
 	PerformValidation(context.Context, *ValidationMessage) (*ValidationMessage, error)
+	Sync(*SyncRequest, ValidationService_SyncServer) error
 	mustEmbedUnimplementedValidationServiceServer()
 }
 
@@ -60,6 +95,9 @@ type UnimplementedValidationServiceServer struct {
 
 func (UnimplementedValidationServiceServer) PerformValidation(context.Context, *ValidationMessage) (*ValidationMessage, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method PerformValidation not implemented")
+}
+func (UnimplementedValidationServiceServer) Sync(*SyncRequest, ValidationService_SyncServer) error {
+	return status.Errorf(codes.Unimplemented, "method Sync not implemented")
 }
 func (UnimplementedValidationServiceServer) mustEmbedUnimplementedValidationServiceServer() {}
 
@@ -92,6 +130,27 @@ func _ValidationService_PerformValidation_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ValidationService_Sync_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SyncRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ValidationServiceServer).Sync(m, &validationServiceSyncServer{stream})
+}
+
+type ValidationService_SyncServer interface {
+	Send(*SyncResponse) error
+	grpc.ServerStream
+}
+
+type validationServiceSyncServer struct {
+	grpc.ServerStream
+}
+
+func (x *validationServiceSyncServer) Send(m *SyncResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
 // ValidationService_ServiceDesc is the grpc.ServiceDesc for ValidationService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -104,7 +163,13 @@ var ValidationService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ValidationService_PerformValidation_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Sync",
+			Handler:       _ValidationService_Sync_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "node.proto",
 }
 

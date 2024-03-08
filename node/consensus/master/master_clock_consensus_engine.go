@@ -150,7 +150,6 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
-	e.pubSub.Subscribe(e.pubSub.GetPeerID(), e.handleSync, true)
 
 	e.state = consensus.EngineStateCollecting
 
@@ -186,6 +185,12 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			time.Sleep(30 * time.Second)
 
 			e.logger.Info("broadcasting self-test info")
+			head, err := e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+
+			e.report.MasterHeadFrame = head.FrameNumber
 
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
@@ -306,6 +311,7 @@ func (
 			Cores:              peerManifest.Cores,
 			Memory:             new(big.Int).SetBytes(peerManifest.Memory).Bytes(),
 			Storage:            new(big.Int).SetBytes(peerManifest.Storage).Bytes(),
+			MasterHeadFrame:    peerManifest.MasterHeadFrame,
 		}
 
 		for _, capability := range peerManifest.Capabilities {
