@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"time"
 
 	"github.com/pkg/errors"
@@ -163,8 +164,8 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 	for _, v := range e.peerMap {
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
 		if v.maxFrame > max &&
-			v.timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() &&
-			bytes.Compare(v.version, consensus.GetMinimumVersion()) >= 0 && !ok {
+			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
+			bytes.Compare(v.version, config.GetMinimumVersion()) >= 0 && !ok {
 			peer = v.peerId
 			max = v.maxFrame
 		}

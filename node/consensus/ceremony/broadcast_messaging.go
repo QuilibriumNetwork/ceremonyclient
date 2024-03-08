@@ -3,6 +3,7 @@ package ceremony
 import (
 	"bytes"
 	"encoding/binary"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"strings"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -98,7 +98,7 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 	case protobufs.ClockFrameType:
 		e.peerMapMx.Lock()
 		if peer, ok := e.peerMap[string(message.From)]; !ok ||
-			bytes.Compare(peer.version, consensus.GetMinimumVersion()) < 0 {
+			bytes.Compare(peer.version, config.GetMinimumVersion()) < 0 {
 			return nil
 		}
 		e.peerMapMx.Unlock()
@@ -186,8 +186,8 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 				continue
 			}
 
-			if bytes.Compare(p.Version, consensus.GetMinimumVersion()) < 0 &&
-				p.Timestamp > consensus.GetMinimumVersionCutoff().UnixMilli() {
+			if bytes.Compare(p.Version, config.GetMinimumVersion()) < 0 &&
+				p.Timestamp > config.GetMinimumVersionCutoff().UnixMilli() {
 				e.logger.Debug(
 					"peer provided outdated version, penalizing app score",
 					zap.Binary("peer_id", p.PeerId),
