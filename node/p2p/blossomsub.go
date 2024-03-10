@@ -55,6 +55,11 @@ var BITMASK_ALL = []byte{
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 }
 
+// While we iterate through these next phases, we're going to aggressively
+// enforce keeping updated. This will be achieved through announce strings
+// that will vary with each update
+var ANNOUNCE = "quilibrium-1.4.4-sunset-horizon"
+
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
 	logger *zap.Logger,
@@ -97,7 +102,7 @@ func NewBlossomSub(
 
 	kademliaDHT := initDHT(ctx, p2pConfig, logger, h)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	util.Advertise(ctx, routingDiscovery, string(BITMASK_ALL))
+	util.Advertise(ctx, routingDiscovery, ANNOUNCE)
 
 	go discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
 
