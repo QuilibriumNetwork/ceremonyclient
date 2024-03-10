@@ -300,11 +300,16 @@ func (e *MasterClockConsensusEngine) publishProof(
 
 	e.masterTimeReel.Insert(frame)
 
-	if err := e.publishMessage(e.filter, frame); err != nil {
-		return errors.Wrap(
-			err,
-			"publish proof",
-		)
+	peers, err := e.GetMostAheadPeers()
+	if err != nil || len(peers) == 0 {
+		// publish if we don't see anyone (empty peer list) or if we're the most
+		// ahead:
+		if err := e.publishMessage(e.filter, frame); err != nil {
+			return errors.Wrap(
+				err,
+				"publish proof",
+			)
+		}
 	}
 
 	e.state = consensus.EngineStateCollecting
