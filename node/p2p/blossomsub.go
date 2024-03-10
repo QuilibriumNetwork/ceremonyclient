@@ -22,6 +22,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -58,7 +60,27 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE = "quilibrium-1.4.4-sunset-horizon"
+var ANNOUNCE = "quilibrium-1.4.5-sunset-mirage"
+
+func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
+	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
+	if err != nil {
+		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+	}
+
+	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
+	if err != nil {
+		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+	}
+
+	pub := privKey.GetPublic()
+	id, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		panic(errors.Wrap(err, "error getting peer id"))
+	}
+
+	return id
+}
 
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
@@ -68,6 +90,44 @@ func NewBlossomSub(
 
 	opts := []libp2pconfig.Option{
 		libp2p.ListenAddrStrings(p2pConfig.ListenMultiaddr),
+	}
+
+	isBootstrapPeer := false
+	peerId := getPeerID(p2pConfig)
+
+	for _, peerAddr := range p2pConfig.BootstrapPeers {
+		peerinfo, err := peer.AddrInfoFromString(peerAddr)
+		if err != nil {
+			panic(err)
+		}
+
+		if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
+			isBootstrapPeer = true
+			break
+		}
+	}
+
+	if isBootstrapPeer {
+		limits := rcmgr.DefaultLimits
+		libp2p.SetDefaultServiceLimits(&limits)
+		limits.SystemBaseLimit.ConnsInbound = 2048
+		limits.SystemBaseLimit.StreamsInbound = 2048
+		rmgr, err := rcmgr.NewResourceManager(
+			rcmgr.NewFixedLimiter(limits.AutoScale()),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		mgr, err := connmgr.NewConnManager(512, 2048)
+		if err != nil {
+			panic(err)
+		}
+
+		opts = append(opts,
+			libp2p.ResourceManager(rmgr),
+			libp2p.ConnectionManager(mgr),
+		)
 	}
 
 	var privKey crypto.PrivKey
@@ -100,7 +160,7 @@ func NewBlossomSub(
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
 
-	kademliaDHT := initDHT(ctx, p2pConfig, logger, h)
+	kademliaDHT := initDHT(ctx, p2pConfig, logger, h, isBootstrapPeer)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, ANNOUNCE)
 
@@ -285,20 +345,8 @@ func initDHT(
 	p2pConfig *config.P2PConfig,
 	logger *zap.Logger,
 	h host.Host,
+	isBootstrapPeer bool,
 ) *dht.IpfsDHT {
-	isBootstrapPeer := false
-	for _, peerAddr := range p2pConfig.BootstrapPeers {
-		peerinfo, err := peer.AddrInfoFromString(peerAddr)
-		if err != nil {
-			panic(err)
-		}
-
-		if bytes.Equal([]byte(peerinfo.ID), []byte(h.ID())) {
-			isBootstrapPeer = true
-			break
-		}
-	}
-
 	logger.Info("establishing dht")
 	var kademliaDHT *dht.IpfsDHT
 	var err error
@@ -516,7 +564,7 @@ func discoverPeers(
 	logger.Info("initiating peer discovery")
 
 	discover := func() {
-		peerChan, err := routingDiscovery.FindPeers(ctx, string(BITMASK_ALL))
+		peerChan, err := routingDiscovery.FindPeers(ctx, ANNOUNCE)
 		if err != nil {
 			logger.Error("could not find peers", zap.Error(err))
 		}

@@ -981,7 +981,7 @@ func (p *PubSub) notifySubs(msg *Message) {
 		case f.ch <- msg:
 		default:
 			p.tracer.UndeliverableMessage(msg)
-			log.Infof("Can't deliver message to subscription for bitmask %s; subscriber too slow", bitmask)
+			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 		}
 	}
 }

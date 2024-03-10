@@ -1589,7 +1589,7 @@ func (bs *BlossomSubRouter) heartbeat() {
 				})
 
 				for _, p := range plst {
-					log.Debugf("HEARTBEAT: Opportunistically graft peer %s on bitmask %s", p, bitmask)
+					log.Debugf("HEARTBEAT: Opportunistically graft peer %s on bitmask %x", p, bitmask)
 					graftPeer(p)
 				}
 			}
