@@ -12,6 +12,9 @@ import (
 func (a *CeremonyApplication) applyTranscript(
 	transcript *protobufs.CeremonyTranscript,
 ) error {
+	if a.UpdatedTranscript == nil {
+		return errors.Wrap(errors.New("invalid transcript"), "apply transcript")
+	}
 	if len(a.UpdatedTranscript.G1Powers) != len(transcript.G1Powers) {
 		return errors.Wrap(errors.New("invalid g1s"), "apply transcript")
 	}
