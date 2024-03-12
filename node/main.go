@@ -31,7 +31,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto/kzg"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 )
 
@@ -150,7 +149,6 @@ func main() {
 	}
 
 	clearIfTestData(*configDirectory, nodeConfig)
-	migrate(*configDirectory, nodeConfig)
 
 	if *dbConsole {
 		console, err := app.NewDBConsole(nodeConfig)
@@ -429,36 +427,6 @@ func repair(configDir string, node *app.Node) {
 		}
 
 		err = repairFile.Close()
-		if err != nil {
-			panic(err)
-		}
-	}
-}
-
-func migrate(configDir string, nodeConfig *config.Config) {
-	_, err := os.Stat(filepath.Join(configDir, "MIGRATIONS"))
-	if os.IsNotExist(err) {
-		fmt.Println("Deduplicating and compressing clock frame data...")
-		clock, err := app.NewClockStore(nodeConfig)
-		if err := clock.Deduplicate(application.CEREMONY_ADDRESS); err != nil {
-			panic(err)
-		}
-
-		migrationFile, err := os.OpenFile(
-			filepath.Join(configDir, "MIGRATIONS"),
-			os.O_CREATE|os.O_RDWR,
-			fs.FileMode(0600),
-		)
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = migrationFile.Write([]byte{0x00, 0x00, 0x01})
-		if err != nil {
-			panic(err)
-		}
-
-		err = migrationFile.Close()
 		if err != nil {
 			panic(err)
 		}

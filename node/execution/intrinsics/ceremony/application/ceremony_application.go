@@ -571,6 +571,13 @@ func GetOutputsFromClockFrame(
 						return nil, nil, errors.Wrap(err, "get outputs from clock frame")
 					}
 
+					// apply a small fixup based on a pre-dusk bug showing up with dusk
+					// conventions
+					if frame.FrameNumber == 0 && len(output.Address) == 32 {
+						output.Address = append(output.Address, output.Output[:48]...)
+						output.Output = output.Output[48:]
+					}
+
 					lobbyState = &protobufs.CeremonyLobbyState{}
 					if err := proto.Unmarshal(output.Output, lobbyState); err != nil {
 						return nil, nil, errors.Wrap(err, "get outputs from clock frame")

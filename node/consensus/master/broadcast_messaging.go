@@ -12,7 +12,6 @@ import (
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -38,41 +37,41 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		return errors.Wrap(err, "handle message")
 	}
 
-	eg := errgroup.Group{}
-	eg.SetLimit(len(e.executionEngines))
-	for name := range e.executionEngines {
-		name := name
-		eg.Go(func() error {
-			messages, err := e.executionEngines[name].ProcessMessage(
-				msg.Address,
-				msg,
-			)
-			if err != nil {
-				e.logger.Error(
-					"could not process message for engine",
-					zap.Error(err),
-					zap.String("engine_name", name),
-				)
-				return errors.Wrap(err, "handle message")
-			}
-			for _, m := range messages {
-				m := m
-				if err := e.publishMessage(m.Address, m); err != nil {
-					e.logger.Error(
-						"could not publish message for engine",
-						zap.Error(err),
-						zap.String("engine_name", name),
-					)
-					return errors.Wrap(err, "handle message")
-				}
-			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		e.logger.Error("rejecting invalid message", zap.Error(err))
-		return errors.Wrap(err, "execution failed")
-	}
+	// eg := errgroup.Group{}
+	// eg.SetLimit(len(e.executionEngines))
+	// for name := range e.executionEngines {
+	// 	name := name
+	// 	eg.Go(func() error {
+	// 		messages, err := e.executionEngines[name].ProcessMessage(
+	// 			msg.Address,
+	// 			msg,
+	// 		)
+	// 		if err != nil {
+	// 			e.logger.Error(
+	// 				"could not process message for engine",
+	// 				zap.Error(err),
+	// 				zap.String("engine_name", name),
+	// 			)
+	// 			return errors.Wrap(err, "handle message")
+	// 		}
+	// 		for _, m := range messages {
+	// 			m := m
+	// 			if err := e.publishMessage(m.Address, m); err != nil {
+	// 				e.logger.Error(
+	// 					"could not publish message for engine",
+	// 					zap.Error(err),
+	// 					zap.String("engine_name", name),
+	// 				)
+	// 				return errors.Wrap(err, "handle message")
+	// 			}
+	// 		}
+	// 		return nil
+	// 	})
+	// }
+	// if err := eg.Wait(); err != nil {
+	// 	e.logger.Error("rejecting invalid message", zap.Error(err))
+	// 	return errors.Wrap(err, "execution failed")
+	// }
 
 	switch any.TypeUrl {
 	case protobufs.ClockFrameType:
