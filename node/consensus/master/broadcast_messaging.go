@@ -81,6 +81,7 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+		return nil
 	case protobufs.SelfTestReportType:
 		if err := e.handleSelfTestReport(
 			message.From,
@@ -88,9 +89,10 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+		return nil
 	}
 
-	return nil
+	return errors.Wrap(errors.New("invalid message"), "handle message")
 }
 
 func (e *MasterClockConsensusEngine) handleClockFrameData(
