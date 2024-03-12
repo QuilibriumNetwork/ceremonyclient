@@ -980,10 +980,14 @@ func (p *PubSub) notifySubs(msg *Message) {
 	for f := range subs {
 		select {
 		case f.ch <- msg:
+			log.Infof("Processed: %s sent %d bytes", base58.Encode(msg.From), len(msg.Data))
 		default:
 			p.tracer.UndeliverableMessage(msg)
 			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 			log.Infof("Peer %s sent %d bytes", base58.Encode(msg.From), len(msg.Data))
+			if len(msg.Data) < 1200 {
+				log.Infof("%x", msg.Data)
+			}
 		}
 	}
 }
