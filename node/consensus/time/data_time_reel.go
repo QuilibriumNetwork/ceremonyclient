@@ -127,6 +127,7 @@ func (d *DataTimeReel) Start() error {
 	}
 
 	if frame == nil {
+
 		d.head, d.proverTrie = d.createGenesisFrame()
 		d.totalDistance = big.NewInt(0)
 		d.headDistance = big.NewInt(0)
@@ -239,13 +240,30 @@ func (d *DataTimeReel) createGenesisFrame() (
 		panic(err)
 	}
 
+	selector, err := frame.GetSelector()
+	if err != nil {
+		panic(err)
+	}
+
 	txn, err := d.clockStore.NewTransaction()
 	if err != nil {
 		panic(err)
 	}
 
-	if err := d.clockStore.PutDataClockFrame(
+	err = d.clockStore.StageDataClockFrame(
+		selector.FillBytes(make([]byte, 32)),
 		frame,
+		txn,
+	)
+	if err != nil {
+		txn.Abort()
+		panic(err)
+	}
+
+	if err := d.clockStore.CommitDataClockFrame(
+		d.filter,
+		0,
+		selector.FillBytes(make([]byte, 32)),
 		trie,
 		txn,
 		false,
@@ -294,7 +312,7 @@ func (d *DataTimeReel) runLoop() {
 					panic(err)
 				}
 
-				rawFrame, err := d.clockStore.GetParentDataClockFrame(
+				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
 					d.filter,
 					frame.frameNumber,
 					frame.selector.FillBytes(make([]byte, 32)),
@@ -341,7 +359,7 @@ func (d *DataTimeReel) runLoop() {
 					continue
 				}
 
-				rawFrame, err := d.clockStore.GetParentDataClockFrame(
+				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
 					d.filter,
 					frame.frameNumber,
 					frame.selector.FillBytes(make([]byte, 32)),
@@ -460,7 +478,7 @@ func (d *DataTimeReel) storePending(
 	frame *protobufs.ClockFrame,
 ) {
 	// avoid db thrashing
-	if existing, err := d.clockStore.GetParentDataClockFrame(
+	if existing, err := d.clockStore.GetStagedDataClockFrame(
 		frame.Filter,
 		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
@@ -478,9 +496,7 @@ func (d *DataTimeReel) storePending(
 		if err != nil {
 			panic(err)
 		}
-		err = d.clockStore.PutCandidateDataClockFrame(
-			parent.FillBytes(make([]byte, 32)),
-			distance.FillBytes(make([]byte, 32)),
+		err = d.clockStore.StageDataClockFrame(
 			selector.FillBytes(make([]byte, 32)),
 			frame,
 			txn,
@@ -578,8 +594,15 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 		zap.String("distance", distance.Text(16)),
 	)
 
-	if err := d.clockStore.PutDataClockFrame(
-		frame,
+	selector, err := frame.GetSelector()
+	if err != nil {
+		panic(err)
+	}
+
+	if err := d.clockStore.CommitDataClockFrame(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
 		d.proverTrie,
 		txn,
 		false,
@@ -607,7 +630,7 @@ func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
 	}
 
 	for index := frame; err == nil &&
-		index.FrameNumber > 0; index, err = d.clockStore.GetParentDataClockFrame(
+		index.FrameNumber > 0; index, err = d.clockStore.GetStagedDataClockFrame(
 		d.filter,
 		index.FrameNumber-1,
 		index.ParentSelector,
@@ -692,7 +715,7 @@ func (d *DataTimeReel) forkChoice(
 			rightReplaySelectors...,
 		)
 
-		rightIndex, err = d.clockStore.GetParentDataClockFrame(
+		rightIndex, err = d.clockStore.GetStagedDataClockFrame(
 			d.filter,
 			rightIndex.FrameNumber-1,
 			rightIndex.ParentSelector,
@@ -737,7 +760,7 @@ func (d *DataTimeReel) forkChoice(
 			),
 			rightReplaySelectors...,
 		)
-		leftIndex, err = d.clockStore.GetParentDataClockFrame(
+		leftIndex, err = d.clockStore.GetStagedDataClockFrame(
 			d.filter,
 			leftIndex.FrameNumber-1,
 			leftIndex.ParentSelector,
@@ -755,7 +778,7 @@ func (d *DataTimeReel) forkChoice(
 			panic(err)
 		}
 
-		rightIndex, err = d.clockStore.GetParentDataClockFrame(
+		rightIndex, err = d.clockStore.GetStagedDataClockFrame(
 			d.filter,
 			rightIndex.FrameNumber-1,
 			rightIndex.ParentSelector,
@@ -810,23 +833,15 @@ func (d *DataTimeReel) forkChoice(
 		rightReplaySelectors =
 			rightReplaySelectors[1:]
 
-		rightIndex, err = d.clockStore.GetParentDataClockFrame(
-			d.filter,
-			frameNumber,
-			next,
-			false,
-		)
-		if err != nil {
-			panic(err)
-		}
-
 		txn, err := d.clockStore.NewTransaction()
 		if err != nil {
 			panic(err)
 		}
 
-		if err := d.clockStore.PutDataClockFrame(
-			rightIndex,
+		if err := d.clockStore.CommitDataClockFrame(
+			d.filter,
+			frameNumber,
+			next,
 			d.proverTrie,
 			txn,
 			rightIndex.FrameNumber < d.head.FrameNumber,
@@ -846,8 +861,10 @@ func (d *DataTimeReel) forkChoice(
 		panic(err)
 	}
 
-	if err := d.clockStore.PutDataClockFrame(
-		frame,
+	if err := d.clockStore.CommitDataClockFrame(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
 		d.proverTrie,
 		txn,
 		false,

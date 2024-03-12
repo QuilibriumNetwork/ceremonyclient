@@ -12,6 +12,22 @@ func (e *MasterClockConsensusEngine) Sync(
 	request *protobufs.SyncRequest,
 	server protobufs.ValidationService_SyncServer,
 ) error {
+	e.currentReceivingSyncPeersMx.Lock()
+	if e.currentReceivingSyncPeers > 4 {
+		e.currentReceivingSyncPeersMx.Unlock()
+
+		e.logger.Debug("currently processing maximum sync requests, returning")
+		return nil
+	}
+	e.currentReceivingSyncPeers++
+	e.currentReceivingSyncPeersMx.Unlock()
+
+	defer func() {
+		e.currentReceivingSyncPeersMx.Lock()
+		e.currentReceivingSyncPeers--
+		e.currentReceivingSyncPeersMx.Unlock()
+	}()
+
 	from := request.FramesRequest.FromFrameNumber
 
 	masterFrame, err := e.masterTimeReel.Head()

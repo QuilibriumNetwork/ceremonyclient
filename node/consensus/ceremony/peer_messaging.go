@@ -300,28 +300,23 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 
 			return errors.Wrap(err, "get compressed sync frames")
 		} else {
-			frames, err := e.clockStore.GetCandidateDataClockFrames(e.filter, from)
-			if err != nil || len(frames) == 0 {
-				e.logger.Debug(
-					"peer asked for undiscovered frame",
-					zap.Uint64("frame_number", request.FromFrameNumber),
-				)
+			e.logger.Debug(
+				"peer asked for undiscovered frame",
+				zap.Uint64("frame_number", request.FromFrameNumber),
+			)
 
-				if err := server.SendMsg(
-					&protobufs.ClockFramesResponse{
-						Filter:          request.Filter,
-						FromFrameNumber: 0,
-						ToFrameNumber:   0,
-						ClockFrames:     []*protobufs.ClockFrame{},
-					},
-				); err != nil {
-					return errors.Wrap(err, "get compressed sync frames")
-				}
-
-				return nil
+			if err := server.SendMsg(
+				&protobufs.ClockFramesResponse{
+					Filter:          request.Filter,
+					FromFrameNumber: 0,
+					ToFrameNumber:   0,
+					ClockFrames:     []*protobufs.ClockFrame{},
+				},
+			); err != nil {
+				return errors.Wrap(err, "get compressed sync frames")
 			}
 
-			parent = nil
+			return nil
 		}
 	}
 
@@ -333,7 +328,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 		}
 
 		for !bytes.Equal(frame.ParentSelector, parent) {
-			ours, err := e.clockStore.GetParentDataClockFrame(
+			ours, err := e.clockStore.GetStagedDataClockFrame(
 				e.filter,
 				frame.FrameNumber-1,
 				frame.ParentSelector,
@@ -345,7 +340,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 				break
 			}
 
-			theirs, err := e.clockStore.GetParentDataClockFrame(
+			theirs, err := e.clockStore.GetStagedDataClockFrame(
 				e.filter,
 				frame.FrameNumber-1,
 				parent,
@@ -365,7 +360,7 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 
 	if request.RangeParentSelectors != nil {
 		for _, selector := range request.RangeParentSelectors {
-			frame, err := e.clockStore.GetParentDataClockFrame(
+			frame, err := e.clockStore.GetStagedDataClockFrame(
 				e.filter,
 				selector.FrameNumber,
 				selector.ParentSelector,

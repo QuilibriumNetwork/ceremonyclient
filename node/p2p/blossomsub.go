@@ -576,7 +576,7 @@ func discoverPeers(
 				continue
 			}
 
-			logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
+			logger.Debug("found peer", zap.String("peer_id", peer.ID.Pretty()))
 			err := h.Connect(ctx, peer)
 			if err != nil {
 				logger.Debug(
@@ -585,7 +585,7 @@ func discoverPeers(
 					zap.Error(err),
 				)
 			} else {
-				logger.Info(
+				logger.Debug(
 					"connected to peer",
 					zap.String("peer_id", peer.ID.Pretty()),
 				)

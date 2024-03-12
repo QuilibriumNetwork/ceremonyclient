@@ -32,9 +32,6 @@ type ClockStore interface {
 		filter []byte,
 		proverTrie *tries.RollingFrecencyCritbitTrie,
 	) (*protobufs.ClockFrame, error)
-	GetLatestCandidateDataClockFrame(
-		filter []byte,
-	) (*protobufs.ClockFrame, error)
 	GetEarliestDataClockFrame(filter []byte) (*protobufs.ClockFrame, error)
 	GetDataClockFrame(
 		filter []byte,
@@ -46,44 +43,24 @@ type ClockStore interface {
 		startFrameNumber uint64,
 		endFrameNumber uint64,
 	) (*PebbleClockIterator, error)
-	PutDataClockFrame(
-		frame *protobufs.ClockFrame,
+	CommitDataClockFrame(
+		filter []byte,
+		frameNumber uint64,
+		selector []byte,
 		proverTrie *tries.RollingFrecencyCritbitTrie,
 		txn Transaction,
 		backfill bool,
 	) error
-	PutCandidateDataClockFrame(
-		parentSelector []byte,
-		distance []byte,
+	StageDataClockFrame(
 		selector []byte,
 		frame *protobufs.ClockFrame,
 		txn Transaction,
 	) error
-	GetCandidateDataClockFrame(
-		filter []byte,
-		frameNumber uint64,
-		parentSelector []byte,
-		distance []byte,
-	) (*protobufs.ClockFrame, error)
-	GetCandidateDataClockFrames(
-		filter []byte,
-		frameNumber uint64,
-	) ([]*protobufs.ClockFrame, error)
-	GetParentDataClockFrame(
+	GetStagedDataClockFrame(
 		filter []byte,
 		frameNumber uint64,
 		parentSelector []byte,
 		truncate bool,
-	) (*protobufs.ClockFrame, error)
-	RangeCandidateDataClockFrames(
-		filter []byte,
-		parent []byte,
-		frameNumber uint64,
-	) (*PebbleCandidateClockIterator, error)
-	GetLeadingCandidateDataClockFrame(
-		filter []byte,
-		parent []byte,
-		frameNumber uint64,
 	) (*protobufs.ClockFrame, error)
 	Deduplicate(filter []byte) error
 	GetCompressedDataClockFrames(
@@ -95,14 +72,6 @@ type ClockStore interface {
 		filter []byte,
 		frameNumber uint64,
 	) error
-	DeleteCandidateDataClockFrameRange(
-		filter []byte,
-		fromFrameNumber uint64,
-		toFrameNumber uint64,
-	) error
-	GetHighestCandidateDataClockFrame(
-		filter []byte,
-	) (*protobufs.ClockFrame, error)
 	ResetMasterClockFrames(filter []byte) error
 	ResetDataClockFrames(filter []byte) error
 	Compact(
@@ -127,14 +96,8 @@ type PebbleClockIterator struct {
 	db *PebbleClockStore
 }
 
-type PebbleCandidateClockIterator struct {
-	i  Iterator
-	db *PebbleClockStore
-}
-
 var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleMasterClockIterator)(nil)
 var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleClockIterator)(nil)
-var _ TypedIterator[*protobufs.ClockFrame] = (*PebbleCandidateClockIterator)(nil)
 
 func (p *PebbleMasterClockIterator) First() bool {
 	return p.i.First()
@@ -247,7 +210,7 @@ func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 		)
 	}
 
-	if err := p.db.fillAggregateProofs(frame); err != nil {
+	if err := p.db.fillAggregateProofs(frame, false); err != nil {
 		return nil, errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
 			"get clock frame iterator value",
@@ -259,66 +222,6 @@ func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 
 func (p *PebbleClockIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing clock frame iterator")
-}
-
-func (p *PebbleCandidateClockIterator) First() bool {
-	return p.i.First()
-}
-
-func (p *PebbleCandidateClockIterator) Next() bool {
-	return p.i.Next()
-}
-
-func (p *PebbleCandidateClockIterator) Valid() bool {
-	return p.i.Valid()
-}
-
-func (p *PebbleCandidateClockIterator) TruncatedValue() (
-	*protobufs.ClockFrame,
-	error,
-) {
-	if !p.i.Valid() {
-		return nil, ErrNotFound
-	}
-
-	value := p.i.Value()
-	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get candidate clock frame iterator value",
-		)
-	}
-
-	return frame, nil
-}
-
-func (p *PebbleCandidateClockIterator) Value() (*protobufs.ClockFrame, error) {
-	if !p.i.Valid() {
-		return nil, ErrNotFound
-	}
-
-	value := p.i.Value()
-	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get candidate clock frame iterator value",
-		)
-	}
-
-	if err := p.db.fillAggregateProofs(frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get clock frame iterator value",
-		)
-	}
-
-	return frame, nil
-}
-
-func (p *PebbleCandidateClockIterator) Close() error {
-	return errors.Wrap(p.i.Close(), "closing candidate clock frame iterator")
 }
 
 func NewPebbleClockStore(db KVDB, logger *zap.Logger) *PebbleClockStore {
@@ -419,6 +322,7 @@ func clockDataEarliestIndex(filter []byte) []byte {
 	return clockEarliestIndex(filter, CLOCK_DATA_FRAME_INDEX_EARLIEST)
 }
 
+// Produces an index key of size: len(filter) + 42
 func clockParentIndexKey(
 	filter []byte,
 	frameNumber uint64,
@@ -639,17 +543,38 @@ func (p *PebbleClockStore) GetDataClockFrame(
 		return nil, nil, errors.Wrap(err, "get data clock frame")
 	}
 
-	defer closer.Close()
 	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get data clock frame",
-		)
+	genesisFramePreIndex := false
+
+	// We do a bit of a cheap trick here while things are still stuck in the old
+	// ways: we use the size of the parent index key to determine if it's the new
+	// format, or the old raw frame
+	if len(value) == (len(filter) + 42) {
+		frameValue, frameCloser, err := p.db.Get(value)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "get data clock frame")
+		}
+		if err := proto.Unmarshal(frameValue, frame); err != nil {
+			return nil, nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get data clock frame",
+			)
+		}
+		closer.Close()
+		defer frameCloser.Close()
+	} else {
+		genesisFramePreIndex = frameNumber == 0
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return nil, nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get data clock frame",
+			)
+		}
+		defer closer.Close()
 	}
 
 	if !truncate {
-		if err = p.fillAggregateProofs(frame); err != nil {
+		if err = p.fillAggregateProofs(frame, genesisFramePreIndex); err != nil {
 			return nil, nil, errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"get data clock frame",
@@ -677,8 +602,9 @@ func (p *PebbleClockStore) GetDataClockFrame(
 
 func (p *PebbleClockStore) fillAggregateProofs(
 	frame *protobufs.ClockFrame,
+	genesisFramePreIndex bool,
 ) error {
-	if frame.FrameNumber == 0 {
+	if frame.FrameNumber == 0 && genesisFramePreIndex {
 		return nil
 	}
 
@@ -809,72 +735,21 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	return frame, nil
 }
 
-func (p *PebbleClockStore) GetLatestCandidateDataClockFrame(
-	filter []byte,
-) (*protobufs.ClockFrame, error) {
-	idxValue, closer, err := p.db.Get(clockDataCandidateLatestIndex(filter))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get latest candidate data clock frame")
-	}
-
-	frameNumber := binary.BigEndian.Uint64(idxValue)
-	frames, err := p.GetCandidateDataClockFrames(filter, frameNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "get latest candidate data clock frame")
-	}
-
-	closer.Close()
-
-	if len(frames) == 0 {
-		return nil, ErrNotFound
-	}
-
-	return frames[0], nil
-}
-
-// GetLeadingCandidateDataClockFrame implements ClockStore.
-func (p *PebbleClockStore) GetLeadingCandidateDataClockFrame(
-	filter []byte,
-	parent []byte,
-	frameNumber uint64,
-) (*protobufs.ClockFrame, error) {
-	iter, err := p.RangeCandidateDataClockFrames(filter, parent, frameNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "get leading candidate data clock frame")
-	}
-
-	if !iter.First() {
-		return nil, ErrNotFound
-	}
-
-	defer iter.Close()
-	frame, err := iter.Value()
-	return frame, errors.Wrap(err, "get leading candidate data clock frame")
-}
-
-// GetParentDataClockFrame implements ClockStore.
-func (p *PebbleClockStore) GetParentDataClockFrame(
+// GetStagedDataClockFrame implements ClockStore.
+func (p *PebbleClockStore) GetStagedDataClockFrame(
 	filter []byte,
 	frameNumber uint64,
 	parentSelector []byte,
 	truncate bool,
 ) (*protobufs.ClockFrame, error) {
-	check := false
 	data, closer, err := p.db.Get(
 		clockDataParentIndexKey(filter, frameNumber, parentSelector),
 	)
-	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		return nil, errors.Wrap(err, "get parent data clock frame")
-	} else if err != nil && errors.Is(err, pebble.ErrNotFound) {
-		data, closer, err = p.db.Get(clockDataFrameKey(filter, frameNumber))
-		if err != nil {
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, errors.Wrap(ErrNotFound, "get parent data clock frame")
 		}
-		check = true
+		return nil, errors.Wrap(err, "get parent data clock frame")
 	}
 
 	parent := &protobufs.ClockFrame{}
@@ -882,18 +757,8 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 		return nil, errors.Wrap(err, "get parent data clock frame")
 	}
 
-	if check {
-		selector, err := parent.GetSelector()
-		if err != nil {
-			return nil, errors.Wrap(err, "get parent data clock frame")
-		}
-		if !bytes.Equal(selector.FillBytes(make([]byte, 32)), parentSelector) {
-			return nil, errors.Wrap(ErrNotFound, "get parent data clock frame")
-		}
-	}
-
 	if !truncate {
-		if err := p.fillAggregateProofs(parent); err != nil {
+		if err := p.fillAggregateProofs(parent, false); err != nil {
 			return nil, errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"get clock frame iterator value",
@@ -908,10 +773,8 @@ func (p *PebbleClockStore) GetParentDataClockFrame(
 	return parent, nil
 }
 
-// PutCandidateDataClockFrame implements ClockStore.
-func (p *PebbleClockStore) PutCandidateDataClockFrame(
-	parentSelector []byte,
-	distance []byte,
+// StageDataClockFrame implements ClockStore.
+func (p *PebbleClockStore) StageDataClockFrame(
 	selector []byte,
 	frame *protobufs.ClockFrame,
 	txn Transaction,
@@ -919,7 +782,7 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 	if err := p.saveAggregateProofs(txn, frame); err != nil {
 		return errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
-			"put candidate data clock frame",
+			"stage data clock frame",
 		)
 	}
 
@@ -933,23 +796,11 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 	if err != nil {
 		return errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
-			"put candidate data clock frame",
+			"stage data clock frame",
 		)
 	}
 
 	frame.AggregateProofs = temp
-
-	if err = txn.Set(
-		clockDataCandidateFrameKey(
-			frame.Filter,
-			frame.FrameNumber,
-			frame.ParentSelector,
-			distance,
-		),
-		data,
-	); err != nil {
-		return errors.Wrap(err, "put candidate data clock frame")
-	}
 
 	if err = txn.Set(
 		clockDataParentIndexKey(
@@ -959,118 +810,54 @@ func (p *PebbleClockStore) PutCandidateDataClockFrame(
 		),
 		data,
 	); err != nil {
-		return errors.Wrap(err, "put candidate data clock frame")
-	}
-
-	numberBytes, closer, err := p.db.Get(clockDataCandidateLatestIndex(frame.Filter))
-	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		return errors.Wrap(err, "put candidate data clock frame")
-	}
-
-	existingNumber := uint64(0)
-
-	if numberBytes != nil {
-		existingNumber = binary.BigEndian.Uint64(numberBytes)
-		closer.Close()
-	}
-
-	if frame.FrameNumber > existingNumber {
-		frameNumberBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(frameNumberBytes, frame.FrameNumber)
-		if err = txn.Set(
-			clockDataCandidateLatestIndex(frame.Filter),
-			frameNumberBytes,
-		); err != nil {
-			return errors.Wrap(err, "put candidate data clock frame")
-		}
+		return errors.Wrap(err, "stage data clock frame")
 	}
 
 	return nil
 }
 
-// PutDataClockFrame implements ClockStore.
-func (p *PebbleClockStore) PutDataClockFrame(
-	frame *protobufs.ClockFrame,
+// CommitDataClockFrame implements ClockStore.
+func (p *PebbleClockStore) CommitDataClockFrame(
+	filter []byte,
+	frameNumber uint64,
+	selector []byte,
 	proverTrie *tries.RollingFrecencyCritbitTrie,
 	txn Transaction,
 	backfill bool,
 ) error {
-	if frame.FrameNumber != 0 {
-		if err := p.saveAggregateProofs(txn, frame); err != nil {
-			return errors.Wrap(
-				errors.Wrap(err, ErrInvalidData.Error()),
-				"put candidate data clock frame",
-			)
-		}
-	}
-
-	temp := append(
-		[]*protobufs.InclusionAggregateProof{},
-		frame.AggregateProofs...,
-	)
-	if frame.FrameNumber != 0 {
-		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
-	}
-	data, err := proto.Marshal(frame)
-	if err != nil {
-		return errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"put data clock frame",
-		)
-	}
-
-	if frame.FrameNumber != 0 {
-		frame.AggregateProofs = temp
-	}
 	frameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(frameNumberBytes, frame.FrameNumber)
+	binary.BigEndian.PutUint64(frameNumberBytes, frameNumber)
 
-	if err = txn.Set(
-		clockDataFrameKey(frame.Filter, frame.FrameNumber),
-		data,
+	if err := txn.Set(
+		clockDataFrameKey(filter, frameNumber),
+		clockDataParentIndexKey(filter, frameNumber, selector),
 	); err != nil {
-		return errors.Wrap(err, "put data clock frame")
-	}
-
-	selector, err := frame.GetSelector()
-	if err != nil {
-		return errors.Wrap(err, "put data clock frame")
-	}
-
-	if err = txn.Set(
-		clockDataParentIndexKey(
-			frame.Filter,
-			frame.FrameNumber,
-			selector.FillBytes(make([]byte, 32)),
-		),
-		data,
-	); err != nil {
-		return errors.Wrap(err, "put data clock frame")
+		return errors.Wrap(err, "commit data clock frame")
 	}
 
 	proverData, err := proverTrie.Serialize()
 	if err != nil {
-		return errors.Wrap(err, "put data clock frame")
+		return errors.Wrap(err, "commit data clock frame")
 	}
 
 	if err = txn.Set(
-		clockProverTrieKey(frame.Filter, frame.FrameNumber),
+		clockProverTrieKey(filter, frameNumber),
 		proverData,
 	); err != nil {
-		return errors.Wrap(err, "put data clock frame")
+		return errors.Wrap(err, "commit data clock frame")
 	}
 
-	_, closer, err := p.db.Get(clockDataEarliestIndex(frame.Filter))
+	_, closer, err := p.db.Get(clockDataEarliestIndex(filter))
 	if err != nil {
 		if !errors.Is(err, pebble.ErrNotFound) {
-			return errors.Wrap(err, "put data clock frame")
+			return errors.Wrap(err, "commit data clock frame")
 		}
 
 		if err = txn.Set(
-			clockDataEarliestIndex(frame.Filter),
+			clockDataEarliestIndex(filter),
 			frameNumberBytes,
 		); err != nil {
-			return errors.Wrap(err, "put data clock frame")
+			return errors.Wrap(err, "commit data clock frame")
 		}
 	}
 
@@ -1080,170 +867,14 @@ func (p *PebbleClockStore) PutDataClockFrame(
 
 	if !backfill {
 		if err = txn.Set(
-			clockDataLatestIndex(frame.Filter),
+			clockDataLatestIndex(filter),
 			frameNumberBytes,
 		); err != nil {
-			return errors.Wrap(err, "put data clock frame")
+			return errors.Wrap(err, "commit data clock frame")
 		}
 	}
 
 	return nil
-}
-
-func (p *PebbleClockStore) GetCandidateDataClockFrame(
-	filter []byte,
-	frameNumber uint64,
-	parentSelector []byte,
-	distance []byte,
-) (*protobufs.ClockFrame, error) {
-	value, closer, err := p.db.Get(clockDataCandidateFrameKey(
-		filter,
-		frameNumber,
-		parentSelector,
-		distance,
-	))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get candidate data clock frame")
-	}
-
-	defer closer.Close()
-	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get candidate data clock frame",
-		)
-	}
-
-	if err = p.fillAggregateProofs(frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get candidate data clock frame",
-		)
-	}
-
-	return frame, nil
-}
-
-// GetCandidateDataClockFrames implements ClockStore.
-// Distance is 32-byte aligned, so we just use a 0x00 * 32 -> 0xff * 32 range
-func (p *PebbleClockStore) GetCandidateDataClockFrames(
-	filter []byte,
-	frameNumber uint64,
-) ([]*protobufs.ClockFrame, error) {
-	iter, err := p.db.NewIter(
-		clockDataCandidateFrameKey(
-			filter,
-			frameNumber,
-			[]byte{
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			},
-			[]byte{
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			},
-		),
-		clockDataCandidateFrameKey(
-			filter,
-			frameNumber,
-			[]byte{
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			},
-			[]byte{
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			},
-		),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get candidate data clock frames")
-	}
-
-	frames := []*protobufs.ClockFrame{}
-	i := &PebbleCandidateClockIterator{i: iter, db: p}
-
-	for i.First(); i.Valid(); i.Next() {
-		value, err := i.Value()
-		if err != nil {
-			return nil, errors.Wrap(err, "get candidate data clock frames")
-		}
-
-		frames = append(frames, value)
-	}
-
-	if err := i.Close(); err != nil {
-		return nil, errors.Wrap(err, "get candidate data clock frames")
-	}
-
-	return frames, nil
-}
-
-// RangeCandidateDataClockFrames implements ClockStore.
-// Distance is 32-byte aligned, so we just use a 0x00 * 32 -> 0xff * 32 range
-func (p *PebbleClockStore) RangeCandidateDataClockFrames(
-	filter []byte,
-	parent []byte,
-	frameNumber uint64,
-) (*PebbleCandidateClockIterator, error) {
-	fromParent := rightAlign(parent, 32)
-	toParent := rightAlign(parent, 32)
-
-	if bytes.Equal(parent, []byte{
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	}) {
-		toParent = []byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		}
-	}
-	iter, err := p.db.NewIter(
-		clockDataCandidateFrameKey(
-			filter,
-			frameNumber,
-			fromParent,
-			[]byte{
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			},
-		),
-		clockDataCandidateFrameKey(
-			filter,
-			frameNumber,
-			toParent,
-			[]byte{
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			},
-		),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "range candidate data clock frames")
-	}
-
-	return &PebbleCandidateClockIterator{i: iter, db: p}, nil
 }
 
 // RangeDataClockFrames implements ClockStore.
@@ -1469,6 +1100,33 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 	for iter.First(); iter.Valid(); iter.Next() {
 		value := iter.Value()
 		frame := &protobufs.ClockFrame{}
+		genesisFramePreIndex := false
+
+		// We do a bit of a cheap trick here while things are still stuck in the old
+		// ways: we use the size of the parent index key to determine if it's the new
+		// format, or the old raw frame
+		if len(value) == (len(filter) + 42) {
+			frameValue, frameCloser, err := p.db.Get(value)
+			if err != nil {
+				return nil, errors.Wrap(err, "get compressed data clock frames")
+			}
+			if err := proto.Unmarshal(frameValue, frame); err != nil {
+				return nil, errors.Wrap(
+					errors.Wrap(err, ErrInvalidData.Error()),
+					"get compressed data clock frames",
+				)
+			}
+			frameCloser.Close()
+		} else {
+			if err := proto.Unmarshal(value, frame); err != nil {
+				return nil, errors.Wrap(
+					errors.Wrap(err, ErrInvalidData.Error()),
+					"get compressed data clock frames",
+				)
+			}
+			genesisFramePreIndex = frame.FrameNumber == 0
+		}
+
 		if err := proto.Unmarshal(value, frame); err != nil {
 			return nil, errors.Wrap(err, "get compressed data clock frames")
 		}
@@ -1477,7 +1135,7 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 			syncMessage.TruncatedClockFrames,
 			frame,
 		)
-		if frame.FrameNumber == 0 {
+		if frame.FrameNumber == 0 && genesisFramePreIndex {
 			continue
 		}
 		for i := 0; i < len(frame.Input[516:])/74; i++ {
@@ -1620,48 +1278,6 @@ func (p *PebbleClockStore) SetLatestDataClockFrameNumber(
 	return errors.Wrap(err, "set latest data clock frame number")
 }
 
-func (p *PebbleClockStore) DeleteCandidateDataClockFrameRange(
-	filter []byte,
-	fromFrameNumber uint64,
-	toFrameNumber uint64,
-) error {
-	err := p.db.DeleteRange(
-		clockDataCandidateFrameKey(
-			filter,
-			fromFrameNumber,
-			[]byte{
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			},
-			[]byte{
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			},
-		),
-		clockDataCandidateFrameKey(
-			filter,
-			toFrameNumber,
-			[]byte{
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			},
-			[]byte{
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			},
-		),
-	)
-	return errors.Wrap(err, "delete candidate data clock frame range")
-}
-
 func (p *PebbleClockStore) DeleteDataClockFrameRange(
 	filter []byte,
 	fromFrameNumber uint64,
@@ -1680,16 +1296,6 @@ func (p *PebbleClockStore) DeleteDataClockFrameRange(
 	return errors.Wrap(err, "delete data clock frame range")
 }
 
-func (p *PebbleClockStore) GetHighestCandidateDataClockFrame(
-	filter []byte,
-) (*protobufs.ClockFrame, error) {
-	frame, err := p.GetLatestCandidateDataClockFrame(filter)
-	if err != nil {
-		return nil, errors.Wrap(err, "get highest candidate data clock frame")
-	}
-
-	return frame, nil
-}
 func (p *PebbleClockStore) ResetMasterClockFrames(filter []byte) error {
 	if err := p.db.DeleteRange(
 		clockMasterFrameKey(filter, 0),
@@ -1741,7 +1347,60 @@ func (p *PebbleClockStore) Compact(
 		}
 	}
 
+	// If this node has been around since the early days, this is going to free
+	// up a lot of cruft.
+	if err := p.db.DeleteRange(
+		clockDataCandidateFrameKey(
+			make([]byte, 32),
+			0,
+			make([]byte, 32),
+			make([]byte, 32),
+		),
+		clockDataCandidateFrameKey(
+			bytes.Repeat([]byte{0xff}, 32),
+			1000000,
+			bytes.Repeat([]byte{0xff}, 32),
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+	); err != nil {
+		return errors.Wrap(err, "compact")
+	}
+	if err := p.db.Compact(
+		clockDataCandidateFrameKey(
+			make([]byte, 32),
+			0,
+			make([]byte, 32),
+			make([]byte, 32),
+		),
+		clockDataCandidateFrameKey(
+			bytes.Repeat([]byte{0xff}, 32),
+			1000000,
+			bytes.Repeat([]byte{0xff}, 32),
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+		true,
+	); err != nil {
+		return errors.Wrap(err, "compact")
+	}
+
 	if dataFilter != nil {
+		if err := p.db.DeleteRange(
+			clockDataCandidateFrameKey(
+				dataFilter,
+				0,
+				make([]byte, 32),
+				make([]byte, 32),
+			),
+			clockDataCandidateFrameKey(
+				dataFilter,
+				1000000,
+				bytes.Repeat([]byte{0xff}, 32),
+				bytes.Repeat([]byte{0xff}, 32),
+			),
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+
 		if err := p.db.Compact(
 			clockDataFrameKey(dataFilter, 0),
 			clockDataFrameKey(dataFilter, 1000000),
@@ -1761,6 +1420,22 @@ func (p *PebbleClockStore) Compact(
 				dataFilter,
 				1000000,
 				bytes.Repeat([]byte{0xff}, 32),
+				bytes.Repeat([]byte{0xff}, 32),
+			),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+
+		if err := p.db.Compact(
+			clockDataParentIndexKey(
+				dataFilter,
+				0,
+				make([]byte, 32),
+			),
+			clockDataParentIndexKey(
+				dataFilter,
+				1000000,
 				bytes.Repeat([]byte{0xff}, 32),
 			),
 			true,

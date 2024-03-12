@@ -183,7 +183,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	)
 
 	if report.Cores < 3 || memory < 16000000000 {
-		e.logger.Info(
+		e.logger.Debug(
 			"peer reported invalid configuration",
 			zap.String("peer_id", base58.Encode(peerID)),
 			zap.Uint32("difficulty", report.Difficulty),
@@ -208,7 +208,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 
 	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
 	if err != nil {
-		e.logger.Error(
+		e.logger.Debug(
 			"could not connect for validation",
 			zap.String("peer_id", base58.Encode(peerID)),
 			zap.Uint32("difficulty", report.Difficulty),
@@ -245,7 +245,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	cc.Close()
 
 	if !bytes.Equal(verification, validation.Validation) {
-		e.logger.Error(
+		e.logger.Debug(
 			"provided invalid verification",
 			zap.String("peer_id", base58.Encode(peerID)),
 			zap.Uint32("difficulty", report.Difficulty),
@@ -266,7 +266,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	}
 
 	if end-start > 2000 {
-		e.logger.Error(
+		e.logger.Debug(
 			"slow bandwidth, scoring out",
 			zap.String("peer_id", base58.Encode(peerID)),
 			zap.Uint32("difficulty", report.Difficulty),

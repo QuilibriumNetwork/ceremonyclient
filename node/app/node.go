@@ -77,7 +77,7 @@ func (n *Node) RunRepair() {
 	if err == nil && head != nil {
 		for head != nil && head.FrameNumber != 0 {
 			prev := head
-			head, err = n.clockStore.GetParentDataClockFrame(
+			head, err = n.clockStore.GetStagedDataClockFrame(
 				intrinsicFilter,
 				head.FrameNumber-1,
 				head.ParentSelector,
@@ -99,11 +99,11 @@ func (n *Node) RunRepair() {
 					"repairing frame",
 					zap.Uint64("frame_number", head.FrameNumber),
 				)
-				head, err = n.clockStore.GetParentDataClockFrame(
+				head, err = n.clockStore.GetStagedDataClockFrame(
 					intrinsicFilter,
 					prev.FrameNumber-1,
 					prev.ParentSelector,
-					false,
+					true,
 				)
 				if err != nil {
 					panic(err)
@@ -114,7 +114,19 @@ func (n *Node) RunRepair() {
 					panic(err)
 				}
 
-				err = n.clockStore.PutDataClockFrame(head, proverTrie, txn, true)
+				selector, err := head.GetSelector()
+				if err != nil {
+					panic(err)
+				}
+
+				err = n.clockStore.CommitDataClockFrame(
+					intrinsicFilter,
+					head.FrameNumber,
+					selector.FillBytes(make([]byte, 32)),
+					proverTrie,
+					txn,
+					true,
+				)
 				if err != nil {
 					panic(err)
 				}

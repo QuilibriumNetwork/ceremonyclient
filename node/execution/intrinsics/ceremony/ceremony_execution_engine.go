@@ -1386,7 +1386,7 @@ func (e *CeremonyExecutionEngine) VerifyExecution(
 						return errors.Wrap(err, "verify execution")
 					}
 
-					parent, err := e.clockStore.GetParentDataClockFrame(
+					parent, err := e.clockStore.GetStagedDataClockFrame(
 						append(
 							p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
 							p2p.GetBloomFilterIndices(

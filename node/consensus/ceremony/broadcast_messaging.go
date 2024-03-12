@@ -145,6 +145,10 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			continue
 		}
 
+		if !bytes.Equal(p.PeerId, peerID) {
+			continue
+		}
+
 		if p.PublicKey == nil || p.Signature == nil || p.Version == nil {
 			continue
 		}
@@ -188,7 +192,7 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 					"peer provided outdated version, penalizing app score",
 					zap.Binary("peer_id", p.PeerId),
 				)
-				e.pubSub.SetPeerScore(p.PeerId, -100)
+				e.pubSub.SetPeerScore(p.PeerId, -10000)
 				continue
 			}
 		}

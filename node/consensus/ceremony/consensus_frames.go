@@ -292,7 +292,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 	parentSelector := make([]byte, 32)
 
 	for _, selector := range preflight.Preflight.RangeParentSelectors {
-		match, err := e.clockStore.GetParentDataClockFrame(
+		match, err := e.clockStore.GetStagedDataClockFrame(
 			e.filter,
 			selector.FrameNumber,
 			selector.ParentSelector,
@@ -309,10 +309,37 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		if match != nil && found == 0 {
 			found = match.FrameNumber
 			parentSelector = match.ParentSelector
+			break
 		}
 	}
-	if found != 0 {
-		from = found
+	if found != 0 && !bytes.Equal(parentSelector, make([]byte, 32)) {
+		check, err := e.clockStore.GetStagedDataClockFrame(
+			e.filter,
+			found,
+			parentSelector,
+			true,
+		)
+		if err != nil {
+			from = 1
+		} else {
+			e.logger.Info("checking interstitial continuity")
+			for check.FrameNumber > 1 {
+				check, err = e.clockStore.GetStagedDataClockFrame(
+					e.filter,
+					check.FrameNumber-1,
+					check.ParentSelector,
+					true,
+				)
+				if err != nil {
+					from = 1
+					e.logger.Info(
+						"could not confirm interstitial continuity, setting search to 1",
+					)
+					break
+				}
+			}
+			from = found
+		}
 	}
 
 	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
