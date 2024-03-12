@@ -980,13 +980,13 @@ func (p *PubSub) notifySubs(msg *Message) {
 		// unbounded, should block
 		if len(f.ch) == 0 {
 			f.ch <- msg
-		}
-
-		select {
-		case f.ch <- msg:
-		default:
-			p.tracer.UndeliverableMessage(msg)
-			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
+		} else {
+			select {
+			case f.ch <- msg:
+			default:
+				p.tracer.UndeliverableMessage(msg)
+				log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
+			}
 		}
 	}
 }
