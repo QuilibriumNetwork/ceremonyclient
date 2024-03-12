@@ -19,7 +19,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/mr-tron/base58"
 
 	logging "github.com/ipfs/go-log/v2"
 )
@@ -980,14 +979,9 @@ func (p *PubSub) notifySubs(msg *Message) {
 	for f := range subs {
 		select {
 		case f.ch <- msg:
-			log.Infof("Processed: %s sent %d bytes", base58.Encode(msg.From), len(msg.Data))
 		default:
 			p.tracer.UndeliverableMessage(msg)
-			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
-			log.Infof("Peer %s sent %d bytes", base58.Encode(msg.From), len(msg.Data))
-			if len(msg.Data) < 1200 {
-				log.Infof("%x", msg.Data)
-			}
+			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow, sub len %d", bitmask, len(f.ch))
 		}
 	}
 }
