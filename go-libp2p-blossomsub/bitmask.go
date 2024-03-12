@@ -160,8 +160,8 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 	}
 
 	if sub.ch == nil {
-		// apply the default size
-		sub.ch = make(chan *Message, 128)
+		// make unbounded
+		sub.ch = make(chan *Message)
 	}
 
 	out := make(chan *Subscription, 1)

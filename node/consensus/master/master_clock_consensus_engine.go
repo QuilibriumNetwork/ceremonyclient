@@ -54,7 +54,7 @@ type MasterClockConsensusEngine struct {
 	clockStore                  store.ClockStore
 	masterTimeReel              *qtime.MasterTimeReel
 	report                      *protobufs.SelfTestReport
-	peerMapMx                   sync.Mutex
+	peerMapMx                   sync.RWMutex
 	peerMap                     map[string]*protobufs.SelfTestReport
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
