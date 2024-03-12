@@ -306,6 +306,11 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				panic(err)
 			}
 
+			e.logger.Info(
+				"preparing peer announce",
+				zap.Uint64("frame_number", frame.FrameNumber),
+			)
+
 			timestamp := time.Now().UnixMilli()
 			msg := binary.BigEndian.AppendUint64([]byte{}, frame.FrameNumber)
 			msg = append(msg, consensus.GetVersion()...)

@@ -22,7 +22,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
-	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
@@ -108,24 +107,12 @@ func NewBlossomSub(
 	}
 
 	if isBootstrapPeer {
-		limits := rcmgr.DefaultLimits
-		libp2p.SetDefaultServiceLimits(&limits)
-		limits.SystemBaseLimit.ConnsInbound = 2048
-		limits.SystemBaseLimit.StreamsInbound = 2048
-		rmgr, err := rcmgr.NewResourceManager(
-			rcmgr.NewFixedLimiter(limits.AutoScale()),
-		)
-		if err != nil {
-			panic(err)
-		}
-
-		mgr, err := connmgr.NewConnManager(512, 2048)
+		mgr, err := connmgr.NewConnManager(512, 8192)
 		if err != nil {
 			panic(err)
 		}
 
 		opts = append(opts,
-			libp2p.ResourceManager(rmgr),
 			libp2p.ConnectionManager(mgr),
 		)
 	}
@@ -576,7 +563,7 @@ func discoverPeers(
 				continue
 			}
 
-			logger.Info("found peer", zap.String("peer_id", peer.ID.Pretty()))
+			logger.Debug("found peer", zap.String("peer_id", peer.ID.Pretty()))
 			err := h.Connect(ctx, peer)
 			if err != nil {
 				logger.Debug(
@@ -585,7 +572,7 @@ func discoverPeers(
 					zap.Error(err),
 				)
 			} else {
-				logger.Info(
+				logger.Debug(
 					"connected to peer",
 					zap.String("peer_id", peer.ID.Pretty()),
 				)

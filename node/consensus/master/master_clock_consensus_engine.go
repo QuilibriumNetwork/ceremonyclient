@@ -40,22 +40,24 @@ type MasterClockConsensusEngine struct {
 	frameProver         crypto.FrameProver
 	lastFrameReceivedAt time.Time
 
-	frameChan        chan *protobufs.ClockFrame
-	executionEngines map[string]execution.ExecutionEngine
-	filter           []byte
-	input            []byte
-	syncingStatus    SyncStatusType
-	syncingTarget    []byte
-	engineMx         sync.Mutex
-	seenFramesMx     sync.Mutex
-	historicFramesMx sync.Mutex
-	seenFrames       []*protobufs.ClockFrame
-	historicFrames   []*protobufs.ClockFrame
-	clockStore       store.ClockStore
-	masterTimeReel   *qtime.MasterTimeReel
-	report           *protobufs.SelfTestReport
-	peerMapMx        sync.Mutex
-	peerMap          map[string]*protobufs.SelfTestReport
+	frameChan                   chan *protobufs.ClockFrame
+	executionEngines            map[string]execution.ExecutionEngine
+	filter                      []byte
+	input                       []byte
+	syncingStatus               SyncStatusType
+	syncingTarget               []byte
+	engineMx                    sync.Mutex
+	seenFramesMx                sync.Mutex
+	historicFramesMx            sync.Mutex
+	seenFrames                  []*protobufs.ClockFrame
+	historicFrames              []*protobufs.ClockFrame
+	clockStore                  store.ClockStore
+	masterTimeReel              *qtime.MasterTimeReel
+	report                      *protobufs.SelfTestReport
+	peerMapMx                   sync.Mutex
+	peerMap                     map[string]*protobufs.SelfTestReport
+	currentReceivingSyncPeers   int
+	currentReceivingSyncPeersMx sync.Mutex
 }
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)

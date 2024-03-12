@@ -70,27 +70,6 @@ func (r *RPCServer) GetFrameInfo(
 			ClockFrame: frame,
 		}, nil
 	} else {
-		frames, err := r.clockStore.GetCandidateDataClockFrames(
-			req.Filter,
-			req.FrameNumber,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get frame info")
-		}
-
-		for _, frame := range frames {
-			selector, err := frame.GetSelector()
-			if err != nil {
-				return nil, errors.Wrap(err, "get frame info")
-			}
-
-			if bytes.Equal(selector.Bytes(), req.Selector) {
-				return &protobufs.FrameInfoResponse{
-					ClockFrame: frame,
-				}, nil
-			}
-		}
-
 		return nil, errors.Wrap(errors.New("not found"), "get frame info")
 	}
 }
@@ -149,44 +128,6 @@ func (r *RPCServer) GetFrames(
 
 		if err := iter.Close(); err != nil {
 			return nil, errors.Wrap(err, "get frames")
-		}
-
-		if req.IncludeCandidates {
-			from := req.FromFrameNumber
-			if len(frames) > 0 {
-				from = frames[len(frames)-1].FrameNumber + 1
-			}
-
-			for from < req.ToFrameNumber {
-				iter, err := r.clockStore.RangeCandidateDataClockFrames(
-					req.Filter,
-					[]byte{
-						0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-						0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-						0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-						0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-					},
-					from,
-				)
-				if err != nil {
-					return nil, errors.Wrap(err, "get frames")
-				}
-
-				for iter.First(); iter.Valid(); iter.Next() {
-					frame, err := iter.TruncatedValue()
-					if err != nil {
-						iter.Close()
-						return nil, errors.Wrap(err, "get frames")
-					}
-					frames = append(frames, frame)
-				}
-
-				if err := iter.Close(); err != nil {
-					return nil, errors.Wrap(err, "get frames")
-				}
-
-				from++
-			}
 		}
 
 		return &protobufs.FramesResponse{
@@ -289,17 +230,15 @@ func (r *RPCServer) GetTokenInfo(
 	}
 
 	confirmedTotal := new(big.Int)
-	unconfirmedTotal := new(big.Int)
 	ownedTotal := new(big.Int)
-	unconfirmedOwnedTotal := new(big.Int)
 	if confirmed.RewardTrie.Root == nil ||
 		(confirmed.RewardTrie.Root.External == nil &&
 			confirmed.RewardTrie.Root.Internal == nil) {
 		return &protobufs.TokenInfoResponse{
 			ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
-			UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
+			UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
 			OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
-			UnconfirmedOwnedTokens: unconfirmedOwnedTotal.FillBytes(make([]byte, 32)),
+			UnconfirmedOwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
 		}, nil
 	}
 
@@ -358,76 +297,8 @@ func (r *RPCServer) GetTokenInfo(
 		limbs = nextLimbs
 	}
 
-	candidateFrame, err := r.clockStore.GetHighestCandidateDataClockFrame(
-		append(
-			p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-			p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-		),
-	)
 	if err != nil {
 		return nil, errors.Wrap(err, "get token info")
-	}
-
-	unconfirmed, err := application.MaterializeApplicationFromFrame(
-		candidateFrame,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
-
-	limbs = []*tries.RewardInternalNode{}
-	if unconfirmed.RewardTrie.Root.Internal != nil {
-		limbs = append(limbs, unconfirmed.RewardTrie.Root.Internal)
-	} else {
-		unconfirmedTotal = unconfirmedTotal.Add(
-			unconfirmedTotal,
-			new(big.Int).SetUint64(unconfirmed.RewardTrie.Root.External.Total),
-		)
-		if bytes.Equal(
-			unconfirmed.RewardTrie.Root.External.Key,
-			addrBytes,
-		) {
-			unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
-				unconfirmedOwnedTotal,
-				new(big.Int).SetUint64(unconfirmed.RewardTrie.Root.External.Total),
-			)
-		}
-	}
-
-	for len(limbs) != 0 {
-		nextLimbs := []*tries.RewardInternalNode{}
-		for _, limb := range limbs {
-			for _, child := range limb.Child {
-				child := child
-				if child.Internal != nil {
-					nextLimbs = append(nextLimbs, child.Internal)
-				} else {
-					unconfirmedTotal = unconfirmedTotal.Add(
-						unconfirmedTotal,
-						new(big.Int).SetUint64(child.External.Total),
-					)
-					if bytes.Equal(
-						child.External.Key,
-						addrBytes,
-					) {
-						unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
-							unconfirmedOwnedTotal,
-							new(big.Int).SetUint64(child.External.Total),
-						)
-					}
-					if bytes.Equal(
-						child.External.Key,
-						peerAddrBytes,
-					) {
-						unconfirmedOwnedTotal = unconfirmedOwnedTotal.Add(
-							unconfirmedOwnedTotal,
-							new(big.Int).SetUint64(child.External.Total),
-						)
-					}
-				}
-			}
-		}
-		limbs = nextLimbs
 	}
 
 	// 1 QUIL = 0x1DCD65000 units
@@ -437,18 +308,13 @@ func (r *RPCServer) GetTokenInfo(
 	}
 
 	confirmedTotal = confirmedTotal.Mul(confirmedTotal, conversionFactor)
-	unconfirmedTotal = unconfirmedTotal.Mul(unconfirmedTotal, conversionFactor)
 	ownedTotal = ownedTotal.Mul(ownedTotal, conversionFactor)
-	unconfirmedOwnedTotal = unconfirmedOwnedTotal.Mul(
-		unconfirmedOwnedTotal,
-		conversionFactor,
-	)
 
 	return &protobufs.TokenInfoResponse{
 		ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
-		UnconfirmedTokenSupply: unconfirmedTotal.FillBytes(make([]byte, 32)),
+		UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
 		OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
-		UnconfirmedOwnedTokens: unconfirmedOwnedTotal.FillBytes(make([]byte, 32)),
+		UnconfirmedOwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
 	}, nil
 }
 
