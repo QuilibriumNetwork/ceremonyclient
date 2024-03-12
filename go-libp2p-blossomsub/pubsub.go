@@ -260,18 +260,18 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		peerFilter:            DefaultPeerFilter,
 		disc:                  &discover{},
 		maxMessageSize:        DefaultMaxMessageSize,
-		peerOutboundQueueSize: 1000,
+		peerOutboundQueueSize: 128,
 		signID:                h.ID(),
 		signKey:               nil,
 		signPolicy:            StrictSign,
-		incoming:              make(chan *RPC, 1000),
+		incoming:              make(chan *RPC, 128),
 		newPeers:              make(chan struct{}, 1),
 		newPeersPend:          make(map[peer.ID]struct{}),
 		newPeerStream:         make(chan network.Stream),
 		newPeerError:          make(chan peer.ID),
 		peerDead:              make(chan struct{}, 1),
 		peerDeadPend:          make(map[peer.ID]struct{}),
-		deadPeerBackoff:       newBackoff(ctx, 1000, BackoffCleanupInterval, MaxBackoffAttempts),
+		deadPeerBackoff:       newBackoff(ctx, 128, BackoffCleanupInterval, MaxBackoffAttempts),
 		cancelCh:              make(chan *Subscription),
 		getPeers:              make(chan *listPeerReq),
 		addSub:                make(chan *addSubReq),
@@ -280,7 +280,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		addBitmask:            make(chan *addBitmaskReq),
 		rmBitmask:             make(chan *rmBitmaskReq),
 		getBitmasks:           make(chan *bitmaskReq),
-		sendMsg:               make(chan *Message, 1000),
+		sendMsg:               make(chan *Message, 128),
 		addVal:                make(chan *addValReq),
 		rmVal:                 make(chan *rmValReq),
 		eval:                  make(chan func()),
@@ -977,9 +977,12 @@ func (p *PubSub) notifySubs(msg *Message) {
 	bitmask := msg.GetBitmask()
 	subs := p.mySubs[string(bitmask)]
 	for f := range subs {
-		// unbounded, should block
+		// unbounded should be handled differently:
 		if len(f.ch) == 0 {
-			f.ch <- msg
+			f := f
+			go func() {
+				f.ch <- msg
+			}()
 		} else {
 			select {
 			case f.ch <- msg:
@@ -1313,11 +1316,20 @@ func (p *PubSub) Subscribe(bitmask []byte, opts ...SubOpt) (*Subscription, error
 }
 
 // WithBufferSize is a Subscribe option to customize the size of the subscribe output buffer.
-// The default length is 1000 but it can be configured to avoid dropping messages if the consumer is not reading fast
+// The default length is 128 but it can be configured to avoid dropping messages if the consumer is not reading fast
 // enough.
 func WithBufferSize(size int) SubOpt {
 	return func(sub *Subscription) error {
 		sub.ch = make(chan *Message, size)
+		return nil
+	}
+}
+
+// WithUnboundedBuffer is a Subscribe option to customize the size of the subscribe output buffer.
+// This sets the channel to unbounded. Be sure you can handle the message volume.
+func WithUnboundedBuffer() SubOpt {
+	return func(sub *Subscription) error {
+		sub.ch = make(chan *Message)
 		return nil
 	}
 }
