@@ -977,11 +977,16 @@ func (p *PubSub) notifySubs(msg *Message) {
 	bitmask := msg.GetBitmask()
 	subs := p.mySubs[string(bitmask)]
 	for f := range subs {
+		// unbounded, should block
+		if len(f.ch) == 0 {
+			f.ch <- msg
+		}
+
 		select {
 		case f.ch <- msg:
 		default:
 			p.tracer.UndeliverableMessage(msg)
-			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow, sub len %d", bitmask, len(f.ch))
+			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 		}
 	}
 }
