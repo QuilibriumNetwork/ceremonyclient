@@ -277,9 +277,11 @@ func (b *BlossomSub) Subscribe(
 					)
 				}
 
-				if err = handler(m.Message); err != nil {
-					b.logger.Debug("message handler returned error", zap.Error(err))
-				}
+				go func() {
+					if err = handler(m.Message); err != nil {
+						b.logger.Debug("message handler returned error", zap.Error(err))
+					}
+				}()
 			}
 		}()
 
