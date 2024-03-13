@@ -1,12 +1,16 @@
 package master
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"math/big"
 	"sync"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -57,6 +61,7 @@ type MasterClockConsensusEngine struct {
 	peerMapMx                   sync.RWMutex
 	peerMap                     map[string]*protobufs.SelfTestReport
 	frameValidationCh           chan *protobufs.ClockFrame
+	bandwidthTestCh             chan []byte
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
 }
@@ -119,6 +124,7 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		peerMap:             map[string]*protobufs.SelfTestReport{},
 		frameValidationCh:   make(chan *protobufs.ClockFrame, 10),
+		bandwidthTestCh:     make(chan []byte),
 	}
 
 	e.peerMap[string(e.pubSub.GetPeerID())] = report
@@ -162,6 +168,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				}
 
 				e.masterTimeReel.Insert(newFrame)
+			case peerId := <-e.bandwidthTestCh:
+				e.performBandwidthTest(peerId)
 			}
 		}
 	}()
@@ -302,6 +310,71 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
+	result := e.pubSub.GetMultiaddrOfPeer(peerID)
+	if result == "" {
+		go func() {
+			e.bandwidthTestCh <- peerID
+		}()
+		return
+	}
+
+	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
+	if err != nil {
+		e.logger.Info(
+			"could not connect for validation",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+
+	client := protobufs.NewValidationServiceClient(cc)
+	verification := make([]byte, 1048576)
+	rand.Read(verification)
+	start := time.Now().UnixMilli()
+	validation, err := client.PerformValidation(
+		context.Background(),
+		&protobufs.ValidationMessage{
+			Validation: verification,
+		},
+	)
+	end := time.Now().UnixMilli()
+	if err != nil && err != io.EOF {
+		cc.Close()
+		e.logger.Info(
+			"peer returned error",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Error(err),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+	cc.Close()
+
+	if !bytes.Equal(verification, validation.Validation) {
+		e.logger.Info(
+			"provided invalid verification",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+
+	if end-start > 2000 {
+		e.logger.Info(
+			"slow bandwidth, scoring out",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
 }
 
 func (
