@@ -259,12 +259,7 @@ func (b *BlossomSub) Subscribe(
 		b.bitmaskMap[string(bitmask)] = bm
 
 		b.logger.Info("subscribe to bitmask", zap.Binary("bitmask", bitmask))
-		opts := []blossomsub.SubOpt{}
-		if b.isBootstrapPeer {
-			opts = append(opts, blossomsub.WithUnboundedBuffer())
-		}
-
-		sub, err := bm.Subscribe(opts...)
+		sub, err := bm.Subscribe()
 		if err != nil {
 			b.logger.Error("subscription failed", zap.Error(err))
 			return errors.Wrap(err, "subscribe")
@@ -283,10 +278,14 @@ func (b *BlossomSub) Subscribe(
 						zap.Error(err),
 					)
 				}
-
+				start := time.Now()
 				if err = handler(m.Message); err != nil {
 					b.logger.Debug("message handler returned error", zap.Error(err))
 				}
+				b.logger.Info(
+					"message processed",
+					zap.Duration("duration", time.Since(start)),
+				)
 			}
 		}()
 

@@ -977,19 +977,14 @@ func (p *PubSub) notifySubs(msg *Message) {
 	bitmask := msg.GetBitmask()
 	subs := p.mySubs[string(bitmask)]
 	for f := range subs {
-		// unbounded should be handled differently:
-		if len(f.ch) == 0 {
-			f := f
-			go func() {
-				f.ch <- msg
-			}()
-		} else {
-			select {
-			case f.ch <- msg:
-			default:
-				p.tracer.UndeliverableMessage(msg)
-				log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
-			}
+		select {
+		case f.ch <- msg:
+		case <-time.After(5 * time.Millisecond):
+			// it's unreasonable to immediately fall over because a subscriber didn't
+			// answer, message delivery sometimes lands next nanosecond and dropping
+			// it when there's room is absurd.
+			p.tracer.UndeliverableMessage(msg)
+			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 		}
 	}
 }
@@ -1321,15 +1316,6 @@ func (p *PubSub) Subscribe(bitmask []byte, opts ...SubOpt) (*Subscription, error
 func WithBufferSize(size int) SubOpt {
 	return func(sub *Subscription) error {
 		sub.ch = make(chan *Message, size)
-		return nil
-	}
-}
-
-// WithUnboundedBuffer is a Subscribe option to customize the size of the subscribe output buffer.
-// This sets the channel to unbounded. Be sure you can handle the message volume.
-func WithUnboundedBuffer() SubOpt {
-	return func(sub *Subscription) error {
-		sub.ch = make(chan *Message)
 		return nil
 	}
 }
