@@ -98,7 +98,7 @@ type CeremonyDataClockConsensusEngine struct {
 	engineMx                       sync.Mutex
 	dependencyMapMx                sync.Mutex
 	stagedLobbyStateTransitionsMx  sync.Mutex
-	peerMapMx                      sync.Mutex
+	peerMapMx                      sync.RWMutex
 	peerAnnounceMapMx              sync.Mutex
 	lastKeyBundleAnnouncementFrame uint64
 	peerMap                        map[string]*peerInfo
@@ -574,7 +574,7 @@ func (
 	e *CeremonyDataClockConsensusEngine,
 ) GetPeerInfo() *protobufs.PeerInfoResponse {
 	resp := &protobufs.PeerInfoResponse{}
-	e.peerMapMx.Lock()
+	e.peerMapMx.RLock()
 	for _, v := range e.peerMap {
 		resp.PeerInfo = append(resp.PeerInfo, &protobufs.PeerInfo{
 			PeerId:        v.peerId,
@@ -602,6 +602,6 @@ func (
 			},
 		)
 	}
-	e.peerMapMx.Unlock()
+	e.peerMapMx.RUnlock()
 	return resp
 }

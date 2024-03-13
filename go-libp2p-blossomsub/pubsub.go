@@ -979,7 +979,10 @@ func (p *PubSub) notifySubs(msg *Message) {
 	for f := range subs {
 		select {
 		case f.ch <- msg:
-		default:
+		case <-time.After(15 * time.Millisecond):
+			// it's unreasonable to immediately fall over because a subscriber didn't
+			// answer, message delivery sometimes lands next nanosecond and dropping
+			// it when there's room is absurd.
 			p.tracer.UndeliverableMessage(msg)
 			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 		}
@@ -1308,7 +1311,7 @@ func (p *PubSub) Subscribe(bitmask []byte, opts ...SubOpt) (*Subscription, error
 }
 
 // WithBufferSize is a Subscribe option to customize the size of the subscribe output buffer.
-// The default length is 1000 but it can be configured to avoid dropping messages if the consumer is not reading fast
+// The default length is 128 but it can be configured to avoid dropping messages if the consumer is not reading fast
 // enough.
 func WithBufferSize(size int) SubOpt {
 	return func(sub *Subscription) error {

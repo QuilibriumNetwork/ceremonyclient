@@ -96,12 +96,12 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 
 	switch any.TypeUrl {
 	case protobufs.ClockFrameType:
-		e.peerMapMx.Lock()
+		e.peerMapMx.RLock()
 		if peer, ok := e.peerMap[string(message.From)]; !ok ||
 			bytes.Compare(peer.version, consensus.GetMinimumVersion()) < 0 {
 			return nil
 		}
-		e.peerMapMx.Unlock()
+		e.peerMapMx.RUnlock()
 		if err := e.handleClockFrameData(
 			message.From,
 			msg.Address,
@@ -134,13 +134,6 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 	}
 
 	for _, p := range announce.PeerList {
-		e.peerMapMx.Lock()
-		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
-			e.peerMapMx.Unlock()
-			continue
-		}
-		e.peerMapMx.Unlock()
-
 		if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
 			continue
 		}
@@ -197,13 +190,20 @@ func (e *CeremonyDataClockConsensusEngine) handleCeremonyPeerListAnnounce(
 			}
 		}
 
+		e.peerMapMx.RLock()
+		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
+			e.peerMapMx.RUnlock()
+			continue
+		}
+		e.peerMapMx.RUnlock()
+
 		multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
 
 		e.pubSub.SetPeerScore(p.PeerId, 10)
 
-		e.peerMapMx.Lock()
+		e.peerMapMx.RLock()
 		existing, ok := e.peerMap[string(p.PeerId)]
-		e.peerMapMx.Unlock()
+		e.peerMapMx.RUnlock()
 
 		if ok {
 			if existing.signature != nil && p.Signature == nil {

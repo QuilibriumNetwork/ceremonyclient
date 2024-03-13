@@ -159,7 +159,7 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 
 	max := frame.FrameNumber
 	var peer []byte = nil
-	e.peerMapMx.Lock()
+	e.peerMapMx.RLock()
 	for _, v := range e.peerMap {
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
 		if v.maxFrame > max &&
@@ -169,7 +169,7 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
 			max = v.maxFrame
 		}
 	}
-	e.peerMapMx.Unlock()
+	e.peerMapMx.RUnlock()
 
 	if peer == nil {
 		return nil, 0, p2p.ErrNoPeersAvailable

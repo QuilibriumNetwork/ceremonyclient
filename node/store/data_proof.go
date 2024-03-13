@@ -220,7 +220,6 @@ func internalPutAggregateProof(
 	txn Transaction,
 	aggregateProof *protobufs.InclusionAggregateProof,
 	commitment []byte,
-	inclusionSplitter func(typeUrl string, data []byte) ([][]byte, error),
 ) error {
 	buf := binary.BigEndian.AppendUint64(
 		nil,
@@ -229,9 +228,18 @@ func internalPutAggregateProof(
 	buf = append(buf, aggregateProof.Proof...)
 
 	for i, inc := range aggregateProof.InclusionCommitments {
-		segments, err := inclusionSplitter(inc.TypeUrl, inc.Data)
-		if err != nil {
-			return errors.Wrap(err, "get aggregate proof")
+		var segments [][]byte
+		if inc.TypeUrl == protobufs.IntrinsicExecutionOutputType {
+			o := &protobufs.IntrinsicExecutionOutput{}
+			if err := proto.Unmarshal(inc.Data, o); err != nil {
+				return errors.Wrap(err, "get aggregate proof")
+			}
+			leftBits := append([]byte{}, o.Address...)
+			leftBits = append(leftBits, o.Output...)
+			rightBits := o.Proof
+			segments = [][]byte{leftBits, rightBits}
+		} else {
+			segments = [][]byte{inc.Data}
 		}
 
 		urlLength := len(inc.TypeUrl)
@@ -244,7 +252,7 @@ func internalPutAggregateProof(
 
 		for _, segment := range segments {
 			hash := sha3.Sum256(segment)
-			if err = txn.Set(
+			if err := txn.Set(
 				dataProofSegmentKey(aggregateProof.Filter, hash[:]),
 				segment,
 			); err != nil {
@@ -253,7 +261,7 @@ func internalPutAggregateProof(
 			encoded = append(encoded, hash[:]...)
 		}
 
-		if err = txn.Set(
+		if err := txn.Set(
 			dataProofInclusionKey(aggregateProof.Filter, commitment, uint64(i)),
 			encoded,
 		); err != nil {
@@ -275,13 +283,11 @@ func (p *PebbleDataProofStore) PutAggregateProof(
 	txn Transaction,
 	aggregateProof *protobufs.InclusionAggregateProof,
 	commitment []byte,
-	inclusionSplitter func(typeUrl string, data []byte) ([][]byte, error),
 ) error {
 	return internalPutAggregateProof(
 		p.db,
 		txn,
 		aggregateProof,
 		commitment,
-		inclusionSplitter,
 	)
 }

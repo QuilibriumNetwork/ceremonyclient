@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
-	"sync"
 	"time"
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -453,12 +452,6 @@ type BlossomSubRouter struct {
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
 
-	fanoutMx   sync.Mutex
-	lastpubMx  sync.Mutex
-	meshMx     sync.Mutex
-	peerhaveMx sync.Mutex
-	iaskedMx   sync.Mutex
-
 	mcache       *MessageCache
 	tracer       *pubsubTracer
 	score        *peerScore
@@ -664,9 +657,7 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 	}
 
 	// IHAVE flood protection
-	bs.peerhaveMx.Lock()
 	bs.peerhave[p]++
-	bs.peerhaveMx.Unlock()
 	if bs.peerhave[p] > bs.params.MaxIHaveMessages {
 		log.Debugf("IHAVE: peer %s has advertised too many times (%d) within this heartbeat interval; ignoring", p, bs.peerhave[p])
 		return nil
@@ -718,9 +709,7 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 
 	// truncate to the messages we are actually asking for and update the iasked counter
 	iwantlst = iwantlst[:iask]
-	bs.iaskedMx.Lock()
 	bs.iasked[p] += iask
-	bs.iaskedMx.Unlock()
 
 	bs.gossipTracer.AddPromise(p, iwantlst)
 
@@ -1055,9 +1044,7 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 
 				if len(peers) > 0 {
 					gmap = peerListToMap(peers)
-					bs.fanoutMx.Lock()
 					bs.fanout[string(bitmask)] = gmap
-					bs.fanoutMx.Unlock()
 				}
 			}
 			bs.lastpub[string(bitmask)] = time.Now().UnixNano()
@@ -1114,15 +1101,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 			}
 		}
 
-		bs.meshMx.Lock()
 		bs.mesh[string(bitmask)] = gmap
-		bs.meshMx.Unlock()
-		bs.fanoutMx.Lock()
 		delete(bs.fanout, string(bitmask))
-		bs.fanoutMx.Unlock()
-		bs.lastpubMx.Lock()
 		delete(bs.lastpub, string(bitmask))
-		bs.lastpubMx.Unlock()
 	} else {
 		backoff := bs.backoff[string(bitmask)]
 		peers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
@@ -1151,9 +1132,7 @@ func (bs *BlossomSubRouter) Leave(bitmask []byte) {
 	log.Debugf("LEAVE %s", bitmask)
 	bs.tracer.Leave(bitmask)
 
-	bs.meshMx.Lock()
 	delete(bs.mesh, string(bitmask))
-	bs.meshMx.Unlock()
 
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, bitmask)
@@ -1604,12 +1583,8 @@ func (bs *BlossomSubRouter) heartbeat() {
 	now := time.Now().UnixNano()
 	for bitmask, lastpub := range bs.lastpub {
 		if lastpub+int64(bs.params.FanoutTTL) < now {
-			bs.fanoutMx.Lock()
 			delete(bs.fanout, bitmask)
-			bs.fanoutMx.Unlock()
-			bs.lastpubMx.Lock()
 			delete(bs.lastpub, bitmask)
-			bs.lastpubMx.Unlock()
 		}
 	}
 
@@ -1657,16 +1632,12 @@ func (bs *BlossomSubRouter) heartbeat() {
 func (bs *BlossomSubRouter) clearIHaveCounters() {
 	if len(bs.peerhave) > 0 {
 		// throw away the old map and make a new one
-		bs.peerhaveMx.Lock()
 		bs.peerhave = make(map[peer.ID]int)
-		bs.peerhaveMx.Unlock()
 	}
 
 	if len(bs.iasked) > 0 {
 		// throw away the old map and make a new one
-		bs.iaskedMx.Lock()
 		bs.iasked = make(map[peer.ID]int)
-		bs.iaskedMx.Unlock()
 	}
 }
 

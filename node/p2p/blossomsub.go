@@ -35,15 +35,16 @@ import (
 )
 
 type BlossomSub struct {
-	ps          *blossomsub.PubSub
-	ctx         context.Context
-	logger      *zap.Logger
-	peerID      peer.ID
-	bitmaskMap  map[string]*blossomsub.Bitmask
-	h           host.Host
-	signKey     crypto.PrivKey
-	peerScore   map[string]int64
-	peerScoreMx sync.Mutex
+	ps              *blossomsub.PubSub
+	ctx             context.Context
+	logger          *zap.Logger
+	peerID          peer.ID
+	bitmaskMap      map[string]*blossomsub.Bitmask
+	h               host.Host
+	signKey         crypto.PrivKey
+	peerScore       map[string]int64
+	peerScoreMx     sync.Mutex
+	isBootstrapPeer bool
 }
 
 var _ PubSub = (*BlossomSub)(nil)
@@ -133,11 +134,12 @@ func NewBlossomSub(
 	}
 
 	bs := &BlossomSub{
-		ctx:        ctx,
-		logger:     logger,
-		bitmaskMap: make(map[string]*blossomsub.Bitmask),
-		signKey:    privKey,
-		peerScore:  make(map[string]int64),
+		ctx:             ctx,
+		logger:          logger,
+		bitmaskMap:      make(map[string]*blossomsub.Bitmask),
+		signKey:         privKey,
+		peerScore:       make(map[string]int64),
+		isBootstrapPeer: isBootstrapPeer,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -267,6 +269,7 @@ func (b *BlossomSub) Subscribe(
 			"begin streaming from bitmask",
 			zap.Binary("bitmask", bitmask),
 		)
+
 		go func() {
 			for {
 				m, err := sub.Next(b.ctx)
@@ -276,7 +279,6 @@ func (b *BlossomSub) Subscribe(
 						zap.Error(err),
 					)
 				}
-
 				if err = handler(m.Message); err != nil {
 					b.logger.Debug("message handler returned error", zap.Error(err))
 				}

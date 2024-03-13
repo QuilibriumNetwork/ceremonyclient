@@ -1,12 +1,16 @@
 package master
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"math/big"
 	"sync"
 	"time"
 
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -54,8 +58,10 @@ type MasterClockConsensusEngine struct {
 	clockStore                  store.ClockStore
 	masterTimeReel              *qtime.MasterTimeReel
 	report                      *protobufs.SelfTestReport
-	peerMapMx                   sync.Mutex
+	peerMapMx                   sync.RWMutex
 	peerMap                     map[string]*protobufs.SelfTestReport
+	frameValidationCh           chan *protobufs.ClockFrame
+	bandwidthTestCh             chan []byte
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
 }
@@ -117,6 +123,8 @@ func NewMasterClockConsensusEngine(
 		masterTimeReel:      masterTimeReel,
 		report:              report,
 		peerMap:             map[string]*protobufs.SelfTestReport{},
+		frameValidationCh:   make(chan *protobufs.ClockFrame, 10),
+		bandwidthTestCh:     make(chan []byte),
 	}
 
 	e.peerMap[string(e.pubSub.GetPeerID())] = report
@@ -149,6 +157,22 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}
 
 	e.buildHistoricFrameCache(frame)
+
+	go func() {
+		for {
+			select {
+			case newFrame := <-e.frameValidationCh:
+				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
+					e.logger.Error("could not verify clock frame", zap.Error(err))
+					continue
+				}
+
+				e.masterTimeReel.Insert(newFrame)
+			case peerId := <-e.bandwidthTestCh:
+				e.performBandwidthTest(peerId)
+			}
+		}
+	}()
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
@@ -183,9 +207,10 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
-		for {
-			time.Sleep(30 * time.Second)
+		// Let it sit until we at least have a few more peers inbound
+		time.Sleep(30 * time.Second)
 
+		for {
 			e.logger.Info("broadcasting self-test info")
 			head, err := e.masterTimeReel.Head()
 			if err != nil {
@@ -197,6 +222,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
 			}
+			time.Sleep(30 * time.Minute)
 		}
 	}()
 
@@ -286,6 +312,71 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
+	result := e.pubSub.GetMultiaddrOfPeer(peerID)
+	if result == "" {
+		go func() {
+			e.bandwidthTestCh <- peerID
+		}()
+		return
+	}
+
+	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
+	if err != nil {
+		e.logger.Info(
+			"could not connect for validation",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+
+	client := protobufs.NewValidationServiceClient(cc)
+	verification := make([]byte, 1048576)
+	rand.Read(verification)
+	start := time.Now().UnixMilli()
+	validation, err := client.PerformValidation(
+		context.Background(),
+		&protobufs.ValidationMessage{
+			Validation: verification,
+		},
+	)
+	end := time.Now().UnixMilli()
+	if err != nil && err != io.EOF {
+		cc.Close()
+		e.logger.Info(
+			"peer returned error",
+			zap.String("peer_id", base58.Encode(peerID)),
+			zap.Error(err),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+	cc.Close()
+
+	if !bytes.Equal(verification, validation.Validation) {
+		e.logger.Info(
+			"provided invalid verification",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
+
+	if end-start > 2000 {
+		e.logger.Info(
+			"slow bandwidth, scoring out",
+			zap.String("peer_id", base58.Encode(peerID)),
+		)
+		// tag: dusk – nuke this peer for now
+		e.pubSub.SetPeerScore(peerID, -1000)
+		return
+	}
 }
 
 func (

@@ -127,7 +127,6 @@ func (d *DataTimeReel) Start() error {
 	}
 
 	if frame == nil {
-
 		d.head, d.proverTrie = d.createGenesisFrame()
 		d.totalDistance = big.NewInt(0)
 		d.headDistance = big.NewInt(0)

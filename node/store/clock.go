@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -62,7 +61,6 @@ type ClockStore interface {
 		parentSelector []byte,
 		truncate bool,
 	) (*protobufs.ClockFrame, error)
-	Deduplicate(filter []byte) error
 	GetCompressedDataClockFrames(
 		filter []byte,
 		fromFrameNumber uint64,
@@ -186,11 +184,25 @@ func (p *PebbleClockIterator) TruncatedValue() (
 
 	value := p.i.Value()
 	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get candidate clock frame iterator value",
-		)
+	if len(value) == (len(p.i.Key()) + 32) {
+		frameValue, frameCloser, err := p.db.db.Get(value)
+		if err != nil {
+			return nil, errors.Wrap(err, "get truncated clock frame iterator value")
+		}
+		if err := proto.Unmarshal(frameValue, frame); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get truncated clock frame iterator value",
+			)
+		}
+		frameCloser.Close()
+	} else {
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get truncated clock frame iterator value",
+			)
+		}
 	}
 
 	return frame, nil
@@ -203,14 +215,34 @@ func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 
 	value := p.i.Value()
 	frame := &protobufs.ClockFrame{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get clock frame iterator value",
-		)
+	genesisFramePreIndex := false
+
+	// We do a bit of a cheap trick here while things are still stuck in the old
+	// ways: we use the size of the parent index key to determine if it's the new
+	// format, or the old raw frame
+	if len(value) == (len(p.i.Key()) + 32) {
+		frameValue, frameCloser, err := p.db.db.Get(value)
+		if err != nil {
+			return nil, errors.Wrap(err, "get clock frame iterator value")
+		}
+		if err := proto.Unmarshal(frameValue, frame); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get clock frame iterator value",
+			)
+		}
+		defer frameCloser.Close()
+	} else {
+		if err := proto.Unmarshal(value, frame); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, ErrInvalidData.Error()),
+				"get clock frame iterator value",
+			)
+		}
+		genesisFramePreIndex = frame.FrameNumber == 0
 	}
 
-	if err := p.db.fillAggregateProofs(frame, false); err != nil {
+	if err := p.db.fillAggregateProofs(frame, genesisFramePreIndex); err != nil {
 		return nil, errors.Wrap(
 			errors.Wrap(err, ErrInvalidData.Error()),
 			"get clock frame iterator value",
@@ -647,20 +679,8 @@ func (p *PebbleClockStore) saveAggregateProofs(
 			p.db,
 			txn,
 			frame.AggregateProofs[i],
-			commit, func(typeUrl string, data []byte) ([][]byte, error) {
-				if typeUrl == protobufs.IntrinsicExecutionOutputType {
-					o := &protobufs.IntrinsicExecutionOutput{}
-					if err := proto.Unmarshal(data, o); err != nil {
-						return nil, err
-					}
-					leftBits := append([]byte{}, o.Address...)
-					leftBits = append(leftBits, o.Output...)
-					rightBits := o.Proof
-					return [][]byte{leftBits, rightBits}, nil
-				}
-
-				return [][]byte{data}, nil
-			})
+			commit,
+		)
 		if err != nil {
 			if err = txn.Abort(); err != nil {
 				return err
@@ -900,185 +920,6 @@ func (p *PebbleClockStore) RangeDataClockFrames(
 	return &PebbleClockIterator{i: iter, db: p}, nil
 }
 
-// Should only need be run once, before starting
-func (p *PebbleClockStore) Deduplicate(filter []byte) error {
-	from := clockDataParentIndexKey(
-		filter,
-		1,
-		[]byte{
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		},
-	)
-	to := clockDataParentIndexKey(
-		filter,
-		20000,
-		[]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		},
-	)
-
-	iter, err := p.db.NewIter(from, to)
-	if err != nil {
-		return errors.Wrap(err, "deduplicate")
-	}
-
-	i := 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		value := iter.Value()
-		frame := &protobufs.ClockFrame{}
-		if err := proto.Unmarshal(value, frame); err != nil {
-			return err
-		}
-
-		if err := p.saveAggregateProofs(nil, frame); err != nil {
-			return err
-		}
-
-		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
-		newValue, err := proto.Marshal(frame)
-		if err != nil {
-			return err
-		}
-
-		err = p.db.Set(iter.Key(), newValue)
-		if err != nil {
-			return err
-		}
-		i++
-		if i%100 == 0 {
-			fmt.Println("Deduplicated 100 parent frames")
-		}
-	}
-
-	iter.Close()
-	if err := p.db.Compact(from, to, true); err != nil {
-		return err
-	}
-
-	from = clockDataFrameKey(filter, 1)
-	to = clockDataFrameKey(filter, 20000)
-
-	iter, err = p.db.NewIter(from, to)
-	if err != nil {
-		return errors.Wrap(err, "deduplicate")
-	}
-
-	i = 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		value := iter.Value()
-		frame := &protobufs.ClockFrame{}
-		if err := proto.Unmarshal(value, frame); err != nil {
-			return err
-		}
-
-		if err := p.saveAggregateProofs(nil, frame); err != nil {
-			return err
-		}
-
-		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
-		newValue, err := proto.Marshal(frame)
-		if err != nil {
-			return err
-		}
-
-		err = p.db.Set(iter.Key(), newValue)
-		if err != nil {
-			return err
-		}
-		i++
-		if i%100 == 0 {
-			fmt.Println("Deduplicated 100 data frames")
-		}
-	}
-
-	iter.Close()
-	if err := p.db.Compact(from, to, true); err != nil {
-		return err
-	}
-
-	from = clockDataCandidateFrameKey(
-		filter,
-		1,
-		[]byte{
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		},
-		[]byte{
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		},
-	)
-	to = clockDataCandidateFrameKey(
-		filter,
-		20000,
-		[]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		},
-		[]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		},
-	)
-
-	iter, err = p.db.NewIter(from, to)
-	if err != nil {
-		return errors.Wrap(err, "deduplicate")
-	}
-
-	i = 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		value := iter.Value()
-		frame := &protobufs.ClockFrame{}
-		if err := proto.Unmarshal(value, frame); err != nil {
-			return err
-		}
-
-		if err := p.saveAggregateProofs(nil, frame); err != nil {
-			return err
-		}
-
-		frame.AggregateProofs = []*protobufs.InclusionAggregateProof{}
-		newValue, err := proto.Marshal(frame)
-		if err != nil {
-			return err
-		}
-
-		err = p.db.Set(iter.Key(), newValue)
-		if err != nil {
-			return err
-		}
-
-		i++
-		if i%100 == 0 {
-			fmt.Println("Deduplicated 100 candidate frames")
-		}
-	}
-
-	iter.Close()
-	if err := p.db.Compact(from, to, true); err != nil {
-		return err
-	}
-
-	p.db.Close()
-
-	return nil
-}
-
 func (p *PebbleClockStore) GetCompressedDataClockFrames(
 	filter []byte,
 	fromFrameNumber uint64,
@@ -1103,8 +944,8 @@ func (p *PebbleClockStore) GetCompressedDataClockFrames(
 		genesisFramePreIndex := false
 
 		// We do a bit of a cheap trick here while things are still stuck in the old
-		// ways: we use the size of the parent index key to determine if it's the new
-		// format, or the old raw frame
+		// ways: we use the size of the parent index key to determine if it's the
+		// new format, or the old raw frame
 		if len(value) == (len(filter) + 42) {
 			frameValue, frameCloser, err := p.db.Get(value)
 			if err != nil {

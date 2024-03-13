@@ -2,17 +2,13 @@ package master
 
 import (
 	"bytes"
-	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"strings"
-	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -28,7 +24,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		zap.Binary("signature", message.Signature),
 	)
 	msg := &protobufs.Message{}
-
 	if err := proto.Unmarshal(message.Data, msg); err != nil {
 		return errors.Wrap(err, "handle message")
 	}
@@ -36,42 +31,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	any := &anypb.Any{}
 	if err := proto.Unmarshal(msg.Payload, any); err != nil {
 		return errors.Wrap(err, "handle message")
-	}
-
-	eg := errgroup.Group{}
-	eg.SetLimit(len(e.executionEngines))
-	for name := range e.executionEngines {
-		name := name
-		eg.Go(func() error {
-			messages, err := e.executionEngines[name].ProcessMessage(
-				msg.Address,
-				msg,
-			)
-			if err != nil {
-				e.logger.Error(
-					"could not process message for engine",
-					zap.Error(err),
-					zap.String("engine_name", name),
-				)
-				return errors.Wrap(err, "handle message")
-			}
-			for _, m := range messages {
-				m := m
-				if err := e.publishMessage(m.Address, m); err != nil {
-					e.logger.Error(
-						"could not publish message for engine",
-						zap.Error(err),
-						zap.String("engine_name", name),
-					)
-					return errors.Wrap(err, "handle message")
-				}
-			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		e.logger.Error("rejecting invalid message", zap.Error(err))
-		return errors.Wrap(err, "execution failed")
 	}
 
 	switch any.TypeUrl {
@@ -82,6 +41,7 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+		return nil
 	case protobufs.SelfTestReportType:
 		if err := e.handleSelfTestReport(
 			message.From,
@@ -89,9 +49,10 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
+		return nil
 	}
 
-	return nil
+	return errors.Wrap(errors.New("invalid message"), "handle message")
 }
 
 func (e *MasterClockConsensusEngine) handleClockFrameData(
@@ -131,12 +92,19 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		zap.Int("proof_count", len(frame.AggregateProofs)),
 	)
 
-	if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
-		e.logger.Error("could not verify clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	e.masterTimeReel.Insert(frame)
+	go func() {
+		select {
+		case e.frameValidationCh <- frame:
+		default:
+			e.logger.Debug(
+				"dropped frame due to overwhelmed queue",
+				zap.Binary("sender", peerID),
+				zap.Binary("filter", frame.Filter),
+				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.Int("proof_count", len(frame.AggregateProofs)),
+			)
+		}
+	}()
 
 	return nil
 }
@@ -206,86 +174,9 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		return nil
 	}
 
-	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
-	if err != nil {
-		e.logger.Debug(
-			"could not connect for validation",
-			zap.String("peer_id", base58.Encode(peerID)),
-			zap.Uint32("difficulty", report.Difficulty),
-			zap.Int64("difficulty_metric", report.DifficultyMetric),
-			zap.Int64("commit_16_metric", report.Commit_16Metric),
-			zap.Int64("commit_128_metric", report.Commit_128Metric),
-			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
-			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
-			zap.Int64("proof_16_metric", report.Proof_16Metric),
-			zap.Int64("proof_128_metric", report.Proof_128Metric),
-			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
-			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
-			zap.Uint32("cores", report.Cores),
-			zap.Uint64("memory", memory),
-			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
-		)
-		return errors.Wrap(err, "handle self test report")
-	}
-	client := protobufs.NewValidationServiceClient(cc)
-	verification := make([]byte, 1048576)
-	rand.Read(verification)
-	start := time.Now().UnixMilli()
-	validation, err := client.PerformValidation(
-		context.Background(),
-		&protobufs.ValidationMessage{
-			Validation: verification,
-		},
-	)
-	end := time.Now().UnixMilli()
-	if err != nil {
-		cc.Close()
-		return errors.Wrap(err, "handle self test report")
-	}
-	cc.Close()
-
-	if !bytes.Equal(verification, validation.Validation) {
-		e.logger.Debug(
-			"provided invalid verification",
-			zap.String("peer_id", base58.Encode(peerID)),
-			zap.Uint32("difficulty", report.Difficulty),
-			zap.Int64("difficulty_metric", report.DifficultyMetric),
-			zap.Int64("commit_16_metric", report.Commit_16Metric),
-			zap.Int64("commit_128_metric", report.Commit_128Metric),
-			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
-			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
-			zap.Int64("proof_16_metric", report.Proof_16Metric),
-			zap.Int64("proof_128_metric", report.Proof_128Metric),
-			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
-			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
-			zap.Uint32("cores", report.Cores),
-			zap.Uint64("memory", memory),
-			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
-		)
-		return nil
-	}
-
-	if end-start > 2000 {
-		e.logger.Debug(
-			"slow bandwidth, scoring out",
-			zap.String("peer_id", base58.Encode(peerID)),
-			zap.Uint32("difficulty", report.Difficulty),
-			zap.Int64("difficulty_metric", report.DifficultyMetric),
-			zap.Int64("commit_16_metric", report.Commit_16Metric),
-			zap.Int64("commit_128_metric", report.Commit_128Metric),
-			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
-			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
-			zap.Int64("proof_16_metric", report.Proof_16Metric),
-			zap.Int64("proof_128_metric", report.Proof_128Metric),
-			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
-			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
-			zap.Uint32("cores", report.Cores),
-			zap.Uint64("memory", memory),
-			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
-		)
-		// tag: dusk – nuke this peer for now
-		e.pubSub.SetPeerScore(peerID, -1000)
-	}
+	go func() {
+		e.bandwidthTestCh <- peerID
+	}()
 
 	return nil
 }
