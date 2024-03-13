@@ -13,7 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -31,12 +30,9 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 				continue
 			}
 
-			eg := errgroup.Group{}
-			eg.SetLimit(len(e.executionEngines))
-
 			for name := range e.executionEngines {
 				name := name
-				eg.Go(func() error {
+				go func() error {
 					messages, err := e.executionEngines[name].ProcessMessage(
 						msg.Address,
 						msg,
@@ -77,12 +73,7 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 					}
 
 					return nil
-				})
-			}
-
-			if err := eg.Wait(); err != nil {
-				e.logger.Debug("rejecting invalid message", zap.Error(err))
-				continue
+				}()
 			}
 
 			any := &anypb.Any{}
@@ -90,31 +81,33 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 				continue
 			}
 
-			switch any.TypeUrl {
-			case protobufs.ClockFrameType:
-				e.peerMapMx.RLock()
-				if peer, ok := e.peerMap[string(message.From)]; !ok ||
-					bytes.Compare(peer.version, config.GetMinimumVersion()) < 0 {
-					continue
+			go func() {
+				switch any.TypeUrl {
+				case protobufs.ClockFrameType:
+					e.peerMapMx.RLock()
+					if peer, ok := e.peerMap[string(message.From)]; !ok ||
+						bytes.Compare(peer.version, config.GetMinimumVersion()) < 0 {
+						return
+					}
+					e.peerMapMx.RUnlock()
+					if err := e.handleClockFrameData(
+						message.From,
+						msg.Address,
+						any,
+						false,
+					); err != nil {
+						return
+					}
+				case protobufs.CeremonyPeerListAnnounceType:
+					if err := e.handleCeremonyPeerListAnnounce(
+						message.From,
+						msg.Address,
+						any,
+					); err != nil {
+						return
+					}
 				}
-				e.peerMapMx.RUnlock()
-				if err := e.handleClockFrameData(
-					message.From,
-					msg.Address,
-					any,
-					false,
-				); err != nil {
-					continue
-				}
-			case protobufs.CeremonyPeerListAnnounceType:
-				if err := e.handleCeremonyPeerListAnnounce(
-					message.From,
-					msg.Address,
-					any,
-				); err != nil {
-					continue
-				}
-			}
+			}()
 		}
 	}
 }
