@@ -279,14 +279,9 @@ func (b *BlossomSub) Subscribe(
 						zap.Error(err),
 					)
 				}
-				start := time.Now()
 				if err = handler(m.Message); err != nil {
 					b.logger.Debug("message handler returned error", zap.Error(err))
 				}
-				b.logger.Info(
-					"message processed",
-					zap.Duration("duration", time.Since(start)),
-				)
 			}
 		}()
 

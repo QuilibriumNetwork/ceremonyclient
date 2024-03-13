@@ -207,9 +207,10 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
-		for {
-			time.Sleep(30 * time.Second)
+		// Let it sit until we at least have a few more peers inbound
+		time.Sleep(30 * time.Second)
 
+		for {
 			e.logger.Info("broadcasting self-test info")
 			head, err := e.masterTimeReel.Head()
 			if err != nil {
@@ -221,6 +222,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
 			}
+			time.Sleep(30 * time.Minute)
 		}
 	}()
 

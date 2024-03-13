@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"strings"
-	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/mr-tron/base58"
@@ -25,61 +24,14 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		zap.Binary("signature", message.Signature),
 	)
 	msg := &protobufs.Message{}
-	start := time.Now()
 	if err := proto.Unmarshal(message.Data, msg); err != nil {
 		return errors.Wrap(err, "handle message")
 	}
-	e.logger.Info(
-		"envelope unmarshal",
-		zap.Duration("duration", time.Since(start)),
-	)
-	start = time.Now()
 
 	any := &anypb.Any{}
 	if err := proto.Unmarshal(msg.Payload, any); err != nil {
 		return errors.Wrap(err, "handle message")
 	}
-
-	e.logger.Info(
-		"payload unmarshal",
-		zap.Duration("duration", time.Since(start)),
-	)
-	start = time.Now()
-	// eg := errgroup.Group{}
-	// eg.SetLimit(len(e.executionEngines))
-	// for name := range e.executionEngines {
-	// 	name := name
-	// 	eg.Go(func() error {
-	// 		messages, err := e.executionEngines[name].ProcessMessage(
-	// 			msg.Address,
-	// 			msg,
-	// 		)
-	// 		if err != nil {
-	// 			e.logger.Error(
-	// 				"could not process message for engine",
-	// 				zap.Error(err),
-	// 				zap.String("engine_name", name),
-	// 			)
-	// 			return errors.Wrap(err, "handle message")
-	// 		}
-	// 		for _, m := range messages {
-	// 			m := m
-	// 			if err := e.publishMessage(m.Address, m); err != nil {
-	// 				e.logger.Error(
-	// 					"could not publish message for engine",
-	// 					zap.Error(err),
-	// 					zap.String("engine_name", name),
-	// 				)
-	// 				return errors.Wrap(err, "handle message")
-	// 			}
-	// 		}
-	// 		return nil
-	// 	})
-	// }
-	// if err := eg.Wait(); err != nil {
-	// 	e.logger.Error("rejecting invalid message", zap.Error(err))
-	// 	return errors.Wrap(err, "execution failed")
-	// }
 
 	switch any.TypeUrl {
 	case protobufs.ClockFrameType:
@@ -89,11 +41,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
-		e.logger.Info(
-			"handle clock frame time",
-			zap.Duration("duration", time.Since(start)),
-		)
-		start = time.Now()
 		return nil
 	case protobufs.SelfTestReportType:
 		if err := e.handleSelfTestReport(
@@ -102,11 +49,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		); err != nil {
 			return errors.Wrap(err, "handle message")
 		}
-		e.logger.Info(
-			"handle self test time",
-			zap.Duration("duration", time.Since(start)),
-		)
-		start = time.Now()
 		return nil
 	}
 
