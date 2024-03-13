@@ -313,7 +313,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 
 			timestamp := time.Now().UnixMilli()
 			msg := binary.BigEndian.AppendUint64([]byte{}, frame.FrameNumber)
-			msg = append(msg, consensus.GetVersion()...)
+			msg = append(msg, config.GetVersion()...)
 			msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
 			sig, err := e.pubSub.SignMessage(msg)
 			if err != nil {
@@ -325,7 +325,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				peerId:    e.pubSub.GetPeerID(),
 				multiaddr: "",
 				maxFrame:  frame.FrameNumber,
-				version:   consensus.GetVersion(),
+				version:   config.GetVersion(),
 				signature: sig,
 				publicKey: e.pubSub.GetPublicKey(),
 				timestamp: timestamp,
@@ -338,7 +338,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				PeerId:    e.pubSub.GetPeerID(),
 				Multiaddr: "",
 				MaxFrame:  frame.FrameNumber,
-				Version:   consensus.GetVersion(),
+				Version:   config.GetVersion(),
 				Signature: sig,
 				PublicKey: e.pubSub.GetPublicKey(),
 				Timestamp: timestamp,
@@ -369,7 +369,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 								PeerId:     e.pubSub.GetPeerID(),
 								Multiaddrs: []string{""},
 								MaxFrame:   frame.FrameNumber,
-								Version:    consensus.GetVersion(),
+								Version:    config.GetVersion(),
 								Signature:  sig,
 								PublicKey:  e.pubSub.GetPublicKey(),
 								Timestamp:  timestamp,
