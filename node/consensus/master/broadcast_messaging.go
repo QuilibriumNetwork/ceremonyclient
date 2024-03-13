@@ -132,12 +132,19 @@ func (e *MasterClockConsensusEngine) handleClockFrameData(
 		zap.Int("proof_count", len(frame.AggregateProofs)),
 	)
 
-	if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
-		e.logger.Error("could not verify clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	e.masterTimeReel.Insert(frame)
+	go func() {
+		select {
+		case e.frameValidationCh <- frame:
+		default:
+			e.logger.Debug(
+				"dropped frame due to overwhelmed queue",
+				zap.Binary("sender", peerID),
+				zap.Binary("filter", frame.Filter),
+				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.Int("proof_count", len(frame.AggregateProofs)),
+			)
+		}
+	}()
 
 	return nil
 }

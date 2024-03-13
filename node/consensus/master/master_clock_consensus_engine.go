@@ -56,6 +56,7 @@ type MasterClockConsensusEngine struct {
 	report                      *protobufs.SelfTestReport
 	peerMapMx                   sync.RWMutex
 	peerMap                     map[string]*protobufs.SelfTestReport
+	frameValidationCh           chan *protobufs.ClockFrame
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
 }
@@ -117,6 +118,7 @@ func NewMasterClockConsensusEngine(
 		masterTimeReel:      masterTimeReel,
 		report:              report,
 		peerMap:             map[string]*protobufs.SelfTestReport{},
+		frameValidationCh:   make(chan *protobufs.ClockFrame, 10),
 	}
 
 	e.peerMap[string(e.pubSub.GetPeerID())] = report
@@ -149,6 +151,20 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}
 
 	e.buildHistoricFrameCache(frame)
+
+	go func() {
+		for {
+			select {
+			case newFrame := <-e.frameValidationCh:
+				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
+					e.logger.Error("could not verify clock frame", zap.Error(err))
+					continue
+				}
+
+				e.masterTimeReel.Insert(newFrame)
+			}
+		}
+	}()
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)

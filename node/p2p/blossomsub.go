@@ -269,6 +269,7 @@ func (b *BlossomSub) Subscribe(
 			"begin streaming from bitmask",
 			zap.Binary("bitmask", bitmask),
 		)
+
 		go func() {
 			for {
 				m, err := sub.Next(b.ctx)
