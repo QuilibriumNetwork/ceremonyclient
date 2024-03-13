@@ -25,7 +25,7 @@ On command line, run
 Check GO Version
     go version
 
-It must show "go version go.1.20.13 linux/amd64"
+It must show "go version go.1.20.14 linux/amd64"
 
 ## Configure Linux Network Device Settings
 
@@ -157,15 +157,50 @@ To view service logs run
 Go to ceremonyclient/node folder and run
 
     GOEXPERIMENT=arenas go clean -v -n -a ./...
-    rm /root/go/bin
+    rm /root/go/bin/node
     GOEXPERIMENT=arenas go install ./...
     service ceremonyclient start
 
 If everything is okay you would see logs when you run
 
     sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
-
+}
 Ensure that your service running correctly.
+
+## Auto Upgrading Script
+
+Create a file named update.sh in your server and put the code below.
+
+
+
+    #!/bin/bash
+
+    # Stop the ceremonyclient service
+    service ceremonyclient stop
+
+    # Switch to the ~/ceremonyclient directory
+    cd ~/ceremonyclient
+
+    # Fetch updates from the remote repository
+    git fetch origin
+    git merge origin
+
+    # Switch to the ~/ceremonyclient/node directory
+    cd ~/ceremonyclient/node
+
+    # Clean and reinstall node
+    GOEXPERIMENT=arenas go clean -v -n -a ./...
+    rm /root/go/bin/node
+    GOEXPERIMENT=arenas go install ./...
+
+    # Start the ceremonyclient service
+    service ceremonyclient start
+
+
+    chmod u+x update.sh
+
+When there is new update, run
+    ./update.sh
 
 ## Stats Collection
 
