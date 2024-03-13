@@ -164,7 +164,7 @@ Go to ceremonyclient/node folder and run
 If everything is okay you would see logs when you run
 
     sudo journalctl -u ceremonyclient.service -f --no-hostname -o cat
-}
+
 Ensure that your service running correctly.
 
 ## Auto Upgrading Script
