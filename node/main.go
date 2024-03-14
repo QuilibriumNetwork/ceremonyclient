@@ -363,7 +363,7 @@ func RunSelfTestIfNeeded(
 
 	report.Cores = uint32(cores)
 	report.Memory = binary.BigEndian.AppendUint64([]byte{}, memory)
-	disk := utils.GetDiskSpace(nodeConfig.DB.Path)
+	disk := utils.GetDiskSpace(configDir)
 	report.Storage = binary.BigEndian.AppendUint64([]byte{}, disk)
 	logger.Info("writing report")
 
