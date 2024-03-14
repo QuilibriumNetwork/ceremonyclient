@@ -979,7 +979,7 @@ func (p *PubSub) notifySubs(msg *Message) {
 	for f := range subs {
 		select {
 		case f.ch <- msg:
-		case <-time.After(15 * time.Millisecond):
+		case <-time.After(5 * time.Millisecond):
 			// it's unreasonable to immediately fall over because a subscriber didn't
 			// answer, message delivery sometimes lands next nanosecond and dropping
 			// it when there's room is absurd.
