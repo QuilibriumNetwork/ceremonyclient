@@ -22,7 +22,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -105,17 +104,6 @@ func NewBlossomSub(
 			isBootstrapPeer = true
 			break
 		}
-	}
-
-	if isBootstrapPeer {
-		mgr, err := connmgr.NewConnManager(512, 8192)
-		if err != nil {
-			panic(err)
-		}
-
-		opts = append(opts,
-			libp2p.ConnectionManager(mgr),
-		)
 	}
 
 	var privKey crypto.PrivKey
