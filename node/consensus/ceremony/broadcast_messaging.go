@@ -3,22 +3,114 @@ package ceremony
 import (
 	"bytes"
 	"encoding/binary"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"strings"
 	"time"
+
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
+
+func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
+	for {
+		select {
+		case message := <-e.messageProcessorCh:
+			msg := &protobufs.Message{}
+
+			if err := proto.Unmarshal(message.Data, msg); err != nil {
+				continue
+			}
+
+			for name := range e.executionEngines {
+				name := name
+				go func() error {
+					messages, err := e.executionEngines[name].ProcessMessage(
+						msg.Address,
+						msg,
+					)
+					if err != nil {
+						e.logger.Debug(
+							"could not process message for engine",
+							zap.Error(err),
+							zap.String("engine_name", name),
+						)
+						return nil
+					}
+
+					for _, appMessage := range messages {
+						appMsg := &anypb.Any{}
+						err := proto.Unmarshal(appMessage.Payload, appMsg)
+						if err != nil {
+							e.logger.Error(
+								"could not unmarshal app message",
+								zap.Error(err),
+								zap.String("engine_name", name),
+							)
+							continue
+						}
+
+						switch appMsg.TypeUrl {
+						case protobufs.CeremonyLobbyStateTransitionType:
+							t := &protobufs.CeremonyLobbyStateTransition{}
+							err := proto.Unmarshal(appMsg.Value, t)
+							if err != nil {
+								continue
+							}
+
+							if err := e.handleCeremonyLobbyStateTransition(t); err != nil {
+								continue
+							}
+						}
+					}
+
+					return nil
+				}()
+			}
+
+			any := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, any); err != nil {
+				continue
+			}
+
+			go func() {
+				switch any.TypeUrl {
+				case protobufs.ClockFrameType:
+					e.peerMapMx.RLock()
+					if peer, ok := e.peerMap[string(message.From)]; !ok ||
+						bytes.Compare(peer.version, config.GetMinimumVersion()) < 0 {
+						return
+					}
+					e.peerMapMx.RUnlock()
+					if err := e.handleClockFrameData(
+						message.From,
+						msg.Address,
+						any,
+						false,
+					); err != nil {
+						return
+					}
+				case protobufs.CeremonyPeerListAnnounceType:
+					if err := e.handleCeremonyPeerListAnnounce(
+						message.From,
+						msg.Address,
+						any,
+					); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}
+}
 
 func (e *CeremonyDataClockConsensusEngine) handleMessage(
 	message *pb.Message,
@@ -29,96 +121,10 @@ func (e *CeremonyDataClockConsensusEngine) handleMessage(
 		zap.Binary("from", message.From),
 		zap.Binary("signature", message.Signature),
 	)
-	msg := &protobufs.Message{}
 
-	if err := proto.Unmarshal(message.Data, msg); err != nil {
-		return errors.Wrap(err, "handle message")
-	}
-
-	eg := errgroup.Group{}
-	eg.SetLimit(len(e.executionEngines))
-
-	for name := range e.executionEngines {
-		name := name
-		eg.Go(func() error {
-			messages, err := e.executionEngines[name].ProcessMessage(
-				msg.Address,
-				msg,
-			)
-			if err != nil {
-				e.logger.Debug(
-					"could not process message for engine",
-					zap.Error(err),
-					zap.String("engine_name", name),
-				)
-				return errors.Wrap(err, "handle message")
-			}
-
-			for _, appMessage := range messages {
-				appMsg := &anypb.Any{}
-				err := proto.Unmarshal(appMessage.Payload, appMsg)
-				if err != nil {
-					e.logger.Error(
-						"could not unmarshal app message",
-						zap.Error(err),
-						zap.String("engine_name", name),
-					)
-					return errors.Wrap(err, "handle message")
-				}
-
-				switch appMsg.TypeUrl {
-				case protobufs.CeremonyLobbyStateTransitionType:
-					t := &protobufs.CeremonyLobbyStateTransition{}
-					err := proto.Unmarshal(appMsg.Value, t)
-					if err != nil {
-						return errors.Wrap(err, "handle message")
-					}
-
-					if err := e.handleCeremonyLobbyStateTransition(t); err != nil {
-						return errors.Wrap(err, "handle message")
-					}
-				}
-			}
-
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		e.logger.Debug("rejecting invalid message", zap.Error(err))
-		return nil
-	}
-
-	any := &anypb.Any{}
-	if err := proto.Unmarshal(msg.Payload, any); err != nil {
-		return errors.Wrap(err, "handle message")
-	}
-
-	switch any.TypeUrl {
-	case protobufs.ClockFrameType:
-		e.peerMapMx.RLock()
-		if peer, ok := e.peerMap[string(message.From)]; !ok ||
-			bytes.Compare(peer.version, config.GetMinimumVersion()) < 0 {
-			return nil
-		}
-		e.peerMapMx.RUnlock()
-		if err := e.handleClockFrameData(
-			message.From,
-			msg.Address,
-			any,
-			false,
-		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-	case protobufs.CeremonyPeerListAnnounceType:
-		if err := e.handleCeremonyPeerListAnnounce(
-			message.From,
-			msg.Address,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-	}
+	go func() {
+		e.messageProcessorCh <- message
+	}()
 
 	return nil
 }

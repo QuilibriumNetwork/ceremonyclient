@@ -209,6 +209,14 @@ func RunSelfTestIfNeeded(
 
 	cores := runtime.GOMAXPROCS(0)
 	memory := memory.TotalMemory()
+	d, err := os.Stat(filepath.Join(configDir, "store"))
+	if d == nil {
+		err := os.Mkdir(filepath.Join(configDir, "store"), 0755)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	f, err := os.Stat(filepath.Join(configDir, "SELF_TEST"))
 
 	if f != nil {

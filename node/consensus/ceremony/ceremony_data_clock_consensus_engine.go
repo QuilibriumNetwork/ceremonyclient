@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/anypb"
+	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
@@ -103,6 +104,7 @@ type CeremonyDataClockConsensusEngine struct {
 	lastKeyBundleAnnouncementFrame uint64
 	peerMap                        map[string]*peerInfo
 	uncooperativePeersMap          map[string]*peerInfo
+	messageProcessorCh             chan *pb.Message
 }
 
 var _ consensus.DataConsensusEngine = (*CeremonyDataClockConsensusEngine)(nil)
@@ -233,6 +235,7 @@ func NewCeremonyDataClockConsensusEngine(
 		masterTimeReel:            masterTimeReel,
 		dataTimeReel:              dataTimeReel,
 		statsClient:               statsClient,
+		messageProcessorCh:        make(chan *pb.Message, 128),
 	}
 
 	logger.Info("constructing consensus engine")
@@ -269,6 +272,10 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	if err != nil {
 		panic(err)
 	}
+
+	go func() {
+		e.runLoop()
+	}()
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
