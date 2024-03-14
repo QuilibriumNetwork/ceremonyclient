@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"math/big"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -75,6 +76,17 @@ type ClockStore interface {
 	Compact(
 		masterFilter []byte,
 		dataFilter []byte,
+	) error
+	GetTotalDistance(
+		filter []byte,
+		frameNumber uint64,
+		selector []byte,
+	) (*big.Int, error)
+	SetTotalDistance(
+		filter []byte,
+		frameNumber uint64,
+		selector []byte,
+		totalDistance *big.Int,
 	) error
 }
 
@@ -268,6 +280,7 @@ const CLOCK_MASTER_FRAME_DATA = 0x00
 const CLOCK_DATA_FRAME_DATA = 0x01
 const CLOCK_DATA_FRAME_CANDIDATE_DATA = 0x02
 const CLOCK_DATA_FRAME_FRECENCY_DATA = 0x03
+const CLOCK_DATA_FRAME_DISTANCE_DATA = 0x04
 const CLOCK_MASTER_FRAME_INDEX_EARLIEST = 0x10 | CLOCK_MASTER_FRAME_DATA
 const CLOCK_MASTER_FRAME_INDEX_LATEST = 0x20 | CLOCK_MASTER_FRAME_DATA
 const CLOCK_MASTER_FRAME_INDEX_PARENT = 0x30 | CLOCK_MASTER_FRAME_DATA
@@ -399,6 +412,18 @@ func clockProverTrieKey(filter []byte, frameNumber uint64) []byte {
 	key := []byte{CLOCK_FRAME, CLOCK_DATA_FRAME_FRECENCY_DATA}
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, filter...)
+	return key
+}
+
+func clockDataTotalDistanceKey(
+	filter []byte,
+	frameNumber uint64,
+	selector []byte,
+) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_DATA_FRAME_DISTANCE_DATA}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, filter...)
+	key = append(key, rightAlign(selector, 32)...)
 	return key
 }
 
@@ -1286,4 +1311,40 @@ func (p *PebbleClockStore) Compact(
 	}
 
 	return nil
+}
+
+func (p *PebbleClockStore) GetTotalDistance(
+	filter []byte,
+	frameNumber uint64,
+	selector []byte,
+) (*big.Int, error) {
+	value, closer, err := p.db.Get(
+		clockDataTotalDistanceKey(filter, frameNumber, selector),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get total distance")
+	}
+
+	defer closer.Close()
+	dist := new(big.Int).SetBytes(value)
+
+	return dist, nil
+}
+
+func (p *PebbleClockStore) SetTotalDistance(
+	filter []byte,
+	frameNumber uint64,
+	selector []byte,
+	totalDistance *big.Int,
+) error {
+	err := p.db.Set(
+		clockDataTotalDistanceKey(filter, frameNumber, selector),
+		totalDistance.Bytes(),
+	)
+
+	return errors.Wrap(err, "set total distance")
 }

@@ -615,6 +615,14 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 
 	d.head = frame
 	d.totalDistance.Add(d.totalDistance, distance)
+
+	d.clockStore.SetTotalDistance(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
+		d.totalDistance,
+	)
+
 	d.headDistance = distance
 	go func() {
 		d.newFrameCh <- frame
@@ -623,7 +631,21 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 
 // tag: dusk – store the distance with the frame
 func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
-	total, err := d.GetDistance(frame)
+	selector, err := frame.GetSelector()
+	if err != nil {
+		panic(err)
+	}
+
+	total, err := d.clockStore.GetTotalDistance(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
+	)
+	if err == nil && total != nil {
+		return total
+	}
+
+	total, err = d.GetDistance(frame)
 	if err != nil {
 		panic(err)
 	}
@@ -642,6 +664,13 @@ func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
 
 		total.Add(total, distance)
 	}
+
+	d.clockStore.SetTotalDistance(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
+		total,
+	)
 
 	return total
 }
@@ -883,6 +912,14 @@ func (d *DataTimeReel) forkChoice(
 		"set total distance",
 		zap.String("total_distance", d.totalDistance.Text(16)),
 	)
+
+	d.clockStore.SetTotalDistance(
+		d.filter,
+		frame.FrameNumber,
+		selector.FillBytes(make([]byte, 32)),
+		d.totalDistance,
+	)
+
 	go func() {
 		d.newFrameCh <- frame
 	}()
