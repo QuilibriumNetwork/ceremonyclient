@@ -353,11 +353,19 @@ func (e *CeremonyDataClockConsensusEngine) publishProof(
 		"publishing frame and aggregations",
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
-	if err := e.publishMessage(e.filter, frame); err != nil {
-		return errors.Wrap(
-			err,
-			"publish proof",
-		)
+	head, err := e.dataTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	peers, max, err := e.GetMostAheadPeer()
+	if err != nil || len(peers) == 0 || head.FrameNumber+3 > max {
+		if err := e.publishMessage(e.filter, frame); err != nil {
+			return errors.Wrap(
+				err,
+				"publish proof",
+			)
+		}
 	}
 
 	return nil
