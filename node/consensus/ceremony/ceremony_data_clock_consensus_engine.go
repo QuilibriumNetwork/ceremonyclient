@@ -274,7 +274,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 	}
 
 	go func() {
-		e.runLoop()
+		e.runMessageHandler()
 	}()
 
 	e.logger.Info("subscribing to pubsub messages")
@@ -302,7 +302,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 		thresholdBeforeConfirming := 4
 
 		for {
-			time.Sleep(30 * time.Second)
+			time.Sleep(120 * time.Second)
 
 			list := &protobufs.CeremonyPeerListAnnounce{
 				PeerList: []*protobufs.CeremonyPeer{},
@@ -611,4 +611,38 @@ func (
 	}
 	e.peerMapMx.RUnlock()
 	return resp
+}
+
+func (e *CeremonyDataClockConsensusEngine) createCommunicationKeys() error {
+	_, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-idk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "announce key bundle")
+			}
+		} else {
+			return errors.Wrap(err, "announce key bundle")
+		}
+	}
+
+	_, err = e.keyManager.GetAgreementKey("q-ratchet-spk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-spk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "announce key bundle")
+			}
+		} else {
+			return errors.Wrap(err, "announce key bundle")
+		}
+	}
+
+	return nil
 }
