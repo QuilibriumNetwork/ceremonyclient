@@ -451,8 +451,13 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					panic(err)
 				}
 
+				if latestFrame != nil &&
+					dataFrame.FrameNumber > latestFrame.FrameNumber {
+					latestFrame = dataFrame
+				}
+
 				go func() {
-					e.frameChan <- dataFrame
+					e.frameChan <- latestFrame
 				}()
 
 				if bytes.Equal(
@@ -460,7 +465,7 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.provingKeyAddress,
 				) {
 					var nextFrame *protobufs.ClockFrame
-					if nextFrame, err = e.prove(dataFrame); err != nil {
+					if nextFrame, err = e.prove(latestFrame); err != nil {
 						e.logger.Error("could not prove", zap.Error(err))
 						e.state = consensus.EngineStateCollecting
 						continue

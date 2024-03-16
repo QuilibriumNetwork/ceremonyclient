@@ -472,7 +472,7 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 	message *protobufs.Message,
 ) ([]*protobufs.Message, error) {
 	if bytes.Equal(address, e.GetSupportedApplications()[0].Address) {
-		e.logger.Info("processing execution message")
+		e.logger.Debug("processing execution message")
 		any := &anypb.Any{}
 		if err := proto.Unmarshal(message.Payload, any); err != nil {
 			return nil, errors.Wrap(err, "process message")
