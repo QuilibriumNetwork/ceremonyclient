@@ -167,7 +167,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 					continue
 				}
 
-				e.masterTimeReel.Insert(newFrame)
+				e.masterTimeReel.Insert(newFrame, false)
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
 			}

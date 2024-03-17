@@ -155,7 +155,7 @@ func TestDataTimeReel(t *testing.T) {
 		frame, err = prover.ProveMasterClockFrame(frame, i+1, 10)
 		assert.NoError(t, err)
 
-		err := m.Insert(frame)
+		err := m.Insert(frame, false)
 		assert.NoError(t, err)
 	}
 
@@ -249,7 +249,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(frame)
+		d.Insert(frame, false)
 	}
 
 	// 2. z-dist optimal, out of order – proof submission is strictly master-frame
@@ -278,7 +278,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 9; i >= 0; i-- {
-		err := d.Insert(insertFrames[i])
+		err := d.Insert(insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 
@@ -303,7 +303,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(frame)
+		d.Insert(frame, false)
 	}
 
 	masterSelector, err := frames[25].GetSelector()
@@ -349,7 +349,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 4; i >= 0; i-- {
-		err := d.Insert(insertFrames[i])
+		err := d.Insert(insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 
@@ -402,7 +402,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 9; i >= 0; i-- {
-		err := d.Insert(conflictFrames[i])
+		err := d.Insert(conflictFrames[i], false)
 		// force linear ordering
 		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
@@ -410,7 +410,7 @@ func TestDataTimeReel(t *testing.T) {
 
 	// Someone is honest, but running backwards:
 	for i := 9; i >= 0; i-- {
-		err := d.Insert(insertFrames[i])
+		err := d.Insert(insertFrames[i], false)
 		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
 	}

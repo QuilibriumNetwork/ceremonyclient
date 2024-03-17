@@ -14,9 +14,12 @@ func GetMinimumVersion() []byte {
 }
 
 func GetVersion() []byte {
-	return []byte{0x01, 0x04, 0x08}
+	return []byte{0x01, 0x04, 0x09}
 }
 
 func GetVersionString() string {
-	return fmt.Sprintf("%d.%d.%d", GetVersion()[0], GetVersion()[1], GetVersion()[2])
+	return fmt.Sprintf(
+		"%d.%d.%d",
+		GetVersion()[0], GetVersion()[1], GetVersion()[2],
+	)
 }

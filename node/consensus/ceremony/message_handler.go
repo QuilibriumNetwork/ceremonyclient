@@ -331,6 +331,6 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
 
-	e.dataTimeReel.Insert(frame)
+	e.dataTimeReel.Insert(frame, isSync)
 	return nil
 }
