@@ -445,6 +445,8 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		e.logger.Error("error while closing connection", zap.Error(err))
 	}
 
+	e.dataTimeReel.Insert(latest, false)
+
 	return latest, nil
 }
 

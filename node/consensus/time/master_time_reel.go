@@ -114,7 +114,10 @@ func (m *MasterTimeReel) Head() (*protobufs.ClockFrame, error) {
 // Insert enqueues a structurally valid frame into the time reel. If the frame
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
-func (m *MasterTimeReel) Insert(frame *protobufs.ClockFrame) error {
+func (m *MasterTimeReel) Insert(
+	frame *protobufs.ClockFrame,
+	isSync bool,
+) error {
 	go func() {
 		m.frames <- frame
 	}()

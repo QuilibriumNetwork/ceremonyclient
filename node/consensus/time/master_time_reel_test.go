@@ -54,7 +54,7 @@ func TestMasterTimeReel(t *testing.T) {
 		frame, err = prover.ProveMasterClockFrame(frame, i+1, 10)
 		assert.NoError(t, err)
 
-		err := m.Insert(frame)
+		err := m.Insert(frame, false)
 		assert.NoError(t, err)
 	}
 
@@ -69,7 +69,7 @@ func TestMasterTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := m.Insert(insertFrames[i])
+		err := m.Insert(insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 

@@ -136,7 +136,7 @@ func (e *MasterClockConsensusEngine) collect(
 					break
 				}
 
-				e.masterTimeReel.Insert(frame)
+				e.masterTimeReel.Insert(frame, false)
 				latest = frame
 			}
 		}

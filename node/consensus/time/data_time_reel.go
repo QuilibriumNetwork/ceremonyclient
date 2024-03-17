@@ -152,7 +152,7 @@ func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 // Insert enqueues a structurally valid frame into the time reel. If the frame
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
-func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame) error {
+func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
 	if !d.running {
 		return nil
 	}
@@ -179,13 +179,15 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame) error {
 
 	d.storePending(selector, parent, distance, frame)
 
-	go func() {
-		d.frames <- &pendingFrame{
-			selector:       selector,
-			parentSelector: parent,
-			frameNumber:    frame.FrameNumber,
-		}
-	}()
+	if !isSync {
+		go func() {
+			d.frames <- &pendingFrame{
+				selector:       selector,
+				parentSelector: parent,
+				frameNumber:    frame.FrameNumber,
+			}
+		}()
+	}
 
 	return nil
 }

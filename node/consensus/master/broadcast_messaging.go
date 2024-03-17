@@ -189,7 +189,7 @@ func (e *MasterClockConsensusEngine) publishProof(
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
 
-	e.masterTimeReel.Insert(frame)
+	e.masterTimeReel.Insert(frame, false)
 
 	peers, err := e.GetMostAheadPeers()
 	if err != nil || len(peers) == 0 {

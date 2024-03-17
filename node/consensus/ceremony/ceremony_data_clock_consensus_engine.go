@@ -471,7 +471,7 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.frameProverTrie.FindNearest(e.provingKeyAddress).External.Key,
 					e.provingKeyAddress,
 				) {
-					e.dataTimeReel.Insert(nextFrame)
+					e.dataTimeReel.Insert(nextFrame, false)
 
 					if err = e.publishProof(nextFrame); err != nil {
 						e.logger.Error("could not publish", zap.Error(err))
@@ -513,7 +513,7 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					e.frameProverTrie.FindNearest(e.provingKeyAddress).External.Key,
 					e.provingKeyAddress,
 				) {
-					e.dataTimeReel.Insert(nextFrame)
+					e.dataTimeReel.Insert(nextFrame, false)
 
 					if err = e.publishProof(nextFrame); err != nil {
 						e.logger.Error("could not publish", zap.Error(err))
