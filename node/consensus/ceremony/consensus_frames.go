@@ -454,9 +454,6 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 	e.logger.Info("collecting vdf proofs")
 
 	latest := currentFramePublished
-	if e.syncingStatus == SyncStatusFailed {
-		e.syncingStatus = SyncStatusNotSyncing
-	}
 
 	// With the increase of network size, constrain down to top thirty
 	for i := 0; i < 30; i++ {
@@ -468,12 +465,15 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			e.logger.Info("currently up to date, skipping sync")
 			break
 		} else if maxFrame-2 > latest.FrameNumber {
+			e.syncingStatus = SyncStatusSynchronizing
 			latest, err = e.sync(latest, maxFrame, peerId)
 			if err == nil {
 				break
 			}
 		}
 	}
+
+	e.syncingStatus = SyncStatusNotSyncing
 
 	if latest.FrameNumber < currentFramePublished.FrameNumber {
 		latest = currentFramePublished

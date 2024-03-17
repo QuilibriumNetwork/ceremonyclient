@@ -30,7 +30,11 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 			peer, ok := e.peerMap[string(message.From)]
 			e.peerMapMx.RUnlock()
 
-			if ok && bytes.Compare(peer.version, config.GetMinimumVersion()) >= 0 {
+			if ok && bytes.Compare(peer.version, config.GetMinimumVersion()) >= 0 &&
+				bytes.Equal(
+					e.frameProverTrie.FindNearest(e.provingKeyAddress).External.Key,
+					e.provingKeyAddress,
+				) && e.syncingStatus == SyncStatusNotSyncing {
 				for name := range e.executionEngines {
 					name := name
 					go func() error {
