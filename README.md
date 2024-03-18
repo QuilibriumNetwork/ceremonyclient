@@ -46,6 +46,20 @@ The confirmed token balance will be printed to stdout in QUILs.
 
 Note that this feature requires that [gRPC support](#experimental--grpcrest-support) is enabled.
 
+## Version number check
+
+The version number is displayed during startup of the node. In order to find the version number of a running node, execute the following command from the `node/` folder in a new/seperate terminal window:
+```
+printf "Your local Quilibrium node version is " && printf "$(cat config/version.go | grep -A 1 'func GetVersion() \[\]byte {' | grep -Eo '0x[0-9a-fA-F]+' | xargs printf '%d.%d.%d')" && printf "\n"
+```
+The local node version number will be printed to stdout.
+
+To check the latest node version on GitHub, execute the following command:
+```
+printf "The latest version on GitHub is " && printf "$(wget -O- -q https://raw.githubusercontent.com/QuilibriumNetwork/ceremonyclient/main/node/config/version.go | grep -A 1 'func GetVersion() \[\]byte {' | grep -Eo '0x[0-9a-fA-F]+' | xargs printf '%d.%d.%d')" && printf "\n"
+```
+The latest node version number on GitHub will be printed to stdout.
+
 ## Stats Collection
 
 In order to opt-in to stats collection about the health of the network, edit your `config.yml` in the `node/.config` directory to have a new section under `engine`:
