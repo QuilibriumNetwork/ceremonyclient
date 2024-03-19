@@ -36,7 +36,9 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 	server protobufs.CeremonyService_NegotiateCompressedSyncFramesServer,
 ) error {
 	e.currentReceivingSyncPeersMx.Lock()
-	if e.currentReceivingSyncPeers > int(memory.TotalMemory()/uint64(4294967296)) {
+	if e.currentReceivingSyncPeers > int(
+		memory.TotalMemory()/uint64(2147483648)-4,
+	) {
 		e.currentReceivingSyncPeersMx.Unlock()
 
 		e.logger.Debug(
