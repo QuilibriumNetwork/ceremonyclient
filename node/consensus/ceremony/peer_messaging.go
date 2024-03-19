@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mr-tron/base58"
+	"github.com/pbnjay/memory"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -35,7 +36,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 	server protobufs.CeremonyService_NegotiateCompressedSyncFramesServer,
 ) error {
 	e.currentReceivingSyncPeersMx.Lock()
-	if e.currentReceivingSyncPeers > 4 {
+	if e.currentReceivingSyncPeers > int(memory.TotalMemory()/uint64(4294967296)) {
 		e.currentReceivingSyncPeersMx.Unlock()
 
 		e.logger.Debug(

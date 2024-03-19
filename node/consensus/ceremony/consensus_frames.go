@@ -271,16 +271,37 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		},
 	})
 	if err != nil {
+		e.peerMapMx.Lock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+		e.peerMapMx.Unlock()
 		return latest, errors.Wrap(err, "sync")
 	}
 
 	syncMsg, err := s.Recv()
 	if err != nil {
+		e.peerMapMx.Lock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+		e.peerMapMx.Unlock()
 		return latest, errors.Wrap(err, "sync")
 	}
 	preflight, ok := syncMsg.
 		SyncMessage.(*protobufs.CeremonyCompressedSyncResponseMessage_Preflight)
 	if !ok {
+		e.peerMapMx.Lock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+		e.peerMapMx.Unlock()
 		s.CloseSend()
 		return latest, errors.Wrap(
 			errors.New("preflight message invalid"),
