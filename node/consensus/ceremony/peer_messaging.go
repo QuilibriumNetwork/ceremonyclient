@@ -246,179 +246,21 @@ func (e *CeremonyDataClockConsensusEngine) GetCompressedSyncFrames(
 	request *protobufs.ClockFramesRequest,
 	server protobufs.CeremonyService_GetCompressedSyncFramesServer,
 ) error {
-	e.logger.Info(
+	e.logger.Debug(
 		"received clock frame request",
 		zap.Uint64("from_frame_number", request.FromFrameNumber),
 		zap.Uint64("to_frame_number", request.ToFrameNumber),
 	)
 
-	e.currentReceivingSyncPeersMx.Lock()
-	if e.currentReceivingSyncPeers > 4 {
-		e.currentReceivingSyncPeersMx.Unlock()
-
-		e.logger.Info(
-			"currently processing maximum sync requests, returning",
-		)
-
-		if err := server.SendMsg(
-			&protobufs.ClockFramesResponse{
-				Filter:          request.Filter,
-				FromFrameNumber: 0,
-				ToFrameNumber:   0,
-				ClockFrames:     []*protobufs.ClockFrame{},
-			},
-		); err != nil {
-			return errors.Wrap(err, "get compressed sync frames")
-		}
-
-		return nil
-	}
-
-	e.currentReceivingSyncPeers++
-	e.currentReceivingSyncPeersMx.Unlock()
-
-	defer func() {
-		e.currentReceivingSyncPeersMx.Lock()
-		e.currentReceivingSyncPeers--
-		e.currentReceivingSyncPeersMx.Unlock()
-	}()
-
-	from := request.FromFrameNumber
-	parent := request.ParentSelector
-
-	frame, _, err := e.clockStore.GetDataClockFrame(
-		request.Filter,
-		from,
-		true,
-	)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			e.logger.Error(
-				"peer asked for frame that returned error",
-				zap.Uint64("frame_number", request.FromFrameNumber),
-			)
-
-			return errors.Wrap(err, "get compressed sync frames")
-		} else {
-			e.logger.Debug(
-				"peer asked for undiscovered frame",
-				zap.Uint64("frame_number", request.FromFrameNumber),
-			)
-
-			if err := server.SendMsg(
-				&protobufs.ClockFramesResponse{
-					Filter:          request.Filter,
-					FromFrameNumber: 0,
-					ToFrameNumber:   0,
-					ClockFrames:     []*protobufs.ClockFrame{},
-				},
-			); err != nil {
-				return errors.Wrap(err, "get compressed sync frames")
-			}
-
-			return nil
-		}
-	}
-
-	if parent != nil {
-		if !bytes.Equal(frame.ParentSelector, parent) {
-			e.logger.Debug(
-				"peer specified out of consensus head, seeking backwards for fork",
-			)
-		}
-
-		for !bytes.Equal(frame.ParentSelector, parent) {
-			ours, err := e.clockStore.GetStagedDataClockFrame(
-				e.filter,
-				frame.FrameNumber-1,
-				frame.ParentSelector,
-				true,
-			)
-			if err != nil {
-				from = 1
-				e.logger.Debug("peer fully out of sync, rewinding sync head to start")
-				break
-			}
-
-			theirs, err := e.clockStore.GetStagedDataClockFrame(
-				e.filter,
-				frame.FrameNumber-1,
-				parent,
-				true,
-			)
-			if err != nil {
-				from = 1
-				e.logger.Debug("peer fully out of sync, rewinding sync head to start")
-				break
-			}
-
-			from--
-			frame = ours
-			parent = theirs.ParentSelector
-		}
-	}
-
-	if request.RangeParentSelectors != nil {
-		for _, selector := range request.RangeParentSelectors {
-			frame, err := e.clockStore.GetStagedDataClockFrame(
-				e.filter,
-				selector.FrameNumber,
-				selector.ParentSelector,
-				true,
-			)
-			if err == nil && frame != nil {
-				from = selector.FrameNumber
-				break
-			}
-		}
-	}
-
-	head, err := e.dataTimeReel.Head()
-	if err != nil {
-		panic(err)
-	}
-
-	max := head.FrameNumber
-	to := request.ToFrameNumber
-
-	// We need to slightly rewind, to compensate for unconfirmed frame heads on a
-	// given branch
-	if from >= 2 {
-		from--
-	}
-
-	for {
-		if to == 0 || to-from > 16 {
-			if max > from+15 {
-				to = from + 16
-			} else {
-				to = max + 1
-			}
-		}
-
-		syncMsg, err := e.clockStore.GetCompressedDataClockFrames(
-			e.filter,
-			from,
-			to,
-		)
-		if err != nil {
-			return errors.Wrap(err, "get compressed sync frames")
-		}
-
-		if err := server.SendMsg(syncMsg); err != nil {
-			return errors.Wrap(err, "get compressed sync frames")
-		}
-
-		if (request.ToFrameNumber == 0 || request.ToFrameNumber > to) && max > to {
-			from = to + 1
-			if request.ToFrameNumber > to {
-				to = request.ToFrameNumber
-			} else {
-				to = 0
-			}
-		} else {
-			break
-		}
+	if err := server.SendMsg(
+		&protobufs.ClockFramesResponse{
+			Filter:          request.Filter,
+			FromFrameNumber: 0,
+			ToFrameNumber:   0,
+			ClockFrames:     []*protobufs.ClockFrame{},
+		},
+	); err != nil {
+		return errors.Wrap(err, "get compressed sync frames")
 	}
 
 	return nil
@@ -430,6 +272,11 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 ) (*protobufs.ClockFrame, error) {
 	if len(syncMsg.TruncatedClockFrames) == 0 {
 		return nil, ErrNoNewFrames
+	}
+
+	head, err := e.dataTimeReel.Head()
+	if err != nil {
+		panic(err)
 	}
 
 	if len(syncMsg.TruncatedClockFrames) < int(
@@ -595,7 +442,10 @@ func (e *CeremonyDataClockConsensusEngine) decompressAndStoreCandidates(
 				p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
 			),
 			any,
-			true,
+			// We'll tell the time reel to process it (isSync = false) if we're caught
+			// up beyond the head and frame number is divisible by 100 (limited to
+			// avoid thrash):
+			head.FrameNumber > frame.FrameNumber || frame.FrameNumber%100 != 0,
 		); err != nil {
 			return nil, errors.Wrap(err, "decompress and store candidates")
 		}

@@ -42,7 +42,7 @@ func (e *CeremonyDataClockConsensusEngine) publishProof(
 	}
 
 	peers, max, err := e.GetMostAheadPeer()
-	if err != nil || len(peers) == 0 || head.FrameNumber+3 > max {
+	if err != nil || len(peers) == 0 || head.FrameNumber > max {
 		if err := e.publishMessage(e.filter, frame); err != nil {
 			return errors.Wrap(
 				err,
