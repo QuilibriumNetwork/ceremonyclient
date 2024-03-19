@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"math/big"
+	random "math/rand"
 	"sync"
 	"time"
 
@@ -318,6 +319,7 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 	result := e.pubSub.GetMultiaddrOfPeer(peerID)
 	if result == "" {
 		go func() {
+			time.Sleep(time.Duration(random.Intn(3)) * time.Second)
 			e.bandwidthTestCh <- peerID
 		}()
 		return
