@@ -27,7 +27,7 @@ const (
 var (
 	BlossomSubD                                = 6
 	BlossomSubDlo                              = 5
-	BlossomSubDhi                              = 12
+	BlossomSubDhi                              = 24
 	BlossomSubDscore                           = 4
 	BlossomSubDout                             = 2
 	BlossomSubHistoryLength                    = 5
@@ -50,7 +50,7 @@ var (
 	BlossomSubOpportunisticGraftPeers          = 2
 	BlossomSubGraftFloodThreshold              = 10 * time.Second
 	BlossomSubMaxIHaveLength                   = 5000
-	BlossomSubMaxIHaveMessages                 = 10
+	BlossomSubMaxIHaveMessages                 = 100
 	BlossomSubIWantFollowupTime                = 3 * time.Second
 )
 

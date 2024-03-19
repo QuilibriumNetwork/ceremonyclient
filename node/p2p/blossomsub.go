@@ -141,7 +141,7 @@ func NewBlossomSub(
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, ANNOUNCE)
 
-	go discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
+	discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
 
 	// TODO: turn into an option flag for console logging, this is too noisy for
 	// default logging behavior
@@ -158,19 +158,23 @@ func NewBlossomSub(
 		}
 	}
 
-	blossomOpts := []blossomsub.Option{
-		blossomsub.WithPeerExchange(true),
+	blossomOpts := []blossomsub.Option{}
+	if isBootstrapPeer {
+		blossomOpts = append(blossomOpts,
+			blossomsub.WithPeerExchange(true),
+		)
 	}
+
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
 	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
 		&blossomsub.PeerScoreParams{
 			SkipAtomicValidation:        false,
-			BitmaskScoreCap:             100,
+			BitmaskScoreCap:             0,
 			IPColocationFactorWeight:    0,
 			IPColocationFactorThreshold: 6,
-			BehaviourPenaltyWeight:      -80,
+			BehaviourPenaltyWeight:      0,
 			BehaviourPenaltyThreshold:   100,
 			BehaviourPenaltyDecay:       .5,
 			DecayInterval:               10 * time.Second,
@@ -382,7 +386,7 @@ func initDHT(
 			time.Sleep(30 * time.Second)
 			// try to assert some stability, never go below min peers for data
 			// consensus:
-			if len(h.Network().Peers()) < 3 {
+			if len(h.Network().Peers()) < 4 {
 				logger.Info("reconnecting to peers")
 				reconnect()
 			}
@@ -574,7 +578,7 @@ func discoverPeers(
 
 	go func() {
 		for {
-			time.Sleep(30 * time.Second)
+			time.Sleep(5 * time.Minute)
 			discover()
 		}
 	}()
