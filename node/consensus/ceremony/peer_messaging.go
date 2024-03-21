@@ -177,7 +177,6 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 		e.logger.Warn(
 			"peer manifest was null or bandwidth was low",
 			zap.Binary("peer_id", authentication.Authentication.PeerId),
-			zap.Uint64("bandwidth", manifest.Bandwidth),
 		)
 		return nil
 	}
