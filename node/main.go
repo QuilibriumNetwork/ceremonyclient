@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -167,6 +168,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	nodeConfig = loadBootstrapFile(*configDirectory, nodeConfig)
 
 	clearIfTestData(*configDirectory, nodeConfig)
 
@@ -219,6 +221,13 @@ func main() {
 			}
 		}()
 	}
+
+	go func() {
+		for {
+			time.Sleep(2 * time.Minute)
+			exportBootstrapFile(*configDirectory, node)
+		}
+	}()
 
 	node.Start()
 
@@ -457,6 +466,71 @@ func clearIfTestData(configDir string, nodeConfig *config.Config) {
 		if err != nil {
 			panic(err)
 		}
+	}
+}
+
+func loadBootstrapFile(configDir string, config *config.Config) *config.Config {
+	f, _ := os.Stat(filepath.Join(configDir, "BOOTSTRAP"))
+	if f != nil {
+		if f.Size() != 0 {
+			logger, _ := zap.NewProduction()
+			logger.Info("Loading bootstrap file.")
+			peerBytes, _ := os.ReadFile(filepath.Join(configDir, "BOOTSTRAP"))
+			if peerBytes != nil {
+				for _, peer := range strings.Split(string(peerBytes), "$") {
+					if peer != "" {
+						config.P2P.BootstrapPeers = append(config.P2P.BootstrapPeers, peer)
+					}
+				}
+			}
+		}
+	}
+	return config
+}
+
+func exportBootstrapFile(configDir string, node *app.Node) {
+	logger, _ := zap.NewProduction()
+	infos := node.GetPubSub().GetNetworkInfo()
+	topPeers := make(map[string]int)
+	for _, peer := range infos.NetworkInfo {
+		if peer.PeerScore > 0 && len(peer.Multiaddrs) > 0 && peer.Multiaddrs[0] != "" {
+			if len(topPeers) < 100 {
+				topPeers[peer.Multiaddrs[0]] = int(peer.PeerScore)
+			} else {
+				var replaceKey string = ""
+				for key, score := range topPeers {
+					if score < int(peer.PeerScore) {
+						replaceKey = key
+						break
+					}
+				}
+				if replaceKey != "" {
+					delete(topPeers, replaceKey)
+					topPeers[peer.Multiaddrs[0]] = int(peer.PeerScore)
+				}
+			}
+		}
+	}
+	peers := make([]string, 0)
+	for peer, _ := range topPeers {
+		if peer != "" {
+			peers = append(peers, peer)
+		}
+	}
+	if len(peers) < 2 {
+		return // not worth saving and we could end up replacing a good value
+	}
+	peersString := strings.Join(peers, "$")
+
+	err := os.WriteFile(
+		filepath.Join(configDir, "BOOTSTRAP"),
+		[]byte(peersString),
+		fs.FileMode(0600),
+	)
+	if err != nil {
+		logger.Error("Failed to save bootstrap file.", zap.Error(err))
+	} else {
+		logger.Info("Stored bootstrap file.")
 	}
 }
 
