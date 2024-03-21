@@ -11,7 +11,7 @@ vars:
   PROJECT_NAME: quilibrium
   SERVICE_NAME: node
   GIT_REPO:
-    sh: git config --get remote.origin.url
+    sh: git config --get remote.origin.url | sed 's/\.git$//'
   GIT_BRANCH:
     sh: git rev-parse --abbrev-ref HEAD
   GIT_COMMIT:
@@ -33,6 +33,7 @@ tasks:
     cmds:
       - |
         docker build \
+        --build-arg NODE_VERSION={{.VERSION}} \
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \

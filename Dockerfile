@@ -13,6 +13,7 @@ RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
 FROM alpine:3.19
 
+ARG NODE_VERSION
 ARG GIT_REPO
 ARG GIT_BRANCH
 ARG GIT_COMMIT
@@ -21,6 +22,7 @@ ENV GOEXPERIMENT=arenas
 
 LABEL org.opencontainers.image.title="Quilibrium Network Node"
 LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
 LABEL org.opencontainers.image.vendor=Quilibrium
 LABEL org.opencontainers.image.url=https://quilibrium.com/
 LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
