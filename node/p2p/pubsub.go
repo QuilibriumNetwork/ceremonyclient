@@ -1,6 +1,9 @@
 package p2p
 
 import (
+	"context"
+
+	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -16,6 +19,10 @@ type PubSub interface {
 	GetPeerstoreCount() int
 	GetNetworkPeersCount() int
 	GetRandomPeer(bitmask []byte) ([]byte, error)
+	GetMultiaddrOfPeerStream(
+		ctx context.Context,
+		peerId []byte,
+	) <-chan multiaddr.Multiaddr
 	GetMultiaddrOfPeer(peerId []byte) string
 	StartDirectChannelListener(
 		key []byte,

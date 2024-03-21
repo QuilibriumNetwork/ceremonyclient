@@ -2,8 +2,10 @@ package master
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strings"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/mr-tron/base58"
@@ -122,14 +124,13 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		return errors.Wrap(err, "handle self test report")
 	}
 
-	e.peerMapMx.Lock()
-	if _, ok := e.peerMap[string(peerID)]; ok {
-		e.peerMap[string(peerID)].MasterHeadFrame = report.MasterHeadFrame
-		e.peerMapMx.Unlock()
+	info := e.peerInfoManager.GetPeerInfo(peerID)
+	if info != nil {
+		info.MasterHeadFrame = report.MasterHeadFrame
 		return nil
 	}
-	e.peerMap[string(peerID)] = report
-	e.peerMapMx.Unlock()
+
+	e.addPeerManifestReport(peerID, report)
 
 	memory := binary.BigEndian.Uint64(report.Memory)
 	e.logger.Debug(
@@ -175,7 +176,16 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	}
 
 	go func() {
-		e.bandwidthTestCh <- peerID
+		ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
+		defer cancel()
+		ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
+		select {
+		case <-ch:
+			go func() {
+				e.bandwidthTestCh <- peerID
+			}()
+		case <-ctx.Done():
+		}
 	}()
 
 	return nil

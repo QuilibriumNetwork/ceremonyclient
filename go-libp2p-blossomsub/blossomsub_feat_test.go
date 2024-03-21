@@ -15,15 +15,15 @@ func TestDefaultBlossomSubFeatures(t *testing.T) {
 	if BlossomSubDefaultFeatures(BlossomSubFeatureMesh, FloodSubID) {
 		t.Fatal("floodsub should not support Mesh")
 	}
-	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v11) {
-		t.Fatal("BlossomSub-v1.1 should support Mesh")
+	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v12) {
+		t.Fatal("BlossomSub-v1.2 should support Mesh")
 	}
 
 	if BlossomSubDefaultFeatures(BlossomSubFeaturePX, FloodSubID) {
 		t.Fatal("floodsub should not support PX")
 	}
-	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v11) {
-		t.Fatal("BlossomSub-v1.1 should support PX")
+	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v12) {
+		t.Fatal("BlossomSub-v1.2 should support PX")
 	}
 }
 

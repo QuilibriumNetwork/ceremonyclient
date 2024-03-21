@@ -23,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/mr-tron/base58"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -449,6 +450,13 @@ func (b *BlossomSub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
 
 func (b *BlossomSub) GetNetworkPeersCount() int {
 	return len(b.h.Network().Peers())
+}
+
+func (b *BlossomSub) GetMultiaddrOfPeerStream(
+	ctx context.Context,
+	peerId []byte,
+) <-chan multiaddr.Multiaddr {
+	return b.h.Peerstore().AddrStream(ctx, peer.ID(peerId))
 }
 
 func (b *BlossomSub) GetMultiaddrOfPeer(peerId []byte) string {

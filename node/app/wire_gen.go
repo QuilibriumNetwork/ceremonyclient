@@ -36,9 +36,10 @@ func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestRepo
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
+	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
 	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
-	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, pebbleKeyStore)
-	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, selfTestReport)
+	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, inMemoryPeerInfoManager, pebbleKeyStore)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
 	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
@@ -81,7 +82,7 @@ var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.
 
 var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)))
 
-var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)))
+var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewInMemoryPeerInfoManager, p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)), wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)))
 
 var engineSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), crypto.NewWesolowskiFrameProver, wire.Bind(new(crypto.FrameProver), new(*crypto.WesolowskiFrameProver)), crypto.NewKZGInclusionProver, wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)), time.NewMasterTimeReel, ceremony.NewCeremonyExecutionEngine)
 

@@ -44,8 +44,8 @@ func (e *MasterClockConsensusEngine) GetMostAheadPeers() (
 	max := frame.FrameNumber + 10
 
 	var peers [][]byte = [][]byte{}
-	e.peerMapMx.Lock()
-	for peerId, v := range e.peerMap {
+	peerMap := e.peerInfoManager.GetPeerMap()
+	for peerId, v := range peerMap {
 		if v.MasterHeadFrame > max {
 			peers = append(peers, []byte(peerId))
 		}
@@ -54,7 +54,6 @@ func (e *MasterClockConsensusEngine) GetMostAheadPeers() (
 			break
 		}
 	}
-	e.peerMapMx.Unlock()
 
 	if len(peers) == 0 {
 		return nil, p2p.ErrNoPeersAvailable

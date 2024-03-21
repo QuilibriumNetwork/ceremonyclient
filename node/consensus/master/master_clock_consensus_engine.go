@@ -57,9 +57,8 @@ type MasterClockConsensusEngine struct {
 	historicFrames              []*protobufs.ClockFrame
 	clockStore                  store.ClockStore
 	masterTimeReel              *qtime.MasterTimeReel
+	peerInfoManager             p2p.PeerInfoManager
 	report                      *protobufs.SelfTestReport
-	peerMapMx                   sync.RWMutex
-	peerMap                     map[string]*protobufs.SelfTestReport
 	frameValidationCh           chan *protobufs.ClockFrame
 	bandwidthTestCh             chan []byte
 	currentReceivingSyncPeers   int
@@ -76,6 +75,7 @@ func NewMasterClockConsensusEngine(
 	pubSub p2p.PubSub,
 	frameProver crypto.FrameProver,
 	masterTimeReel *qtime.MasterTimeReel,
+	peerInfoManager p2p.PeerInfoManager,
 	report *protobufs.SelfTestReport,
 ) *MasterClockConsensusEngine {
 	if logger == nil {
@@ -121,13 +121,13 @@ func NewMasterClockConsensusEngine(
 		clockStore:          clockStore,
 		frameProver:         frameProver,
 		masterTimeReel:      masterTimeReel,
+		peerInfoManager:     peerInfoManager,
 		report:              report,
-		peerMap:             map[string]*protobufs.SelfTestReport{},
 		frameValidationCh:   make(chan *protobufs.ClockFrame, 10),
 		bandwidthTestCh:     make(chan []byte),
 	}
 
-	e.peerMap[string(e.pubSub.GetPeerID())] = report
+	e.addPeerManifestReport(e.pubSub.GetPeerID(), report)
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
 		panic(errors.Wrap(err, "could not parse filter value"))
@@ -142,6 +142,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.logger.Info("starting master consensus engine")
 	e.state = consensus.EngineStateStarting
 	errChan := make(chan error)
+
+	e.peerInfoManager.Start()
 
 	e.state = consensus.EngineStateLoading
 	e.logger.Info("syncing last seen state")
@@ -222,7 +224,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
 			}
-			time.Sleep(30 * time.Minute)
+			time.Sleep(5 * time.Minute)
 		}
 	}()
 
@@ -306,6 +308,7 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 	wg.Wait()
 	e.logger.Info("execution engines stopped")
 	e.masterTimeReel.Stop()
+	e.peerInfoManager.Stop()
 
 	e.state = consensus.EngineStateStopped
 	go func() {
@@ -317,9 +320,6 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 	result := e.pubSub.GetMultiaddrOfPeer(peerID)
 	if result == "" {
-		go func() {
-			e.bandwidthTestCh <- peerID
-		}()
 		return
 	}
 
@@ -377,6 +377,47 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 		e.pubSub.SetPeerScore(peerID, -1000)
 		return
 	}
+
+	duration := end - start
+	bandwidth := uint64(1048576*1000) / uint64(duration)
+	manifest := e.peerInfoManager.GetPeerInfo(peerID)
+	if manifest == nil {
+		return
+	}
+
+	peerManifest := &p2p.PeerManifest{
+		PeerId:             peerID,
+		Difficulty:         manifest.Difficulty,
+		DifficultyMetric:   manifest.DifficultyMetric,
+		Commit_16Metric:    manifest.Commit_16Metric,
+		Commit_128Metric:   manifest.Commit_128Metric,
+		Commit_1024Metric:  manifest.Commit_1024Metric,
+		Commit_65536Metric: manifest.Commit_65536Metric,
+		Proof_16Metric:     manifest.Proof_16Metric,
+		Proof_128Metric:    manifest.Proof_128Metric,
+		Proof_1024Metric:   manifest.Proof_1024Metric,
+		Proof_65536Metric:  manifest.Proof_65536Metric,
+		Cores:              manifest.Cores,
+		Memory:             manifest.Memory,
+		Storage:            manifest.Storage,
+		Capabilities:       []p2p.Capability{},
+		MasterHeadFrame:    manifest.MasterHeadFrame,
+		Bandwidth:          bandwidth,
+	}
+
+	for _, capability := range manifest.Capabilities {
+		metadata := make([]byte, len(capability.AdditionalMetadata))
+		copy(metadata[:], capability.AdditionalMetadata[:])
+		peerManifest.Capabilities = append(
+			peerManifest.Capabilities,
+			p2p.Capability{
+				ProtocolIdentifier: capability.ProtocolIdentifier,
+				AdditionalMetadata: metadata,
+			},
+		)
+	}
+
+	e.peerInfoManager.AddPeerInfo(manifest)
 }
 
 func (
@@ -385,8 +426,8 @@ func (
 	response := &protobufs.PeerManifestsResponse{
 		PeerManifests: []*protobufs.PeerManifest{},
 	}
-	e.peerMapMx.Lock()
-	for peerId, peerManifest := range e.peerMap {
+	peerMap := e.peerInfoManager.GetPeerMap()
+	for peerId, peerManifest := range peerMap {
 		peerId := peerId
 		peerManifest := peerManifest
 		manifest := &protobufs.PeerManifest{
@@ -424,7 +465,6 @@ func (
 			manifest,
 		)
 	}
-	e.peerMapMx.Unlock()
 	return response
 }
 
@@ -486,4 +526,42 @@ func (e *MasterClockConsensusEngine) buildHistoricFrameCache(
 	}
 
 	e.historicFrames = append(e.historicFrames, latestFrame)
+}
+
+func (e *MasterClockConsensusEngine) addPeerManifestReport(
+	peerId []byte,
+	report *protobufs.SelfTestReport,
+) {
+	manifest := &p2p.PeerManifest{
+		PeerId:             peerId,
+		Difficulty:         report.Difficulty,
+		DifficultyMetric:   report.DifficultyMetric,
+		Commit_16Metric:    report.Commit_16Metric,
+		Commit_128Metric:   report.Commit_128Metric,
+		Commit_1024Metric:  report.Commit_1024Metric,
+		Commit_65536Metric: report.Commit_65536Metric,
+		Proof_16Metric:     report.Proof_16Metric,
+		Proof_128Metric:    report.Proof_128Metric,
+		Proof_1024Metric:   report.Proof_1024Metric,
+		Proof_65536Metric:  report.Proof_65536Metric,
+		Cores:              report.Cores,
+		Memory:             report.Memory,
+		Storage:            report.Storage,
+		Capabilities:       []p2p.Capability{},
+		MasterHeadFrame:    report.MasterHeadFrame,
+	}
+
+	for _, capability := range manifest.Capabilities {
+		metadata := make([]byte, len(capability.AdditionalMetadata))
+		copy(metadata[:], capability.AdditionalMetadata[:])
+		manifest.Capabilities = append(
+			manifest.Capabilities,
+			p2p.Capability{
+				ProtocolIdentifier: capability.ProtocolIdentifier,
+				AdditionalMetadata: metadata,
+			},
+		)
+	}
+
+	e.peerInfoManager.AddPeerInfo(manifest)
 }

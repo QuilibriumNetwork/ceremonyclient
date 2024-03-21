@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	// BlossomSubID_v11 is the protocol ID for version 1.1.0 of the BlossomSub protocol.
-	// It retains versioning matching to GossipSub 1.1.0 to indicate point of fork
-	BlossomSubID_v11 = protocol.ID("/blossomsub/1.1.0")
+	// BlossomSubID_v12 is the protocol ID for version 1.2.0 of the BlossomSub protocol.
+	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.0")
 )
 
 // Defines the default BlossomSub parameters.

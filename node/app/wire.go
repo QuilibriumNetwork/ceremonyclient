@@ -51,8 +51,10 @@ var storeSet = wire.NewSet(
 
 var pubSubSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "P2P"),
+	p2p.NewInMemoryPeerInfoManager,
 	p2p.NewBlossomSub,
 	wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)),
+	wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
 )
 
 var engineSet = wire.NewSet(

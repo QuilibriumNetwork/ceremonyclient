@@ -151,10 +151,17 @@ message CeremonyCompressedSync {
   repeated InclusionSegmentsMap segments = 5;
 }
 
+message SyncRequestAuthentication {
+  bytes peer_id = 1;
+  bytes challenge = 2;
+  quilibrium.node.keys.pb.Ed448Signature response = 3;
+}
+
 message CeremonyCompressedSyncRequestMessage {
   oneof sync_message {
     quilibrium.node.clock.pb.ClockFramesPreflight preflight = 1;
     quilibrium.node.clock.pb.ClockFramesRequest request = 2;
+    SyncRequestAuthentication authentication = 3; 
   }
 }
 

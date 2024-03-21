@@ -19,9 +19,9 @@ func TestBlossomSubMatchingFn(t *testing.T) {
 
 	h := getNetHosts(t, ctx, 4)
 	psubs := []*PubSub{
-		getBlossomSub(ctx, h[0], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{customsubA100, BlossomSubID_v11}, BlossomSubDefaultFeatures)),
+		getBlossomSub(ctx, h[0], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{customsubA100, BlossomSubID_v12}, BlossomSubDefaultFeatures)),
 		getBlossomSub(ctx, h[1], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{customsubA101Beta}, BlossomSubDefaultFeatures)),
-		getBlossomSub(ctx, h[2], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{BlossomSubID_v11}, BlossomSubDefaultFeatures)),
+		getBlossomSub(ctx, h[2], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{BlossomSubID_v12}, BlossomSubDefaultFeatures)),
 		getBlossomSub(ctx, h[3], WithProtocolMatchFn(protocolNameMatch), WithBlossomSubProtocols([]protocol.ID{customsubB100}, BlossomSubDefaultFeatures)),
 	}
 

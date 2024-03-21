@@ -1250,6 +1250,36 @@ func (p *PebbleClockStore) Compact(
 	}
 
 	if dataFilter != nil {
+		if err := p.db.Compact(
+			dataProofMetadataKey(
+				dataFilter,
+				make([]byte, 74),
+			),
+			dataProofMetadataKey(
+				dataFilter,
+				bytes.Repeat([]byte{0xff}, 74),
+			),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+
+		if err := p.db.Compact(
+			dataProofInclusionKey(
+				dataFilter,
+				make([]byte, 74),
+				0,
+			),
+			dataProofInclusionKey(
+				dataFilter,
+				bytes.Repeat([]byte{0xff}, 74),
+				20000,
+			),
+			true,
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+
 		if err := p.db.DeleteRange(
 			clockDataCandidateFrameKey(
 				dataFilter,

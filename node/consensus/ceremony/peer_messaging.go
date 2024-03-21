@@ -3,9 +3,12 @@ package ceremony
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"time"
 
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pbnjay/memory"
 	"github.com/pkg/errors"
@@ -60,6 +63,128 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 
 		return nil
 	}
+
+	request, err := server.Recv()
+	if err == io.EOF {
+		return nil
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "negotiate compressed sync frames")
+	}
+
+	authentication, ok := request.
+		SyncMessage.(*protobufs.CeremonyCompressedSyncRequestMessage_Authentication)
+	if !ok {
+		return nil
+	}
+
+	if authentication.Authentication == nil ||
+		authentication.Authentication.Challenge == nil ||
+		authentication.Authentication.PeerId == nil ||
+		authentication.Authentication.Response == nil ||
+		authentication.Authentication.Response.PublicKey == nil ||
+		authentication.Authentication.Response.PublicKey.KeyValue == nil ||
+		authentication.Authentication.Response.Signature == nil ||
+		len(authentication.Authentication.Challenge) < 8 {
+		return nil
+	}
+
+	if !bytes.Equal(
+		authentication.Authentication.Challenge[:len(
+			authentication.Authentication.Challenge,
+		)-8],
+		e.pubSub.GetPeerID(),
+	) {
+		e.logger.Warn(
+			"peer provided invalid challenge",
+		)
+		return nil
+	}
+
+	// probably some remark to make about chronometers here, whether one or three
+	challenge := int64(
+		binary.BigEndian.Uint64(
+			authentication.Authentication.Challenge[len(
+				authentication.Authentication.Challenge,
+			)-8:],
+		),
+	)
+	dist := time.Now().UnixMilli() - challenge
+	if dist < 0 {
+		dist *= -1
+	}
+
+	// account for skew
+	if dist > 30000 {
+		e.logger.Warn(
+			"peer provided challenge with too great of a distance",
+			zap.Int64("distance", dist),
+		)
+		return nil
+	}
+
+	key, err := pcrypto.UnmarshalEd448PublicKey(
+		authentication.Authentication.Response.PublicKey.KeyValue,
+	)
+	if err != nil {
+		e.logger.Warn(
+			"peer provided invalid pubkey",
+			zap.Binary(
+				"public_key",
+				authentication.Authentication.Response.PublicKey.KeyValue,
+			),
+		)
+		return errors.Wrap(err, "negotiate compressed sync frames")
+	}
+
+	if !(peer.ID(authentication.Authentication.PeerId)).MatchesPublicKey(key) {
+		e.logger.Warn(
+			"peer id does not match pubkey",
+			zap.Binary("peer_id", authentication.Authentication.PeerId),
+			zap.Binary(
+				"public_key",
+				authentication.Authentication.Response.PublicKey.KeyValue,
+			),
+		)
+		return nil
+	}
+
+	b, err := key.Verify(
+		authentication.Authentication.Challenge,
+		authentication.Authentication.Response.Signature,
+	)
+	if err != nil || !b {
+		e.logger.Warn(
+			"peer provided invalid signature",
+			zap.Binary("peer_id", authentication.Authentication.PeerId),
+			zap.Binary(
+				"public_key",
+				authentication.Authentication.Response.PublicKey.KeyValue,
+			),
+			zap.Binary(
+				"signature",
+				authentication.Authentication.Response.Signature,
+			),
+		)
+		return nil
+	}
+
+	manifest := e.peerInfoManager.GetPeerInfo(
+		authentication.Authentication.PeerId,
+	)
+	if manifest == nil || manifest.Bandwidth <= 1048576 {
+		e.logger.Warn(
+			"peer manifest was null or bandwidth was low",
+			zap.Binary("peer_id", authentication.Authentication.PeerId),
+			zap.Uint64("bandwidth", manifest.Bandwidth),
+		)
+		return nil
+	}
+
+	// TODO: should give this more tlc, but should remap into blossomsub
+	// heuristics
+
 	e.currentReceivingSyncPeers++
 	e.currentReceivingSyncPeersMx.Unlock()
 

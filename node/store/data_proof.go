@@ -25,9 +25,10 @@ type DataProofStore interface {
 		txn Transaction,
 		aggregateProof *protobufs.InclusionAggregateProof,
 		commitment []byte,
-		inclusionSplitter func(typeUrl string, data []byte) ([][]byte, error),
 	) error
 }
+
+var _ DataProofStore = (*PebbleDataProofStore)(nil)
 
 type PebbleDataProofStore struct {
 	db     KVDB
