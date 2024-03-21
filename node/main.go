@@ -490,33 +490,7 @@ func loadBootstrapFile(configDir string, config *config.Config) *config.Config {
 
 func exportBootstrapFile(configDir string, node *app.Node) {
 	logger, _ := zap.NewProduction()
-	infos := node.GetPubSub().GetNetworkInfo()
-	topPeers := make(map[string]int)
-	for _, peer := range infos.NetworkInfo {
-		if peer.PeerScore > 0 && len(peer.Multiaddrs) > 0 && peer.Multiaddrs[0] != "" {
-			if len(topPeers) < 100 {
-				topPeers[peer.Multiaddrs[0]] = int(peer.PeerScore)
-			} else {
-				var replaceKey string = ""
-				for key, score := range topPeers {
-					if score < int(peer.PeerScore) {
-						replaceKey = key
-						break
-					}
-				}
-				if replaceKey != "" {
-					delete(topPeers, replaceKey)
-					topPeers[peer.Multiaddrs[0]] = int(peer.PeerScore)
-				}
-			}
-		}
-	}
-	peers := make([]string, 0)
-	for peer, _ := range topPeers {
-		if peer != "" {
-			peers = append(peers, peer)
-		}
-	}
+	peers := node.GetPubSub().ExportTopScoreBootstrap()
 	if len(peers) < 2 {
 		return // not worth saving and we could end up replacing a good value
 	}
