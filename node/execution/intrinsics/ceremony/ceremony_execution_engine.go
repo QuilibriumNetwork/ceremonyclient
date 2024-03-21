@@ -73,6 +73,7 @@ func NewCeremonyExecutionEngine(
 	inclusionProver qcrypto.InclusionProver,
 	clockStore store.ClockStore,
 	masterTimeReel *time.MasterTimeReel,
+	peerInfoManager p2p.PeerInfoManager,
 	keyStore store.KeyStore,
 ) *CeremonyExecutionEngine {
 	if logger == nil {
@@ -144,6 +145,7 @@ func NewCeremonyExecutionEngine(
 		inclusionProver,
 		masterTimeReel,
 		dataTimeReel,
+		peerInfoManager,
 		intrinsicFilter,
 		seed,
 	)

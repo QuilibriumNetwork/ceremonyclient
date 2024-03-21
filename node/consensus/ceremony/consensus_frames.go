@@ -3,6 +3,7 @@ package ceremony
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"time"
 
@@ -253,6 +254,40 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			"received error from peer",
 			zap.Error(err),
 		)
+		e.peerMapMx.Lock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+		e.peerMapMx.Unlock()
+		return latest, errors.Wrap(err, "sync")
+	}
+
+	challenge := binary.BigEndian.AppendUint64(
+		append([]byte{}, peerId...),
+		uint64(time.Now().UnixMilli()),
+	)
+	signature, err := e.pubSub.SignMessage(challenge)
+	if err != nil {
+		panic(err)
+	}
+
+	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
+		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Authentication{
+			Authentication: &protobufs.SyncRequestAuthentication{
+				PeerId:    e.pubSub.GetPeerID(),
+				Challenge: challenge,
+				Response: &protobufs.Ed448Signature{
+					Signature: signature,
+					PublicKey: &protobufs.Ed448PublicKey{
+						KeyValue: e.pubSub.GetPublicKey(),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
 		e.peerMapMx.Lock()
 		if _, ok := e.peerMap[string(peerId)]; ok {
 			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]

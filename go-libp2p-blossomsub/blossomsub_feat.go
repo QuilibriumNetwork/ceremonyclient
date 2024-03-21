@@ -14,22 +14,22 @@ type BlossomSubFeatureTest = func(BlossomSubFeature, protocol.ID) bool
 type BlossomSubFeature int
 
 const (
-	// Protocol supports basic BlossomSub Mesh -- BlossomSub-v1.1 compatible
+	// Protocol supports basic BlossomSub Mesh -- BlossomSub-v1.2 compatible
 	BlossomSubFeatureMesh = iota
-	// Protocol supports Peer eXchange on prune -- BlossomSub-v1.1 compatible
+	// Protocol supports Peer eXchange on prune -- BlossomSub-v1.2 compatible
 	BlossomSubFeaturePX
 )
 
 // BlossomSubDefaultProtocols is the default BlossomSub router protocol list
-var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v11, FloodSubID}
+var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v12, FloodSubID}
 
 // BlossomSubDefaultFeatures is the feature test function for the default BlossomSub protocols
 func BlossomSubDefaultFeatures(feat BlossomSubFeature, proto protocol.ID) bool {
 	switch feat {
 	case BlossomSubFeatureMesh:
-		return proto == BlossomSubID_v11
+		return proto == BlossomSubID_v12
 	case BlossomSubFeaturePX:
-		return proto == BlossomSubID_v11
+		return proto == BlossomSubID_v12
 	default:
 		return false
 	}

@@ -86,7 +86,7 @@ func TestBlossomSubConnTagMessageDeliveries(t *testing.T) {
 	sybilHosts := getNetHosts(t, ctx, nSquatter)
 	for _, h := range sybilHosts {
 		squatter := &sybilSquatter{h: h}
-		h.SetStreamHandler(BlossomSubID_v11, squatter.handleStream)
+		h.SetStreamHandler(BlossomSubID_v12, squatter.handleStream)
 	}
 
 	// connect the honest hosts

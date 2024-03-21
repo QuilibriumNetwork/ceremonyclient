@@ -70,6 +70,7 @@ type CeremonyDataClockConsensusEngine struct {
 	keyManager                  keys.KeyManager
 	masterTimeReel              *qtime.MasterTimeReel
 	dataTimeReel                *qtime.DataTimeReel
+	peerInfoManager             p2p.PeerInfoManager
 	provingKey                  crypto.Signer
 	provingKeyBytes             []byte
 	provingKeyType              keys.KeyType
@@ -124,6 +125,7 @@ func NewCeremonyDataClockConsensusEngine(
 	inclusionProver qcrypto.InclusionProver,
 	masterTimeReel *qtime.MasterTimeReel,
 	dataTimeReel *qtime.DataTimeReel,
+	peerInfoManager p2p.PeerInfoManager,
 	filter []byte,
 	seed []byte,
 ) *CeremonyDataClockConsensusEngine {
@@ -165,6 +167,10 @@ func NewCeremonyDataClockConsensusEngine(
 
 	if dataTimeReel == nil {
 		panic(errors.New("data time reel is nil"))
+	}
+
+	if peerInfoManager == nil {
+		panic(errors.New("peer info manager is nil"))
 	}
 
 	minimumPeersRequired := engineConfig.MinimumPeersRequired
@@ -234,6 +240,7 @@ func NewCeremonyDataClockConsensusEngine(
 		frameProver:               frameProver,
 		masterTimeReel:            masterTimeReel,
 		dataTimeReel:              dataTimeReel,
+		peerInfoManager:           peerInfoManager,
 		statsClient:               statsClient,
 		messageProcessorCh:        make(chan *pb.Message, 128),
 	}

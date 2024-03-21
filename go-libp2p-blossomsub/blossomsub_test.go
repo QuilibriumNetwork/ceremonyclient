@@ -1039,7 +1039,7 @@ func TestBlossomSubTreeTopology(t *testing.T) {
 	checkMessageRouting(t, []byte{0xf1, 0x22, 0xb0, 0x22}, []*PubSub{psubs[9], psubs[3]}, chs)
 }
 
-// this tests overlay bootstrapping through px in BlossomSub v1.1
+// this tests overlay bootstrapping through px in BlossomSub v1.2
 // we start with a star topology and rely on px through prune to build the mesh
 func TestBlossomSubStarTopology(t *testing.T) {
 	originalBlossomSubD := BlossomSubD
@@ -1122,7 +1122,7 @@ func TestBlossomSubStarTopology(t *testing.T) {
 	}
 }
 
-// this tests overlay bootstrapping through px in BlossomSub v1.1, with addresses
+// this tests overlay bootstrapping through px in BlossomSub v1.2, with addresses
 // exchanged in signed peer records.
 // we start with a star topology and rely on px through prune to build the mesh
 func TestBlossomSubStarTopologyWithSignedPeerRecords(t *testing.T) {
@@ -1853,7 +1853,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 	// sybil squatters for the remaining 40 hosts
 	for _, h := range hosts[10:] {
 		squatter := &sybilSquatter{h: h}
-		h.SetStreamHandler(BlossomSubID_v11, squatter.handleStream)
+		h.SetStreamHandler(BlossomSubID_v12, squatter.handleStream)
 	}
 
 	// connect all squatters to every real host
@@ -2037,7 +2037,7 @@ type sybilSquatter struct {
 func (sq *sybilSquatter) handleStream(s network.Stream) {
 	defer s.Close()
 
-	os, err := sq.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v11)
+	os, err := sq.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v12)
 	if err != nil {
 		panic(err)
 	}
@@ -2203,7 +2203,7 @@ func TestBlossomSubRPCFragmentation(t *testing.T) {
 
 	// make a fake peer that requests everything through IWANT gossip
 	iwe := iwantEverything{h: hosts[1]}
-	iwe.h.SetStreamHandler(BlossomSubID_v11, iwe.handleStream)
+	iwe.h.SetStreamHandler(BlossomSubID_v12, iwe.handleStream)
 
 	connect(t, hosts[0], hosts[1])
 
@@ -2265,7 +2265,7 @@ type iwantEverything struct {
 func (iwe *iwantEverything) handleStream(s network.Stream) {
 	defer s.Close()
 
-	os, err := iwe.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v11)
+	os, err := iwe.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v12)
 	if err != nil {
 		panic(err)
 	}
