@@ -70,6 +70,11 @@ var (
 		"",
 		"write memory profile after 20m to this file",
 	)
+	nodeInfo = flag.Bool(
+		"node-info",
+		false,
+		"print node related information",
+	)
 )
 
 func main() {
@@ -104,26 +109,7 @@ func main() {
 			panic(err)
 		}
 
-		if config.ListenGRPCMultiaddr == "" {
-			_, _ = fmt.Fprintf(os.Stderr, "gRPC Not Enabled, Please Configure\n")
-			os.Exit(1)
-		}
-
-		conn, err := app.ConnectToNode(config)
-		if err != nil {
-			panic(err)
-		}
-		defer conn.Close()
-
-		client := protobufs.NewNodeServiceClient(conn)
-
-		balance, err := app.FetchTokenBalance(client)
-		if err != nil {
-			panic(err)
-		}
-
-		fmt.Println("Owned balance:", balance.Owned, "QUIL")
-		fmt.Println("Unconfirmed balance:", balance.UnconfirmedOwned, "QUIL")
+		printBalance(config)
 
 		return
 	}
@@ -148,6 +134,17 @@ func main() {
 		fmt.Println("Import completed, you are ready for the launch.")
 		return
 	}
+
+	if *nodeInfo {
+		config, err := config.LoadConfig(*configDirectory, "")
+		if err != nil {
+			panic(err)
+		}
+
+		printNodeInfo(config)
+		return
+	}
+
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 
@@ -455,6 +452,29 @@ func repair(configDir string, node *app.Node) {
 	}
 }
 
+func printBalance(config *config.Config) {
+	if config.ListenGRPCMultiaddr == "" {
+		_, _ = fmt.Fprintf(os.Stderr, "gRPC Not Enabled, Please Configure\n")
+		os.Exit(1)
+	}
+
+	conn, err := app.ConnectToNode(config)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	client := protobufs.NewNodeServiceClient(conn)
+
+	balance, err := app.FetchTokenBalance(client)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Owned balance:", balance.Owned, "QUIL")
+	fmt.Println("Unconfirmed balance:", balance.UnconfirmedOwned, "QUIL")
+}
+
 func printPeerID(p2pConfig *config.P2PConfig) {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 	if err != nil {
@@ -473,6 +493,12 @@ func printPeerID(p2pConfig *config.P2PConfig) {
 	}
 
 	fmt.Println("Peer ID: " + id.String())
+}
+
+func printNodeInfo(cfg *config.Config) {
+	printPeerID(cfg.P2P)
+	fmt.Println("Version: " + config.GetVersionString())
+	printBalance(cfg)
 }
 
 func printLogo() {
