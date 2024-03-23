@@ -40,7 +40,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 ) error {
 	e.currentReceivingSyncPeersMx.Lock()
 	if e.currentReceivingSyncPeers > int(
-		memory.TotalMemory()/uint64(2147483648)-4,
+		memory.TotalMemory()/uint64(4294967296)-4,
 	) {
 		e.currentReceivingSyncPeersMx.Unlock()
 
@@ -117,7 +117,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 
 	// account for skew
 	if dist > 30000 {
-		e.logger.Warn(
+		e.logger.Debug(
 			"peer provided challenge with too great of a distance",
 			zap.Int64("distance", dist),
 		)
@@ -128,7 +128,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 		authentication.Authentication.Response.PublicKey.KeyValue,
 	)
 	if err != nil {
-		e.logger.Warn(
+		e.logger.Debug(
 			"peer provided invalid pubkey",
 			zap.Binary(
 				"public_key",
@@ -139,7 +139,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 	}
 
 	if !(peer.ID(authentication.Authentication.PeerId)).MatchesPublicKey(key) {
-		e.logger.Warn(
+		e.logger.Debug(
 			"peer id does not match pubkey",
 			zap.Binary("peer_id", authentication.Authentication.PeerId),
 			zap.Binary(
@@ -155,7 +155,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 		authentication.Authentication.Response.Signature,
 	)
 	if err != nil || !b {
-		e.logger.Warn(
+		e.logger.Debug(
 			"peer provided invalid signature",
 			zap.Binary("peer_id", authentication.Authentication.PeerId),
 			zap.Binary(
@@ -174,7 +174,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 		authentication.Authentication.PeerId,
 	)
 	if manifest == nil || manifest.Bandwidth <= 1048576 {
-		e.logger.Warn(
+		e.logger.Debug(
 			"peer manifest was null or bandwidth was low",
 			zap.Binary("peer_id", authentication.Authentication.PeerId),
 		)
@@ -243,7 +243,7 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 					ParentSelector: selector.FillBytes(make([]byte, 32)),
 				},
 			)
-			rangeSubtract := uint64(16)
+			rangeSubtract := uint64(4)
 			for {
 				parentNumber := to - uint64(rangeSubtract)
 
@@ -323,9 +323,9 @@ func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 			}
 
 			for {
-				if to == 0 || to-from > 16 {
-					if max > from+15 {
-						to = from + 16
+				if to == 0 || to-from > 4 {
+					if max > from+3 {
+						to = from + 4
 					} else {
 						to = max + 1
 					}

@@ -344,4 +344,8 @@ func (d *InMemKVDB) DeleteRange(start, end []byte) error {
 	return nil
 }
 
+func (d *InMemKVDB) CompactAll() error {
+	return nil
+}
+
 var _ KVDB = (*InMemKVDB)(nil)

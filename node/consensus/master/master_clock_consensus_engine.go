@@ -326,9 +326,10 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 	cc, err := e.pubSub.GetDirectChannel(peerID, "validation")
 	if err != nil {
 		e.logger.Info(
-			"could not connect for validation",
+			"could not connect to peer for validation",
 			zap.String("peer_id", base58.Encode(peerID)),
 		)
+
 		// tag: dusk – nuke this peer for now
 		e.pubSub.SetPeerScore(peerID, -1000)
 		return
@@ -360,7 +361,7 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 
 	if !bytes.Equal(verification, validation.Validation) {
 		e.logger.Info(
-			"provided invalid verification",
+			"peer provided invalid verification",
 			zap.String("peer_id", base58.Encode(peerID)),
 		)
 		// tag: dusk – nuke this peer for now
@@ -370,7 +371,7 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 
 	if end-start > 2000 {
 		e.logger.Info(
-			"slow bandwidth, scoring out",
+			"peer has slow bandwidth, scoring out",
 			zap.String("peer_id", base58.Encode(peerID)),
 		)
 		// tag: dusk – nuke this peer for now

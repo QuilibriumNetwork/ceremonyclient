@@ -320,6 +320,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 				panic(err)
 			}
 
+			e.latestFrameReceived = frame.FrameNumber
 			e.logger.Info(
 				"preparing peer announce",
 				zap.Uint64("frame_number", frame.FrameNumber),
@@ -463,9 +464,12 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					latestFrame = dataFrame
 				}
 
-				go func() {
-					e.frameChan <- latestFrame
-				}()
+				if e.latestFrameReceived < latestFrame.FrameNumber {
+					e.latestFrameReceived = latestFrame.FrameNumber
+					go func() {
+						e.frameChan <- latestFrame
+					}()
+				}
 
 				var nextFrame *protobufs.ClockFrame
 				if nextFrame, err = e.prove(latestFrame); err != nil {
@@ -505,9 +509,12 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					}
 				}
 
-				go func() {
-					e.frameChan <- latestFrame
-				}()
+				if e.latestFrameReceived < latestFrame.FrameNumber {
+					e.latestFrameReceived = latestFrame.FrameNumber
+					go func() {
+						e.frameChan <- latestFrame
+					}()
+				}
 
 				var nextFrame *protobufs.ClockFrame
 				if nextFrame, err = e.prove(latestFrame); err != nil {

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/big"
+	"sort"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
@@ -74,7 +76,6 @@ type ClockStore interface {
 	ResetMasterClockFrames(filter []byte) error
 	ResetDataClockFrames(filter []byte) error
 	Compact(
-		masterFilter []byte,
 		dataFilter []byte,
 	) error
 	GetTotalDistance(
@@ -281,6 +282,7 @@ const CLOCK_DATA_FRAME_DATA = 0x01
 const CLOCK_DATA_FRAME_CANDIDATE_DATA = 0x02
 const CLOCK_DATA_FRAME_FRECENCY_DATA = 0x03
 const CLOCK_DATA_FRAME_DISTANCE_DATA = 0x04
+const CLOCK_COMPACTION_DATA = 0x05
 const CLOCK_MASTER_FRAME_INDEX_EARLIEST = 0x10 | CLOCK_MASTER_FRAME_DATA
 const CLOCK_MASTER_FRAME_INDEX_LATEST = 0x20 | CLOCK_MASTER_FRAME_DATA
 const CLOCK_MASTER_FRAME_INDEX_PARENT = 0x30 | CLOCK_MASTER_FRAME_DATA
@@ -1200,84 +1202,361 @@ func (p *PebbleClockStore) ResetDataClockFrames(filter []byte) error {
 }
 
 func (p *PebbleClockStore) Compact(
-	masterFilter []byte,
 	dataFilter []byte,
 ) error {
-	if masterFilter != nil {
-		if err := p.db.Compact(
-			clockMasterFrameKey(masterFilter, 0),
-			clockMasterFrameKey(masterFilter, 1000000),
-			true,
-		); err != nil {
-			return errors.Wrap(err, "compact")
+	version, closer, err := p.db.Get([]byte{CLOCK_COMPACTION_DATA})
+	cleared := true
+	if err != nil {
+		cleared = false
+	} else {
+		if bytes.Compare(version, config.GetVersion()) < 0 {
+			cleared = false
 		}
+		closer.Close()
 	}
 
-	// If this node has been around since the early days, this is going to free
-	// up a lot of cruft.
-	if err := p.db.DeleteRange(
-		clockDataCandidateFrameKey(
-			make([]byte, 32),
-			0,
-			make([]byte, 32),
-			make([]byte, 32),
-		),
-		clockDataCandidateFrameKey(
-			bytes.Repeat([]byte{0xff}, 32),
-			1000000,
-			bytes.Repeat([]byte{0xff}, 32),
-			bytes.Repeat([]byte{0xff}, 32),
-		),
-	); err != nil {
-		return errors.Wrap(err, "compact")
-	}
-	if err := p.db.Compact(
-		clockDataCandidateFrameKey(
-			make([]byte, 32),
-			0,
-			make([]byte, 32),
-			make([]byte, 32),
-		),
-		clockDataCandidateFrameKey(
-			bytes.Repeat([]byte{0xff}, 32),
-			1000000,
-			bytes.Repeat([]byte{0xff}, 32),
-			bytes.Repeat([]byte{0xff}, 32),
-		),
-		true,
-	); err != nil {
-		return errors.Wrap(err, "compact")
-	}
-
-	if dataFilter != nil {
-		if err := p.db.Compact(
-			dataProofMetadataKey(
-				dataFilter,
-				make([]byte, 74),
-			),
-			dataProofMetadataKey(
-				dataFilter,
-				bytes.Repeat([]byte{0xff}, 74),
-			),
-			true,
-		); err != nil {
-			return errors.Wrap(err, "compact")
-		}
-
-		if err := p.db.Compact(
-			dataProofInclusionKey(
-				dataFilter,
-				make([]byte, 74),
+	if !cleared {
+		// If this node has been around since the early days, this is going to free
+		// up a lot of cruft.
+		if err := p.db.DeleteRange(
+			clockDataCandidateFrameKey(
+				make([]byte, 32),
 				0,
+				make([]byte, 32),
+				make([]byte, 32),
 			),
-			dataProofInclusionKey(
-				dataFilter,
-				bytes.Repeat([]byte{0xff}, 74),
-				20000,
+			clockDataCandidateFrameKey(
+				bytes.Repeat([]byte{0xff}, 32),
+				1000000,
+				bytes.Repeat([]byte{0xff}, 32),
+				bytes.Repeat([]byte{0xff}, 32),
+			),
+		); err != nil {
+			return errors.Wrap(err, "compact")
+		}
+		if err := p.db.Compact(
+			clockDataCandidateFrameKey(
+				make([]byte, 32),
+				0,
+				make([]byte, 32),
+				make([]byte, 32),
+			),
+			clockDataCandidateFrameKey(
+				bytes.Repeat([]byte{0xff}, 32),
+				1000000,
+				bytes.Repeat([]byte{0xff}, 32),
+				bytes.Repeat([]byte{0xff}, 32),
 			),
 			true,
 		); err != nil {
 			return errors.Wrap(err, "compact")
+		}
+	}
+
+	if dataFilter != nil && !cleared {
+		parents := [][]byte{}
+		proofs := map[string]struct{}{}
+		commits := map[string]struct{}{}
+		data := map[string]struct{}{}
+
+		idxValue, closer, err := p.db.Get(clockDataLatestIndex(dataFilter))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return errors.Wrap(err, "compact")
+			}
+
+			return errors.Wrap(err, "compact")
+		}
+
+		last := binary.BigEndian.Uint64(idxValue)
+
+		closer.Close()
+
+		for frameNumber := uint64(1); frameNumber <= last; frameNumber++ {
+			value, closer, err := p.db.Get(clockDataFrameKey(dataFilter, frameNumber))
+			if err != nil {
+				if errors.Is(err, pebble.ErrNotFound) {
+					return errors.Wrap(err, "compact")
+				}
+
+				return errors.Wrap(err, "compact")
+			}
+
+			frame := &protobufs.ClockFrame{}
+
+			if len(value) == (len(dataFilter) + 42) {
+				frameValue, frameCloser, err := p.db.Get(value)
+				if err != nil {
+					return errors.Wrap(err, "compact")
+				}
+				if err := proto.Unmarshal(frameValue, frame); err != nil {
+					return errors.Wrap(err, "compact")
+				}
+
+				selector, err := frame.GetSelector()
+				if err != nil {
+					panic(err)
+				}
+
+				parents = append(parents,
+					clockDataParentIndexKey(dataFilter, frameNumber, selector.FillBytes(
+						make([]byte, 32),
+					)),
+				)
+
+				closer.Close()
+				frameCloser.Close()
+			} else {
+				if err := proto.Unmarshal(value, frame); err != nil {
+					return errors.Wrap(err, "compact")
+				}
+
+				selector, err := frame.GetSelector()
+				if err != nil {
+					panic(err)
+				}
+
+				err = p.db.Set(
+					clockDataParentIndexKey(dataFilter, frameNumber, selector.FillBytes(
+						make([]byte, 32),
+					)),
+					value,
+				)
+				if err != nil {
+					return errors.Wrap(err, "compact")
+				}
+
+				err = p.db.Set(
+					clockDataFrameKey(dataFilter, frameNumber),
+					clockDataParentIndexKey(dataFilter, frameNumber, selector.FillBytes(
+						make([]byte, 32),
+					)),
+				)
+
+				parents = append(parents,
+					clockDataParentIndexKey(dataFilter, frameNumber, selector.FillBytes(
+						make([]byte, 32),
+					)),
+				)
+
+				closer.Close()
+			}
+
+			for i := 0; i < len(frame.Input[516:])/74; i++ {
+				p.logger.Info(
+					"preparing indexes for frame compaction",
+					zap.Uint64("frame_number", frameNumber),
+					zap.Uint64("max_frame_number", last),
+				)
+				commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
+				frameProofs, frameCommits, frameData, err :=
+					internalListAggregateProofKeys(
+						p.db,
+						dataFilter,
+						commit,
+						frameNumber,
+					)
+				if err != nil {
+					return errors.Wrap(err, "compact")
+				}
+				for _, proof := range frameProofs {
+					proof := proof
+					proofs[string(proof)] = struct{}{}
+				}
+				for _, comm := range frameCommits {
+					comm := comm
+					commits[string(comm)] = struct{}{}
+				}
+				for _, d := range frameData {
+					d := d
+					data[string(d)] = struct{}{}
+				}
+			}
+		}
+
+		p.logger.Info("sorting indexes for bulk clear")
+
+		sortedProofKeys := [][]byte{}
+		for k := range proofs {
+			k := k
+			sortedProofKeys = append(sortedProofKeys, []byte(k))
+		}
+		proofs = nil
+		sort.Slice(sortedProofKeys, func(i, j int) bool {
+			return bytes.Compare(sortedProofKeys[i], sortedProofKeys[j]) < 0
+		})
+
+		sortedCommitKeys := [][]byte{}
+		for k := range commits {
+			k := k
+			sortedCommitKeys = append(sortedCommitKeys, []byte(k))
+		}
+		commits = nil
+		sort.Slice(sortedCommitKeys, func(i, j int) bool {
+			return bytes.Compare(sortedCommitKeys[i], sortedCommitKeys[j]) < 0
+		})
+
+		sortedDataKeys := [][]byte{}
+		for k := range data {
+			k := k
+			sortedDataKeys = append(sortedDataKeys, []byte(k))
+		}
+		data = nil
+		sort.Slice(sortedDataKeys, func(i, j int) bool {
+			return bytes.Compare(sortedDataKeys[i], sortedDataKeys[j]) < 0
+		})
+
+		for i := uint64(0); i < uint64(len(parents)); i++ {
+			p.logger.Info(
+				"clearing orphaned frames for frame number",
+				zap.Uint64("frame_number", i+1),
+				zap.Int("max_frame_number", len(parents)),
+			)
+			pre := clockDataParentIndexKey(
+				dataFilter,
+				i+1,
+				bytes.Repeat([]byte{0x00}, 32),
+			)
+
+			err := p.db.DeleteRange(
+				pre,
+				parents[i],
+			)
+			if err != nil {
+				return errors.Wrap(err, "compact")
+			}
+			start := new(big.Int).SetBytes(parents[i])
+			start.Add(start, big.NewInt(1))
+			startBytes := start.FillBytes(make([]byte, len(parents[i])))
+			post := clockDataParentIndexKey(
+				dataFilter,
+				i+1,
+				bytes.Repeat([]byte{0xff}, 32),
+			)
+
+			err = p.db.DeleteRange(
+				startBytes,
+				post,
+			)
+			if err != nil {
+				return errors.Wrap(err, "compact")
+			}
+		}
+
+		for i := -1; i < len(sortedProofKeys); i++ {
+			p.logger.Info(
+				"clearing orphaned proof metadata",
+				zap.Int("proof_range_index", i+1),
+				zap.Int("max_proof_range_index", len(sortedProofKeys)),
+			)
+			var start, end []byte
+			if i == -1 {
+				start = dataProofMetadataKey(
+					dataFilter,
+					bytes.Repeat([]byte{0x00}, 74),
+				)
+			} else {
+				startBI := new(big.Int).SetBytes(sortedProofKeys[i])
+				startBI.Add(startBI, big.NewInt(1))
+				start = startBI.FillBytes(make([]byte, len(sortedProofKeys[i])))
+			}
+
+			if i == len(sortedProofKeys)-1 {
+				end = dataProofMetadataKey(
+					dataFilter,
+					bytes.Repeat([]byte{0xff}, 74),
+				)
+			} else {
+				end = sortedProofKeys[i+1]
+			}
+			err := p.db.DeleteRange(
+				start,
+				end,
+			)
+			if err != nil {
+				return errors.Wrap(err, "compact")
+			}
+		}
+
+		for i := -1; i < len(sortedCommitKeys); i++ {
+			p.logger.Info(
+				"clearing orphaned commits",
+				zap.Int("commit_range_index", i+1),
+				zap.Int("max_commit_range_index", len(sortedProofKeys)),
+			)
+			var start, end []byte
+			if i == -1 {
+				start = dataProofInclusionKey(
+					dataFilter,
+					bytes.Repeat([]byte{0x00}, 74),
+					0,
+				)
+			} else {
+				start = make([]byte, len(sortedCommitKeys[i]))
+				copy(start[:], sortedCommitKeys[i][:])
+				start[74] = 0xff
+				start[75] = 0xff
+				start[76] = 0xff
+				start[77] = 0xff
+				start[78] = 0xff
+				start[79] = 0xff
+				start[80] = 0xff
+				start[81] = 0xff
+			}
+
+			if i == len(sortedCommitKeys)-1 {
+				end = dataProofInclusionKey(
+					dataFilter,
+					bytes.Repeat([]byte{0xff}, 74),
+					0xffffffffffffffff,
+				)
+			} else {
+				end = sortedCommitKeys[i+1]
+			}
+
+			err := p.db.DeleteRange(
+				start,
+				end,
+			)
+			if err != nil {
+				return errors.Wrap(err, "compact")
+			}
+		}
+
+		for i := -1; i < len(sortedDataKeys); i++ {
+			p.logger.Info(
+				"clearing orphaned data",
+				zap.Int("data_range_index", i+1),
+				zap.Int("max_data_range_index", len(sortedProofKeys)),
+			)
+			var start, end []byte
+			if i == -1 {
+				start = dataProofSegmentKey(
+					dataFilter,
+					bytes.Repeat([]byte{0x00}, 32),
+				)
+			} else {
+				startBI := new(big.Int).SetBytes(sortedDataKeys[i])
+				startBI.Add(startBI, big.NewInt(1))
+				start = startBI.FillBytes(make([]byte, len(sortedDataKeys[i])))
+			}
+
+			if i == len(sortedDataKeys)-1 {
+				end = dataProofSegmentKey(
+					dataFilter,
+					bytes.Repeat([]byte{0xff}, 32),
+				)
+			} else {
+				end = sortedDataKeys[i+1]
+			}
+
+			err := p.db.DeleteRange(
+				start,
+				end,
+			)
+			if err != nil {
+				return errors.Wrap(err, "compact")
+			}
 		}
 
 		if err := p.db.DeleteRange(
@@ -1297,47 +1576,14 @@ func (p *PebbleClockStore) Compact(
 			return errors.Wrap(err, "compact")
 		}
 
-		if err := p.db.Compact(
-			clockDataFrameKey(dataFilter, 0),
-			clockDataFrameKey(dataFilter, 1000000),
-			true,
-		); err != nil {
+		err = p.db.Set([]byte{CLOCK_COMPACTION_DATA}, config.GetVersion())
+		if err != nil {
 			return errors.Wrap(err, "compact")
 		}
+	}
 
-		if err := p.db.Compact(
-			clockDataCandidateFrameKey(
-				dataFilter,
-				0,
-				make([]byte, 32),
-				make([]byte, 32),
-			),
-			clockDataCandidateFrameKey(
-				dataFilter,
-				1000000,
-				bytes.Repeat([]byte{0xff}, 32),
-				bytes.Repeat([]byte{0xff}, 32),
-			),
-			true,
-		); err != nil {
-			return errors.Wrap(err, "compact")
-		}
-
-		if err := p.db.Compact(
-			clockDataParentIndexKey(
-				dataFilter,
-				0,
-				make([]byte, 32),
-			),
-			clockDataParentIndexKey(
-				dataFilter,
-				1000000,
-				bytes.Repeat([]byte{0xff}, 32),
-			),
-			true,
-		); err != nil {
-			return errors.Wrap(err, "compact")
-		}
+	if err := p.db.CompactAll(); err != nil {
+		return errors.Wrap(err, "compact")
 	}
 
 	return nil
