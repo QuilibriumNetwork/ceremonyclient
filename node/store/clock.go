@@ -1346,7 +1346,7 @@ func (p *PebbleClockStore) Compact(
 				p.logger.Info(
 					"preparing indexes for frame compaction",
 					zap.Uint64("frame_number", frameNumber),
-					zap.Uint64("frame_number", last),
+					zap.Uint64("max_frame_number", last),
 				)
 				commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
 				frameProofs, frameCommits, frameData, err :=
