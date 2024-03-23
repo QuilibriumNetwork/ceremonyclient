@@ -18,8 +18,12 @@ func GetVersion() []byte {
 }
 
 func GetVersionString() string {
+	return FormatVersion(GetVersion())
+}
+
+func FormatVersion(version []byte) string {
 	return fmt.Sprintf(
 		"%d.%d.%d",
-		GetVersion()[0], GetVersion()[1], GetVersion()[2],
+		version[0], version[1], version[2],
 	)
 }
