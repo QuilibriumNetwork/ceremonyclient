@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
@@ -201,6 +202,75 @@ func internalGetAggregateProof(
 	}
 
 	return aggregate, nil
+}
+
+func internalListAggregateProofKeys(
+	db KVDB,
+	filter []byte,
+	commitment []byte,
+	frameNumber uint64,
+) ([][]byte, [][]byte, [][]byte, error) {
+	proofs := [][]byte{dataProofMetadataKey(filter, commitment)}
+	commits := [][]byte{}
+	data := [][]byte{}
+
+	value, closer, err := db.Get(dataProofMetadataKey(filter, commitment))
+	if err != nil {
+		fmt.Println("proof lookup failed")
+
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil, nil, ErrNotFound
+		}
+
+		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
+	}
+
+	defer closer.Close()
+	copied := make([]byte, len(value[8:]))
+	limit := binary.BigEndian.Uint64(value[0:8])
+	copy(copied, value[8:])
+
+	iter, err := db.NewIter(
+		dataProofInclusionKey(filter, commitment, 0),
+		dataProofInclusionKey(filter, commitment, limit+1),
+	)
+	if err != nil {
+		fmt.Println("inclusion lookup failed")
+
+		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
+	}
+
+	i := uint32(0)
+	commits = append(commits, dataProofInclusionKey(filter, commitment, 0))
+	for iter.First(); iter.Valid(); iter.Next() {
+		incCommit := iter.Value()
+
+		urlLength := binary.BigEndian.Uint16(incCommit[:2])
+		commitLength := binary.BigEndian.Uint16(incCommit[2:4])
+
+		url := make([]byte, urlLength)
+		copy(url, incCommit[4:urlLength+4])
+
+		commit := make([]byte, commitLength)
+		copy(commit, incCommit[urlLength+4:urlLength+4+commitLength])
+
+		remainder := int(urlLength + 4 + commitLength)
+
+		for j := 0; j < (len(incCommit)-remainder)/32; j++ {
+			start := remainder + (j * 32)
+			end := remainder + ((j + 1) * 32)
+
+			data = append(data, dataProofSegmentKey(filter, incCommit[start:end]))
+		}
+
+		i++
+	}
+
+	if err = iter.Close(); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
+	}
+
+	return proofs, commits, data, nil
 }
 
 func (p *PebbleDataProofStore) GetAggregateProof(

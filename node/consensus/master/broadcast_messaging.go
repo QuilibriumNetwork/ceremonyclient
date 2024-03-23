@@ -127,6 +127,20 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	info := e.peerInfoManager.GetPeerInfo(peerID)
 	if info != nil {
 		info.MasterHeadFrame = report.MasterHeadFrame
+		if info.Bandwidth <= 1048576 {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
+				defer cancel()
+				ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
+				select {
+				case <-ch:
+					go func() {
+						e.bandwidthTestCh <- peerID
+					}()
+				case <-ctx.Done():
+				}
+			}()
+		}
 		return nil
 	}
 

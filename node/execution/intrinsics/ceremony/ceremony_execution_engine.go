@@ -571,243 +571,245 @@ func (e *CeremonyExecutionEngine) ProcessMessage(
 func (e *CeremonyExecutionEngine) RunWorker() {
 	frameChan := e.clock.GetFrameChannel()
 	for {
-		frame := <-frameChan
-		e.activeClockFrame = frame
-		e.logger.Info(
-			"evaluating next frame",
-			zap.Uint64(
-				"frame_number",
-				frame.FrameNumber,
-			),
-		)
-		app, err := application.MaterializeApplicationFromFrame(frame)
-		if err != nil {
-			e.logger.Error(
-				"error while materializing application from frame",
-				zap.Error(err),
-			)
-			panic(err)
-		}
-
-		_, _, reward := app.RewardTrie.Get(e.provingKeyAddress)
-		_, _, retro := app.RewardTrie.Get(e.peerIdHash)
-		e.logger.Info(
-			"current application state",
-			zap.Uint64("my_balance", reward+retro),
-			zap.String("lobby_state", app.LobbyState.String()),
-		)
-
-		switch app.LobbyState {
-		case application.CEREMONY_APPLICATION_STATE_OPEN:
-			e.alreadyPublishedShare = false
-			e.alreadyPublishedTranscript = false
-			alreadyJoined := false
-			for _, join := range app.LobbyJoins {
-				if bytes.Equal(
-					join.PublicKeySignatureEd448.PublicKey.KeyValue,
-					e.proverPublicKey,
-				) {
-					alreadyJoined = true
-					break
-				}
-			}
-
+		select {
+		case frame := <-frameChan:
+			e.activeClockFrame = frame
 			e.logger.Info(
-				"lobby open for joins",
-				zap.Int("joined_participants", len(app.LobbyJoins)),
-				zap.Int(
-					"preferred_participants",
-					len(app.NextRoundPreferredParticipants),
+				"evaluating next frame",
+				zap.Uint64(
+					"frame_number",
+					frame.FrameNumber,
 				),
-				zap.Bool("in_lobby", alreadyJoined),
-				zap.Uint64("state_count", app.StateCount),
 			)
-
-			if !alreadyJoined {
-				e.logger.Info(
-					"joining lobby",
-					zap.Binary("proving_key", e.proverPublicKey),
+			app, err := application.MaterializeApplicationFromFrame(frame)
+			if err != nil {
+				e.logger.Error(
+					"error while materializing application from frame",
+					zap.Error(err),
 				)
-				if err := e.announceJoin(frame); err != nil {
-					e.logger.Error(
-						"failed to announce join",
-						zap.Error(err),
-					)
-				}
-
-				e.logger.Info("preparing contribution")
-				// Calculate this now after announcing, this gives 10 frames of buffer
-				e.ensureSecrets(app)
-			}
-		case application.CEREMONY_APPLICATION_STATE_IN_PROGRESS:
-			inRound := false
-			for _, p := range app.ActiveParticipants {
-				if bytes.Equal(
-					p.PublicKeySignatureEd448.PublicKey.KeyValue,
-					e.proverPublicKey,
-				) {
-					inRound = true
-					break
-				}
+				panic(err)
 			}
 
-			if len(e.activeSecrets) == 0 && inRound {
-				// If we ended up in the scenario where we do not have any secrets
-				// available but we're in the round, we should politely leave.
-				e.publishDroppedParticipant(e.proverPublicKey)
-				continue
-			}
-
+			_, _, reward := app.RewardTrie.Get(e.provingKeyAddress)
+			_, _, retro := app.RewardTrie.Get(e.peerIdHash)
 			e.logger.Info(
-				"round in progress",
-				zap.Any("participants", app.ActiveParticipants),
-				zap.Any(
-					"current_seen_attestations",
-					len(app.LatestSeenProverAttestations),
-				),
-				zap.Any(
-					"current_dropped_attestations",
-					len(app.DroppedParticipantAttestations),
-				),
-				zap.Any(
-					"preferred_participants_for_next_round",
-					len(app.NextRoundPreferredParticipants),
-				),
-				zap.Bool("in_round", inRound),
-				zap.Uint64("current_sub_round", app.RoundCount),
-				zap.Uint64("stale_state_count", app.StateCount),
+				"current application state",
+				zap.Uint64("my_balance", reward+retro),
+				zap.String("lobby_state", app.LobbyState.String()),
 			)
 
-			shouldConnect := false
-			position := 0
-			if len(e.peerChannels) == 0 && app.RoundCount == 1 &&
-				len(app.ActiveParticipants) > 1 {
-				for i, p := range app.ActiveParticipants {
+			switch app.LobbyState {
+			case application.CEREMONY_APPLICATION_STATE_OPEN:
+				e.alreadyPublishedShare = false
+				e.alreadyPublishedTranscript = false
+				alreadyJoined := false
+				for _, join := range app.LobbyJoins {
+					if bytes.Equal(
+						join.PublicKeySignatureEd448.PublicKey.KeyValue,
+						e.proverPublicKey,
+					) {
+						alreadyJoined = true
+						break
+					}
+				}
+
+				e.logger.Info(
+					"lobby open for joins",
+					zap.Int("joined_participants", len(app.LobbyJoins)),
+					zap.Int(
+						"preferred_participants",
+						len(app.NextRoundPreferredParticipants),
+					),
+					zap.Bool("in_lobby", alreadyJoined),
+					zap.Uint64("state_count", app.StateCount),
+				)
+
+				if !alreadyJoined {
+					e.logger.Info(
+						"joining lobby",
+						zap.Binary("proving_key", e.proverPublicKey),
+					)
+					if err := e.announceJoin(frame); err != nil {
+						e.logger.Error(
+							"failed to announce join",
+							zap.Error(err),
+						)
+					}
+
+					e.logger.Info("preparing contribution")
+					// Calculate this now after announcing, this gives 10 frames of buffer
+					e.ensureSecrets(app)
+				}
+			case application.CEREMONY_APPLICATION_STATE_IN_PROGRESS:
+				inRound := false
+				for _, p := range app.ActiveParticipants {
 					if bytes.Equal(
 						p.PublicKeySignatureEd448.PublicKey.KeyValue,
 						e.proverPublicKey,
 					) {
-						shouldConnect = true
-						position = i
+						inRound = true
 						break
 					}
 				}
-			}
 
-			if shouldConnect {
-				e.logger.Info(
-					"connecting to peers",
-					zap.Any("participants", app.ActiveParticipants),
-				)
-				err := e.connectToActivePeers(app, position)
-				if err != nil {
-					e.logger.Error("error while connecting to peers", zap.Error(err))
+				if len(e.activeSecrets) == 0 && inRound {
+					// If we ended up in the scenario where we do not have any secrets
+					// available but we're in the round, we should politely leave.
 					e.publishDroppedParticipant(e.proverPublicKey)
 					continue
 				}
-			}
 
-			if len(e.peerChannels) != 0 {
-				done := false
-				rounds := app.TranscriptRoundAdvanceCommits
-				if len(rounds) != 0 {
-					for _, c := range rounds[app.RoundCount-1].Commits {
+				e.logger.Info(
+					"round in progress",
+					zap.Any("participants", app.ActiveParticipants),
+					zap.Any(
+						"current_seen_attestations",
+						len(app.LatestSeenProverAttestations),
+					),
+					zap.Any(
+						"current_dropped_attestations",
+						len(app.DroppedParticipantAttestations),
+					),
+					zap.Any(
+						"preferred_participants_for_next_round",
+						len(app.NextRoundPreferredParticipants),
+					),
+					zap.Bool("in_round", inRound),
+					zap.Uint64("current_sub_round", app.RoundCount),
+					zap.Uint64("stale_state_count", app.StateCount),
+				)
+
+				shouldConnect := false
+				position := 0
+				if len(e.peerChannels) == 0 && app.RoundCount == 1 &&
+					len(app.ActiveParticipants) > 1 {
+					for i, p := range app.ActiveParticipants {
 						if bytes.Equal(
-							c.ProverSignature.PublicKey.KeyValue,
+							p.PublicKeySignatureEd448.PublicKey.KeyValue,
 							e.proverPublicKey,
 						) {
-							done = true
+							shouldConnect = true
+							position = i
+							break
 						}
 					}
 				}
 
-				if !done {
+				if shouldConnect {
 					e.logger.Info(
-						"participating in round",
+						"connecting to peers",
 						zap.Any("participants", app.ActiveParticipants),
-						zap.Uint64("current_round", app.RoundCount),
 					)
-					err := e.participateRound(app)
+					err := e.connectToActivePeers(app, position)
 					if err != nil {
-						e.logger.Error("error while participating in round", zap.Error(err))
+						e.logger.Error("error while connecting to peers", zap.Error(err))
 						e.publishDroppedParticipant(e.proverPublicKey)
+						continue
 					}
 				}
-			} else if len(app.ActiveParticipants) == 1 &&
-				bytes.Equal(
-					app.ActiveParticipants[0].PublicKeySignatureEd448.PublicKey.KeyValue,
-					e.proverPublicKey,
-				) {
-				if err = e.commitRound(e.activeSecrets); err != nil {
-					e.logger.Error("error while participating in round", zap.Error(err))
-				}
-			}
-		case application.CEREMONY_APPLICATION_STATE_FINALIZING:
-			e.logger.Info(
-				"round contribution finalizing",
-				zap.Any("participants", len(app.ActiveParticipants)),
-				zap.Any(
-					"current_seen_attestations",
-					len(app.LatestSeenProverAttestations),
-				),
-				zap.Any(
-					"current_dropped_attestations",
-					len(app.DroppedParticipantAttestations),
-				),
-				zap.Any(
-					"preferred_participants_for_next_round",
-					len(app.NextRoundPreferredParticipants),
-				),
-				zap.Int("finalized_shares", len(app.TranscriptShares)),
-			)
 
-			for _, s := range app.TranscriptShares {
-				if bytes.Equal(
-					s.ProverSignature.PublicKey.KeyValue,
-					e.proverPublicKey,
-				) {
-					e.alreadyPublishedShare = true
-				}
-			}
+				if len(e.peerChannels) != 0 {
+					done := false
+					rounds := app.TranscriptRoundAdvanceCommits
+					if len(rounds) != 0 {
+						for _, c := range rounds[app.RoundCount-1].Commits {
+							if bytes.Equal(
+								c.ProverSignature.PublicKey.KeyValue,
+								e.proverPublicKey,
+							) {
+								done = true
+							}
+						}
+					}
 
-			shouldPublish := false
-			for _, p := range app.ActiveParticipants {
-				if bytes.Equal(
-					p.PublicKeySignatureEd448.PublicKey.KeyValue,
-					e.proverPublicKey,
-				) {
-					shouldPublish = true
-					break
+					if !done {
+						e.logger.Info(
+							"participating in round",
+							zap.Any("participants", app.ActiveParticipants),
+							zap.Uint64("current_round", app.RoundCount),
+						)
+						err := e.participateRound(app)
+						if err != nil {
+							e.logger.Error("error while participating in round", zap.Error(err))
+							e.publishDroppedParticipant(e.proverPublicKey)
+						}
+					}
+				} else if len(app.ActiveParticipants) == 1 &&
+					bytes.Equal(
+						app.ActiveParticipants[0].PublicKeySignatureEd448.PublicKey.KeyValue,
+						e.proverPublicKey,
+					) {
+					if err = e.commitRound(e.activeSecrets); err != nil {
+						e.logger.Error("error while participating in round", zap.Error(err))
+					}
 				}
-			}
+			case application.CEREMONY_APPLICATION_STATE_FINALIZING:
+				e.logger.Info(
+					"round contribution finalizing",
+					zap.Any("participants", len(app.ActiveParticipants)),
+					zap.Any(
+						"current_seen_attestations",
+						len(app.LatestSeenProverAttestations),
+					),
+					zap.Any(
+						"current_dropped_attestations",
+						len(app.DroppedParticipantAttestations),
+					),
+					zap.Any(
+						"preferred_participants_for_next_round",
+						len(app.NextRoundPreferredParticipants),
+					),
+					zap.Int("finalized_shares", len(app.TranscriptShares)),
+				)
 
-			if !e.alreadyPublishedShare && shouldPublish {
-				if len(e.activeSecrets) == 0 {
-					e.publishDroppedParticipant(e.proverPublicKey)
-					continue
+				for _, s := range app.TranscriptShares {
+					if bytes.Equal(
+						s.ProverSignature.PublicKey.KeyValue,
+						e.proverPublicKey,
+					) {
+						e.alreadyPublishedShare = true
+					}
 				}
-				err := e.publishTranscriptShare(app)
-				if err != nil {
-					e.logger.Error(
-						"error while publishing transcript share",
-						zap.Error(err),
-					)
-				}
-			}
-		case application.CEREMONY_APPLICATION_STATE_VALIDATING:
-			e.logger.Info("round contribution validating")
-			e.alreadyPublishedShare = false
-			for _, c := range e.peerChannels {
-				c.Close()
-			}
 
-			e.peerChannels = map[string]*p2p.PublicP2PChannel{}
-			if app.UpdatedTranscript != nil && !e.alreadyPublishedTranscript {
-				if err := e.publishTranscript(app); err != nil {
-					e.logger.Error(
-						"error while publishing transcript",
-						zap.Error(err),
-					)
+				shouldPublish := false
+				for _, p := range app.ActiveParticipants {
+					if bytes.Equal(
+						p.PublicKeySignatureEd448.PublicKey.KeyValue,
+						e.proverPublicKey,
+					) {
+						shouldPublish = true
+						break
+					}
+				}
+
+				if !e.alreadyPublishedShare && shouldPublish {
+					if len(e.activeSecrets) == 0 {
+						e.publishDroppedParticipant(e.proverPublicKey)
+						continue
+					}
+					err := e.publishTranscriptShare(app)
+					if err != nil {
+						e.logger.Error(
+							"error while publishing transcript share",
+							zap.Error(err),
+						)
+					}
+				}
+			case application.CEREMONY_APPLICATION_STATE_VALIDATING:
+				e.logger.Info("round contribution validating")
+				e.alreadyPublishedShare = false
+				for _, c := range e.peerChannels {
+					c.Close()
+				}
+
+				e.peerChannels = map[string]*p2p.PublicP2PChannel{}
+				if app.UpdatedTranscript != nil && !e.alreadyPublishedTranscript {
+					if err := e.publishTranscript(app); err != nil {
+						e.logger.Error(
+							"error while publishing transcript",
+							zap.Error(err),
+						)
+					}
 				}
 			}
 		}

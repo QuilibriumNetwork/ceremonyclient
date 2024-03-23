@@ -331,6 +331,12 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		zap.Uint64("frame_number", frame.FrameNumber),
 	)
 
+	if e.latestFrameReceived < frame.FrameNumber {
+		e.latestFrameReceived = frame.FrameNumber
+		go func() {
+			e.frameChan <- frame
+		}()
+	}
 	e.dataTimeReel.Insert(frame, isSync)
 	return nil
 }

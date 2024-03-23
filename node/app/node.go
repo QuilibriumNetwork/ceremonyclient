@@ -49,7 +49,6 @@ func newNode(
 	logger.Info("running compaction")
 
 	if err := clockStore.Compact(
-		bytes.Repeat([]byte{0xff}, 32),
 		intrinsicFilter,
 	); err != nil {
 		panic(err)

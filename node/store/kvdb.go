@@ -11,6 +11,7 @@ type KVDB interface {
 	NewBatch() Transaction
 	NewIter(lowerBound []byte, upperBound []byte) (Iterator, error)
 	Compact(start, end []byte, parallelize bool) error
+	CompactAll() error
 	Close() error
 	DeleteRange(start, end []byte) error
 }

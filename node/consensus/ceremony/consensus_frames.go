@@ -513,21 +513,23 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 	latest := currentFramePublished
 
-	// With the increase of network size, constrain down to top thirty
-	for i := 0; i < 30; i++ {
+	for {
 		peerId, maxFrame, err := e.GetMostAheadPeer()
-		if err != nil {
-			e.logger.Warn("no peers available, skipping sync")
-			break
-		} else if peerId == nil {
-			e.logger.Info("currently up to date, skipping sync")
-			break
-		} else if maxFrame-2 > latest.FrameNumber {
+		if maxFrame > latest.FrameNumber {
 			e.syncingStatus = SyncStatusSynchronizing
-			latest, err = e.sync(latest, maxFrame, peerId)
-			if err == nil {
-				break
+			if err != nil {
+				e.logger.Info("no peers available for sync, waiting")
+				time.Sleep(5 * time.Second)
+			} else if maxFrame-2 > latest.FrameNumber {
+				latest, err = e.sync(latest, maxFrame, peerId)
+				if err != nil {
+					time.Sleep(30 * time.Second)
+				} else {
+					break
+				}
 			}
+		} else {
+			break
 		}
 	}
 

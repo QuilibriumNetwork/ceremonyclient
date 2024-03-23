@@ -60,6 +60,11 @@ var (
 		false,
 		"print the peer id to stdout from the config and exit",
 	)
+	cpuprofile = flag.String(
+		"cpuprofile",
+		"",
+		"write cpu profile to file",
+	)
 	memprofile = flag.String(
 		"memprofile",
 		"",
@@ -82,6 +87,15 @@ func main() {
 				f.Close()
 			}
 		}()
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
 
 	if *balance {

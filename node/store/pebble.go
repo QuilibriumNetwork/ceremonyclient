@@ -4,6 +4,7 @@ import (
 	"io"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -58,6 +59,30 @@ func (p *PebbleDB) Close() error {
 
 func (p *PebbleDB) DeleteRange(start, end []byte) error {
 	return p.db.DeleteRange(start, end, &pebble.WriteOptions{Sync: true})
+}
+
+func (p *PebbleDB) CompactAll() error {
+	iter, err := p.db.NewIter(nil)
+	if err != nil {
+		return errors.Wrap(err, "compact all")
+	}
+
+	var first, last []byte
+	if iter.First() {
+		first = append(first, iter.Key()...)
+	}
+	if iter.Last() {
+		last = append(last, iter.Key()...)
+	}
+	if err := iter.Close(); err != nil {
+		return errors.Wrap(err, "compact all")
+	}
+
+	if err := p.Compact(first, last, true); err != nil {
+		return errors.Wrap(err, "compact all")
+	}
+
+	return nil
 }
 
 var _ KVDB = (*PebbleDB)(nil)
