@@ -64,7 +64,7 @@ tasks:
   logs:
     desc: Print the logs of the running Quilibrium container.
     cmds:
-      - docker compose logs
+      - docker compose logs -f
 
   logs-folder:
     desc: Show where Docker stores the logs for the Quilibrium node. You need root permissions to access the folder.
