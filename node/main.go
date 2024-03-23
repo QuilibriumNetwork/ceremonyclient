@@ -496,10 +496,13 @@ func printPeerID(p2pConfig *config.P2PConfig) {
 	fmt.Println("Peer ID: " + id.String())
 }
 
-func printMaxFrame(cfg *config.Config) {
+func printNodeInfo(cfg *config.Config) {
 	if cfg.ListenGRPCMultiaddr == "" {
-		return
+		_, _ = fmt.Fprintf(os.Stderr, "gRPC Not Enabled, Please Configure\n")
+		os.Exit(1)
 	}
+
+	printPeerID(cfg.P2P)
 
 	conn, err := app.ConnectToNode(cfg)
 	if err != nil {
@@ -514,13 +517,10 @@ func printMaxFrame(cfg *config.Config) {
 		panic(err)
 	}
 
-	fmt.Println("Max Fame: " + strconv.FormatUint(nodeInfo.GetMaxFrame(), 10))
-}
+	fmt.Println("Version: " + config.FormatVersion(nodeInfo.Version))
 
-func printNodeInfo(cfg *config.Config) {
-	printPeerID(cfg.P2P)
-	fmt.Println("Version: " + config.GetVersionString())
-	printMaxFrame(cfg)
+	fmt.Println("Max Fame: " + strconv.FormatUint(nodeInfo.GetMaxFrame(), 10))
+
 	printBalance(cfg)
 }
 
