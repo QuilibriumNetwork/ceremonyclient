@@ -166,7 +166,7 @@ func (r *RPCServer) GetNodeInfo(
 
 	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
 
-	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxFrame.FrameNumber, PeerScore: uint64(peerScore), Version: config.GetVersion()}, nil
+	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxFrame.GetFrameNumber(), PeerScore: uint64(peerScore), Version: config.GetVersion()}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.

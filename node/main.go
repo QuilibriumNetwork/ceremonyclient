@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -495,9 +496,31 @@ func printPeerID(p2pConfig *config.P2PConfig) {
 	fmt.Println("Peer ID: " + id.String())
 }
 
+func printMaxFrame(cfg *config.Config) {
+	if cfg.ListenGRPCMultiaddr == "" {
+		return
+	}
+
+	conn, err := app.ConnectToNode(cfg)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	client := protobufs.NewNodeServiceClient(conn)
+
+	maxFrame, err := app.FetchMaxFrame(client)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Max Fame: " + strconv.FormatUint(maxFrame, 10))
+}
+
 func printNodeInfo(cfg *config.Config) {
 	printPeerID(cfg.P2P)
 	fmt.Println("Version: " + config.GetVersionString())
+	printMaxFrame(cfg)
 	printBalance(cfg)
 }
 
