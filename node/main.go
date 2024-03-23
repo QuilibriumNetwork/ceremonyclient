@@ -509,12 +509,12 @@ func printMaxFrame(cfg *config.Config) {
 
 	client := protobufs.NewNodeServiceClient(conn)
 
-	maxFrame, err := app.FetchMaxFrame(client)
+	nodeInfo, err := app.FetchNodeInfo(client)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println("Max Fame: " + strconv.FormatUint(maxFrame, 10))
+	fmt.Println("Max Fame: " + strconv.FormatUint(nodeInfo.GetMaxFrame(), 10))
 }
 
 func printNodeInfo(cfg *config.Config) {

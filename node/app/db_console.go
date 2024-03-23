@@ -833,16 +833,16 @@ func FetchTokenBalance(client protobufs.NodeServiceClient) (TokenBalance, error)
 	}, nil
 }
 
-func FetchMaxFrame(client protobufs.NodeServiceClient) (uint64, error) {
+func FetchNodeInfo(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, error) {
 	info, err := client.GetNodeInfo(
 		context.Background(),
 		&protobufs.GetNodeInfoRequest{},
 	)
 	if err != nil {
-		return 0, errors.Wrap(err, "error getting node info")
+		return nil, errors.Wrap(err, "error getting node info")
 	}
 
-	return info.MaxFrame, nil
+	return info, nil
 }
 
 // Runs the DB console
