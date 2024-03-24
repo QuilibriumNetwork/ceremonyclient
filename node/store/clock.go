@@ -1277,7 +1277,7 @@ func (p *PebbleClockStore) Compact(
 		idxValue, closer, err := p.db.Get(clockDataLatestIndex(dataFilter))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
-				return errors.Wrap(err, "compact")
+				return ErrNotFound
 			}
 
 			return errors.Wrap(err, "compact")
@@ -1291,7 +1291,7 @@ func (p *PebbleClockStore) Compact(
 			value, closer, err := p.db.Get(clockDataFrameKey(dataFilter, frameNumber))
 			if err != nil {
 				if errors.Is(err, pebble.ErrNotFound) {
-					return errors.Wrap(err, "compact")
+					return ErrNotFound
 				}
 
 				return errors.Wrap(err, "compact")
