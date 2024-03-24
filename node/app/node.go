@@ -51,7 +51,11 @@ func newNode(
 	if err := clockStore.Compact(
 		intrinsicFilter,
 	); err != nil {
-		panic(err)
+		if errors.Is(err, store.ErrNotFound) {
+			logger.Error("Missing compaction data. Skipping for now.", zap.Error(err))
+		} else {
+			panic(err)
+		}
 	}
 	logger.Info("compaction complete")
 
