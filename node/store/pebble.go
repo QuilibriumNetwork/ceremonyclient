@@ -78,7 +78,7 @@ func (p *PebbleDB) CompactAll() error {
 		return errors.Wrap(err, "compact all")
 	}
 
-	if err := p.Compact(first, last, true); err != nil {
+	if err := p.Compact(first, last, false); err != nil {
 		return errors.Wrap(err, "compact all")
 	}
 

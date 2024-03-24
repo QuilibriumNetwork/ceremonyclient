@@ -566,6 +566,7 @@ func (e *CeremonyDataClockConsensusEngine) Stop(force bool) <-chan error {
 	wg.Wait()
 	e.logger.Info("execution engines stopped")
 
+	e.dataTimeReel.Stop()
 	e.state = consensus.EngineStateStopped
 
 	e.engineMx.Lock()

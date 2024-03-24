@@ -41,7 +41,7 @@ func (e *CeremonyDataClockConsensusEngine) publishProof(
 		panic(err)
 	}
 
-	peers, max, err := e.GetMostAheadPeer()
+	peers, max, err := e.GetMostAheadPeer(head.FrameNumber)
 	if err != nil || len(peers) == 0 || head.FrameNumber > max {
 		if err := e.publishMessage(e.filter, frame); err != nil {
 			return errors.Wrap(

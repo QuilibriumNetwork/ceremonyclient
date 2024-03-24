@@ -458,11 +458,11 @@ func (e *CeremonyExecutionEngine) Start() <-chan error {
 }
 
 // Stop implements ExecutionEngine
-func (*CeremonyExecutionEngine) Stop(force bool) <-chan error {
+func (e *CeremonyExecutionEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error)
 
 	go func() {
-		errChan <- nil
+		errChan <- <-e.clock.Stop(force)
 	}()
 
 	return errChan

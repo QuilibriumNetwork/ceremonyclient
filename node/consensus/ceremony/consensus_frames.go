@@ -143,24 +143,21 @@ func (e *CeremonyDataClockConsensusEngine) prove(
 	return frame, nil
 }
 
-func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer() (
+func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
+	frameNumber uint64,
+) (
 	[]byte,
 	uint64,
 	error,
 ) {
-	frame, err := e.dataTimeReel.Head()
-	if err != nil {
-		panic(err)
-	}
-
 	e.logger.Info(
 		"checking peer list",
 		zap.Int("peers", len(e.peerMap)),
 		zap.Int("uncooperative_peers", len(e.uncooperativePeersMap)),
-		zap.Uint64("current_head_frame", frame.FrameNumber),
+		zap.Uint64("current_head_frame", frameNumber),
 	)
 
-	max := frame.FrameNumber
+	max := frameNumber
 	var peer []byte = nil
 	e.peerMapMx.RLock()
 	for _, v := range e.peerMap {
@@ -514,7 +511,7 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 	latest := currentFramePublished
 
 	for {
-		peerId, maxFrame, err := e.GetMostAheadPeer()
+		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
 		if maxFrame > latest.FrameNumber {
 			e.syncingStatus = SyncStatusSynchronizing
 			if err != nil {
