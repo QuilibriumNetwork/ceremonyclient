@@ -833,6 +833,18 @@ func FetchTokenBalance(client protobufs.NodeServiceClient) (TokenBalance, error)
 	}, nil
 }
 
+func FetchNodeInfo(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, error) {
+	info, err := client.GetNodeInfo(
+		context.Background(),
+		&protobufs.GetNodeInfoRequest{},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting node info")
+	}
+
+	return info, nil
+}
+
 // Runs the DB console
 func (c *DBConsole) Run() {
 	conn, err := ConnectToNode(c.nodeConfig)

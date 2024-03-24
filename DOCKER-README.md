@@ -200,21 +200,16 @@ docker compose exec -it node sh
 
 Watch the logs:
 ```shell
-docker compose logs
+docker compose logs -f
 ```
 
-Get the Peer ID:
+Get the node related info (peer id, version, max frame and balance):
 ```shell
-docker compose exec node go run ./... -peer-id
-```
-
-Get the token balance:
-```shell
-docker compose exec node go run ./... -balance
+docker compose exec node node -node-info
 ```
 
 Run the DB console:
 ```shell
-docker compose exec node go run ./... -db-console
+docker compose exec node node -db-console
 ```
 

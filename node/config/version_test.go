@@ -45,3 +45,7 @@ func TestGetVersionString(t *testing.T) {
 
 	assert.Regexp(t, versionRegexp, version)
 }
+
+func TestFormatVersion(t *testing.T) {
+	assert.Equal(t, "1.4.12", FormatVersion([]byte{1, 4, 12}))
+}

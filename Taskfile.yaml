@@ -11,7 +11,7 @@ vars:
   PROJECT_NAME: quilibrium
   SERVICE_NAME: node
   GIT_REPO:
-    sh: git config --get remote.origin.url
+    sh: git config --get remote.origin.url | sed 's/\.git$//'
   GIT_BRANCH:
     sh: git rev-parse --abbrev-ref HEAD
   GIT_COMMIT:
@@ -33,6 +33,7 @@ tasks:
     cmds:
       - |
         docker build \
+        --build-arg NODE_VERSION={{.VERSION}} \
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
         --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
@@ -63,7 +64,7 @@ tasks:
   logs:
     desc: Print the logs of the running Quilibrium container.
     cmds:
-      - docker compose logs
+      - docker compose logs -f
 
   logs-folder:
     desc: Show where Docker stores the logs for the Quilibrium node. You need root permissions to access the folder.
@@ -97,6 +98,11 @@ tasks:
     desc: Login to GitHub container registry.
     cmds:
       - echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
+
+  docker:login:
+    desc: Login to Docker hub
+    cmds:
+      - echo $DOCKER_TOKEN | docker login -u $DOCKER_USERNAME --password-stdin
 
   push:
     desc: Push Quilibrium docker image to the container registry.
