@@ -1597,10 +1597,6 @@ func (p *PebbleClockStore) Compact(
 		}
 	}
 
-	if err := p.db.CompactAll(); err != nil {
-		return errors.Wrap(err, "compact")
-	}
-
 	return nil
 }
 
