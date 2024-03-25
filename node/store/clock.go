@@ -611,6 +611,10 @@ func (p *PebbleClockStore) GetDataClockFrame(
 	if len(value) == (len(filter) + 42) {
 		frameValue, frameCloser, err := p.db.Get(value)
 		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return nil, nil, ErrNotFound
+			}
+
 			return nil, nil, errors.Wrap(err, "get data clock frame")
 		}
 		if err := proto.Unmarshal(frameValue, frame); err != nil {
@@ -762,6 +766,10 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+
 		return nil, errors.Wrap(err, "get latest data clock frame")
 	}
 
@@ -769,6 +777,10 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	if proverTrie != nil {
 		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
 		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return nil, ErrNotFound
+			}
+
 			return nil, errors.Wrap(err, "get latest data clock frame")
 		}
 

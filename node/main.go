@@ -21,7 +21,10 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -211,6 +214,26 @@ func main() {
 
 	<-done
 	node.Stop()
+}
+
+// Reintroduce at a later date
+func RunCompaction(clockStore *store.PebbleClockStore) {
+	intrinsicFilter := append(
+		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	)
+	fmt.Println("running compaction")
+
+	if err := clockStore.Compact(
+		intrinsicFilter,
+	); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			fmt.Println("missing compaction data, skipping for now", zap.Error(err))
+		} else {
+			panic(err)
+		}
+	}
+	fmt.Println("compaction complete")
 }
 
 func RunSelfTestIfNeeded(

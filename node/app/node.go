@@ -42,23 +42,6 @@ func newNode(
 		execEngines[ceremonyExecutionEngine.GetName()] = ceremonyExecutionEngine
 	}
 
-	intrinsicFilter := append(
-		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-	)
-	logger.Info("running compaction")
-
-	if err := clockStore.Compact(
-		intrinsicFilter,
-	); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			logger.Error("Missing compaction data. Skipping for now.", zap.Error(err))
-		} else {
-			panic(err)
-		}
-	}
-	logger.Info("compaction complete")
-
 	return &Node{
 		logger,
 		clockStore,
