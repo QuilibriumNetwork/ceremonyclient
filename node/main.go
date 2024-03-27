@@ -552,7 +552,7 @@ func printNodeInfo(cfg *config.Config) {
 
 	fmt.Println("Version: " + config.FormatVersion(nodeInfo.Version))
 
-	fmt.Println("Max Fame: " + strconv.FormatUint(nodeInfo.GetMaxFrame(), 10))
+	fmt.Println("Max Frame: " + strconv.FormatUint(nodeInfo.GetMaxFrame(), 10))
 
 	printBalance(cfg)
 }
