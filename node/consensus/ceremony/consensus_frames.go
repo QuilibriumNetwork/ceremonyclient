@@ -269,12 +269,12 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 	for {
 		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
-		if maxFrame > latest.FrameNumber {
+		if maxFrame-2 > latest.FrameNumber {
 			e.syncingStatus = SyncStatusSynchronizing
 			if err != nil {
 				e.logger.Info("no peers available for sync, waiting")
 				time.Sleep(5 * time.Second)
-			} else if maxFrame-2 > latest.FrameNumber {
+			} else {
 				latest, err = e.sync(latest, maxFrame, peerId)
 				if err != nil {
 					time.Sleep(30 * time.Second)
