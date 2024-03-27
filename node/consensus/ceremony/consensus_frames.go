@@ -167,7 +167,7 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
 			zap.Binary("version", v.version),
 		)
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
-		if v.maxFrame > max &&
+		if v.maxFrame >= max &&
 			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
 			bytes.Compare(v.version, config.GetMinimumVersion()) >= 0 && !ok {
 			manifest := e.peerInfoManager.GetPeerInfo(v.peerId)
