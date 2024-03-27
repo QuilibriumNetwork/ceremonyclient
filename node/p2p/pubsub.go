@@ -35,4 +35,5 @@ type PubSub interface {
 	GetPublicKey() []byte
 	GetPeerScore(peerId []byte) int64
 	SetPeerScore(peerId []byte, score int64)
+	ExportTopScoreBootstrap() []string
 }

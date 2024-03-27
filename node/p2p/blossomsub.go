@@ -98,7 +98,8 @@ func NewBlossomSub(
 	for _, peerAddr := range p2pConfig.BootstrapPeers {
 		peerinfo, err := peer.AddrInfoFromString(peerAddr)
 		if err != nil {
-			panic(err)
+			logger.Warn("Invalid bootstrap peer", zap.String("addr", peerAddr))
+			continue
 		}
 
 		if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
@@ -357,7 +358,8 @@ func initDHT(
 		for _, peerAddr := range defaultBootstrapPeers {
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
 			if err != nil {
-				panic(err)
+				logger.Warn("Invalid bootstrap peer", zap.String("addr", peerAddr))
+				continue
 			}
 			wg.Add(1)
 			go func() {
@@ -402,6 +404,45 @@ func (b *BlossomSub) GetPeerScore(peerId []byte) int64 {
 	score := b.peerScore[string(peerId)]
 	b.peerScoreMx.Unlock()
 	return score
+}
+
+func (b *BlossomSub) ExportTopScoreBootstrap() []string {
+	topPeers := make(map[string]float64)
+	for _, p := range b.h.Network().Peers() {
+		peerScore := b.ps.PeerScore(p)
+		addrs := b.h.Peerstore().Addrs(p)
+		if peerScore >= 0 && len(addrs) > 0 {
+			addr, err := peer.AddrInfoToP2pAddrs(&peer.AddrInfo{
+				ID:    p,
+				Addrs: addrs,
+			})
+			if err != nil || len(addr) < 1 {
+				continue
+			}
+			if len(topPeers) < 100 {
+				topPeers[addr[0].String()] = peerScore
+			} else {
+				var replaceKey string = ""
+				for key, score := range topPeers {
+					if score < peerScore {
+						replaceKey = key
+						break
+					}
+				}
+				if replaceKey != "" {
+					delete(topPeers, replaceKey)
+					topPeers[addr[0].String()] = peerScore
+				}
+			}
+		}
+	}
+	peers := make([]string, 0)
+	for peer, _ := range topPeers {
+		if peer != "" {
+			peers = append(peers, peer)
+		}
+	}
+	return peers
 }
 
 func (b *BlossomSub) SetPeerScore(peerId []byte, score int64) {

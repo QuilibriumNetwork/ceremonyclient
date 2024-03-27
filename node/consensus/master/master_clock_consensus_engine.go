@@ -369,22 +369,13 @@ func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
 		return
 	}
 
-	if end-start > 2000 {
-		e.logger.Debug(
-			"peer has slow bandwidth, scoring out",
-			zap.String("peer_id", base58.Encode(peerID)),
-		)
-		// tag: dusk – nuke this peer for now
-		e.pubSub.SetPeerScore(peerID, -1000)
-		return
-	}
-
 	duration := end - start
 	bandwidth := uint64(1048576*1000) / uint64(duration)
 	manifest := e.peerInfoManager.GetPeerInfo(peerID)
 	if manifest == nil {
 		return
 	}
+	e.pubSub.SetPeerScore(peerID, 1000-duration)
 
 	peerManifest := &p2p.PeerManifest{
 		PeerId:             peerID,
