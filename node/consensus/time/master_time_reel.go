@@ -233,7 +233,6 @@ func (m *MasterTimeReel) runLoop() {
 						frame,
 					)
 				}
-				m.processPending()
 			} else {
 				m.logger.Debug(
 					"new frame has same or lower frame number",
@@ -242,6 +241,7 @@ func (m *MasterTimeReel) runLoop() {
 				)
 				continue
 			}
+			m.processPending()
 		case <-m.done:
 			return
 		}
