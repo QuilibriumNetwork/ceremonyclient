@@ -3,14 +3,9 @@ package ceremony
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
-	"io"
 	"time"
 
-	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
-	"github.com/pbnjay/memory"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -24,347 +19,63 @@ import (
 
 var ErrNoNewFrames = errors.New("peer reported no frames")
 
-// Compressed sync negotiation:
-// Recipients of the sync                                 Servers providing sync
-// |                                                                           |
-// |---------[Preflight{HEAD, HEAD-16, HEAD-32, HEAD-64, ..., 1}]------------->|
-// |<--------[Preflight{HEAD, HEAD-16, HEAD-32, HEAD-64, ..., M}]--------------|
-// |                    M = matching selector or 1                             |
-// |------------------------------[Request{N}]-------------------------------->|
-// |                    N = matching higher selector or M                      |
-// |<-------------------------[Response{N...N+16}]-----------------------------|
-// |<--------------------------[Response{N+17...}]-----------------------------|
-// |<--------------------------[Response{...HEAD}]-----------------------------|
+func (e *CeremonyDataClockConsensusEngine) GetDataFrame(
+	ctx context.Context,
+	request *protobufs.GetDataFrameRequest,
+) (*protobufs.DataFrameResponse, error) {
+	e.logger.Debug(
+		"received frame request",
+		zap.Uint64("frame_number", request.FrameNumber),
+	)
+	var frame *protobufs.ClockFrame
+	var err error
+	if request.FrameNumber == 0 {
+		frame, err = e.dataTimeReel.Head()
+	} else {
+		frame, _, err = e.clockStore.GetDataClockFrame(
+			e.filter,
+			request.FrameNumber,
+			false,
+		)
+	}
+
+	if err != nil {
+		e.logger.Error(
+			"received error while fetching time reel head",
+			zap.Error(err),
+		)
+		return nil, errors.Wrap(err, "get data frame")
+	}
+
+	idx, err := e.frameProver.GenerateWeakRecursiveProofIndex(frame)
+	if err != nil {
+		return nil, errors.Wrap(err, "get data frame")
+	}
+
+	indexFrame, _, err := e.clockStore.GetDataClockFrame(e.filter, idx, false)
+	if err != nil {
+		return &protobufs.DataFrameResponse{
+			ClockFrame: frame,
+		}, nil
+	}
+
+	proof := e.frameProver.FetchRecursiveProof(indexFrame)
+
+	e.logger.Debug(
+		"sending frame response",
+		zap.Uint64("frame_number", frame.FrameNumber),
+	)
+
+	return &protobufs.DataFrameResponse{
+		ClockFrame: frame,
+		Proof:      proof,
+	}, nil
+}
+
 func (e *CeremonyDataClockConsensusEngine) NegotiateCompressedSyncFrames(
 	server protobufs.CeremonyService_NegotiateCompressedSyncFramesServer,
 ) error {
-	e.currentReceivingSyncPeersMx.Lock()
-	if e.currentReceivingSyncPeers > int(
-		memory.TotalMemory()/uint64(4294967296)-4,
-	) {
-		e.currentReceivingSyncPeersMx.Unlock()
-
-		e.logger.Debug(
-			"currently processing maximum sync requests, returning",
-		)
-
-		if err := server.SendMsg(
-			&protobufs.CeremonyCompressedSyncResponseMessage{
-				SyncMessage: &protobufs.CeremonyCompressedSyncResponseMessage_Response{
-					Response: &protobufs.CeremonyCompressedSync{
-						FromFrameNumber: 0,
-						ToFrameNumber:   0,
-					},
-				},
-			},
-		); err != nil {
-			return errors.Wrap(err, "negotiate compressed sync frames")
-		}
-
-		return nil
-	}
-
-	request, err := server.Recv()
-	if err == io.EOF {
-		return nil
-	}
-
-	if err != nil {
-		return errors.Wrap(err, "negotiate compressed sync frames")
-	}
-
-	authentication, ok := request.
-		SyncMessage.(*protobufs.CeremonyCompressedSyncRequestMessage_Authentication)
-	if !ok {
-		return nil
-	}
-
-	if authentication.Authentication == nil ||
-		authentication.Authentication.Challenge == nil ||
-		authentication.Authentication.PeerId == nil ||
-		authentication.Authentication.Response == nil ||
-		authentication.Authentication.Response.PublicKey == nil ||
-		authentication.Authentication.Response.PublicKey.KeyValue == nil ||
-		authentication.Authentication.Response.Signature == nil ||
-		len(authentication.Authentication.Challenge) < 8 {
-		return nil
-	}
-
-	if !bytes.Equal(
-		authentication.Authentication.Challenge[:len(
-			authentication.Authentication.Challenge,
-		)-8],
-		e.pubSub.GetPeerID(),
-	) {
-		e.logger.Warn(
-			"peer provided invalid challenge",
-		)
-		return nil
-	}
-
-	// probably some remark to make about chronometers here, whether one or three
-	challenge := int64(
-		binary.BigEndian.Uint64(
-			authentication.Authentication.Challenge[len(
-				authentication.Authentication.Challenge,
-			)-8:],
-		),
-	)
-	dist := time.Now().UnixMilli() - challenge
-	if dist < 0 {
-		dist *= -1
-	}
-
-	// account for skew
-	if dist > 30000 {
-		e.logger.Debug(
-			"peer provided challenge with too great of a distance",
-			zap.Int64("distance", dist),
-		)
-		return nil
-	}
-
-	key, err := pcrypto.UnmarshalEd448PublicKey(
-		authentication.Authentication.Response.PublicKey.KeyValue,
-	)
-	if err != nil {
-		e.logger.Debug(
-			"peer provided invalid pubkey",
-			zap.Binary(
-				"public_key",
-				authentication.Authentication.Response.PublicKey.KeyValue,
-			),
-		)
-		return errors.Wrap(err, "negotiate compressed sync frames")
-	}
-
-	if !(peer.ID(authentication.Authentication.PeerId)).MatchesPublicKey(key) {
-		e.logger.Debug(
-			"peer id does not match pubkey",
-			zap.Binary("peer_id", authentication.Authentication.PeerId),
-			zap.Binary(
-				"public_key",
-				authentication.Authentication.Response.PublicKey.KeyValue,
-			),
-		)
-		return nil
-	}
-
-	b, err := key.Verify(
-		authentication.Authentication.Challenge,
-		authentication.Authentication.Response.Signature,
-	)
-	if err != nil || !b {
-		e.logger.Debug(
-			"peer provided invalid signature",
-			zap.Binary("peer_id", authentication.Authentication.PeerId),
-			zap.Binary(
-				"public_key",
-				authentication.Authentication.Response.PublicKey.KeyValue,
-			),
-			zap.Binary(
-				"signature",
-				authentication.Authentication.Response.Signature,
-			),
-		)
-		return nil
-	}
-
-	manifest := e.peerInfoManager.GetPeerInfo(
-		authentication.Authentication.PeerId,
-	)
-	if manifest == nil || manifest.Bandwidth <= 1048576 {
-		e.logger.Debug(
-			"peer manifest was null or bandwidth was low",
-			zap.Binary("peer_id", authentication.Authentication.PeerId),
-		)
-		return nil
-	}
-
-	// TODO: should give this more tlc, but should remap into blossomsub
-	// heuristics
-
-	e.currentReceivingSyncPeers++
-	e.currentReceivingSyncPeersMx.Unlock()
-
-	defer func() {
-		e.currentReceivingSyncPeersMx.Lock()
-		e.currentReceivingSyncPeers--
-		e.currentReceivingSyncPeersMx.Unlock()
-	}()
-
-	for {
-		request, err := server.Recv()
-		if err == io.EOF {
-			return nil
-		}
-
-		if err != nil {
-			return errors.Wrap(err, "negotiate compressed sync frames")
-		}
-
-		switch msg := request.SyncMessage.(type) {
-		case *protobufs.CeremonyCompressedSyncRequestMessage_Preflight:
-			e.logger.Debug(
-				"received clock frame preflight",
-				zap.Int("selector_count", len(msg.Preflight.RangeParentSelectors)),
-			)
-
-			from := uint64(1)
-
-			preflightResponse := []*protobufs.ClockFrameParentSelectors{}
-			for _, selector := range msg.Preflight.RangeParentSelectors {
-				frame, _, err := e.clockStore.GetDataClockFrame(
-					e.filter,
-					selector.FrameNumber,
-					true,
-				)
-				if err == nil && frame != nil {
-					from = selector.FrameNumber
-					break
-				}
-			}
-
-			head, err := e.dataTimeReel.Head()
-			if err != nil {
-				return errors.Wrap(err, "negotiate compressed sync frames")
-			}
-
-			to := head.FrameNumber
-			selector, err := head.GetSelector()
-			if err != nil {
-				return errors.Wrap(err, "negotiate compressed sync frames")
-			}
-
-			preflightResponse = append(
-				preflightResponse,
-				&protobufs.ClockFrameParentSelectors{
-					FrameNumber:    to,
-					ParentSelector: selector.FillBytes(make([]byte, 32)),
-				},
-			)
-			rangeSubtract := uint64(4)
-			for {
-				parentNumber := to - uint64(rangeSubtract)
-
-				if parentNumber < from {
-					break
-				}
-				rangeSubtract *= 2
-				parent, _, err := e.clockStore.GetDataClockFrame(
-					e.filter,
-					parentNumber,
-					true,
-				)
-				if err != nil {
-					break
-				}
-
-				parentSelector, err := parent.GetSelector()
-				if err != nil {
-					return errors.Wrap(err, "negotiate compressed sync frames")
-				}
-
-				preflightResponse = append(
-					preflightResponse,
-					&protobufs.ClockFrameParentSelectors{
-						FrameNumber:    parent.FrameNumber,
-						ParentSelector: parentSelector.FillBytes(make([]byte, 32)),
-					},
-				)
-			}
-			err = server.Send(&protobufs.CeremonyCompressedSyncResponseMessage{
-				SyncMessage: &protobufs.CeremonyCompressedSyncResponseMessage_Preflight{
-					Preflight: &protobufs.ClockFramesPreflight{
-						RangeParentSelectors: preflightResponse,
-					},
-				},
-			})
-			if err != nil {
-				return errors.Wrap(err, "negotiate compressed sync frames")
-			}
-		case *protobufs.CeremonyCompressedSyncRequestMessage_Request:
-			e.logger.Info(
-				"received clock frame request",
-				zap.Uint64("from_frame_number", msg.Request.FromFrameNumber),
-				zap.Uint64("to_frame_number", msg.Request.ToFrameNumber),
-			)
-			from := msg.Request.FromFrameNumber
-			_, _, err := e.clockStore.GetDataClockFrame(
-				e.filter,
-				from,
-				true,
-			)
-			if err != nil {
-				if !errors.Is(err, store.ErrNotFound) {
-					e.logger.Error(
-						"peer asked for frame that returned error",
-						zap.Uint64("frame_number", msg.Request.FromFrameNumber),
-					)
-
-					return errors.Wrap(err, "negotiate compressed sync frames")
-				} else {
-					from = 1
-				}
-			}
-
-			head, err := e.dataTimeReel.Head()
-			if err != nil {
-				panic(err)
-			}
-
-			max := head.FrameNumber
-			to := msg.Request.ToFrameNumber
-
-			// We need to slightly rewind, to compensate for unconfirmed frame heads
-			// on a given branch
-			if from >= 2 {
-				from--
-			}
-
-			for {
-				if to == 0 || to-from > 4 {
-					if max > from+3 {
-						to = from + 4
-					} else {
-						to = max + 1
-					}
-				}
-
-				syncMsg, err := e.clockStore.GetCompressedDataClockFrames(
-					e.filter,
-					from,
-					to,
-				)
-				if err != nil {
-					return errors.Wrap(err, "negotiate compressed sync frames")
-				}
-
-				if err := server.Send(&protobufs.CeremonyCompressedSyncResponseMessage{
-					SyncMessage: &protobufs.
-						CeremonyCompressedSyncResponseMessage_Response{
-						Response: syncMsg,
-					},
-				}); err != nil {
-					return errors.Wrap(err, "negotiate compressed sync frames")
-				}
-
-				if (msg.Request.ToFrameNumber == 0 || msg.Request.ToFrameNumber > to) &&
-					max > to {
-					from = to + 1
-					if msg.Request.ToFrameNumber > to {
-						to = msg.Request.ToFrameNumber
-					} else {
-						to = 0
-					}
-				} else {
-					break
-				}
-			}
-
-			return nil
-		}
-	}
+	return nil
 }
 
 // Deprecated: Use NegotiateCompressedSyncFrames.

@@ -40,4 +40,15 @@ type FrameProver interface {
 	VerifyDataClockFrame(
 		frame *protobufs.ClockFrame,
 	) error
+	GenerateWeakRecursiveProofIndex(
+		frame *protobufs.ClockFrame,
+	) (uint64, error)
+	FetchRecursiveProof(
+		frame *protobufs.ClockFrame,
+	) []byte
+	VerifyWeakRecursiveProof(
+		frame *protobufs.ClockFrame,
+		proof []byte,
+		deepVerifier *protobufs.ClockFrame,
+	) bool
 }

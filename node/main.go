@@ -79,6 +79,11 @@ var (
 		false,
 		"print node related information",
 	)
+	debug = flag.Bool(
+		"debug",
+		false,
+		"sets log output to debug (verbose)",
+	)
 )
 
 func main() {
@@ -180,7 +185,12 @@ func main() {
 
 	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
 
-	node, err := app.NewNode(nodeConfig, report)
+	var node *app.Node
+	if *debug {
+		node, err = app.NewDebugNode(nodeConfig, report)
+	} else {
+		node, err = app.NewNode(nodeConfig, report)
+	}
 	if err != nil {
 		panic(err)
 	}

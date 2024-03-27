@@ -123,7 +123,7 @@ func NewMasterClockConsensusEngine(
 		masterTimeReel:      masterTimeReel,
 		peerInfoManager:     peerInfoManager,
 		report:              report,
-		frameValidationCh:   make(chan *protobufs.ClockFrame, 10),
+		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
 	}
 

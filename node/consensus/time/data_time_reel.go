@@ -135,9 +135,9 @@ func (d *DataTimeReel) Start() error {
 		if err != nil {
 			panic(err)
 		}
+		d.totalDistance = big.NewInt(0)
 		d.proverTrie = trie
 		d.headDistance, err = d.GetDistance(frame)
-		d.totalDistance = d.getTotalDistance(frame)
 	}
 
 	go d.runLoop()
@@ -287,7 +287,11 @@ func (d *DataTimeReel) runLoop() {
 		case frame := <-d.frames:
 			// Most common scenario: in order – new frame is higher number
 			if d.head.FrameNumber < frame.frameNumber {
-				d.logger.Debug("frame is higher")
+				d.logger.Debug(
+					"frame is higher",
+					zap.Uint64("head_frame_number", d.head.FrameNumber),
+					zap.Uint64("frame_number", frame.frameNumber),
+				)
 
 				// tag: equinox – master filter changes
 				_, err := d.clockStore.GetMasterClockFrame(
@@ -302,15 +306,7 @@ func (d *DataTimeReel) runLoop() {
 					if !errors.Is(err, store.ErrNotFound) {
 						panic(err)
 					}
-
-					d.addPending(frame.selector, frame.parentSelector, frame.frameNumber)
-					d.processPending(d.head, frame)
 					continue
-				}
-
-				headSelector, err := d.head.GetSelector()
-				if err != nil {
-					panic(err)
 				}
 
 				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
@@ -328,25 +324,8 @@ func (d *DataTimeReel) runLoop() {
 					panic(err)
 				}
 
-				// If the frame has a gap from the head or is not descendent, mark it as
-				// pending:
-				if frame.frameNumber-d.head.FrameNumber != 1 ||
-					frame.parentSelector.Cmp(headSelector) != 0 {
-					d.logger.Debug(
-						"frame has has gap or is non-descendent, fork choice",
-						zap.Bool("has_gap", frame.frameNumber-d.head.FrameNumber != 1),
-						zap.String("parent_selector", frame.parentSelector.Text(16)),
-						zap.String("head_selector", headSelector.Text(16)),
-					)
-
-					d.forkChoice(rawFrame, distance)
-					d.processPending(d.head, frame)
-					continue
-				}
-
 				// Otherwise set it as the next and process all pending
 				d.setHead(rawFrame, distance)
-				d.processPending(d.head, frame)
 			} else if d.head.FrameNumber == frame.frameNumber {
 				// frames are equivalent, no need to act
 				headSelector, err := d.head.GetSelector()
@@ -356,7 +335,6 @@ func (d *DataTimeReel) runLoop() {
 
 				if headSelector.Cmp(frame.selector) == 0 {
 					d.logger.Debug("equivalent frame")
-					d.processPending(d.head, frame)
 					continue
 				}
 
@@ -383,44 +361,11 @@ func (d *DataTimeReel) runLoop() {
 					d.logger.Debug(
 						"frame shares parent, has shorter distance, short circuit",
 					)
-					d.totalDistance.Sub(d.totalDistance, d.headDistance)
 					d.setHead(rawFrame, distance)
-					d.processPending(d.head, frame)
 					continue
 				}
-
-				// Choose fork
-				d.forkChoice(rawFrame, distance)
-				d.processPending(d.head, frame)
 			} else {
 				d.logger.Debug("frame is lower height")
-
-				// tag: dusk – we should have some kind of check here to avoid brutal
-				// thrashing
-				existing, _, err := d.clockStore.GetDataClockFrame(
-					d.filter,
-					frame.frameNumber,
-					true,
-				)
-				if err != nil {
-					// if this returns an error it's either not found (which shouldn't
-					// happen without corruption) or pebble is borked, either way, panic
-					panic(err)
-				}
-
-				existingSelector, err := existing.GetSelector()
-				if err != nil {
-					panic(err)
-				}
-
-				// It's a fork, but it's behind. We need to stash it until it catches
-				// up (or dies off)
-				if existingSelector.Cmp(frame.selector) != 0 {
-					d.logger.Debug("is fork, add pending")
-
-					d.addPending(frame.selector, frame.parentSelector, frame.frameNumber)
-					d.processPending(d.head, frame)
-				}
 			}
 		case <-d.done:
 			return
@@ -616,14 +561,6 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 	}
 
 	d.head = frame
-	d.totalDistance.Add(d.totalDistance, distance)
-
-	d.clockStore.SetTotalDistance(
-		d.filter,
-		frame.FrameNumber,
-		selector.FillBytes(make([]byte, 32)),
-		d.totalDistance,
-	)
 
 	d.headDistance = distance
 	go func() {

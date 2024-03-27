@@ -3,8 +3,6 @@ package ceremony
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
-	"io"
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -161,6 +159,13 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
 	var peer []byte = nil
 	e.peerMapMx.RLock()
 	for _, v := range e.peerMap {
+		e.logger.Debug(
+			"checking peer info",
+			zap.Binary("peer_id", v.peerId),
+			zap.Uint64("max_frame_number", v.maxFrame),
+			zap.Int64("timestamp", v.timestamp),
+			zap.Binary("version", v.version),
+		)
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
 		if v.maxFrame > max &&
 			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
@@ -203,52 +208,16 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 
 	client := protobufs.NewCeremonyServiceClient(cc)
 
-	from := latest.FrameNumber
-	if from == 0 {
-		from = 1
-	}
-
-	rangeParentSelectors := []*protobufs.ClockFrameParentSelectors{}
-	if from > 128 {
-		rangeSubtract := uint64(16)
-		for {
-			if from <= rangeSubtract {
-				break
-			}
-
-			parentNumber := from - uint64(rangeSubtract)
-			rangeSubtract *= 2
-			parent, _, err := e.clockStore.GetDataClockFrame(
-				e.filter,
-				parentNumber,
-				true,
-			)
-			if err != nil {
-				break
-			}
-
-			parentSelector, err := parent.GetSelector()
-			if err != nil {
-				panic(err)
-			}
-
-			rangeParentSelectors = append(
-				rangeParentSelectors,
-				&protobufs.ClockFrameParentSelectors{
-					FrameNumber:    parentNumber,
-					ParentSelector: parentSelector.FillBytes(make([]byte, 32)),
-				},
-			)
-		}
-	}
-
-	s, err := client.NegotiateCompressedSyncFrames(
-		context.Background(),
+	response, err := client.GetDataFrame(
+		context.TODO(),
+		&protobufs.GetDataFrameRequest{
+			FrameNumber: 0,
+		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
 	if err != nil {
-		e.logger.Debug(
-			"received error from peer",
+		e.logger.Error(
+			"could not get frame",
 			zap.Error(err),
 		)
 		e.peerMapMx.Lock()
@@ -258,249 +227,31 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 			delete(e.peerMap, string(peerId))
 		}
 		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "sync")
-	}
-
-	challenge := binary.BigEndian.AppendUint64(
-		append([]byte{}, peerId...),
-		uint64(time.Now().UnixMilli()),
-	)
-	signature, err := e.pubSub.SignMessage(challenge)
-	if err != nil {
-		panic(err)
-	}
-
-	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
-		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Authentication{
-			Authentication: &protobufs.SyncRequestAuthentication{
-				PeerId:    e.pubSub.GetPeerID(),
-				Challenge: challenge,
-				Response: &protobufs.Ed448Signature{
-					Signature: signature,
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: e.pubSub.GetPublicKey(),
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "sync")
-	}
-
-	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
-		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Preflight{
-			Preflight: &protobufs.ClockFramesPreflight{
-				RangeParentSelectors: rangeParentSelectors,
-			},
-		},
-	})
-	if err != nil {
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "sync")
-	}
-
-	syncMsg, err := s.Recv()
-	if err != nil {
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-		return latest, errors.Wrap(err, "sync")
-	}
-	preflight, ok := syncMsg.
-		SyncMessage.(*protobufs.CeremonyCompressedSyncResponseMessage_Preflight)
-	if !ok {
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-		s.CloseSend()
-		return latest, errors.Wrap(
-			errors.New("preflight message invalid"),
-			"sync",
-		)
-	}
-
-	// loop through parent selectors, set found to first match, and if subsequent
-	// matches fail to be found, cancel the search, start from 1.
-	found := uint64(0)
-	parentSelector := make([]byte, 32)
-
-	for _, selector := range preflight.Preflight.RangeParentSelectors {
-		match, err := e.clockStore.GetStagedDataClockFrame(
-			e.filter,
-			selector.FrameNumber,
-			selector.ParentSelector,
-			true,
-		)
-		if err != nil && found == 0 {
-			continue
-		}
-		if err != nil && found != 0 {
-			found = 1
-			e.logger.Info("could not find interstitial frame, setting search to 1")
-			break
-		}
-		if match != nil && found == 0 {
-			found = match.FrameNumber
-			parentSelector = match.ParentSelector
-			break
-		}
-	}
-	if found != 0 && !bytes.Equal(parentSelector, make([]byte, 32)) {
-		check, err := e.clockStore.GetStagedDataClockFrame(
-			e.filter,
-			found,
-			parentSelector,
-			true,
-		)
-		if err != nil {
-			from = 1
-		} else {
-			e.logger.Info("checking interstitial continuity")
-			for check.FrameNumber > 1 {
-				check, err = e.clockStore.GetStagedDataClockFrame(
-					e.filter,
-					check.FrameNumber-1,
-					check.ParentSelector,
-					true,
-				)
-				if err != nil {
-					from = 1
-					e.logger.Info(
-						"could not confirm interstitial continuity, setting search to 1",
-					)
-					break
-				}
-			}
-			from = found
-		}
-	}
-
-	err = s.Send(&protobufs.CeremonyCompressedSyncRequestMessage{
-		SyncMessage: &protobufs.CeremonyCompressedSyncRequestMessage_Request{
-			Request: &protobufs.ClockFramesRequest{
-				Filter:          e.filter,
-				FromFrameNumber: from,
-				ToFrameNumber:   0,
-				ParentSelector:  parentSelector,
-			},
-		},
-	})
-	if err != nil {
-		return latest, errors.Wrap(err, "sync")
-	}
-
-	for syncMsg, err = s.Recv(); err == nil; syncMsg, err = s.Recv() {
-		sync, ok := syncMsg.
-			SyncMessage.(*protobufs.CeremonyCompressedSyncResponseMessage_Response)
-		if !ok {
-			return latest, errors.Wrap(
-				errors.New("response message invalid"),
-				"sync",
-			)
-		}
-
-		response := sync.Response
-
-		e.logger.Info(
-			"received compressed sync frame",
-			zap.Uint64("from", response.FromFrameNumber),
-			zap.Uint64("to", response.ToFrameNumber),
-			zap.Int("frames", len(response.TruncatedClockFrames)),
-			zap.Int("proofs", len(response.Proofs)),
-		)
-
-		// This can only happen if we get a peer with state that was initially
-		// farther ahead, but something happened. However, this has a sticking
-		// effect that doesn't go away for them until they're caught up again,
-		// so let's not penalize their score and make everyone else suffer,
-		// let's just move on:
-		if response.FromFrameNumber == 0 && response.ToFrameNumber == 0 {
-			if err := cc.Close(); err != nil {
-				e.logger.Error("error while closing connection", zap.Error(err))
-			}
-
-			return currentLatest, errors.Wrap(ErrNoNewFrames, "sync")
-		}
-
-		var next *protobufs.ClockFrame
-		if next, err = e.decompressAndStoreCandidates(
-			peerId,
-			response,
-		); err != nil && !errors.Is(err, ErrNoNewFrames) {
-			e.logger.Error(
-				"could not decompress and store candidate",
-				zap.Error(err),
-			)
-			e.peerMapMx.Lock()
-			if _, ok := e.peerMap[string(peerId)]; ok {
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().
-					UnixMilli()
-				delete(e.peerMap, string(peerId))
-			}
-			e.peerMapMx.Unlock()
-
-			if err := cc.Close(); err != nil {
-				e.logger.Error("error while closing connection", zap.Error(err))
-			}
-
-			return currentLatest, errors.Wrap(err, "sync")
-		}
-		if next != nil {
-			latest = next
-		}
-	}
-	if err != nil && err != io.EOF && !errors.Is(err, ErrNoNewFrames) {
-		e.logger.Debug("error while receiving sync", zap.Error(err))
-
 		if err := cc.Close(); err != nil {
 			e.logger.Error("error while closing connection", zap.Error(err))
 		}
-
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-
 		return latest, errors.Wrap(err, "sync")
+	}
+
+	if response == nil {
+		e.logger.Error("received no response from peer")
+		if err := cc.Close(); err != nil {
+			e.logger.Error("error while closing connection", zap.Error(err))
+		}
+		return latest, nil
 	}
 
 	e.logger.Info(
 		"received new leading frame",
-		zap.Uint64("frame_number", latest.FrameNumber),
+		zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
 	)
 	if err := cc.Close(); err != nil {
 		e.logger.Error("error while closing connection", zap.Error(err))
 	}
 
-	e.dataTimeReel.Insert(latest, false)
+	e.dataTimeReel.Insert(response.ClockFrame, false)
 
-	return latest, nil
+	return response.ClockFrame, nil
 }
 
 func (e *CeremonyDataClockConsensusEngine) collect(

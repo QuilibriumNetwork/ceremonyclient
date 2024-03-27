@@ -26,7 +26,7 @@ const (
 var (
 	BlossomSubD                                = 6
 	BlossomSubDlo                              = 5
-	BlossomSubDhi                              = 24
+	BlossomSubDhi                              = 10
 	BlossomSubDscore                           = 4
 	BlossomSubDout                             = 2
 	BlossomSubHistoryLength                    = 5

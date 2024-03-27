@@ -23,6 +23,30 @@ import (
 
 // Injectors from wire.go:
 
+func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestReport) (*Node, error) {
+	zapLogger := debugLogger()
+	dbConfig := configConfig.DB
+	pebbleDB := store.NewPebbleDB(dbConfig)
+	pebbleClockStore := store.NewPebbleClockStore(pebbleDB, zapLogger)
+	keyConfig := configConfig.Key
+	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
+	p2PConfig := configConfig.P2P
+	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	engineConfig := configConfig.Engine
+	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
+	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
+	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
+	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
+	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
+	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, inMemoryPeerInfoManager, pebbleKeyStore)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
+	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
+}
+
 func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestReport) (*Node, error) {
 	zapLogger := logger()
 	dbConfig := configConfig.DB
@@ -74,8 +98,21 @@ func logger() *zap.Logger {
 	return log
 }
 
+func debugLogger() *zap.Logger {
+	log, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+
+	return log
+}
+
 var loggerSet = wire.NewSet(
 	logger,
+)
+
+var debugLoggerSet = wire.NewSet(
+	debugLogger,
 )
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))

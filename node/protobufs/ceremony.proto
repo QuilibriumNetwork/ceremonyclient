@@ -189,8 +189,18 @@ message InclusionCommitmentsMap {
   repeated bytes segment_hashes = 3;
 }
 
+message GetDataFrameRequest {
+  uint64 frame_number = 1;
+}
+
+message DataFrameResponse {
+  quilibrium.node.clock.pb.ClockFrame clock_frame = 1;
+  bytes proof = 2;
+}
+
 service CeremonyService {
   rpc GetCompressedSyncFrames (quilibrium.node.clock.pb.ClockFramesRequest) returns (stream CeremonyCompressedSync);
   rpc NegotiateCompressedSyncFrames (stream CeremonyCompressedSyncRequestMessage) returns (stream CeremonyCompressedSyncResponseMessage);
   rpc GetPublicChannel (stream quilibrium.node.channel.pb.P2PChannelEnvelope) returns (stream quilibrium.node.channel.pb.P2PChannelEnvelope);
+  rpc GetDataFrame (GetDataFrameRequest) returns (DataFrameResponse);
 }
