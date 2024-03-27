@@ -447,9 +447,7 @@ func (e *CeremonyExecutionEngine) Start() <-chan error {
 			panic(err)
 		}
 
-		go func() {
-			e.RunWorker()
-		}()
+		go e.RunWorker()
 
 		errChan <- nil
 	}()

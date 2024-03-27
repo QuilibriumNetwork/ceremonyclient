@@ -481,3 +481,115 @@ func (w *WesolowskiFrameProver) VerifyDataClockFrame(
 
 	return nil
 }
+
+func (w *WesolowskiFrameProver) GenerateWeakRecursiveProofIndex(
+	frame *protobufs.ClockFrame,
+) (uint64, error) {
+	hash, err := poseidon.HashBytes(frame.Output)
+	if err != nil {
+		return 0, errors.Wrap(err, "generate weak recursive proof")
+	}
+
+	return hash.Mod(
+		hash,
+		new(big.Int).SetUint64(frame.FrameNumber),
+	).Uint64(), nil
+}
+
+func (w *WesolowskiFrameProver) FetchRecursiveProof(
+	frame *protobufs.ClockFrame,
+) []byte {
+	var pubkey []byte
+	ed448PublicKey := frame.GetPublicKeySignatureEd448()
+	if ed448PublicKey != nil {
+		pubkey = ed448PublicKey.PublicKey.KeyValue
+	} else {
+		return nil
+	}
+
+	h, err := poseidon.HashBytes(pubkey)
+	if err != nil {
+		return nil
+	}
+
+	address := h.Bytes()
+	input := []byte{}
+	input = append(input, frame.Filter...)
+	input = binary.BigEndian.AppendUint64(input, frame.FrameNumber)
+	input = binary.BigEndian.AppendUint64(input, uint64(frame.Timestamp))
+	input = binary.BigEndian.AppendUint32(input, frame.Difficulty)
+	input = append(input, address...)
+	input = append(input, frame.Input...)
+	input = append(input, frame.Output...)
+
+	return input
+}
+
+func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
+	frame *protobufs.ClockFrame,
+	proof []byte,
+	deepVerifier *protobufs.ClockFrame,
+) bool {
+	hash, err := poseidon.HashBytes(frame.Output)
+	if err != nil {
+		w.logger.Debug("could not hash output")
+		return false
+	}
+
+	frameNumber := hash.Mod(
+		hash,
+		new(big.Int).SetUint64(frame.FrameNumber),
+	).Uint64()
+
+	if len(proof) < 1084 {
+		w.logger.Debug("invalid proof size")
+		return false
+	}
+
+	filter := proof[:len(frame.Filter)]
+	check := binary.BigEndian.Uint64(proof[len(frame.Filter) : len(frame.Filter)+8])
+	timestamp := binary.BigEndian.Uint64(
+		proof[len(frame.Filter)+8 : len(frame.Filter)+16],
+	)
+	difficulty := binary.BigEndian.Uint32(
+		proof[len(frame.Filter)+16 : len(frame.Filter)+20],
+	)
+	input := proof[len(frame.Filter)+52:]
+
+	if check != frameNumber ||
+		!bytes.Equal(filter, frame.Filter) ||
+		int64(timestamp) >= frame.Timestamp ||
+		difficulty > frame.Difficulty ||
+		len(input) < 1032 {
+		w.logger.Debug(
+			"check failed",
+			zap.Bool("failed_frame_number", check != frameNumber),
+			zap.Bool("failed_filter", !bytes.Equal(filter, frame.Filter)),
+			zap.Bool("failed_timestamp", int64(timestamp) >= frame.Timestamp),
+			zap.Bool("failed_difficulty", difficulty > frame.Difficulty),
+			zap.Bool("failed_input_size", len(input) < 1032),
+		)
+		return false
+	}
+
+	if deepVerifier != nil && (check != deepVerifier.FrameNumber ||
+		!bytes.Equal(filter, deepVerifier.Filter) ||
+		int64(timestamp) != deepVerifier.Timestamp ||
+		difficulty != deepVerifier.Difficulty ||
+		!bytes.Equal(input[:len(input)-516], deepVerifier.Input)) {
+		return false
+	}
+
+	b := sha3.Sum256(input[:len(input)-516])
+	v := vdf.New(difficulty, b)
+	output := [516]byte{}
+	copy(output[:], input[len(input)-516:])
+
+	if v.Verify(output) {
+		w.logger.Debug("verification succeeded")
+		return true
+	} else {
+		w.logger.Debug("verification failed")
+		return false
+	}
+}

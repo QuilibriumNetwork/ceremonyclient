@@ -22,6 +22,7 @@ const (
 	CeremonyService_GetCompressedSyncFrames_FullMethodName       = "/quilibrium.node.ceremony.pb.CeremonyService/GetCompressedSyncFrames"
 	CeremonyService_NegotiateCompressedSyncFrames_FullMethodName = "/quilibrium.node.ceremony.pb.CeremonyService/NegotiateCompressedSyncFrames"
 	CeremonyService_GetPublicChannel_FullMethodName              = "/quilibrium.node.ceremony.pb.CeremonyService/GetPublicChannel"
+	CeremonyService_GetDataFrame_FullMethodName                  = "/quilibrium.node.ceremony.pb.CeremonyService/GetDataFrame"
 )
 
 // CeremonyServiceClient is the client API for CeremonyService service.
@@ -31,6 +32,7 @@ type CeremonyServiceClient interface {
 	GetCompressedSyncFrames(ctx context.Context, in *ClockFramesRequest, opts ...grpc.CallOption) (CeremonyService_GetCompressedSyncFramesClient, error)
 	NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_NegotiateCompressedSyncFramesClient, error)
 	GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (CeremonyService_GetPublicChannelClient, error)
+	GetDataFrame(ctx context.Context, in *GetDataFrameRequest, opts ...grpc.CallOption) (*DataFrameResponse, error)
 }
 
 type ceremonyServiceClient struct {
@@ -135,6 +137,15 @@ func (x *ceremonyServiceGetPublicChannelClient) Recv() (*P2PChannelEnvelope, err
 	return m, nil
 }
 
+func (c *ceremonyServiceClient) GetDataFrame(ctx context.Context, in *GetDataFrameRequest, opts ...grpc.CallOption) (*DataFrameResponse, error) {
+	out := new(DataFrameResponse)
+	err := c.cc.Invoke(ctx, CeremonyService_GetDataFrame_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CeremonyServiceServer is the server API for CeremonyService service.
 // All implementations must embed UnimplementedCeremonyServiceServer
 // for forward compatibility
@@ -142,6 +153,7 @@ type CeremonyServiceServer interface {
 	GetCompressedSyncFrames(*ClockFramesRequest, CeremonyService_GetCompressedSyncFramesServer) error
 	NegotiateCompressedSyncFrames(CeremonyService_NegotiateCompressedSyncFramesServer) error
 	GetPublicChannel(CeremonyService_GetPublicChannelServer) error
+	GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error)
 	mustEmbedUnimplementedCeremonyServiceServer()
 }
 
@@ -157,6 +169,9 @@ func (UnimplementedCeremonyServiceServer) NegotiateCompressedSyncFrames(Ceremony
 }
 func (UnimplementedCeremonyServiceServer) GetPublicChannel(CeremonyService_GetPublicChannelServer) error {
 	return status.Errorf(codes.Unimplemented, "method GetPublicChannel not implemented")
+}
+func (UnimplementedCeremonyServiceServer) GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetDataFrame not implemented")
 }
 func (UnimplementedCeremonyServiceServer) mustEmbedUnimplementedCeremonyServiceServer() {}
 
@@ -244,13 +259,36 @@ func (x *ceremonyServiceGetPublicChannelServer) Recv() (*P2PChannelEnvelope, err
 	return m, nil
 }
 
+func _CeremonyService_GetDataFrame_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDataFrameRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CeremonyServiceServer).GetDataFrame(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CeremonyService_GetDataFrame_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CeremonyServiceServer).GetDataFrame(ctx, req.(*GetDataFrameRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CeremonyService_ServiceDesc is the grpc.ServiceDesc for CeremonyService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var CeremonyService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "quilibrium.node.ceremony.pb.CeremonyService",
 	HandlerType: (*CeremonyServiceServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetDataFrame",
+			Handler:    _CeremonyService_GetDataFrame_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "GetCompressedSyncFrames",

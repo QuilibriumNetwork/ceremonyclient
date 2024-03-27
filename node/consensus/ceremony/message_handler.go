@@ -20,6 +20,7 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 	for {
 		select {
 		case message := <-e.messageProcessorCh:
+			e.logger.Debug("handling message")
 			msg := &protobufs.Message{}
 
 			if err := proto.Unmarshal(message.Data, msg); err != nil {
@@ -84,6 +85,7 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 
 			any := &anypb.Any{}
 			if err := proto.Unmarshal(msg.Payload, any); err != nil {
+				e.logger.Error("error while unmarshaling", zap.Error(err))
 				continue
 			}
 
@@ -94,6 +96,7 @@ func (e *CeremonyDataClockConsensusEngine) runMessageHandler() {
 						peer.version,
 						config.GetMinimumVersion(),
 					) < 0 {
+						e.logger.Debug("received frame from unknown or outdated peer")
 						return
 					}
 					if err := e.handleClockFrameData(
@@ -334,7 +337,10 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 	if e.latestFrameReceived < frame.FrameNumber {
 		e.latestFrameReceived = frame.FrameNumber
 		go func() {
-			e.frameChan <- frame
+			select {
+			case e.frameChan <- frame:
+			default:
+			}
 		}()
 	}
 	e.dataTimeReel.Insert(frame, isSync)

@@ -27,8 +27,21 @@ func logger() *zap.Logger {
 	return log
 }
 
+func debugLogger() *zap.Logger {
+	log, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+
+	return log
+}
+
 var loggerSet = wire.NewSet(
 	logger,
+)
+
+var debugLoggerSet = wire.NewSet(
+	debugLogger,
 )
 
 var keyManagerSet = wire.NewSet(
@@ -74,6 +87,18 @@ var consensusSet = wire.NewSet(
 		new(*master.MasterClockConsensusEngine),
 	),
 )
+
+func NewDebugNode(*config.Config, *protobufs.SelfTestReport) (*Node, error) {
+	panic(wire.Build(
+		debugLoggerSet,
+		keyManagerSet,
+		storeSet,
+		pubSubSet,
+		engineSet,
+		consensusSet,
+		newNode,
+	))
+}
 
 func NewNode(*config.Config, *protobufs.SelfTestReport) (*Node, error) {
 	panic(wire.Build(

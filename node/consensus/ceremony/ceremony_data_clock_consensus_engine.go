@@ -242,7 +242,7 @@ func NewCeremonyDataClockConsensusEngine(
 		dataTimeReel:              dataTimeReel,
 		peerInfoManager:           peerInfoManager,
 		statsClient:               statsClient,
-		messageProcessorCh:        make(chan *pb.Message, 128),
+		messageProcessorCh:        make(chan *pb.Message),
 	}
 
 	logger.Info("constructing consensus engine")
@@ -280,9 +280,7 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 		panic(err)
 	}
 
-	go func() {
-		e.runMessageHandler()
-	}()
+	go e.runMessageHandler()
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage, true)
@@ -309,8 +307,6 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 		thresholdBeforeConfirming := 4
 
 		for {
-			time.Sleep(120 * time.Second)
-
 			list := &protobufs.CeremonyPeerListAnnounce{
 				PeerList: []*protobufs.CeremonyPeer{},
 			}
@@ -413,12 +409,12 @@ func (e *CeremonyDataClockConsensusEngine) Start() <-chan error {
 			if thresholdBeforeConfirming > 0 {
 				thresholdBeforeConfirming--
 			}
+
+			time.Sleep(120 * time.Second)
 		}
 	}()
 
-	go func() {
-		e.runLoop()
-	}()
+	go e.runLoop()
 
 	go func() {
 		errChan <- nil
@@ -467,7 +463,10 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 				if e.latestFrameReceived < latestFrame.FrameNumber {
 					e.latestFrameReceived = latestFrame.FrameNumber
 					go func() {
-						e.frameChan <- latestFrame
+						select {
+						case e.frameChan <- latestFrame:
+						default:
+						}
 					}()
 				}
 
@@ -512,7 +511,10 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 				if e.latestFrameReceived < latestFrame.FrameNumber {
 					e.latestFrameReceived = latestFrame.FrameNumber
 					go func() {
-						e.frameChan <- latestFrame
+						select {
+						case e.frameChan <- latestFrame:
+						default:
+						}
 					}()
 				}
 
