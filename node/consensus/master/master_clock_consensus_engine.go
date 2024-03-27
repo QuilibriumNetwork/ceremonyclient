@@ -170,6 +170,12 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				}
 
 				e.masterTimeReel.Insert(newFrame, false)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
 			}
