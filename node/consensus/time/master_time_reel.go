@@ -180,8 +180,8 @@ func (m *MasterTimeReel) runLoop() {
 		select {
 		case frame := <-m.frames:
 			if m.head.FrameNumber < frame.FrameNumber {
-				m.logger.Debug(
-					"new frame has higher number",
+				m.logger.Info(
+					"new master frame received",
 					zap.Uint32("new_frame_number", uint32(frame.FrameNumber)),
 					zap.Uint32("frame_number", uint32(m.head.FrameNumber)),
 				)
