@@ -46,6 +46,14 @@ The confirmed token balance will be printed to stdout in QUILs.
 
 Note that this feature requires that [gRPC support](#experimental--grpcrest-support) is enabled.
 
+## Node Info (peer ID, token balance, version & frame number)
+
+In order to find the peer ID, token balance, version & frame number of a running node, execute the following command from the `node/` folder:
+
+    GOEXPERIMENT=arenas go run ./... -node-info
+
+Note that this command requires gRRC to be enabled (see above).
+
 ## Stats Collection
 
 In order to opt-in to stats collection about the health of the network, edit your `config.yml` in the `node/.config` directory to have a new section under `engine`:
