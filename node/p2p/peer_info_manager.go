@@ -13,7 +13,7 @@ type PeerInfoManager interface {
 	AddPeerInfo(manifest *PeerManifest)
 	GetPeerInfo(peerId []byte) *PeerManifest
 	GetPeerMap() map[string]*PeerManifest
-	GetPeersBySpeed() [][]byte
+	GetPeersBySpeed() map[string]*PeerManifest
 }
 
 type Capability struct {
@@ -111,11 +111,11 @@ func (m *InMemoryPeerInfoManager) GetPeerMap() map[string]*PeerManifest {
 	return data
 }
 
-func (m *InMemoryPeerInfoManager) GetPeersBySpeed() [][]byte {
-	result := [][]byte{}
+func (m *InMemoryPeerInfoManager) GetPeersBySpeed() map[string]*PeerManifest {
+	result := make(map[string]*PeerManifest)
 	m.peerInfoMx.RLock()
 	for _, info := range m.fastestPeers {
-		result = append(result, info.PeerId)
+		result[string(info.PeerId)] = info
 	}
 	m.peerInfoMx.RUnlock()
 	return result

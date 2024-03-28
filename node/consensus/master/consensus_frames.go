@@ -44,7 +44,7 @@ func (e *MasterClockConsensusEngine) GetMostAheadPeers() (
 	max := frame.FrameNumber + 10
 
 	var peers [][]byte = [][]byte{}
-	peerMap := e.peerInfoManager.GetPeerMap()
+	peerMap := e.peerInfoManager.GetPeersBySpeed()
 	for peerId, v := range peerMap {
 		if v.MasterHeadFrame > max {
 			peers = append(peers, []byte(peerId))
