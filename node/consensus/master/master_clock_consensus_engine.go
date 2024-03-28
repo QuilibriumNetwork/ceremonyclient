@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"math/big"
+	"runtime"
 	"sync"
 	"time"
 
@@ -160,19 +161,28 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 
 	e.buildHistoricFrameCache(frame)
 
-	go func() {
-		for {
-			select {
-			case newFrame := <-e.frameValidationCh:
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func() {
+			for newFrame := range e.frameValidationCh {
+				head, err := e.masterTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+				if head.FrameNumber > newFrame.FrameNumber || newFrame.FrameNumber-head.FrameNumber > 1000 {
+					e.logger.Debug("Ignore frame", zap.Uint64("number", newFrame.FrameNumber))
+					continue
+				}
 				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
 					e.logger.Error("could not verify clock frame", zap.Error(err))
 					continue
 				}
-
 				e.masterTimeReel.Insert(newFrame, false)
-			case peerId := <-e.bandwidthTestCh:
-				e.performBandwidthTest(peerId)
 			}
+		}()
+	}
+	go func() {
+		for peerId := range e.bandwidthTestCh {
+			e.performBandwidthTest(peerId)
 		}
 	}()
 

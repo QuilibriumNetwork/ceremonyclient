@@ -44,7 +44,7 @@ func (e *MasterClockConsensusEngine) GetMostAheadPeers() (
 	max := frame.FrameNumber + 10
 
 	var peers [][]byte = [][]byte{}
-	peerMap := e.peerInfoManager.GetPeerMap()
+	peerMap := e.peerInfoManager.GetPeersBySpeed()
 	for peerId, v := range peerMap {
 		if v.MasterHeadFrame > max {
 			peers = append(peers, []byte(peerId))
@@ -79,6 +79,8 @@ func (e *MasterClockConsensusEngine) collect(
 	}
 
 	for i := 0; i < len(peers); i++ {
+		var first = latest
+
 		peer := peers[i]
 		e.logger.Debug("setting syncing target", zap.Binary("peer_id", peer))
 
@@ -112,7 +114,7 @@ func (e *MasterClockConsensusEngine) collect(
 				break
 			}
 
-			for _, frame := range msg.FramesResponse.ClockFrames {
+			for i, frame := range msg.FramesResponse.ClockFrames {
 				frame := frame
 
 				if frame.FrameNumber < latest.FrameNumber {
@@ -127,15 +129,19 @@ func (e *MasterClockConsensusEngine) collect(
 					break
 				}
 
-				if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
-					e.logger.Error(
-						"peer returned invalid frame",
-						zap.String("peer_id", base58.Encode(peer)))
-					e.pubSub.SetPeerScore(peer, -1000)
-					break
+				e.frameValidationCh <- frame
+				// this is verified again elsewhere, but we check some to ban the peer
+				if i == 0 {
+					if err := e.frameProver.VerifyMasterClockFrame(frame); err != nil {
+						e.logger.Error(
+							"peer returned invalid frame",
+							zap.String("peer_id", base58.Encode(peer)))
+						e.pubSub.SetPeerScore(peer, -1000)
+						latest = first
+						break
+					}
 				}
 
-				e.masterTimeReel.Insert(frame, false)
 				latest = frame
 			}
 		}
