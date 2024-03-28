@@ -233,6 +233,7 @@ func (m *MasterTimeReel) runLoop() {
 						frame,
 					)
 				}
+				m.processPending()
 			} else {
 				m.logger.Debug(
 					"new frame has same or lower frame number",
@@ -241,7 +242,6 @@ func (m *MasterTimeReel) runLoop() {
 				)
 				continue
 			}
-			m.processPending()
 		case <-m.done:
 			return
 		}
@@ -253,6 +253,9 @@ func (m *MasterTimeReel) processPending() {
 		ok = m.pending[m.head.FrameNumber+1] {
 
 		for _, frame := range pending {
+			m.logger.Debug(
+				"process pending",
+				zap.Uint64("number", frame.FrameNumber))
 			frame := frame
 			parent := new(big.Int).SetBytes(frame.ParentSelector)
 			selector, err := m.head.GetSelector()
