@@ -295,7 +295,7 @@ func (m *MasterTimeReel) processPending() {
 			break
 		}
 
-		delete(m.pending, m.head.FrameNumber+1)
+		delete(m.pending, m.head.FrameNumber)
 	}
 	deletes := []uint64{}
 	for number := range m.pending {
