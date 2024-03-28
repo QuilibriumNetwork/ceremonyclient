@@ -1,0 +1,50 @@
+name: Build and Release Go Application
+
+on:
+  push:
+#    tags:
+#      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: '1.20.14' # Specify the Go version you need
+
+    - name: Set Environment Variables
+      run: |
+        echo "GOROOT=/usr/local/go" >> $GITHUB_ENV
+        echo "GOPATH=$HOME/go" >> $GITHUB_ENV
+        echo "PATH=$PATH:$GOROOT/bin:$GOPATH/bin" >> $GITHUB_ENV
+        
+    - name: Build Go application
+      run: |
+        cd node # Change directory to where your Go application is
+        GOEXPERIMENT=arenas go build -v -o node ./...
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you don't need to create it
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, grabs the upload URL
+        asset_path: ./node/node # Adjust this path to where your built application is
+        asset_name: node # Replace 'myapp' with your application's name
+        asset_content_type: application/octet-stream
