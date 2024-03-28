@@ -170,6 +170,12 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
 		if v.maxFrame > max &&
 			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
 			bytes.Compare(v.version, config.GetMinimumVersion()) >= 0 && !ok {
+			manifest := e.peerInfoManager.GetPeerInfo(v.peerId)
+			if manifest == nil || manifest.Bandwidth == 0 {
+				e.logger.Debug("peer manifest not found or bandwidth zero")
+				continue
+			}
+
 			peer = v.peerId
 			max = v.maxFrame
 		}
@@ -192,7 +198,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 	e.logger.Info("polling peer for new frames", zap.Binary("peer_id", peerId))
 	cc, err := e.pubSub.GetDirectChannel(peerId, "")
 	if err != nil {
-		e.logger.Error(
+		e.logger.Debug(
 			"could not establish direct channel",
 			zap.Error(err),
 		)
@@ -216,7 +222,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)
 	if err != nil {
-		e.logger.Error(
+		e.logger.Debug(
 			"could not get frame",
 			zap.Error(err),
 		)
@@ -234,7 +240,7 @@ func (e *CeremonyDataClockConsensusEngine) sync(
 	}
 
 	if response == nil {
-		e.logger.Error("received no response from peer")
+		e.logger.Debug("received no response from peer")
 		if err := cc.Close(); err != nil {
 			e.logger.Error("error while closing connection", zap.Error(err))
 		}
