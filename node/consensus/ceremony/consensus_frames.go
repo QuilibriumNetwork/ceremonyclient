@@ -167,7 +167,7 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
 			zap.Binary("version", v.version),
 		)
 		_, ok := e.uncooperativePeersMap[string(v.peerId)]
-		if v.maxFrame > max &&
+		if v.maxFrame >= max &&
 			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
 			bytes.Compare(v.version, config.GetMinimumVersion()) >= 0 && !ok {
 			manifest := e.peerInfoManager.GetPeerInfo(v.peerId)
@@ -269,18 +269,16 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 
 	for {
 		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
-		if maxFrame > latest.FrameNumber {
+		if err != nil {
+			e.logger.Info("no peers available for sync, waiting")
+			time.Sleep(5 * time.Second)
+		} else if maxFrame-2 > latest.FrameNumber {
 			e.syncingStatus = SyncStatusSynchronizing
+			latest, err = e.sync(latest, maxFrame, peerId)
 			if err != nil {
-				e.logger.Info("no peers available for sync, waiting")
-				time.Sleep(5 * time.Second)
-			} else if maxFrame-2 > latest.FrameNumber {
-				latest, err = e.sync(latest, maxFrame, peerId)
-				if err != nil {
-					time.Sleep(30 * time.Second)
-				} else {
-					break
-				}
+				time.Sleep(30 * time.Second)
+			} else {
+				break
 			}
 		} else {
 			break
