@@ -163,25 +163,18 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
-			for {
-				select {
-				case newFrame := <-e.frameValidationCh:
-					if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
-						e.logger.Error("could not verify clock frame", zap.Error(err))
-						continue
-					}
-
-					e.masterTimeReel.Insert(newFrame, false)
+			for newFrame := range e.frameValidationCh {
+				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
+					e.logger.Error("could not verify clock frame", zap.Error(err))
+					continue
 				}
+				e.masterTimeReel.Insert(newFrame, false)
 			}
 		}()
 	}
 	go func() {
-		for {
-			select {
-			case peerId := <-e.bandwidthTestCh:
-				e.performBandwidthTest(peerId)
-			}
+		for peerId := range e.bandwidthTestCh {
+			e.performBandwidthTest(peerId)
 		}
 	}()
 
