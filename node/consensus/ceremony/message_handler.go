@@ -291,6 +291,10 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
+	if e.latestFrameReceived > frame.FrameNumber {
+		return nil
+	}
+
 	addr, err := poseidon.HashBytes(
 		frame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
 	)
@@ -343,6 +347,6 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 			}
 		}()
 	}
-	e.dataTimeReel.Insert(frame, isSync)
+	e.dataTimeReel.Insert(frame, e.latestFrameReceived < frame.FrameNumber)
 	return nil
 }

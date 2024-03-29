@@ -164,6 +164,19 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 		for {
 			select {
 			case newFrame := <-e.frameValidationCh:
+				head, err := e.masterTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+
+				if head.FrameNumber > newFrame.FrameNumber || newFrame.FrameNumber-head.FrameNumber > 128 {
+					e.logger.Debug(
+						"frame out of range, ignoring",
+						zap.Uint64("number", newFrame.FrameNumber),
+					)
+					continue
+				}
+
 				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
 					e.logger.Error("could not verify clock frame", zap.Error(err))
 					continue
