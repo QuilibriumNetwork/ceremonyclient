@@ -15,13 +15,6 @@ import (
 func (e *CeremonyDataClockConsensusEngine) handleMessage(
 	message *pb.Message,
 ) error {
-	e.logger.Debug(
-		"received message",
-		zap.Binary("data", message.Data),
-		zap.Binary("from", message.From),
-		zap.Binary("signature", message.Signature),
-	)
-
 	go func() {
 		e.messageProcessorCh <- message
 	}()

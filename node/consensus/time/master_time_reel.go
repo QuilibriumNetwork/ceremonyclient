@@ -252,6 +252,7 @@ func (m *MasterTimeReel) processPending() {
 	for pending, ok := m.pending[m.head.FrameNumber+1]; ok; pending,
 		ok = m.pending[m.head.FrameNumber+1] {
 
+		prev := m.head
 		for _, frame := range pending {
 			frame := frame
 			parent := new(big.Int).SetBytes(frame.ParentSelector)
@@ -295,7 +296,11 @@ func (m *MasterTimeReel) processPending() {
 			break
 		}
 
-		delete(m.pending, m.head.FrameNumber+1)
+		if m.head.FrameNumber != prev.FrameNumber {
+			delete(m.pending, m.head.FrameNumber)
+		} else {
+			delete(m.pending, m.head.FrameNumber+1)
+		}
 	}
 	deletes := []uint64{}
 	for number := range m.pending {

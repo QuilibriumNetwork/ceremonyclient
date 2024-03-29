@@ -170,12 +170,6 @@ func (e *CeremonyDataClockConsensusEngine) GetMostAheadPeer(
 		if v.maxFrame > max &&
 			v.timestamp > config.GetMinimumVersionCutoff().UnixMilli() &&
 			bytes.Compare(v.version, config.GetMinimumVersion()) >= 0 && !ok {
-			manifest := e.peerInfoManager.GetPeerInfo(v.peerId)
-			if manifest == nil || manifest.Bandwidth == 0 {
-				e.logger.Debug("peer manifest not found or bandwidth zero")
-				continue
-			}
-
 			peer = v.peerId
 			max = v.maxFrame
 		}
@@ -274,11 +268,9 @@ func (e *CeremonyDataClockConsensusEngine) collect(
 			if err != nil {
 				e.logger.Info("no peers available for sync, waiting")
 				time.Sleep(5 * time.Second)
-			} else if maxFrame-2 > latest.FrameNumber {
+			} else if maxFrame > latest.FrameNumber {
 				latest, err = e.sync(latest, maxFrame, peerId)
-				if err != nil {
-					time.Sleep(30 * time.Second)
-				} else {
+				if err == nil {
 					break
 				}
 			}
