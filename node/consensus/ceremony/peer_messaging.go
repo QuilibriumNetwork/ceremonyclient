@@ -31,6 +31,12 @@ func (e *CeremonyDataClockConsensusEngine) GetDataFrame(
 	var err error
 	if request.FrameNumber == 0 {
 		frame, err = e.dataTimeReel.Head()
+		if frame.FrameNumber == 0 {
+			return nil, errors.Wrap(
+				errors.New("not currently syncable"),
+				"get data frame",
+			)
+		}
 	} else {
 		frame, _, err = e.clockStore.GetDataClockFrame(
 			e.filter,
