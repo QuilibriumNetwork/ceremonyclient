@@ -347,6 +347,14 @@ func (e *CeremonyDataClockConsensusEngine) handleClockFrameData(
 			}
 		}()
 	}
-	e.dataTimeReel.Insert(frame, e.latestFrameReceived < frame.FrameNumber)
+
+	head, err := e.dataTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	if frame.FrameNumber > head.FrameNumber {
+		e.dataTimeReel.Insert(frame, e.latestFrameReceived < frame.FrameNumber)
+	}
 	return nil
 }
