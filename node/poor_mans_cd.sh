@@ -35,6 +35,12 @@ kill_process() {
 
 kill_process
 
+if [ $PINNED_VERSION != "" ]; then
+    echo "⚠️ pinned version detected, won't check or apply for future updates"
+    git pull
+    git reset --hard $PINNED_VERSION
+fi
+
 start_process
 
 while true; do
@@ -43,17 +49,19 @@ while true; do
         start_process
     fi
 
-    git fetch
+    if [ $PINNED_VERSION == "" ]; then
+        git fetch
 
-    local_head=$(git rev-parse HEAD)
-    remote_head=$(git rev-parse @{u})
+        local_head=$(git rev-parse HEAD)
+        remote_head=$(git rev-parse @{u})
 
-    if [ "$local_head" != "$remote_head" ]; then
-        kill_process
+        if [ "$local_head" != "$remote_head" ]; then
+            kill_process
 
-        git pull
+            git pull
 
-        start_process
+            start_process
+        fi
     fi
 
     sleep 60
