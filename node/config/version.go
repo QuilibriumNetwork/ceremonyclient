@@ -6,15 +6,15 @@ import (
 )
 
 func GetMinimumVersionCutoff() time.Time {
-	return time.Date(2024, time.March, 27, 8, 30, 0, 0, time.UTC)
+	return time.Date(2024, time.April, 4, 6, 20, 0, 0, time.UTC)
 }
 
 func GetMinimumVersion() []byte {
-	return []byte{0x01, 0x04, 0x0D}
+	return []byte{0x01, 0x04, 0x0E}
 }
 
 func GetVersion() []byte {
-	return []byte{0x01, 0x04, 0x0D}
+	return []byte{0x01, 0x04, 0x0E}
 }
 
 func GetVersionString() string {

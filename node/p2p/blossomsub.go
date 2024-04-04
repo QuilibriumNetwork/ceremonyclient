@@ -160,44 +160,11 @@ func NewBlossomSub(
 	}
 
 	blossomOpts := []blossomsub.Option{}
-	if isBootstrapPeer {
-		blossomOpts = append(blossomOpts,
-			blossomsub.WithPeerExchange(true),
-		)
-	}
-
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
-	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
-		&blossomsub.PeerScoreParams{
-			SkipAtomicValidation:        false,
-			BitmaskScoreCap:             0,
-			IPColocationFactorWeight:    0,
-			IPColocationFactorThreshold: 6,
-			BehaviourPenaltyWeight:      0,
-			BehaviourPenaltyThreshold:   100,
-			BehaviourPenaltyDecay:       .5,
-			DecayInterval:               10 * time.Second,
-			DecayToZero:                 .1,
-			RetainScore:                 5 * time.Minute,
-			AppSpecificScore: func(p peer.ID) float64 {
-				return float64(bs.GetPeerScore([]byte(p)))
-			},
-			AppSpecificWeight: 10.0,
-		},
-		&blossomsub.PeerScoreThresholds{
-			SkipAtomicValidation:        false,
-			GossipThreshold:             -2000,
-			PublishThreshold:            -5000,
-			GraylistThreshold:           -10000,
-			AcceptPXThreshold:           100,
-			OpportunisticGraftThreshold: 2,
-		}))
 
-	params := mergeDefaults(p2pConfig)
-	rt := blossomsub.NewBlossomSubRouter(h, params)
-	ps, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
+	ps, err := blossomsub.NewFloodSub(ctx, h, blossomOpts...)
 	if err != nil {
 		panic(err)
 	}
