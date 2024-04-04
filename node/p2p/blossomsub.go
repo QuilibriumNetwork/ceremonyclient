@@ -160,11 +160,44 @@ func NewBlossomSub(
 	}
 
 	blossomOpts := []blossomsub.Option{}
+	if isBootstrapPeer {
+		blossomOpts = append(blossomOpts,
+			blossomsub.WithPeerExchange(true),
+		)
+	}
+
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
+	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
+		&blossomsub.PeerScoreParams{
+			SkipAtomicValidation:        false,
+			BitmaskScoreCap:             0,
+			IPColocationFactorWeight:    0,
+			IPColocationFactorThreshold: 6,
+			BehaviourPenaltyWeight:      0,
+			BehaviourPenaltyThreshold:   100,
+			BehaviourPenaltyDecay:       .5,
+			DecayInterval:               10 * time.Second,
+			DecayToZero:                 .1,
+			RetainScore:                 5 * time.Minute,
+			AppSpecificScore: func(p peer.ID) float64 {
+				return float64(bs.GetPeerScore([]byte(p)))
+			},
+			AppSpecificWeight: 10.0,
+		},
+		&blossomsub.PeerScoreThresholds{
+			SkipAtomicValidation:        false,
+			GossipThreshold:             -2000,
+			PublishThreshold:            -5000,
+			GraylistThreshold:           -10000,
+			AcceptPXThreshold:           100,
+			OpportunisticGraftThreshold: 2,
+		}))
 
-	ps, err := blossomsub.NewFloodSub(ctx, h, blossomOpts...)
+	params := mergeDefaults(p2pConfig)
+	rt := blossomsub.NewBlossomSubRouter(h, params)
+	ps, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)
 	}
@@ -312,39 +345,45 @@ func initDHT(
 	}
 
 	reconnect := func() {
-		var wg sync.WaitGroup
-
 		logger.Info(
 			"connecting to bootstrap",
 			zap.String("peer_id", h.ID().String()),
 		)
 
 		defaultBootstrapPeers := p2pConfig.BootstrapPeers
+		connected := 0
 
-		for _, peerAddr := range defaultBootstrapPeers {
+		for connected < 2 {
+			i, err := rand.Int(
+				rand.Reader,
+				big.NewInt(int64(len(defaultBootstrapPeers))),
+			)
+			if err != nil {
+				panic(err)
+			}
+
+			peerAddr := defaultBootstrapPeers[i.Int64()]
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
 			if err != nil {
 				panic(err)
 			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if peerinfo.ID == h.ID() ||
-					h.Network().Connectedness(peerinfo.ID) == network.Connected {
-					return
-				}
 
-				if err := h.Connect(ctx, *peerinfo); err != nil {
-					logger.Info("error while connecting to dht peer", zap.Error(err))
-				} else {
-					logger.Info(
-						"connected to peer",
-						zap.String("peer_id", peerinfo.ID.String()),
-					)
-				}
-			}()
+			if peerinfo.ID == h.ID() ||
+				h.Network().Connectedness(peerinfo.ID) == network.Connected ||
+				connected >= 2 {
+				continue
+			}
+
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				logger.Info("error while connecting to dht peer", zap.Error(err))
+			} else {
+				logger.Info(
+					"connected to peer",
+					zap.String("peer_id", peerinfo.ID.String()),
+				)
+				connected++
+			}
 		}
-		wg.Wait()
 	}
 
 	reconnect()
@@ -354,7 +393,7 @@ func initDHT(
 			time.Sleep(30 * time.Second)
 			// try to assert some stability, never go below min peers for data
 			// consensus:
-			if len(h.Network().Peers()) < 4 {
+			if len(h.Network().Peers()) < 2 {
 				logger.Info("reconnecting to peers")
 				reconnect()
 			}
@@ -554,7 +593,9 @@ func discoverPeers(
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
-			discover()
+			if len(h.Network().Peers()) < 4 {
+				discover()
+			}
 		}
 	}()
 
