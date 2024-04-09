@@ -219,11 +219,10 @@ func (e *MasterClockConsensusEngine) publishProof(
 	if err != nil || len(peers) == 0 {
 		// publish if we don't see anyone (empty peer list) or if we're the most
 		// ahead:
-		if err := e.publishMessage(e.filter, frame); err != nil {
-			return errors.Wrap(
-				err,
-				"publish proof",
-			)
+		e.report.MasterHeadFrame = frame.FrameNumber
+
+		if err := e.publishMessage(e.filter, e.report); err != nil {
+			e.logger.Debug("error publishing message", zap.Error(err))
 		}
 	}
 

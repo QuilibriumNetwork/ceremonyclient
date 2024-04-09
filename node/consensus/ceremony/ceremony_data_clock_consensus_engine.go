@@ -489,7 +489,6 @@ func (e *CeremonyDataClockConsensusEngine) runLoop() {
 					}
 				}
 			case <-time.After(20 * time.Second):
-				e.logger.Info("no frames received, kicking off")
 				dataFrame, err := e.dataTimeReel.Head()
 				if err != nil {
 					panic(err)

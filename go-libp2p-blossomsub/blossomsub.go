@@ -33,7 +33,7 @@ var (
 	BlossomSubHistoryGossip                    = 3
 	BlossomSubDlazy                            = 6
 	BlossomSubGossipFactor                     = 0.25
-	BlossomSubGossipRetransmission             = 3
+	BlossomSubGossipRetransmission             = 1
 	BlossomSubHeartbeatInitialDelay            = 100 * time.Millisecond
 	BlossomSubHeartbeatInterval                = 1 * time.Second
 	BlossomSubFanoutTTL                        = 60 * time.Second
@@ -702,9 +702,6 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 	for mid := range iwant {
 		iwantlst = append(iwantlst, mid)
 	}
-
-	// ask in random order
-	shuffleStrings(iwantlst)
 
 	// truncate to the messages we are actually asking for and update the iasked counter
 	iwantlst = iwantlst[:iask]

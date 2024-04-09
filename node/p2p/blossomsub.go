@@ -60,7 +60,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE = "quilibrium-1.4.8-sunset-ceasefire"
+var ANNOUNCE = "quilibrium-1.4.16-sunset-noctilucent"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -191,7 +191,7 @@ func NewBlossomSub(
 			GossipThreshold:             -2000,
 			PublishThreshold:            -5000,
 			GraylistThreshold:           -10000,
-			AcceptPXThreshold:           100,
+			AcceptPXThreshold:           1,
 			OpportunisticGraftThreshold: 2,
 		}))
 
@@ -351,18 +351,8 @@ func initDHT(
 		)
 
 		defaultBootstrapPeers := p2pConfig.BootstrapPeers
-		connected := 0
 
-		for connected < 2 {
-			i, err := rand.Int(
-				rand.Reader,
-				big.NewInt(int64(len(defaultBootstrapPeers))),
-			)
-			if err != nil {
-				panic(err)
-			}
-
-			peerAddr := defaultBootstrapPeers[i.Int64()]
+		for _, peerAddr := range defaultBootstrapPeers {
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
 			if err != nil {
 				panic(err)
@@ -370,7 +360,7 @@ func initDHT(
 
 			if peerinfo.ID == h.ID() ||
 				h.Network().Connectedness(peerinfo.ID) == network.Connected ||
-				connected >= 2 {
+				h.Network().Connectedness(peerinfo.ID) == network.CannotConnect {
 				continue
 			}
 
@@ -381,7 +371,6 @@ func initDHT(
 					"connected to peer",
 					zap.String("peer_id", peerinfo.ID.String()),
 				)
-				connected++
 			}
 		}
 	}
@@ -391,12 +380,8 @@ func initDHT(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			// try to assert some stability, never go below min peers for data
-			// consensus:
-			if len(h.Network().Peers()) < 2 {
-				logger.Info("reconnecting to peers")
-				reconnect()
-			}
+			logger.Debug("reconnecting to peers")
+			reconnect()
 		}
 	}()
 
@@ -567,7 +552,8 @@ func discoverPeers(
 		for peer := range peerChan {
 			peer := peer
 			if peer.ID == h.ID() ||
-				h.Network().Connectedness(peer.ID) == network.Connected {
+				h.Network().Connectedness(peer.ID) == network.Connected ||
+				h.Network().Connectedness(peer.ID) == network.CannotConnect {
 				continue
 			}
 
@@ -593,7 +579,7 @@ func discoverPeers(
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
-			if len(h.Network().Peers()) < 4 {
+			if len(h.Network().Peers()) < 16 {
 				discover()
 			}
 		}
