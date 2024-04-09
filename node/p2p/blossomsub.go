@@ -365,7 +365,7 @@ func initDHT(
 			}
 
 			if err := h.Connect(ctx, *peerinfo); err != nil {
-				logger.Info("error while connecting to dht peer", zap.Error(err))
+				logger.Debug("error while connecting to dht peer", zap.Error(err))
 			} else {
 				logger.Info(
 					"connected to peer",
