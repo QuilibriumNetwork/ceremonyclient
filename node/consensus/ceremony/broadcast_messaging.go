@@ -1,7 +1,9 @@
 package ceremony
 
 import (
+	"encoding/binary"
 	"strings"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
@@ -9,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -36,11 +39,46 @@ func (e *CeremonyDataClockConsensusEngine) publishProof(
 
 	peers, max, err := e.GetMostAheadPeer(head.FrameNumber)
 	if err != nil || len(peers) == 0 || head.FrameNumber > max {
-		if err := e.publishMessage(e.filter, frame); err != nil {
-			return errors.Wrap(
-				err,
-				"publish proof",
-			)
+		timestamp := time.Now().UnixMilli()
+		msg := binary.BigEndian.AppendUint64([]byte{}, frame.FrameNumber)
+		msg = append(msg, config.GetVersion()...)
+		msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
+		sig, err := e.pubSub.SignMessage(msg)
+		if err != nil {
+			panic(err)
+		}
+
+		e.peerMapMx.Lock()
+		e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
+			peerId:    e.pubSub.GetPeerID(),
+			multiaddr: "",
+			maxFrame:  frame.FrameNumber,
+			version:   config.GetVersion(),
+			signature: sig,
+			publicKey: e.pubSub.GetPublicKey(),
+			timestamp: timestamp,
+			totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+				make([]byte, 256),
+			),
+		}
+		list := &protobufs.CeremonyPeerListAnnounce{
+			PeerList: []*protobufs.CeremonyPeer{},
+		}
+		list.PeerList = append(list.PeerList, &protobufs.CeremonyPeer{
+			PeerId:    e.pubSub.GetPeerID(),
+			Multiaddr: "",
+			MaxFrame:  frame.FrameNumber,
+			Version:   config.GetVersion(),
+			Signature: sig,
+			PublicKey: e.pubSub.GetPublicKey(),
+			Timestamp: timestamp,
+			TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+				make([]byte, 256),
+			),
+		})
+		e.peerMapMx.Unlock()
+		if err := e.publishMessage(e.filter, list); err != nil {
+			e.logger.Debug("error publishing message", zap.Error(err))
 		}
 	}
 
