@@ -23,7 +23,7 @@ services:
       - '127.0.0.1:${QUILIBRIUM_GRPC_PORT:-8337}:8337/tcp' # gRPC
       - '127.0.0.1:${QUILIBRIUM_REST_PORT:-8338}:8338/tcp' # REST
     healthcheck:
-      test: ["CMD", "node", "--peer-id"]
+      test: ["CMD", "grpcurl", "-plaintext", "localhost:8337", "list", "quilibrium.node.node.pb.NodeService"]
       interval: 30s
       timeout: 5s
       retries: 3
