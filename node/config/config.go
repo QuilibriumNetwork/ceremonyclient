@@ -83,7 +83,6 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		"/ip4/65.109.17.13/udp/8336/quic/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
 		"/ip4/65.108.194.84/udp/8336/quic/p2p/QmP8C7g9ZRiWzhqN2AgFu5onS6HwHzR6Vv1TCHxAhnCSnq",
 		"/dns/quil.dfcnodes.eu/udp/8336/quic/p2p/QmQaFmbYVrKSwoen5UQdaqyDq4QhXfSSLDVnYpYD4SF9tX",
-		"/ip4/103.219.168.169/udp/8336/quic/p2p/Qme2LDknxE5z8AnECTjJ6ZmTkSYmoQ8phegaD5vEcZM9uB",
 		"/ip4/87.98.167.207/udp/8336/quic/p2p/QmafiAXLu1JWktyfzDtD67i78GRBYCfQ4doTfq7pp7wfQ1",
 		"/ip4/216.244.76.122/udp/8336/quic/p2p/QmUSbMytVBUYiiGE266aZHrHrP17vLx5UJFd7o74HkDoaV",
 		"/ip4/185.177.126.200/udp/8336/quic/p2p/QmQn3bWk5aqaNSv9dwPjBg4qdeGBGNEB72tvuhgEc64Ki5",
