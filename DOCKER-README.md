@@ -54,6 +54,9 @@ docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t q
 
 Use latest version instead of `1.4.2`.
 
+> [!TIP]
+> You can use the `task build` command instead. See the [Task](#task) section below.
+
 The image that is built is light and safe. It is based on Alpine Linux with the Quilibrium node binary, not the
 source code, nor the Go development environment. The image also has the `grpcurl` tool that can be used to
 query the gRPC interface.
@@ -104,6 +107,9 @@ Run Quilibrium in a container:
 ```shell
 docker compose up -d
 ```
+
+> [!TIP]
+> You can alternatively use the `task up` command. See the [Task](#task-1) section above.
 
 A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
 Make sure you backup `config.yml` and `keys.yml`.
@@ -159,10 +165,10 @@ services:
       resources:
         limits:
           cpus: '4'  # Maximum CPU count that the container can use
-          memory: 16G  # Maximum memory that the container can use
+          memory: '16G'  # Maximum memory that the container can use
         reservations:
           cpus: '2'  # CPU count that the container initially requests
-          memory: 8G  # Memory that the container initially request
+          memory: '8G'  # Memory that the container initially request
 ```
 
 
@@ -213,3 +219,9 @@ Run the DB console:
 docker compose exec node node -db-console
 ```
 
+Run the Quilibrium client:
+```shell
+docker compose exec node qclient help
+docker compose exec node qclient token help
+docker compose exec node qclient token balance
+```

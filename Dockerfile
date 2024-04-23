@@ -11,6 +11,10 @@ WORKDIR /opt/ceremonyclient/node
 RUN go install ./...
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
+WORKDIR /opt/ceremonyclient/client
+
+RUN go build -o qclient ./main.go
+
 FROM alpine:3.19
 
 ARG NODE_VERSION
@@ -34,6 +38,7 @@ COPY --from=build /go/bin/node /usr/local/bin
 COPY --from=build /go/bin/grpcurl /usr/local/bin
 COPY --from=build /opt/ceremonyclient/node/ceremony.json /root
 COPY --from=build /opt/ceremonyclient/node/retroactive_peers.json /root
+COPY --from=build /opt/ceremonyclient/client/qclient /usr/local/bin
 
 WORKDIR /root
 
