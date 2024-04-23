@@ -95,7 +95,7 @@ func NewBlossomSub(
 	isBootstrapPeer := false
 	peerId := getPeerID(p2pConfig)
 
-	for _, peerAddr := range p2pConfig.BootstrapPeers {
+	for _, peerAddr := range config.BootstrapPeers {
 		peerinfo, err := peer.AddrInfoFromString(peerAddr)
 		if err != nil {
 			panic(err)
@@ -350,7 +350,19 @@ func initDHT(
 			zap.String("peer_id", h.ID().String()),
 		)
 
-		defaultBootstrapPeers := p2pConfig.BootstrapPeers
+		defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
+		for _, peer := range config.BootstrapPeers {
+			found := false
+			for _, existing := range defaultBootstrapPeers {
+				if existing == peer {
+					found = true
+					break
+				}
+			}
+			if !found {
+				defaultBootstrapPeers = append(defaultBootstrapPeers, peer)
+			}
+		}
 
 		for _, peerAddr := range defaultBootstrapPeers {
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
@@ -365,7 +377,7 @@ func initDHT(
 			}
 
 			if err := h.Connect(ctx, *peerinfo); err != nil {
-				logger.Info("error while connecting to dht peer", zap.Error(err))
+				logger.Debug("error while connecting to dht peer", zap.Error(err))
 			} else {
 				logger.Info(
 					"connected to peer",

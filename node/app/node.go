@@ -25,6 +25,20 @@ type Node struct {
 	engine      consensus.ConsensusEngine
 }
 
+type DHTNode struct {
+	pubSub p2p.PubSub
+	quit   chan struct{}
+}
+
+func newDHTNode(
+	pubSub p2p.PubSub,
+) (*DHTNode, error) {
+	return &DHTNode{
+		pubSub: pubSub,
+		quit:   make(chan struct{}),
+	}, nil
+}
+
 func newNode(
 	logger *zap.Logger,
 	clockStore store.ClockStore,
@@ -124,6 +138,16 @@ func (n *Node) RunRepair() {
 		}
 	}
 	n.logger.Info("check complete")
+}
+
+func (d *DHTNode) Start() {
+	<-d.quit
+}
+
+func (d *DHTNode) Stop() {
+	go func() {
+		d.quit <- struct{}{}
+	}()
 }
 
 func (n *Node) Start() {

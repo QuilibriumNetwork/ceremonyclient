@@ -23,6 +23,17 @@ import (
 
 // Injectors from wire.go:
 
+func NewDHTNode(configConfig *config.Config) (*DHTNode, error) {
+	p2PConfig := configConfig.P2P
+	zapLogger := debugLogger()
+	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	dhtNode, err := newDHTNode(blossomSub)
+	if err != nil {
+		return nil, err
+	}
+	return dhtNode, nil
+}
+
 func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestReport) (*Node, error) {
 	zapLogger := debugLogger()
 	dbConfig := configConfig.DB

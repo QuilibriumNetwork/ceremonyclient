@@ -88,6 +88,14 @@ var consensusSet = wire.NewSet(
 	),
 )
 
+func NewDHTNode(*config.Config) (*DHTNode, error) {
+	panic(wire.Build(
+		debugLoggerSet,
+		pubSubSet,
+		newDHTNode,
+	))
+}
+
 func NewDebugNode(*config.Config, *protobufs.SelfTestReport) (*Node, error) {
 	panic(wire.Build(
 		debugLoggerSet,

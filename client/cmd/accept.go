@@ -18,7 +18,7 @@ var acceptCmd = &cobra.Command{
 	PendingTransaction - the address of the pending transfer
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) == 1 {
+		if len(args) != 1 {
 			fmt.Println("invalid command")
 			os.Exit(1)
 		}
