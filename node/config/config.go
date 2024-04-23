@@ -227,7 +227,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 	// if it's empty, always use latest, if it has the Q bootstrap node, always
 	// use latest.
 	if len(config.P2P.BootstrapPeers) == 0 ||
-		config.P2P.BootstrapPeers[0] == BootstrapPeers[0] {
+		config.P2P.BootstrapPeers[0][:30] == "/dns/bootstrap.quilibrium.com/" {
 		config.P2P.BootstrapPeers = BootstrapPeers
 	}
 
