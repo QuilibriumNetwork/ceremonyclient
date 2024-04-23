@@ -26,7 +26,7 @@ var transferCmd = &cobra.Command{
 	Either Amount or OfCoin must be specified
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) < 2 {
+		if len(args) < 2 || len(args) > 4 {
 			fmt.Println("invalid command")
 			os.Exit(1)
 		}

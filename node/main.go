@@ -84,6 +84,11 @@ var (
 		false,
 		"sets log output to debug (verbose)",
 	)
+	dhtOnly = flag.Bool(
+		"dht-only",
+		false,
+		"sets a node to run strictly as a dht bootstrap peer (not full node)",
+	)
 )
 
 func main() {
@@ -180,10 +185,27 @@ func main() {
 		return
 	}
 
-	fmt.Println("Loading ceremony state and starting node...")
-	kzg.Init()
+	if !*dhtOnly {
+		fmt.Println("Loading ceremony state and starting node...")
+		kzg.Init()
+	}
 
 	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
+
+	if *dhtOnly {
+		dht, err := app.NewDHTNode(nodeConfig)
+		if err != nil {
+			panic(err)
+		}
+
+		go func() {
+			dht.Start()
+		}()
+
+		<-done
+		dht.Stop()
+		return
+	}
 
 	var node *app.Node
 	if *debug {
