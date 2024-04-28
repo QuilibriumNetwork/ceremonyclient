@@ -9,7 +9,7 @@ COPY . .
 WORKDIR /opt/ceremonyclient/node
 
 RUN go install ./...
-RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.8.9
 
 WORKDIR /opt/ceremonyclient/client
 
