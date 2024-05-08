@@ -13,24 +13,21 @@ docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t q
 
 Use latest version instead of `1.4.16`.
 
-> [!TIP]
-> You can use the `task build` command instead. See the [Task](#task) section below.
-
-The image that is built is light and safe. It is based on Alpine Linux with the Quilibrium node binary, not the
+The image that is built is light and safe. It is based on Alpine Linux with the Quilibrium node binary, no
 source code, nor the Go development environment. The image also has the `grpcurl` tool that can be used to
 query the gRPC interface.
 
 ### Task
 
-You can also use the [Task](https://taskfile.dev/) tool, it a simple build tool that takes care of extracting
-parameters, building the image and running the container. The tasks are all defined in [Taskfile.yaml](Taskfile.yaml).
+You can also use the [Task](https://taskfile.dev/) tool, it is a simple build tool that takes care of extracting
+parameters and building the image. The tasks are all defined in [Taskfile.yaml](Taskfile.yaml).
 
 You can optionally create an `.env` file, in the same repository root folder to override specific parameters. Right now
 only one optional env var is supported and that is `QUILIBRIUM_IMAGE_NAME`, if you want to change the default
 image name from `quilibrium` to something else. If you are pushing your images to GitHub then you have to follow the
 GitHub naming convention and use a name like `ghcr.io/mscurtescu/ceremonyclient`.
 
-Bellow there are example interaction with `Task`.
+Bellow there are example interactions with `Task`.
 
 The node version is extracted from [node/main.go](node/main.go). This version string is used to tag the image. The git
 repo, branch and commit are read through the `git` command and depend on the current state of your working

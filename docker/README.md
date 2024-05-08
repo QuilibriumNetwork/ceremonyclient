@@ -1,46 +1,31 @@
 # Quilibrium Docker Instructions
 
-## WARNING
+## Install Docker on a Server
 
-> [!WARNING]
-> The Quilibrium docker container requires host configuration changes.
+> [!IMPORTANT]
+> You have to install Docker Engine on your server, you don't want to install Docker Desktop.
 
-There are extreme buffering requirements, especially during sync, and these in turn require `sysctl`
-configuration changes that unfortunately are not supported by Docker. But if these changes are made on
-the host machine, then luckily containers seem to automatically have the larger buffers.
+The official Linux installation instructions start here:  
+https://docs.docker.com/engine/install/
 
-The buffer related `sysctl` settings are `net.core.rmem_max` and `net.core.wmem_max` and they both
-should be set to `600,000,000` bytes. This value allows pre-buffering of the entire maximum payload
-for sync.
+For Ubuntu you can start here:  
+https://docs.docker.com/engine/install/ubuntu/
 
-You can tell that the buffer size is not large enough by noticing this log entry at beginning when 
-Quilibrium starts, a few lines below the large logo:
-> failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 2048 kiB, got: 416 kiB).
-> See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+While there are several installation methods, you really want to use the apt repository, this way you get
+automatic updates.
 
-To read the currently set values:
-```shell
-sysctl -n net.core.rmem_max
-sysctl -n net.core.wmem_max
-```
+Make sure you also follow the Linux post-installation steps:  
+https://docs.docker.com/engine/install/linux-postinstall/
 
-To set new values, this is not a persistent change:
-```shell
-sudo sysctl -w net.core.rmem_max=600000000
-sudo sysctl -w net.core.wmem_max=600000000
-```
+## Install Docker on a Desktop
 
-To persistently set the new values add a configuration file named `20-quilibrium.conf` to
-`/etc/sysctl.d/`. The file content should be:
-```
-# Quilibrium buffering requirements, especially during sync.
-# The value could be as low as 26214400, but everything would be slower.
+For a Linux desktop follow the server installation steps above, do not install Docker Desktop for Linux unless
+you know what you are doing.
 
-net.core.rmem_max = 600000000
-net.core.wmem_max = 600000000
-```
+For Mac and Windows follow the corresponding Docker Desktop installation links from the top of:  
+https://docs.docker.com/engine/install/
 
-## Run
+## Running a Node
 
 Copy [docker-compose.yml](docker-compose.yml) to a new folder on a server. The official
 Docker image provided by Quilibrium Network will be pulled.
@@ -48,36 +33,48 @@ Docker image provided by Quilibrium Network will be pulled.
 A `.config/` subfolder will be created in this folder, this will hold both configuration
 and the node storage.
 
+Optionally you can also copy [Taskfile.yaml](Taskfile.yaml) and [.env.example](.env.example) to the
+server, if you are planning to use them. See below.
+
 ### New Instance
 
-If you are starting a brand new node then simply run Quilibrium in a container:
+If you are starting a brand new node then simply run Quilibrium in a container with:
 ```shell
 docker compose up -d
 ```
 
-> [!TIP]
-> You can alternatively use the `task up` command. See the [Task](#task-1) section above.
-
 A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
 
 > [!IMPORTANT]
-> Once the node is running make sure you backup `config.yml` and `keys.yml`.
+> Once the node is running (the `-node-info` command shows a balance) make sure you backup
+> `config.yml` and `keys.yml`.
 
 ### Restore Previous Instance
 
-If you have both `config.yml` and `keys.yml` backed up from a previous instance then follow these steps to
-restore them:
+If you have both `config.yml` and `keys.yml` backed up from a previous instance then follow these
+steps to restore them:
 
 1. Create an empty `.config/` subfolder.
 2. Copy `config.yml` and `keys.yml` to `.config/`. 
-3. Start the node:
+3. Start the node with:
    ```shell
    docker compose up -d
    ```
 
 ### Task
 
-Similarly to building the image you can also use `Task`.
+You can also use the [Task](https://taskfile.dev/) tool, it is a simple build tool that takes care of running
+complex commands and intereacting with the container. The tasks are all defined in
+[Taskfile.yaml](Taskfile.yaml).
+
+You can optionally create an `.env` file, in the same folder to override specific parameters. Right now
+only one optional env var is supported with `Task` and that is `QUILIBRIUM_IMAGE_NAME`, if you want to change the
+default image name from `quilibrium` to something else. If you are pushing your images to GitHub, for example, then you
+have to follow the GitHub naming convention and use a name like `ghcr.io/mscurtescu/ceremonyclient`. See the
+[.env.example](.env.example) sample file, and keep in mind that `.env` is shared with
+[docker-compose.yml](docker-compose.yml).
+
+Bellow there are example interactions with `Task`.
 
 Start the container through docker compose:
 ```shell
@@ -108,32 +105,8 @@ The above command will create a `backup.tar.gz` archive in the current folder, y
 file from the server into a safe location. The command adds the `config.yml` and `keys.yml` files from
 the `.config/` subfolder to the archive, with the ownership of the current user.
 
-### Resource management
-To ensure that your client performs optimally within a specific resource configuration, you can specify
-resource limits and reservations in the node configuration as illustrated below. 
 
-This configuration helps in deploying the client with controlled resource usage, such as CPU and memory,
-to avoid overconsumption of resources in your environment.
-
-The [docker-compose.yml](docker-compose.yml) file already specifies resources following the currently
-recommended hardware requirements.
-
-```yaml
-services:
-  node:
-    # Some other configuration sections here
-    deploy:
-      resources:
-        limits:
-          cpus: '4'  # Maximum CPU count that the container can use
-          memory: '16G'  # Maximum memory that the container can use
-        reservations:
-          cpus: '2'  # CPU count that the container initially requests
-          memory: '8G'  # Memory that the container initially request
-```
-
-
-### Customizing docker-compose.yml
+## Customizing docker-compose.yml
 
 If you want to change certain parameters in [docker-compose.yml](docker-compose.yml) it is better not
 to edit the file directly as new versions pushed through git would overwrite your changes. A more
@@ -149,6 +122,10 @@ services:
 ```
 
 The above will override the image name and also the restart policy.
+
+You can optionally create an `.env` file, in the same folder to override specific parameters. See the
+[.env.example](.env.example) sample file, and keep in mind that `.env` is shared with
+[Taskfile.yaml](Taskfile.yaml). You can customize the image name and port mappings.
 
 To check if your overrides are being picked up run the following command:
 ```shell
