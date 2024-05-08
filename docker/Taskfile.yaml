@@ -11,14 +11,26 @@ vars:
 
 tasks:
   up:
-    desc: Run a new Quilibrium container, through docker compose.
+    desc: Run a new Quilibrium and related containers, through docker compose.
     cmds:
       - docker compose up -d
 
   down:
-    desc: Take down the Quilibrium container, through docker compose.
+    desc: Take down the Quilibrium containers, through docker compose.
     cmds:
       - docker compose down
+
+  pull:
+    desc: Pull new Docker images corresponding to the Quilibrium containers, through docker compose.
+    cmds:
+      - docker compose pull
+
+  update:
+    desc: Pull new Docker images corresponding to the Quilibrium containers, then restart all containers.
+    cmds:
+      - task: pull
+      - task: down
+      - task: up
 
   shell:
     desc: Drop into a shell inside the running container.
