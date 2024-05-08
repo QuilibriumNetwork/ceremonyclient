@@ -5,3 +5,4 @@ ceremony-client
 .DS_Store
 *.mprof
 .env
+.task/

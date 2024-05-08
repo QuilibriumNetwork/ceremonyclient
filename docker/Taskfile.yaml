@@ -43,10 +43,19 @@ tasks:
   backup:
     desc: Create a backup file with the critical configuration files.
     prompt: You will be prompted for root access. Make sure you verify the generated backup file. Continue?
+    preconditions:
+      - sh: 'test -d .config'
+        msg: '.config does not exists!'
+      - sh: 'test -f .config/config.yml'
+        msg: '.config/config.yml does not exists!'
+      - sh: 'test -f .config/keys.yml'
+        msg: '.config/keys.yml does not exists!'
+      - sh: '! test -f backup.tar.gz'
+        msg: 'A previous backup.tar.gz found in the current folder!'
     sources:
       - '.config/config.yml'
       - '.config/keys.yml'
-    outputs:
+    generates:
       - 'backup.tar.gz'
     cmds:
       - |
@@ -61,4 +70,23 @@ tasks:
         sudo rm -rf $TMP_DIR
         echo "Backup saved to: backup.tar.gz"
         echo "Do not assume you have a backup unless you verify it!!!"
+    silent: true
+
+  restore:
+    desc: Restores a backup file with the critical configuration files.
+    preconditions:
+      - sh: '! test -d .config'
+        msg: '.config already exists, restore cannot be performed safely!'
+      - sh: 'test -f backup.tar.gz'
+        msg: 'backup.tar.gz not found in the current folder!'
+    sources:
+      - 'backup.tar.gz'
+    generates:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    cmds:
+      - |
+        mkdir .config
+        tar -xzf backup.tar.gz -C .config
+        echo "Backup restored from: backup.tar.gz"
     silent: true
