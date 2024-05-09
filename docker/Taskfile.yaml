@@ -102,3 +102,13 @@ tasks:
         tar -xzf backup.tar.gz -C .config
         echo "Backup restored from: backup.tar.gz"
     silent: true
+
+  test:port:
+    desc: Test if the P2P port is visible to the world.
+    preconditions:
+      - sh: 'test -x "$(command -v nc)"'
+        msg: 'nc is not installed, install with "sudo apt install netcat"'
+      - sh: 'test -n "$NODE_PUBLIC_NAME"'
+        msg: 'The public DNS name or IP address of the server must be set in NODE_PUBLIC_NAME.'
+    cmds:
+      - 'nc -vzu ${NODE_PUBLIC_NAME} ${QUILIBRIUM_P2P_PORT:=8336}'
