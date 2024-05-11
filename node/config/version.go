@@ -14,7 +14,7 @@ func GetMinimumVersion() []byte {
 }
 
 func GetVersion() []byte {
-	return []byte{0x01, 0x04, 0x10}
+	return []byte{0x01, 0x04, 0x11}
 }
 
 func GetVersionString() string {
