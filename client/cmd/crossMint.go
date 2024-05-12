@@ -42,7 +42,6 @@ var crossMintCmd = &cobra.Command{
 		config, err := config.LoadConfig(configDirectory, "")
 		if err != nil {
 			panic(errors.Wrap(err, "invalid config directory: " + configDirectory))
-			os.Exit(1)
 		}
 
 		rawPeerKey, err := hex.DecodeString(config.P2P.PeerPrivKey)
