@@ -1,4 +1,4 @@
-# Quilibrium - Dawn
+# Quilibrium - Aurora
 
 Quilibrium is a decentralized alternative to platform as a service providers.
 This release, mirrored to GitHub, is the Dawn release, which contains the
