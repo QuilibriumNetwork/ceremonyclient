@@ -94,7 +94,7 @@ This section contains community-built clients, applications, guides, etc <br /><
 
 ### 1. The Q Guide - Beginners’ Guide
 
-- A detailed beginners' guide for how to setup a Quilibrium Node (on VPS, Ubuntu 22.04) - [link](https://github.com/demipoet/demipoet.github.io)<br/>
+- A detailed beginners' guide for how to setup a Quilibrium Node, created by [@demipoet](https://www.github.com/demipoet) - [link](https://quilibrium.guide/)<br/>
 
   
 ## Pull Requests
