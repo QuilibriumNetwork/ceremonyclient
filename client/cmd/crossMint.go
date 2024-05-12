@@ -29,19 +29,19 @@ var crossMintCmd = &cobra.Command{
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
-			fmt.Printf("missing payload")
+			fmt.Printf("missing payload\n")
 			os.Exit(1)
 		}
 
 		_, err := os.Stat(configDirectory)
 		if os.IsNotExist(err) {
-			fmt.Printf("config directory doesn't exist: %s", configDirectory)
+			fmt.Printf("config directory '%s' doesn't exist, you can override the config directory with the --config flag\n", configDirectory)
 			os.Exit(1)
 		}
 
 		config, err := config.LoadConfig(configDirectory, "")
 		if err != nil {
-			fmt.Printf("invalid config directory: %s", configDirectory)
+			panic(errors.Wrap(err, "invalid config directory: "+configDirectory))
 			os.Exit(1)
 		}
 
