@@ -41,7 +41,7 @@ var crossMintCmd = &cobra.Command{
 
 		config, err := config.LoadConfig(configDirectory, "")
 		if err != nil {
-			panic(errors.Wrap(err, "invalid config directory: "+configDirectory))
+			panic(errors.Wrap(err, "invalid config directory: " + configDirectory))
 			os.Exit(1)
 		}
 
