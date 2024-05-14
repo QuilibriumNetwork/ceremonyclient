@@ -58,6 +58,11 @@ tasks:
     desc: Generate signatures for node binaries.
     deps: [digest]
     dir: node
+    preconditions:
+      - sh: 'test -n "$SIGNING_KEY_PATH"'
+        msg: 'The path to the signing key must be set in SIGNING_KEY_PATH'
+      - sh: 'test -n "$SIGNING_KEY_ID"'
+        msg: 'The signing key id must be set in SIGNING_KEY_ID'
     sources:
       - node-{{.VERSION}}-*.dgst
     generates:
@@ -66,6 +71,36 @@ tasks:
       - openssl pkeyutl -sign -inkey {{.SIGNING_KEY_PATH}} -rawin -in node-{{.VERSION}}-darwin-arm64.dgst -out node-{{.VERSION}}-darwin-arm64.dgst.sig.{{.SIGNING_KEY_ID}}
       - openssl pkeyutl -sign -inkey {{.SIGNING_KEY_PATH}} -rawin -in node-{{.VERSION}}-linux-amd64.dgst -out node-{{.VERSION}}-linux-amd64.dgst.sig.{{.SIGNING_KEY_ID}}
       - openssl pkeyutl -sign -inkey {{.SIGNING_KEY_PATH}} -rawin -in node-{{.VERSION}}-linux-arm64.dgst -out node-{{.VERSION}}-linux-arm64.dgst.sig.{{.SIGNING_KEY_ID}}
+
+  verify:build:
+    desc: Verify that the existing binaries can be rebuilt exactly the same"
+    dir: node
+    cmds:
+      - GOOS=darwin go build -ldflags "-s -w" -o node-tmp-darwin-arm64.bin
+      - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-tmp-linux-amd64.bin
+      - GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o node-tmp-linux-arm64.bin
+      - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
+      - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
+      - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
+      - task: verify:clean
+
+  verify:digest:
+    desc: Verify that the existing digests are correct.
+    dir: node
+    cmds:
+      - openssl sha3-256 -out node-tmp-darwin-arm64.dgst node-{{.VERSION}}-darwin-arm64.bin   
+      - openssl sha3-256 -out node-tmp-linux-amd64.dgst node-{{.VERSION}}-linux-amd64.bin
+      - openssl sha3-256 -out node-tmp-linux-arm64.dgst node-{{.VERSION}}-linux-arm64.bin
+      - diff node-{{.VERSION}}-darwin-arm64.dgst node-tmp-darwin-arm64.dgst
+      - diff node-{{.VERSION}}-linux-amd64.dgst node-tmp-linux-amd64.dgst
+      - diff node-{{.VERSION}}-linux-arm64.dgst node-tmp-linux-arm64.dgst
+      - task: verify:clean
+
+  verify:clean:
+    desc: Remove temporary files created by various verify tasks.
+    dir: node
+    cmds:
+      - rm node-tmp-*
 
   verify:
     desc: Verify all signatures.
