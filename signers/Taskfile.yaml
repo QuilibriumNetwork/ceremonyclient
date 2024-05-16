@@ -13,7 +13,10 @@ vars:
     sh: cat ../node/config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
   MAX_KEY_ID: 15
   QUILIBRIUM_SIGNERS_IMAGE_NAME: 'quilibrium-signers'
-  QUILIBRIUM_SIGNERS_IMAGE_VERSION: '0.0.1'
+  USER_NAME:
+    sh: whoami
+  PARENT_FOLDER:
+    sh: dirname $(pwd)
 
 tasks:
   status:
@@ -35,33 +38,37 @@ tasks:
     desc: Build the Quilibrium Signers docker image, unless it is already built.
     aliases:
       - image
+    # TODO: add precondition that this is not run as root, maybe?
     cmds:
       - |
         docker build \
-        -t {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}:{{.QUILIBRIUM_SIGNERS_IMAGE_VERSION}} \
+        --build-arg USER_NAME={{.USER_NAME}} \
+        --build-arg UID=$(id -u) \
+        --build-arg GID=$(id -g) \
         -t {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}:latest \
         .
     status:
       - |
         docker image inspect \
-        {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}:{{.QUILIBRIUM_SIGNERS_IMAGE_VERSION}} \
+        {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} \
         >/dev/null 2>/dev/null
 
-  build:docker:
-    desc: Build the Quilibrium node binaries inside a Docker container.
+  build:
+    desc: Build the Quilibrium node binaries by starting a container and starting the build inside the container.
     deps:
       - docker:build_image
-    aliases:
-      - build
     cmds:
-      - |
-        docker run \
-        --rm -it \
-        {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} \
-        /bin/sh -c 'task build:local'
+      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task build:internal
 
-  build:local:
-    desc: Build the Quilibrium node binaries, taged with platform and version.
+  build:shell:
+    desc: Start a shell in a build container.
+    deps:
+      - docker:build_image
+    cmds:
+      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} bash
+
+  build:internal:
+    desc: Build the Quilibrium node binaries, inside the Docker container.
     dir: ../node
     sources:
       - '**/*.go'
@@ -104,7 +111,7 @@ tasks:
       - openssl pkeyutl -sign -inkey {{.SIGNING_KEY_PATH}} -rawin -in node-{{.VERSION}}-linux-arm64.dgst -out node-{{.VERSION}}-linux-arm64.dgst.sig.{{.SIGNING_KEY_ID}}
 
   verify:build:
-    desc: Verify that the existing binaries can be rebuilt exactly the same"
+    desc: Verify that the existing binaries can be rebuilt exactly the same.
     dir: ../node
     cmds:
       - GOOS=darwin go build -ldflags "-s -w" -o node-tmp-darwin-arm64.bin
@@ -127,11 +134,13 @@ tasks:
       - diff node-{{.VERSION}}-linux-arm64.dgst node-tmp-linux-arm64.dgst
       - task: verify:clean
 
-  verify:clean:
-    desc: Remove temporary files created by various verify tasks.
+  clean:
+    desc: Remove temporary files, docker containers and image.
     dir: ../node
     cmds:
-      - rm node-tmp-*
+      - rm -f node-tmp-*
+      - docker container rm -f signers
+      - docker image rm -f {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}
 
   verify:
     desc: Verify all signatures.
