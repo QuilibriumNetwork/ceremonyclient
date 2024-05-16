@@ -38,7 +38,6 @@ tasks:
     desc: Build the Quilibrium Signers docker image, unless it is already built.
     aliases:
       - image
-    # TODO: add precondition that this is not run as root, maybe?
     cmds:
       - |
         docker build \
@@ -113,6 +112,21 @@ tasks:
   verify:build:
     desc: Verify that the existing binaries can be rebuilt exactly the same.
     dir: ../node
+    deps:
+      - docker:build_image
+    cmds:
+      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task verify:build:internal
+      - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
+      - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
+      - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
+  
+  verify:build:internal:
+    desc: Verify that the existing binaries can be rebuilt exactly the same, inside tbe Docker container.
+    dir: ../node
+    sources:
+      - '**/*.go'
+    generates:
+      - node-tmp-*.bin
     cmds:
       - GOOS=darwin go build -ldflags "-s -w" -o node-tmp-darwin-arm64.bin
       - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-tmp-linux-amd64.bin
@@ -120,7 +134,6 @@ tasks:
       - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
       - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
       - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
-      - task: verify:clean
 
   verify:digest:
     desc: Verify that the existing digests are correct.
@@ -132,17 +145,8 @@ tasks:
       - diff node-{{.VERSION}}-darwin-arm64.dgst node-tmp-darwin-arm64.dgst
       - diff node-{{.VERSION}}-linux-amd64.dgst node-tmp-linux-amd64.dgst
       - diff node-{{.VERSION}}-linux-arm64.dgst node-tmp-linux-arm64.dgst
-      - task: verify:clean
 
-  clean:
-    desc: Remove temporary files, docker containers and image.
-    dir: ../node
-    cmds:
-      - rm -f node-tmp-*
-      - docker container rm -f signers
-      - docker image rm -f {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}
-
-  verify:
+  verify:signatures:
     desc: Verify all signatures.
     dir: ../node
     cmds:
@@ -172,3 +176,10 @@ tasks:
         done
     silent: true
 
+  clean:
+    desc: Remove temporary files, docker containers and image.
+    dir: ../node
+    cmds:
+      - rm -f node-tmp-*
+      - docker container rm -f signers
+      - docker image rm -f {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}}
