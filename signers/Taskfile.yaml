@@ -38,6 +38,9 @@ tasks:
     desc: Build the Quilibrium Signers docker image, unless it is already built.
     aliases:
       - image
+    preconditions:
+      - sh: 'test -z "$QUILIBRIUM_DOCKER_CONTAINER"'
+        msg: 'This command cannot be run inside the container'
     cmds:
       - |
         docker build \
@@ -54,6 +57,9 @@ tasks:
 
   build:
     desc: Build the Quilibrium node binaries by starting a container and starting the build inside the container.
+    preconditions:
+      - sh: 'test -z "$QUILIBRIUM_DOCKER_CONTAINER"'
+        msg: 'This command cannot be run inside the container'
     deps:
       - docker:build_image
     cmds:
@@ -61,6 +67,11 @@ tasks:
 
   build:shell:
     desc: Start a shell in a build container.
+    aliases:
+      - shell
+    preconditions:
+      - sh: 'test -z "$QUILIBRIUM_DOCKER_CONTAINER"'
+        msg: 'This command cannot be run inside the container'
     deps:
       - docker:build_image
     cmds:
@@ -112,6 +123,9 @@ tasks:
   verify:build:
     desc: Verify that the existing binaries can be rebuilt exactly the same.
     dir: ../node
+    preconditions:
+      - sh: 'test -z "$QUILIBRIUM_DOCKER_CONTAINER"'
+        msg: 'This command cannot be run inside the container'
     deps:
       - docker:build_image
     cmds:
@@ -119,7 +133,7 @@ tasks:
       - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
       - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
       - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
-  
+
   verify:build:internal:
     desc: Verify that the existing binaries can be rebuilt exactly the same, inside tbe Docker container.
     dir: ../node
@@ -179,6 +193,9 @@ tasks:
   clean:
     desc: Remove temporary files, docker containers and image.
     dir: ../node
+    preconditions:
+      - sh: 'test -z "$QUILIBRIUM_DOCKER_CONTAINER"'
+        msg: 'This command cannot be run inside the container'
     cmds:
       - rm -f node-tmp-*
       - docker container rm -f signers
