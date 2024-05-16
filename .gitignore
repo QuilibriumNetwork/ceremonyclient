@@ -7,3 +7,4 @@ ceremony-client
 .env
 .env.signers
 .task
+node-tmp-*
