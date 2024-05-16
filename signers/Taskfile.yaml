@@ -63,7 +63,7 @@ tasks:
     deps:
       - docker:build_image
     cmds:
-      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task build:internal
+      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task build:container
 
   build:shell:
     desc: Start a shell in a build container.
@@ -77,7 +77,7 @@ tasks:
     cmds:
       - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} bash
 
-  build:internal:
+  build:container:
     desc: Build the Quilibrium node binaries, inside the Docker container.
     dir: ../node
     sources:
@@ -129,12 +129,12 @@ tasks:
     deps:
       - docker:build_image
     cmds:
-      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task verify:build:internal
+      - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task verify:build:container
       - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
       - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
       - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
 
-  verify:build:internal:
+  verify:build:container:
     desc: Verify that the existing binaries can be rebuilt exactly the same, inside tbe Docker container.
     dir: ../node
     sources:
