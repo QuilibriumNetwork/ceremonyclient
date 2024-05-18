@@ -4,7 +4,7 @@ Scripts in this folder are tools for release signers to build and sign Quilibriu
 
 Requirements:
 - bash environment (Ubuntu, macOS, etc.)
-- openssl - digests and sinatures
+- openssl - digests and signatures
 - git - to checkout this branch
 - Docker - to run a container with golang and compile binaries
 - [Taskfile](https://taskfile.dev/installation/)

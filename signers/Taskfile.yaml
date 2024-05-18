@@ -17,6 +17,7 @@ vars:
     sh: whoami
   PARENT_FOLDER:
     sh: dirname $(pwd)
+  SIGNING_KEYS_PEM_DIR: 'pems'
 
 tasks:
   status:
@@ -26,7 +27,6 @@ tasks:
       - echo -n "Priv Key Path :" && echo " {{.SIGNING_KEY_PATH}}"
       - echo -n "Pub  Key Path :" && echo " {{.SIGNING_PUB_KEY_PATH}}"
       - echo -n "Key ID        :" && echo " {{.SIGNING_KEY_ID}}"
-      - echo -n "PEM Dir       :" && echo " {{.SIGNING_KEYS_PEM_DIR}}"
     silent: true
 
   hex:
