@@ -185,13 +185,6 @@ func main() {
 		return
 	}
 
-	if !*dhtOnly {
-		fmt.Println("Loading ceremony state and starting node...")
-		kzg.Init()
-	}
-
-	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
-
 	if *dhtOnly {
 		dht, err := app.NewDHTNode(nodeConfig)
 		if err != nil {
@@ -206,6 +199,11 @@ func main() {
 		dht.Stop()
 		return
 	}
+
+	fmt.Println("Loading ceremony state and starting node...")
+	kzg.Init()
+
+	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
 
 	var node *app.Node
 	if *debug {
