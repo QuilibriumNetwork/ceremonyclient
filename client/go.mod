@@ -8,7 +8,11 @@ replace source.quilibrium.com/quilibrium/monorepo/node => ../node
 
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
 
-require github.com/stretchr/testify v1.8.4
+require (
+	github.com/iden3/go-iden3-crypto v0.0.15
+	github.com/mr-tron/base58 v1.2.0
+	github.com/stretchr/testify v1.8.4
+)
 
 require (
 	filippo.io/edwards25519 v1.0.0-rc.1 // indirect
