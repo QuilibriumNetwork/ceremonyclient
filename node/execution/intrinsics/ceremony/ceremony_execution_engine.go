@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rand"
+	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -206,6 +206,11 @@ func (
 	}
 }
 
+// 2024-01-03: 1.2.0
+//
+//go:embed retroactive_peers.json
+var retroactivePeersJsonBinary []byte
+
 // Creates a genesis state for the intrinsic
 func CreateGenesisState(
 	logger *zap.Logger,
@@ -324,12 +329,6 @@ func CreateGenesisState(
 		rewardTrie.Add(addrBytes, 0, 50)
 	}
 
-	// 2024-01-03: 1.2.0
-	d, err := os.ReadFile("./retroactive_peers.json")
-	if err != nil {
-		panic(err)
-	}
-
 	type peerData struct {
 		PeerId       string `json:"peer_id"`
 		TokenBalance uint64 `json:"token_balance"`
@@ -339,7 +338,7 @@ func CreateGenesisState(
 	}
 
 	retroEntries := &rewards{}
-	err = json.Unmarshal(d, retroEntries)
+	err = json.Unmarshal(retroactivePeersJsonBinary, retroEntries)
 	if err != nil {
 		panic(err)
 	}

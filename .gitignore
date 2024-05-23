@@ -5,4 +5,6 @@ ceremony-client
 .DS_Store
 *.mprof
 .env
-.task/
+.env.signers
+.task
+node-tmp-*

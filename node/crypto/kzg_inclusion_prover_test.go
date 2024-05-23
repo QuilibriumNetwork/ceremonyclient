@@ -15,7 +15,7 @@ import (
 )
 
 func TestKZGVerifyFrame(t *testing.T) {
-	kzg.TestInit("../ceremony.json")
+	kzg.TestInit("./kzg/ceremony.json")
 	data := make([]byte, 1024)
 	rand.Read(data)
 

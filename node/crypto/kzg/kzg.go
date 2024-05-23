@@ -1,6 +1,7 @@
 package kzg
 
 import (
+	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -292,13 +293,11 @@ func TestInit(file string) {
 	}
 }
 
+//go:embed ceremony.json
+var csBytes []byte
+
 func Init() {
 	// start with phase 1 ceremony:
-	csBytes, err := os.ReadFile("./ceremony.json")
-	if err != nil {
-		panic(err)
-	}
-
 	bls48581.Init()
 
 	cs := &CeremonyState{}
