@@ -159,7 +159,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			digestBytes, err := hex.DecodeString(parts[1])
+			digestBytes, err := hex.DecodeString(parts[1][:64])
 			if err != nil {
 				fmt.Println("Invalid digest file format")
 				os.Exit(1)
