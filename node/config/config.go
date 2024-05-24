@@ -115,6 +115,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			ListenMultiaddr: "/ip4/0.0.0.0/udp/8336/quic",
 			BootstrapPeers:  BootstrapPeers,
 			PeerPrivKey:     "",
+			Network:         0,
 		},
 		Engine: &EngineConfig{
 			ProvingKeyId:         "default-proving-key",
