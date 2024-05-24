@@ -89,6 +89,11 @@ var (
 		false,
 		"sets a node to run strictly as a dht bootstrap peer (not full node)",
 	)
+	network = flag.Uint(
+		"network",
+		0,
+		"sets the active network for the node (mainnet = 0, primary testnet = 1)",
+	)
 )
 
 func main() {
@@ -171,6 +176,26 @@ func main() {
 	nodeConfig, err := config.LoadConfig(*configDirectory, "")
 	if err != nil {
 		panic(err)
+	}
+
+	if *network != 0 {
+		if nodeConfig.P2P.BootstrapPeers[0] == config.BootstrapPeers[0] {
+			fmt.Println(
+				"Node has specified to run outside of mainnet but is still " +
+					"using default bootstrap list. This will fail. Exiting.",
+			)
+			os.Exit(1)
+		}
+
+		nodeConfig.Engine.GenesisSeed = fmt.Sprintf(
+			"%02x%s",
+			byte(*network),
+			nodeConfig.Engine.GenesisSeed,
+		)
+		nodeConfig.P2P.Network = uint8(*network)
+		fmt.Println(
+			"Node is operating outside of mainnet – be sure you intended to do this.",
+		)
 	}
 
 	clearIfTestData(*configDirectory, nodeConfig)
