@@ -602,19 +602,19 @@ func printNodeInfo(cfg *config.Config) {
 }
 
 func printLogo() {
-	fmt.Println("                                   %#########")
-	fmt.Println("                          #############################")
-	fmt.Println("                    ########################################&")
-	fmt.Println("                 ###############################################")
-	fmt.Println("             &#####################%        %######################")
-	fmt.Println("           #################                         #################")
-	fmt.Println("         ###############                                 ###############")
-	fmt.Println("       #############                                        ##############")
-	fmt.Println("     #############                                             ############&")
-	fmt.Println("    ############                                                 ############")
-	fmt.Println("   ###########                     ##########                     &###########")
-	fmt.Println("  ###########                    ##############                     ###########")
-	fmt.Println(" ###########                     ##############                      ##########&")
+	fmt.Println("                                   ..-------..")
+	fmt.Println("                          ..---''''           ''''---..")
+	fmt.Println("                    .---''                             ''---.")
+	fmt.Println("                 .-'                                         '-.")
+	fmt.Println("             ..-'            ..--'''''''''''%######################")
+	fmt.Println("           .'           .--''                         #################")
+	fmt.Println("        .''         ..-'                                 ###############")
+	fmt.Println("       '           '                                        ##############")
+	fmt.Println("     ''         .''                                             ############&")
+	fmt.Println("    '         ''                                                 ############")
+	fmt.Println("   '         '                     ##########                     &###########")
+	fmt.Println("  '         '                    ##############                     ###########")
+	fmt.Println(" '         '                     ##############                      ##########&")
 	fmt.Println(" '        '                      ##############                       ##########")
 	fmt.Println("'        '                         ##########                         ##########")
 	fmt.Println("'        '                                                            ##########")
@@ -639,5 +639,5 @@ func printLogo() {
 
 func printVersion() {
 	fmt.Println(" ")
-	fmt.Println("                       Quilibrium Node - v" + config.GetVersionString() + " – Aurora")
+	fmt.Println("                       Quilibrium Node - v" + config.GetVersionString() + " – Nebula")
 }
