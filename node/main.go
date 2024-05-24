@@ -137,8 +137,7 @@ func main() {
 				panic(err)
 			}
 
-			filepath := filepath.Dir(ex)
-			b, err := os.ReadFile(filepath)
+			b, err := os.ReadFile(ex)
 			if err != nil {
 				fmt.Println(
 					"Error encountered during signature check – are you running this " +
@@ -148,7 +147,7 @@ func main() {
 			}
 
 			checksum := sha3.Sum256(b)
-			digest, err := os.ReadFile(filepath + ".dgst")
+			digest, err := os.ReadFile(ex + ".dgst")
 			if err != nil {
 				fmt.Println("Digest file not found")
 				os.Exit(1)
@@ -174,7 +173,7 @@ func main() {
 			count := 0
 
 			for i := 1; i <= len(signatories); i++ {
-				signatureFile := fmt.Sprintf(filepath+".dgst.sig.%d", i)
+				signatureFile := fmt.Sprintf(ex+".dgst.sig.%d", i)
 				sig, err := os.ReadFile(signatureFile)
 				if err != nil {
 					continue
