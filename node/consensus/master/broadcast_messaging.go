@@ -124,9 +124,21 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		return errors.Wrap(err, "handle self test report")
 	}
 
+	// minimum proof size is one timestamp, one vdf proof, must match one fewer
+	// than core count
+	if len(report.Proof) < 516+8 ||
+		((len(report.Proof)-8)/516) != int(report.Cores-1) {
+		return errors.Wrap(errors.New("invalid report"), "handle self test report")
+	}
+
 	info := e.peerInfoManager.GetPeerInfo(peerID)
 	if info != nil {
+		if (time.Now().UnixMilli() - info.LastSeen) < (270 * 1000) {
+			return nil
+		}
+
 		info.MasterHeadFrame = report.MasterHeadFrame
+
 		if info.Bandwidth <= 1048576 {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
@@ -141,6 +153,36 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 				}
 			}()
 		}
+
+		proof := report.Proof
+		timestamp := binary.BigEndian.Uint64(proof[:8])
+		proof = proof[8:]
+
+		// Ignore outdated reports, give 3 minutes for propagation delay
+		if int64(timestamp) < (time.Now().UnixMilli() - (480 * 1000)) {
+			return nil
+		}
+
+		challenge := binary.BigEndian.AppendUint64([]byte{}, report.MasterHeadFrame)
+		challenge = append(challenge, peerID...)
+
+		proofs := make([][]byte, (len(report.Proof)-8)/516)
+		for i := 0; i < len(proofs); i++ {
+			proofs[i] = proof[i*516 : (i+1)*516]
+		}
+		if !e.frameProver.VerifyChallengeProof(
+			challenge,
+			int64(timestamp),
+			report.DifficultyMetric,
+			proofs,
+		) {
+			return errors.Wrap(
+				errors.New("invalid report"),
+				"handle self test report",
+			)
+		}
+
+		info.LastSeen = time.Now().UnixMilli()
 		return nil
 	}
 
@@ -201,6 +243,8 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		case <-ctx.Done():
 		}
 	}()
+
+	info.LastSeen = time.Now().UnixMilli()
 
 	return nil
 }

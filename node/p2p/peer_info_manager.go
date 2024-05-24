@@ -39,6 +39,7 @@ type PeerManifest struct {
 	Capabilities       []Capability
 	MasterHeadFrame    uint64
 	Bandwidth          uint64
+	LastSeen           int64
 }
 
 type InMemoryPeerInfoManager struct {

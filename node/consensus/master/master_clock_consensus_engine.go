@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"math/big"
@@ -233,11 +234,32 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			}
 
 			e.report.MasterHeadFrame = head.FrameNumber
+			parallelism := e.report.Cores - 1
+			skew := (e.report.DifficultyMetric * 12) / 10
+			challenge := binary.BigEndian.AppendUint64(
+				[]byte{},
+				e.report.MasterHeadFrame,
+			)
+			challenge = append(challenge, e.pubSub.GetPeerID()...)
+
+			ts, proofs, err := e.frameProver.CalculateChallengeProof(
+				challenge,
+				parallelism,
+				skew,
+			)
+			if err != nil {
+				panic(err)
+			}
+
+			proof := binary.BigEndian.AppendUint64([]byte{}, uint64(ts))
+			for i := 0; i < len(proofs); i++ {
+				proof = append(proof, proofs[i]...)
+			}
+			e.report.Proof = proof
 
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
 			}
-			time.Sleep(5 * time.Minute)
 		}
 	}()
 
@@ -460,6 +482,7 @@ func (
 			Memory:             new(big.Int).SetBytes(peerManifest.Memory).Bytes(),
 			Storage:            new(big.Int).SetBytes(peerManifest.Storage).Bytes(),
 			MasterHeadFrame:    peerManifest.MasterHeadFrame,
+			LastSeen:           peerManifest.LastSeen,
 		}
 
 		for _, capability := range peerManifest.Capabilities {
