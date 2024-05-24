@@ -26,3 +26,11 @@ func TestMasterProve(t *testing.T) {
 	err = w.VerifyMasterClockFrame(next)
 	assert.NoError(t, err)
 }
+
+func TestChallengeProof(t *testing.T) {
+	l, _ := zap.NewProduction()
+	w := crypto.NewWesolowskiFrameProver(l)
+	now, proofs, err := w.CalculateChallengeProof([]byte{0x01, 0x02, 0x03}, 3, 120000)
+	assert.NoError(t, err)
+	assert.True(t, w.VerifyChallengeProof([]byte{0x01, 0x02, 0x03}, now, 100000, proofs))
+}
