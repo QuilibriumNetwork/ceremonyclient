@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -62,6 +63,7 @@ type MasterClockConsensusEngine struct {
 	report                      *protobufs.SelfTestReport
 	frameValidationCh           chan *protobufs.ClockFrame
 	bandwidthTestCh             chan []byte
+	verifyTestCh                chan verifyChallenge
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
 }
@@ -126,6 +128,7 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
+		verifyTestCh:        make(chan verifyChallenge),
 	}
 
 	e.addPeerManifestReport(e.pubSub.GetPeerID(), report)
@@ -186,6 +189,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				e.masterTimeReel.Insert(newFrame, false)
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
+			case verifyTest := <-e.verifyTestCh:
+				e.performVerifyTest(verifyTest)
 			}
 		}
 	}()
@@ -353,6 +358,34 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+type verifyChallenge struct {
+	peerID           []byte
+	challenge        []byte
+	timestamp        int64
+	difficultyMetric int64
+	proofs           [][]byte
+}
+
+func (e *MasterClockConsensusEngine) performVerifyTest(
+	challenge verifyChallenge,
+) {
+	if !e.frameProver.VerifyChallengeProof(
+		challenge.challenge,
+		challenge.timestamp,
+		challenge.difficultyMetric,
+		challenge.proofs,
+	) {
+		e.logger.Warn(
+			"received invalid proof from peer",
+			zap.String("peer_id", peer.ID(challenge.peerID).String()),
+		)
+		e.pubSub.SetPeerScore(challenge.peerID, -1000)
+	} else {
+		info := e.peerInfoManager.GetPeerInfo(challenge.peerID)
+		info.LastSeen = time.Now().UnixMilli()
+	}
 }
 
 func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {

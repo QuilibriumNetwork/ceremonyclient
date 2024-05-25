@@ -181,25 +181,16 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		for i := 0; i < len(proofs); i++ {
 			proofs[i] = proof[i*516 : (i+1)*516]
 		}
-		if !e.frameProver.VerifyChallengeProof(
-			challenge,
-			int64(timestamp),
-			report.DifficultyMetric,
-			proofs,
-		) {
-			e.logger.Warn(
-				"received invalid proof from peer",
-				zap.String("peer_id", peer.ID(peerID).String()),
-			)
-			e.pubSub.SetPeerScore(peerID, -1000)
+		go func() {
+			e.verifyTestCh <- verifyChallenge{
+				peerID:           peerID,
+				challenge:        challenge,
+				timestamp:        int64(timestamp),
+				difficultyMetric: report.DifficultyMetric,
+				proofs:           proofs,
+			}
+		}()
 
-			return errors.Wrap(
-				errors.New("invalid report"),
-				"handle self test report",
-			)
-		}
-
-		info.LastSeen = time.Now().UnixMilli()
 		return nil
 	}
 
