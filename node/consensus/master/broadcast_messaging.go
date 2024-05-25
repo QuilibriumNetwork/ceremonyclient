@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -128,8 +129,18 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	// than core count
 	if len(report.Proof) < 516+8 ||
 		((len(report.Proof)-8)/516) != int(report.Cores-1) {
+		e.logger.Warn(
+			"received invalid proof from peer",
+			zap.String("peer_id", peer.ID(peerID).String()),
+		)
+		e.pubSub.SetPeerScore(peerID, -1000)
 		return errors.Wrap(errors.New("invalid report"), "handle self test report")
 	}
+
+	e.logger.Debug(
+		"received proof from peer",
+		zap.String("peer_id", peer.ID(peerID).String()),
+	)
 
 	info := e.peerInfoManager.GetPeerInfo(peerID)
 	if info != nil {
@@ -176,6 +187,12 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 			report.DifficultyMetric,
 			proofs,
 		) {
+			e.logger.Warn(
+				"received invalid proof from peer",
+				zap.String("peer_id", peer.ID(peerID).String()),
+			)
+			e.pubSub.SetPeerScore(peerID, -1000)
+
 			return errors.Wrap(
 				errors.New("invalid report"),
 				"handle self test report",
@@ -243,8 +260,6 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		case <-ctx.Done():
 		}
 	}()
-
-	info.LastSeen = time.Now().UnixMilli()
 
 	return nil
 }

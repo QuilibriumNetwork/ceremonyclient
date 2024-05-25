@@ -80,7 +80,7 @@ func (e *MasterClockConsensusEngine) collect(
 
 	for i := 0; i < len(peers); i++ {
 		peer := peers[i]
-		e.logger.Debug("setting syncing target", zap.Binary("peer_id", peer))
+		e.logger.Info("setting syncing target", zap.Binary("peer_id", peer))
 
 		cc, err := e.pubSub.GetDirectChannel(peer, "validation")
 		if err != nil {

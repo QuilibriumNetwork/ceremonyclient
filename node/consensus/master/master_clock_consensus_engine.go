@@ -227,7 +227,6 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 		time.Sleep(30 * time.Second)
 
 		for {
-			e.logger.Info("broadcasting self-test info")
 			head, err := e.masterTimeReel.Head()
 			if err != nil {
 				panic(err)
@@ -256,6 +255,10 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				proof = append(proof, proofs[i]...)
 			}
 			e.report.Proof = proof
+			e.logger.Info(
+				"broadcasting self-test info",
+				zap.Uint64("current_frame", e.report.MasterHeadFrame),
+			)
 
 			if err := e.publishMessage(e.filter, e.report); err != nil {
 				e.logger.Debug("error publishing message", zap.Error(err))
@@ -586,6 +589,7 @@ func (e *MasterClockConsensusEngine) addPeerManifestReport(
 		Storage:            report.Storage,
 		Capabilities:       []p2p.Capability{},
 		MasterHeadFrame:    report.MasterHeadFrame,
+		LastSeen:           time.Now().UnixMilli(),
 	}
 
 	for _, capability := range manifest.Capabilities {
