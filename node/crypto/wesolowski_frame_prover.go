@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -592,4 +594,76 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 		w.logger.Debug("verification failed")
 		return false
 	}
+}
+
+func (w *WesolowskiFrameProver) CalculateChallengeProof(
+	challenge []byte,
+	parallelism uint32,
+	skew int64,
+) (int64, [][]byte, error) {
+	now := time.Now().UnixMilli()
+	input := binary.BigEndian.AppendUint64([]byte{}, uint64(now))
+	input = append(input, challenge...)
+	outputs := make([][]byte, parallelism)
+
+	wg := sync.WaitGroup{}
+	wg.Add(int(parallelism))
+
+	for i := uint32(0); i < parallelism; i++ {
+		i := i
+		go func() {
+			instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
+			instanceInput = append(instanceInput, input...)
+			b := sha3.Sum256(input)
+
+			// 4.5 minutes = 270 seconds, one increment should be ten seconds
+			proofDuration := 270 * 1000
+			calibratedDifficulty := (int64(proofDuration) / skew) * 10000
+
+			v := vdf.New(uint32(calibratedDifficulty), b)
+
+			v.Execute()
+			o := v.GetOutput()
+
+			outputs[i] = make([]byte, 516)
+			copy(outputs[i][:], o[:])
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+	return now, outputs, nil
+}
+
+func (w *WesolowskiFrameProver) VerifyChallengeProof(
+	challenge []byte,
+	timestamp int64,
+	assertedDifficulty int64,
+	proof [][]byte,
+) bool {
+	input := binary.BigEndian.AppendUint64([]byte{}, uint64(timestamp))
+	input = append(input, challenge...)
+
+	for i := uint32(0); i < uint32(len(proof)); i++ {
+		if len(proof[i]) != 516 {
+			return false
+		}
+
+		instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
+		instanceInput = append(instanceInput, input...)
+		b := sha3.Sum256(input)
+
+		// 4.5 minutes = 270 seconds, one increment should be ten seconds
+		proofDuration := 270 * 1000
+		skew := (assertedDifficulty * 12) / 10
+		calibratedDifficulty := (int64(proofDuration) / skew) * 10000
+
+		v := vdf.New(uint32(calibratedDifficulty), b)
+		check := v.Verify([516]byte(proof[i]))
+		if !check {
+			return false
+		}
+	}
+
+	return true
 }

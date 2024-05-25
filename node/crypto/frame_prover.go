@@ -51,4 +51,15 @@ type FrameProver interface {
 		proof []byte,
 		deepVerifier *protobufs.ClockFrame,
 	) bool
+	CalculateChallengeProof(
+		challenge []byte,
+		parallelism uint32,
+		skew int64,
+	) (int64, [][]byte, error)
+	VerifyChallengeProof(
+		challenge []byte,
+		timestamp int64,
+		assertedDifficulty int64,
+		proof [][]byte,
+	) bool
 }

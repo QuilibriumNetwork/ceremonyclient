@@ -45,13 +45,10 @@ func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTes
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	engineConfig := configConfig.Engine
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
-	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
-	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
-	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, inMemoryPeerInfoManager, pebbleKeyStore)
 	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
-	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
+	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
 	}
@@ -69,13 +66,10 @@ func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestRepo
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	engineConfig := configConfig.Engine
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
-	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
-	pebbleKeyStore := store.NewPebbleKeyStore(pebbleDB, zapLogger)
-	ceremonyExecutionEngine := ceremony.NewCeremonyExecutionEngine(zapLogger, engineConfig, fileKeyManager, blossomSub, wesolowskiFrameProver, kzgInclusionProver, pebbleClockStore, masterTimeReel, inMemoryPeerInfoManager, pebbleKeyStore)
 	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
-	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, ceremonyExecutionEngine, masterClockConsensusEngine)
+	node, err := newNode(zapLogger, pebbleClockStore, fileKeyManager, blossomSub, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
 	}
