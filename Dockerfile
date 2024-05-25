@@ -36,8 +36,8 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build /go/bin/node /usr/local/bin
 COPY --from=build /go/bin/grpcurl /usr/local/bin
-COPY --from=build /opt/ceremonyclient/node/ceremony.json /root
-COPY --from=build /opt/ceremonyclient/node/retroactive_peers.json /root
+COPY --from=build /opt/ceremonyclient/node/crypto/kzg/ceremony.json /root
+COPY --from=build /opt/ceremonyclient/node/execution/intrinsics/ceremony/retroactive_peers.json /root
 COPY --from=build /opt/ceremonyclient/client/qclient /usr/local/bin
 
 WORKDIR /root
