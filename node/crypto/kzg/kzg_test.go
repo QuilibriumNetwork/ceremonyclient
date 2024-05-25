@@ -17,7 +17,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	csBytes, err := os.ReadFile("../../ceremony.json")
+	csBytes, err := os.ReadFile("./ceremony.json")
 	if err != nil {
 		panic(err)
 	}

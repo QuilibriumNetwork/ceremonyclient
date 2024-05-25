@@ -8,7 +8,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
@@ -44,7 +43,7 @@ func newNode(
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
-	ceremonyExecutionEngine *ceremony.CeremonyExecutionEngine,
+	// execution engines wire in here
 	engine consensus.ConsensusEngine,
 ) (*Node, error) {
 	if engine == nil {
@@ -52,9 +51,6 @@ func newNode(
 	}
 
 	execEngines := make(map[string]execution.ExecutionEngine)
-	if ceremonyExecutionEngine != nil {
-		execEngines[ceremonyExecutionEngine.GetName()] = ceremonyExecutionEngine
-	}
 
 	return &Node{
 		logger,
