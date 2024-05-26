@@ -3,6 +3,7 @@ package master
 import (
 	"bytes"
 	"context"
+	gcrypto "crypto"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
@@ -135,6 +137,12 @@ func NewMasterClockConsensusEngine(
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
 		panic(errors.Wrap(err, "could not parse filter value"))
+	}
+
+	e.getProvingKey(engineConfig)
+
+	if err := e.createCommunicationKeys(); err != nil {
+		panic(err)
 	}
 
 	logger.Info("constructing consensus engine")
@@ -638,4 +646,78 @@ func (e *MasterClockConsensusEngine) addPeerManifestReport(
 	}
 
 	e.peerInfoManager.AddPeerInfo(manifest)
+}
+
+func (e *MasterClockConsensusEngine) getProvingKey(
+	engineConfig *config.EngineConfig,
+) (gcrypto.Signer, keys.KeyType, []byte, []byte) {
+	provingKey, err := e.keyManager.GetSigningKey(engineConfig.ProvingKeyId)
+	if errors.Is(err, keys.KeyNotFoundErr) {
+		e.logger.Info("could not get proving key, generating")
+		provingKey, err = e.keyManager.CreateSigningKey(
+			engineConfig.ProvingKeyId,
+			keys.KeyTypeEd448,
+		)
+	}
+
+	if err != nil {
+		e.logger.Error("could not get proving key", zap.Error(err))
+		panic(err)
+	}
+
+	rawKey, err := e.keyManager.GetRawKey(engineConfig.ProvingKeyId)
+	if err != nil {
+		e.logger.Error("could not get proving key type", zap.Error(err))
+		panic(err)
+	}
+
+	provingKeyType := rawKey.Type
+
+	h, err := poseidon.HashBytes(rawKey.PublicKey)
+	if err != nil {
+		e.logger.Error("could not hash proving key", zap.Error(err))
+		panic(err)
+	}
+
+	provingKeyAddress := h.Bytes()
+	provingKeyAddress = append(
+		make([]byte, 32-len(provingKeyAddress)),
+		provingKeyAddress...,
+	)
+
+	return provingKey, provingKeyType, rawKey.PublicKey, provingKeyAddress
+}
+
+func (e *MasterClockConsensusEngine) createCommunicationKeys() error {
+	_, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-idk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "create communication keys")
+			}
+		} else {
+			return errors.Wrap(err, "create communication keys")
+		}
+	}
+
+	_, err = e.keyManager.GetAgreementKey("q-ratchet-spk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-spk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "create communication keys")
+			}
+		} else {
+			return errors.Wrap(err, "create communication keys")
+		}
+	}
+
+	return nil
 }
