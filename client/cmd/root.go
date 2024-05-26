@@ -25,7 +25,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(
 		&configDirectory,
 		"config",
-		"../node/.config/",
-		"config directory (default is ../node/.config/)",
+		".config/",
+		"config directory (default is .config/)",
 	)
 }

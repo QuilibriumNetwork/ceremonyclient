@@ -37,4 +37,5 @@ type P2PConfig struct {
 	PeerPrivKey               string        `yaml:"peerPrivKey"`
 	TraceLogFile              string        `yaml:"traceLogFile"`
 	MinPeers                  int           `yaml:"minPeers"`
+	Network                   uint8         `yaml:"network"`
 }

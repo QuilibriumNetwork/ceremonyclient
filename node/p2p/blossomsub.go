@@ -45,6 +45,7 @@ type BlossomSub struct {
 	peerScore       map[string]int64
 	peerScoreMx     sync.Mutex
 	isBootstrapPeer bool
+	network         uint8
 }
 
 var _ PubSub = (*BlossomSub)(nil)
@@ -60,7 +61,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE = "quilibrium-1.4.16-sunset-noctilucent"
+var ANNOUNCE_PREFIX = "quilibrium-1.4.18-nebula-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -129,6 +130,7 @@ func NewBlossomSub(
 		signKey:         privKey,
 		peerScore:       make(map[string]int64),
 		isBootstrapPeer: isBootstrapPeer,
+		network:         p2pConfig.Network,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -140,7 +142,7 @@ func NewBlossomSub(
 
 	kademliaDHT := initDHT(ctx, p2pConfig, logger, h, isBootstrapPeer)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	util.Advertise(ctx, routingDiscovery, ANNOUNCE)
+	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
 
 	discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
 
@@ -212,7 +214,8 @@ func NewBlossomSub(
 }
 
 func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
-	bm, ok := b.bitmaskMap[string(bitmask)]
+	networkBitmask := append([]byte{b.network}, bitmask...)
+	bm, ok := b.bitmaskMap[string(networkBitmask)]
 	if !ok {
 		b.logger.Error(
 			"error while publishing to bitmask",
@@ -237,19 +240,20 @@ func (b *BlossomSub) Subscribe(
 	raw bool,
 ) {
 	eval := func(bitmask []byte) error {
-		_, ok := b.bitmaskMap[string(bitmask)]
+		networkBitmask := append([]byte{b.network}, bitmask...)
+		_, ok := b.bitmaskMap[string(networkBitmask)]
 		if ok {
 			return nil
 		}
 
 		b.logger.Info("joining broadcast")
-		bm, err := b.ps.Join(bitmask)
+		bm, err := b.ps.Join(networkBitmask)
 		if err != nil {
 			b.logger.Error("join failed", zap.Error(err))
 			return errors.Wrap(err, "subscribe")
 		}
 
-		b.bitmaskMap[string(bitmask)] = bm
+		b.bitmaskMap[string(networkBitmask)] = bm
 
 		b.logger.Info("subscribe to bitmask", zap.Binary("bitmask", bitmask))
 		sub, err := bm.Subscribe()
@@ -293,7 +297,8 @@ func (b *BlossomSub) Subscribe(
 }
 
 func (b *BlossomSub) Unsubscribe(bitmask []byte, raw bool) {
-	bm, ok := b.bitmaskMap[string(bitmask)]
+	networkBitmask := append([]byte{b.network}, bitmask...)
+	bm, ok := b.bitmaskMap[string(networkBitmask)]
 	if !ok {
 		return
 	}
@@ -306,7 +311,8 @@ func (b *BlossomSub) GetPeerID() []byte {
 }
 
 func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {
-	peers := b.ps.ListPeers(bitmask)
+	networkBitmask := append([]byte{b.network}, bitmask...)
+	peers := b.ps.ListPeers(networkBitmask)
 	if len(peers) == 0 {
 		return nil, errors.Wrap(
 			ErrNoPeersAvailable,
@@ -351,16 +357,19 @@ func initDHT(
 		)
 
 		defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
-		for _, peer := range config.BootstrapPeers {
-			found := false
-			for _, existing := range defaultBootstrapPeers {
-				if existing == peer {
-					found = true
-					break
+
+		if p2pConfig.Network == 0 {
+			for _, peer := range config.BootstrapPeers {
+				found := false
+				for _, existing := range defaultBootstrapPeers {
+					if existing == peer {
+						found = true
+						break
+					}
 				}
-			}
-			if !found {
-				defaultBootstrapPeers = append(defaultBootstrapPeers, peer)
+				if !found {
+					defaultBootstrapPeers = append(defaultBootstrapPeers, peer)
+				}
 			}
 		}
 
@@ -379,7 +388,7 @@ func initDHT(
 			if err := h.Connect(ctx, *peerinfo); err != nil {
 				logger.Debug("error while connecting to dht peer", zap.Error(err))
 			} else {
-				logger.Info(
+				logger.Debug(
 					"connected to peer",
 					zap.String("peer_id", peerinfo.ID.String()),
 				)
@@ -417,11 +426,11 @@ func (b *BlossomSub) GetBitmaskPeers() map[string][]string {
 	peers := map[string][]string{}
 
 	for _, k := range b.bitmaskMap {
-		peers[fmt.Sprintf("%+x", k.Bitmask())] = []string{}
+		peers[fmt.Sprintf("%+x", k.Bitmask()[1:])] = []string{}
 
 		for _, p := range k.ListPeers() {
-			peers[fmt.Sprintf("%+x", k.Bitmask())] = append(
-				peers[fmt.Sprintf("%+x", k.Bitmask())],
+			peers[fmt.Sprintf("%+x", k.Bitmask()[1:])] = append(
+				peers[fmt.Sprintf("%+x", k.Bitmask()[1:])],
 				p.String(),
 			)
 		}
@@ -502,6 +511,8 @@ func (b *BlossomSub) GetDirectChannel(key []byte, purpose string) (
 		}
 	}()
 
+	// Open question: should we prefix this so a node can run both in mainnet and
+	// testnet? Feels like a bad idea and would be preferable to discourage.
 	dialCtx, err = grpc.DialContext(
 		b.ctx,
 		base58.Encode(key),
@@ -556,7 +567,10 @@ func discoverPeers(
 	logger.Info("initiating peer discovery")
 
 	discover := func() {
-		peerChan, err := routingDiscovery.FindPeers(ctx, ANNOUNCE)
+		peerChan, err := routingDiscovery.FindPeers(
+			ctx,
+			getNetworkNamespace(p2pConfig.Network),
+		)
 		if err != nil {
 			logger.Error("could not find peers", zap.Error(err))
 		}
@@ -716,4 +730,21 @@ func mergeDefaults(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams {
 		IWantFollowupTime:         p2pConfig.IWantFollowupTime,
 		SlowHeartbeatWarning:      0.1,
 	}
+}
+
+func getNetworkNamespace(network uint8) string {
+	var network_name string
+	switch network {
+	case 0:
+		network_name = "mainnet"
+		break
+	case 1:
+		network_name = "testnet-primary"
+		break
+	default:
+		network_name = fmt.Sprintf("network-%d", network)
+		break
+	}
+
+	return ANNOUNCE_PREFIX + network_name
 }
