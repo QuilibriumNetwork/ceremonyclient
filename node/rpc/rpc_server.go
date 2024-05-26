@@ -154,19 +154,9 @@ func (r *RPCServer) GetNodeInfo(
 	if err != nil {
 		return nil, errors.Wrap(err, "getting id from bytes")
 	}
-
-	maxFrame := &protobufs.ClockFrame{}
-	for _, e := range r.executionEngines {
-		if frame := e.GetFrame(); frame != nil {
-			if frameNr := frame.GetFrameNumber(); frameNr > maxFrame.GetFrameNumber() {
-				maxFrame = frame
-			}
-		}
-	}
-
 	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
 
-	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: maxFrame.GetFrameNumber(), PeerScore: uint64(peerScore), Version: config.GetVersion()}, nil
+	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: r.masterClock.GetFrame().GetFrameNumber(), PeerScore: uint64(peerScore), Version: config.GetVersion()}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.

@@ -192,7 +192,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			fmt.Printf("Signature check passed")
+			fmt.Println("Signature check passed")
 		}
 	}
 
