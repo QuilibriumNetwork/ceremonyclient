@@ -132,6 +132,8 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		e.logger.Warn(
 			"received invalid proof from peer",
 			zap.String("peer_id", peer.ID(peerID).String()),
+			zap.Int("proof_size", len(report.Proof)),
+			zap.Uint32("cores", report.Cores),
 		)
 		e.pubSub.SetPeerScore(peerID, -1000)
 		return errors.Wrap(errors.New("invalid report"), "handle self test report")
@@ -148,6 +150,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 			return nil
 		}
 
+		info.DifficultyMetric = report.DifficultyMetric
 		info.MasterHeadFrame = report.MasterHeadFrame
 
 		if info.Bandwidth <= 1048576 {
@@ -169,7 +172,8 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		timestamp := binary.BigEndian.Uint64(proof[:8])
 		proof = proof[8:]
 
-		// Ignore outdated reports, give 3 minutes for propagation delay
+		// Ignore outdated reports, give 3 minutes + proof time for propagation
+		// delay
 		if int64(timestamp) < (time.Now().UnixMilli() - (480 * 1000)) {
 			return nil
 		}
@@ -181,25 +185,16 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		for i := 0; i < len(proofs); i++ {
 			proofs[i] = proof[i*516 : (i+1)*516]
 		}
-		if !e.frameProver.VerifyChallengeProof(
-			challenge,
-			int64(timestamp),
-			report.DifficultyMetric,
-			proofs,
-		) {
-			e.logger.Warn(
-				"received invalid proof from peer",
-				zap.String("peer_id", peer.ID(peerID).String()),
-			)
-			e.pubSub.SetPeerScore(peerID, -1000)
+		go func() {
+			e.verifyTestCh <- verifyChallenge{
+				peerID:           peerID,
+				challenge:        challenge,
+				timestamp:        int64(timestamp),
+				difficultyMetric: report.DifficultyMetric,
+				proofs:           proofs,
+			}
+		}()
 
-			return errors.Wrap(
-				errors.New("invalid report"),
-				"handle self test report",
-			)
-		}
-
-		info.LastSeen = time.Now().UnixMilli()
 		return nil
 	}
 
@@ -264,6 +259,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	return nil
 }
 
+// This does not publish any longer, frames strictly are picked up from sync
 func (e *MasterClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
@@ -273,17 +269,6 @@ func (e *MasterClockConsensusEngine) publishProof(
 	)
 
 	e.masterTimeReel.Insert(frame, false)
-
-	peers, err := e.GetMostAheadPeers()
-	if err != nil || len(peers) == 0 {
-		// publish if we don't see anyone (empty peer list) or if we're the most
-		// ahead:
-		e.report.MasterHeadFrame = frame.FrameNumber
-
-		if err := e.publishMessage(e.filter, e.report); err != nil {
-			e.logger.Debug("error publishing message", zap.Error(err))
-		}
-	}
 
 	e.state = consensus.EngineStateCollecting
 

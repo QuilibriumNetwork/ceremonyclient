@@ -3,6 +3,7 @@ package master
 import (
 	"bytes"
 	"context"
+	gcrypto "crypto"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -62,6 +65,7 @@ type MasterClockConsensusEngine struct {
 	report                      *protobufs.SelfTestReport
 	frameValidationCh           chan *protobufs.ClockFrame
 	bandwidthTestCh             chan []byte
+	verifyTestCh                chan verifyChallenge
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
 }
@@ -126,12 +130,19 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
+		verifyTestCh:        make(chan verifyChallenge),
 	}
 
 	e.addPeerManifestReport(e.pubSub.GetPeerID(), report)
 
 	if e.filter, err = hex.DecodeString(engineConfig.Filter); err != nil {
 		panic(errors.Wrap(err, "could not parse filter value"))
+	}
+
+	e.getProvingKey(engineConfig)
+
+	if err := e.createCommunicationKeys(); err != nil {
+		panic(err)
 	}
 
 	logger.Info("constructing consensus engine")
@@ -170,7 +181,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 					panic(err)
 				}
 
-				if head.FrameNumber > newFrame.FrameNumber || newFrame.FrameNumber-head.FrameNumber > 128 {
+				if head.FrameNumber > newFrame.FrameNumber ||
+					newFrame.FrameNumber-head.FrameNumber > 128 {
 					e.logger.Debug(
 						"frame out of range, ignoring",
 						zap.Uint64("number", newFrame.FrameNumber),
@@ -186,6 +198,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 				e.masterTimeReel.Insert(newFrame, false)
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
+			case verifyTest := <-e.verifyTestCh:
+				e.performVerifyTest(verifyTest)
 			}
 		}
 	}()
@@ -225,6 +239,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	go func() {
 		// Let it sit until we at least have a few more peers inbound
 		time.Sleep(30 * time.Second)
+		difficultyMetric := int64(100000)
+		skew := (difficultyMetric * 12) / 10
 
 		for {
 			head, err := e.masterTimeReel.Head()
@@ -233,22 +249,31 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			}
 
 			e.report.MasterHeadFrame = head.FrameNumber
+			e.report.DifficultyMetric = difficultyMetric
 			parallelism := e.report.Cores - 1
-			skew := (e.report.DifficultyMetric * 12) / 10
+
 			challenge := binary.BigEndian.AppendUint64(
 				[]byte{},
 				e.report.MasterHeadFrame,
 			)
 			challenge = append(challenge, e.pubSub.GetPeerID()...)
 
-			ts, proofs, err := e.frameProver.CalculateChallengeProof(
-				challenge,
-				parallelism,
-				skew,
-			)
+			ts, proofs, nextDifficultyMetric, err :=
+				e.frameProver.CalculateChallengeProof(
+					challenge,
+					parallelism,
+					skew,
+				)
 			if err != nil {
 				panic(err)
 			}
+			e.logger.Info(
+				"recalibrating difficulty metric",
+				zap.Int64("previous_difficulty_metric", difficultyMetric),
+				zap.Int64("next_difficulty_metric", nextDifficultyMetric),
+			)
+			difficultyMetric = nextDifficultyMetric
+			skew = (nextDifficultyMetric * 12) / 10
 
 			proof := binary.BigEndian.AppendUint64([]byte{}, uint64(ts))
 			for i := 0; i < len(proofs); i++ {
@@ -353,6 +378,38 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 		errChan <- nil
 	}()
 	return errChan
+}
+
+type verifyChallenge struct {
+	peerID           []byte
+	challenge        []byte
+	timestamp        int64
+	difficultyMetric int64
+	proofs           [][]byte
+}
+
+func (e *MasterClockConsensusEngine) performVerifyTest(
+	challenge verifyChallenge,
+) {
+	if !e.frameProver.VerifyChallengeProof(
+		challenge.challenge,
+		challenge.timestamp,
+		challenge.difficultyMetric,
+		challenge.proofs,
+	) {
+		e.logger.Warn(
+			"received invalid proof from peer",
+			zap.String("peer_id", peer.ID(challenge.peerID).String()),
+		)
+		e.pubSub.SetPeerScore(challenge.peerID, -1000)
+	} else {
+		e.logger.Debug(
+			"received valid proof from peer",
+			zap.String("peer_id", peer.ID(challenge.peerID).String()),
+		)
+		info := e.peerInfoManager.GetPeerInfo(challenge.peerID)
+		info.LastSeen = time.Now().UnixMilli()
+	}
 }
 
 func (e *MasterClockConsensusEngine) performBandwidthTest(peerID []byte) {
@@ -605,4 +662,78 @@ func (e *MasterClockConsensusEngine) addPeerManifestReport(
 	}
 
 	e.peerInfoManager.AddPeerInfo(manifest)
+}
+
+func (e *MasterClockConsensusEngine) getProvingKey(
+	engineConfig *config.EngineConfig,
+) (gcrypto.Signer, keys.KeyType, []byte, []byte) {
+	provingKey, err := e.keyManager.GetSigningKey(engineConfig.ProvingKeyId)
+	if errors.Is(err, keys.KeyNotFoundErr) {
+		e.logger.Info("could not get proving key, generating")
+		provingKey, err = e.keyManager.CreateSigningKey(
+			engineConfig.ProvingKeyId,
+			keys.KeyTypeEd448,
+		)
+	}
+
+	if err != nil {
+		e.logger.Error("could not get proving key", zap.Error(err))
+		panic(err)
+	}
+
+	rawKey, err := e.keyManager.GetRawKey(engineConfig.ProvingKeyId)
+	if err != nil {
+		e.logger.Error("could not get proving key type", zap.Error(err))
+		panic(err)
+	}
+
+	provingKeyType := rawKey.Type
+
+	h, err := poseidon.HashBytes(rawKey.PublicKey)
+	if err != nil {
+		e.logger.Error("could not hash proving key", zap.Error(err))
+		panic(err)
+	}
+
+	provingKeyAddress := h.Bytes()
+	provingKeyAddress = append(
+		make([]byte, 32-len(provingKeyAddress)),
+		provingKeyAddress...,
+	)
+
+	return provingKey, provingKeyType, rawKey.PublicKey, provingKeyAddress
+}
+
+func (e *MasterClockConsensusEngine) createCommunicationKeys() error {
+	_, err := e.keyManager.GetAgreementKey("q-ratchet-idk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-idk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "create communication keys")
+			}
+		} else {
+			return errors.Wrap(err, "create communication keys")
+		}
+	}
+
+	_, err = e.keyManager.GetAgreementKey("q-ratchet-spk")
+	if err != nil {
+		if errors.Is(err, keys.KeyNotFoundErr) {
+			_, err = e.keyManager.CreateAgreementKey(
+				"q-ratchet-spk",
+				keys.KeyTypeX448,
+			)
+			if err != nil {
+				return errors.Wrap(err, "create communication keys")
+			}
+		} else {
+			return errors.Wrap(err, "create communication keys")
+		}
+	}
+
+	return nil
 }
