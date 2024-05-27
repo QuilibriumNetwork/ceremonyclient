@@ -373,6 +373,8 @@ func initDHT(
 			}
 		}
 
+		wg := sync.WaitGroup{}
+
 		for _, peerAddr := range defaultBootstrapPeers {
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
 			if err != nil {
@@ -385,15 +387,21 @@ func initDHT(
 				continue
 			}
 
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-				logger.Debug("error while connecting to dht peer", zap.Error(err))
-			} else {
-				logger.Debug(
-					"connected to peer",
-					zap.String("peer_id", peerinfo.ID.String()),
-				)
-			}
+			wg.Add(1)
+			go func() {
+				if err := h.Connect(ctx, *peerinfo); err != nil {
+					logger.Debug("error while connecting to dht peer", zap.Error(err))
+				} else {
+					logger.Debug(
+						"connected to peer",
+						zap.String("peer_id", peerinfo.ID.String()),
+					)
+				}
+				wg.Done()
+			}()
 		}
+
+		wg.Wait()
 	}
 
 	reconnect()
@@ -575,6 +583,8 @@ func discoverPeers(
 			logger.Error("could not find peers", zap.Error(err))
 		}
 
+		wg := sync.WaitGroup{}
+
 		for peer := range peerChan {
 			peer := peer
 			if peer.ID == h.ID() ||
@@ -583,21 +593,26 @@ func discoverPeers(
 				continue
 			}
 
-			logger.Debug("found peer", zap.String("peer_id", peer.ID.Pretty()))
-			err := h.Connect(ctx, peer)
-			if err != nil {
-				logger.Debug(
-					"error while connecting to blossomsub peer",
-					zap.String("peer_id", peer.ID.Pretty()),
-					zap.Error(err),
-				)
-			} else {
-				logger.Debug(
-					"connected to peer",
-					zap.String("peer_id", peer.ID.Pretty()),
-				)
-			}
+			wg.Add(1)
+			go func() {
+				logger.Debug("found peer", zap.String("peer_id", peer.ID.Pretty()))
+				err := h.Connect(ctx, peer)
+				if err != nil {
+					logger.Debug(
+						"error while connecting to blossomsub peer",
+						zap.String("peer_id", peer.ID.Pretty()),
+						zap.Error(err),
+					)
+				} else {
+					logger.Debug(
+						"connected to peer",
+						zap.String("peer_id", peer.ID.Pretty()),
+					)
+				}
+				wg.Done()
+			}()
 		}
+		wg.Wait()
 	}
 
 	discover()
