@@ -83,24 +83,28 @@ tasks:
     sources:
       - '**/*.go'
     generates:
-      - node-{{.VERSION}}-*.bin
+      - node-{{.VERSION}}-darwin-arm64
+      - node-{{.VERSION}}-linux-amd64
+      - node-{{.VERSION}}-linux-arm64
     cmds:
-      - GOOS=darwin go build -ldflags "-s -w" -o node-{{.VERSION}}-darwin-arm64.bin
-      - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-{{.VERSION}}-linux-amd64.bin
-      - GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o node-{{.VERSION}}-linux-arm64.bin
+      - GOOS=darwin go build -ldflags "-s -w" -o node-{{.VERSION}}-darwin-arm64
+      - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-{{.VERSION}}-linux-amd64
+      - GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o node-{{.VERSION}}-linux-arm64
 
   digest:
     desc: Generate digests for node binaries.
     deps: [build]
     dir: ../node
     sources:
-      - node-{{.VERSION}}-*.bin
+      - node-{{.VERSION}}-darwin-arm64
+      - node-{{.VERSION}}-linux-amd64
+      - node-{{.VERSION}}-linux-arm64
     generates:
       - node-{{.VERSION}}-*.dgst
     cmds:
-      - openssl sha3-256 -out node-{{.VERSION}}-darwin-arm64.dgst node-{{.VERSION}}-darwin-arm64.bin   
-      - openssl sha3-256 -out node-{{.VERSION}}-linux-amd64.dgst node-{{.VERSION}}-linux-amd64.bin
-      - openssl sha3-256 -out node-{{.VERSION}}-linux-arm64.dgst node-{{.VERSION}}-linux-arm64.bin
+      - openssl sha3-256 -out node-{{.VERSION}}-darwin-arm64.dgst node-{{.VERSION}}-darwin-arm64
+      - openssl sha3-256 -out node-{{.VERSION}}-linux-amd64.dgst node-{{.VERSION}}-linux-amd64
+      - openssl sha3-256 -out node-{{.VERSION}}-linux-arm64.dgst node-{{.VERSION}}-linux-arm64
 
   sign:
     desc: Generate signatures for node binaries.
@@ -130,9 +134,9 @@ tasks:
       - docker:build_image
     cmds:
       - docker run --name signers --rm -it -v {{.PARENT_FOLDER}}:/home/{{.USER_NAME}}/ceremonyclient -u {{.USER_NAME}} -w /home/{{.USER_NAME}}/ceremonyclient/signers {{.QUILIBRIUM_SIGNERS_IMAGE_NAME}} task verify:build:container
-      - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
-      - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
-      - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
+      - diff node-{{.VERSION}}-darwin-arm64 node-tmp-darwin-arm64
+      - diff node-{{.VERSION}}-linux-amd64 node-tmp-linux-amd64
+      - diff node-{{.VERSION}}-linux-arm64 node-tmp-linux-arm64
 
   verify:build:container:
     desc: Verify that the existing binaries can be rebuilt exactly the same, inside tbe Docker container.
@@ -140,22 +144,24 @@ tasks:
     sources:
       - '**/*.go'
     generates:
-      - node-tmp-*.bin
+      - node-tmp-darwin-arm64
+      - node-tmp-linux-amd64
+      - node-tmp-linux-arm64
     cmds:
-      - GOOS=darwin go build -ldflags "-s -w" -o node-tmp-darwin-arm64.bin
-      - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-tmp-linux-amd64.bin
-      - GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o node-tmp-linux-arm64.bin
-      - diff node-{{.VERSION}}-darwin-arm64.bin node-tmp-darwin-arm64.bin
-      - diff node-{{.VERSION}}-linux-amd64.bin node-tmp-linux-amd64.bin
-      - diff node-{{.VERSION}}-linux-arm64.bin node-tmp-linux-arm64.bin
+      - GOOS=darwin go build -ldflags "-s -w" -o node-tmp-darwin-arm64
+      - GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o node-tmp-linux-amd64
+      - GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o node-tmp-linux-arm64
+      - diff node-{{.VERSION}}-darwin-arm64 node-tmp-darwin-arm64
+      - diff node-{{.VERSION}}-linux-amd64 node-tmp-linux-amd64
+      - diff node-{{.VERSION}}-linux-arm64 node-tmp-linux-arm64
 
   verify:digest:
     desc: Verify that the existing digests are correct.
     dir: ../node
     cmds:
-      - openssl sha3-256 -out node-tmp-darwin-arm64.dgst node-{{.VERSION}}-darwin-arm64.bin   
-      - openssl sha3-256 -out node-tmp-linux-amd64.dgst node-{{.VERSION}}-linux-amd64.bin
-      - openssl sha3-256 -out node-tmp-linux-arm64.dgst node-{{.VERSION}}-linux-arm64.bin
+      - openssl sha3-256 -out node-tmp-darwin-arm64.dgst node-{{.VERSION}}-darwin-arm64
+      - openssl sha3-256 -out node-tmp-linux-amd64.dgst node-{{.VERSION}}-linux-amd64
+      - openssl sha3-256 -out node-tmp-linux-arm64.dgst node-{{.VERSION}}-linux-arm64
       - diff node-{{.VERSION}}-darwin-arm64.dgst node-tmp-darwin-arm64.dgst
       - diff node-{{.VERSION}}-linux-amd64.dgst node-tmp-linux-amd64.dgst
       - diff node-{{.VERSION}}-linux-arm64.dgst node-tmp-linux-arm64.dgst

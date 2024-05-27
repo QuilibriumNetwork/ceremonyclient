@@ -192,7 +192,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			fmt.Printf("Signature check passed")
+			fmt.Println("Signature check passed")
 		}
 	}
 
@@ -735,6 +735,11 @@ func printLogo() {
 }
 
 func printVersion() {
+	patch := config.GetPatchNumber()
+	patchString := ""
+	if patch != 0x00 {
+		patchString = fmt.Sprintf("-p%d", patch)
+	}
 	fmt.Println(" ")
-	fmt.Println("                       Quilibrium Node - v" + config.GetVersionString() + " – Nebula")
+	fmt.Println("                       Quilibrium Node - v" + config.GetVersionString() + patchString + " – Nebula")
 }
