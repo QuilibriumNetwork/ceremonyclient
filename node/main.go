@@ -323,7 +323,6 @@ func main() {
 	}
 
 	fmt.Println("Loading ceremony state and starting node...")
-	kzg.Init()
 
 	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
 
@@ -428,6 +427,7 @@ func RunSelfTestIfNeeded(
 		logger.Info("no self-test report found, generating")
 	}
 
+	kzg.Init()
 	report := &protobufs.SelfTestReport{}
 	difficulty := nodeConfig.Engine.Difficulty
 	if difficulty == 0 {
