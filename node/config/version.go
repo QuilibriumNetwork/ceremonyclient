@@ -6,7 +6,7 @@ import (
 )
 
 func GetMinimumVersionCutoff() time.Time {
-	return time.Date(2024, time.May, 24, 4, 0, 0, 0, time.UTC)
+	return time.Date(2024, time.May, 28, 3, 0, 0, 0, time.UTC)
 }
 
 func GetMinimumVersion() []byte {
@@ -26,4 +26,8 @@ func FormatVersion(version []byte) string {
 		"%d.%d.%d",
 		version[0], version[1], version[2],
 	)
+}
+
+func GetPatchNumber() byte {
+	return 0x01
 }

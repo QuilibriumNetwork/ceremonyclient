@@ -55,7 +55,7 @@ type FrameProver interface {
 		challenge []byte,
 		parallelism uint32,
 		skew int64,
-	) (int64, [][]byte, error)
+	) (int64, [][]byte, int64, error)
 	VerifyChallengeProof(
 		challenge []byte,
 		timestamp int64,

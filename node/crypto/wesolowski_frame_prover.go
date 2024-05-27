@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
@@ -549,7 +550,9 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 	}
 
 	filter := proof[:len(frame.Filter)]
-	check := binary.BigEndian.Uint64(proof[len(frame.Filter) : len(frame.Filter)+8])
+	check := binary.BigEndian.Uint64(
+		proof[len(frame.Filter) : len(frame.Filter)+8],
+	)
 	timestamp := binary.BigEndian.Uint64(
 		proof[len(frame.Filter)+8 : len(frame.Filter)+16],
 	)
@@ -600,26 +603,25 @@ func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	challenge []byte,
 	parallelism uint32,
 	skew int64,
-) (int64, [][]byte, error) {
-	now := time.Now().UnixMilli()
-	input := binary.BigEndian.AppendUint64([]byte{}, uint64(now))
+) (int64, [][]byte, int64, error) {
+	now := time.Now()
+	nowMs := now.UnixMilli()
+	input := binary.BigEndian.AppendUint64([]byte{}, uint64(nowMs))
 	input = append(input, challenge...)
 	outputs := make([][]byte, parallelism)
 
 	wg := sync.WaitGroup{}
 	wg.Add(int(parallelism))
 
+	// 4.5 minutes = 270 seconds, one increment should be ten seconds
+	proofDuration := 270 * 1000
+	calibratedDifficulty := (int64(proofDuration) * 10000) / skew
 	for i := uint32(0); i < parallelism; i++ {
 		i := i
 		go func() {
 			instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
 			instanceInput = append(instanceInput, input...)
-			b := sha3.Sum256(input)
-
-			// 4.5 minutes = 270 seconds, one increment should be ten seconds
-			proofDuration := 270 * 1000
-			calibratedDifficulty := (int64(proofDuration) / skew) * 10000
-
+			b := sha3.Sum256(instanceInput)
 			v := vdf.New(uint32(calibratedDifficulty), b)
 
 			v.Execute()
@@ -632,7 +634,10 @@ func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	}
 
 	wg.Wait()
-	return now, outputs, nil
+	after := time.Since(now)
+	nextSkew := (skew * after.Milliseconds()) / int64(proofDuration)
+
+	return nowMs, outputs, nextSkew, nil
 }
 
 func (w *WesolowskiFrameProver) VerifyChallengeProof(
@@ -644,6 +649,10 @@ func (w *WesolowskiFrameProver) VerifyChallengeProof(
 	input := binary.BigEndian.AppendUint64([]byte{}, uint64(timestamp))
 	input = append(input, challenge...)
 
+	if assertedDifficulty < 1 {
+		return false
+	}
+
 	for i := uint32(0); i < uint32(len(proof)); i++ {
 		if len(proof[i]) != 516 {
 			return false
@@ -651,17 +660,28 @@ func (w *WesolowskiFrameProver) VerifyChallengeProof(
 
 		instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
 		instanceInput = append(instanceInput, input...)
-		b := sha3.Sum256(input)
+		b := sha3.Sum256(instanceInput)
 
 		// 4.5 minutes = 270 seconds, one increment should be ten seconds
 		proofDuration := 270 * 1000
 		skew := (assertedDifficulty * 12) / 10
-		calibratedDifficulty := (int64(proofDuration) / skew) * 10000
+		calibratedDifficulty := (int64(proofDuration) * 10000) / skew
 
 		v := vdf.New(uint32(calibratedDifficulty), b)
 		check := v.Verify([516]byte(proof[i]))
 		if !check {
-			return false
+			// TODO: Remove after 2024-05-28
+			if time.Now().Before(config.GetMinimumVersionCutoff()) {
+				calibratedDifficulty = (int64(proofDuration) / skew) * 10000
+
+				v = vdf.New(uint32(calibratedDifficulty), sha3.Sum256(input))
+				check = v.Verify([516]byte(proof[i]))
+				if !check {
+					return false
+				}
+			} else {
+				return false
+			}
 		}
 	}
 

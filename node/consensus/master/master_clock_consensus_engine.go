@@ -181,7 +181,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 					panic(err)
 				}
 
-				if head.FrameNumber > newFrame.FrameNumber || newFrame.FrameNumber-head.FrameNumber > 128 {
+				if head.FrameNumber > newFrame.FrameNumber ||
+					newFrame.FrameNumber-head.FrameNumber > 128 {
 					e.logger.Debug(
 						"frame out of range, ignoring",
 						zap.Uint64("number", newFrame.FrameNumber),
@@ -238,6 +239,8 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	go func() {
 		// Let it sit until we at least have a few more peers inbound
 		time.Sleep(30 * time.Second)
+		difficultyMetric := int64(100000)
+		skew := (difficultyMetric * 12) / 10
 
 		for {
 			head, err := e.masterTimeReel.Head()
@@ -246,22 +249,31 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			}
 
 			e.report.MasterHeadFrame = head.FrameNumber
+			e.report.DifficultyMetric = difficultyMetric
 			parallelism := e.report.Cores - 1
-			skew := (e.report.DifficultyMetric * 12) / 10
+
 			challenge := binary.BigEndian.AppendUint64(
 				[]byte{},
 				e.report.MasterHeadFrame,
 			)
 			challenge = append(challenge, e.pubSub.GetPeerID()...)
 
-			ts, proofs, err := e.frameProver.CalculateChallengeProof(
-				challenge,
-				parallelism,
-				skew,
-			)
+			ts, proofs, nextDifficultyMetric, err :=
+				e.frameProver.CalculateChallengeProof(
+					challenge,
+					parallelism,
+					skew,
+				)
 			if err != nil {
 				panic(err)
 			}
+			e.logger.Info(
+				"recalibrating difficulty metric",
+				zap.Int64("previous_difficulty_metric", difficultyMetric),
+				zap.Int64("next_difficulty_metric", nextDifficultyMetric),
+			)
+			difficultyMetric = nextDifficultyMetric
+			skew = (nextDifficultyMetric * 12) / 10
 
 			proof := binary.BigEndian.AppendUint64([]byte{}, uint64(ts))
 			for i := 0; i < len(proofs); i++ {
@@ -391,6 +403,10 @@ func (e *MasterClockConsensusEngine) performVerifyTest(
 		)
 		e.pubSub.SetPeerScore(challenge.peerID, -1000)
 	} else {
+		e.logger.Debug(
+			"received valid proof from peer",
+			zap.String("peer_id", peer.ID(challenge.peerID).String()),
+		)
 		info := e.peerInfoManager.GetPeerInfo(challenge.peerID)
 		info.LastSeen = time.Now().UnixMilli()
 	}
