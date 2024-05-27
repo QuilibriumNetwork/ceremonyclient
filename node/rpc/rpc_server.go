@@ -5,6 +5,7 @@ import (
 	"context"
 	"math/big"
 	"net/http"
+
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -156,7 +157,12 @@ func (r *RPCServer) GetNodeInfo(
 	}
 	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
 
-	return &protobufs.NodeInfoResponse{PeerId: peerID.String(), MaxFrame: r.masterClock.GetFrame().GetFrameNumber(), PeerScore: uint64(peerScore), Version: config.GetVersion()}, nil
+	return &protobufs.NodeInfoResponse{
+		PeerId:    peerID.String(),
+		MaxFrame:  r.masterClock.GetFrame().GetFrameNumber(),
+		PeerScore: uint64(peerScore),
+		Version:   config.GetVersion(),
+	}, nil
 }
 
 // GetPeerInfo implements protobufs.NodeServiceServer.
@@ -165,13 +171,23 @@ func (r *RPCServer) GetPeerInfo(
 	req *protobufs.GetPeerInfoRequest,
 ) (*protobufs.PeerInfoResponse, error) {
 	resp := &protobufs.PeerInfoResponse{}
-	for _, e := range r.executionEngines {
-		r := e.GetPeerInfo()
-		resp.PeerInfo = append(resp.PeerInfo, r.PeerInfo...)
-		resp.UncooperativePeerInfo = append(
-			resp.UncooperativePeerInfo,
-			r.UncooperativePeerInfo...,
-		)
+	manifests := r.masterClock.GetPeerManifests()
+	for _, m := range manifests.PeerManifests {
+		multiaddr := r.pubSub.GetMultiaddrOfPeer(m.PeerId)
+		addrs := []string{}
+		if multiaddr != "" {
+			addrs = append(addrs, multiaddr)
+		}
+
+		resp.PeerInfo = append(resp.PeerInfo, &protobufs.PeerInfo{
+			PeerId:     m.PeerId,
+			Multiaddrs: addrs,
+			MaxFrame:   m.MasterHeadFrame,
+			Timestamp:  m.LastSeen,
+			// We can get away with this for this release only, we will want to add
+			// version info in manifests.
+			Version: config.GetVersion(),
+		})
 	}
 	return resp, nil
 }
