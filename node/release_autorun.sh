@@ -3,7 +3,7 @@
 start_process() {
     version=$(cat config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d")
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if [[ $arch == arm* ]]; then
+        if [[ $(uname -m) == "aarch64"* ]]; then
             ./node-$version-linux-arm64 &
             main_process_id=$!
         else
