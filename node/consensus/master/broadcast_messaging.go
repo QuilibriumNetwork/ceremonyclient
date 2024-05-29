@@ -116,13 +116,17 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	peerID []byte,
 	any *anypb.Any,
 ) error {
-	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
 	report := &protobufs.SelfTestReport{}
 	if err := any.UnmarshalTo(report); err != nil {
 		return errors.Wrap(err, "handle self test report")
+	}
+
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		info := e.peerInfoManager.GetPeerInfo(peerID)
+		info.LastSeen = time.Now().UnixMilli()
+		info.DifficultyMetric = report.DifficultyMetric
+		info.MasterHeadFrame = report.MasterHeadFrame
+		return nil
 	}
 
 	// minimum proof size is one timestamp, one vdf proof, must match one fewer
