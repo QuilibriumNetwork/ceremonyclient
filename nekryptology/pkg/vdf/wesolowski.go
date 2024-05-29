@@ -89,7 +89,10 @@ func GenerateVDFWithStopChan(seed []byte, iterations, int_size_bits uint32, stop
 func GenerateVDFIteration(seed, x_blob []byte, iterations, int_size_bits uint32) ([]byte, []byte) {
 	int_size := (int_size_bits + 16) >> 4
 	D := iqc.CreateDiscriminant(seed, int_size_bits)
-	x, _ := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
+	x, ok := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
+	if !ok {
+		return nil, nil
+	}
 
 	y, proof := calculateVDF(D, x, iterations, int_size_bits, nil)
 
@@ -105,8 +108,15 @@ func VerifyVDF(seed, proof_blob []byte, iterations, int_size_bits uint32) bool {
 
 	D := iqc.CreateDiscriminant(seed, int_size_bits)
 	x := iqc.NewClassGroupFromAbDiscriminant(big.NewInt(2), big.NewInt(1), D)
-	y, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
-	proof, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
+	y, ok := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
+	if !ok {
+		return false
+	}
+
+	proof, ok := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
+	if !ok {
+		return false
+	}
 
 	return verifyProof(x, y, proof, iterations)
 }
@@ -114,9 +124,20 @@ func VerifyVDF(seed, proof_blob []byte, iterations, int_size_bits uint32) bool {
 func VerifyVDFIteration(seed, x_blob, proof_blob []byte, iterations, int_size_bits uint32) bool {
 	int_size := (int_size_bits + 16) >> 4
 	D := iqc.CreateDiscriminant(seed, int_size_bits)
-	x, _ := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
-	y, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
-	proof, _ := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
+	x, ok := iqc.NewClassGroupFromBytesDiscriminant(x_blob[:(2*int_size)], D)
+	if !ok {
+		return false
+	}
+
+	y, ok := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[:(2*int_size)], D)
+	if !ok {
+		return false
+	}
+
+	proof, ok := iqc.NewClassGroupFromBytesDiscriminant(proof_blob[2*int_size:], D)
+	if !ok {
+		return false
+	}
 
 	return verifyProof(x, y, proof, iterations)
 }

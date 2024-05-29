@@ -30,10 +30,12 @@ func TestMasterProve(t *testing.T) {
 func TestChallengeProof(t *testing.T) {
 	l, _ := zap.NewProduction()
 	w := crypto.NewWesolowskiFrameProver(l)
-	now, proofs, nextSkew, err := w.CalculateChallengeProof([]byte{0x01, 0x02, 0x03}, 3, 120000)
+	now := time.Now().UnixMilli()
+	proofs, nextSkew, err := w.CalculateChallengeProof([]byte{0x01, 0x02, 0x03}, 0, 120000, now)
 	assert.NoError(t, err)
-	assert.True(t, w.VerifyChallengeProof([]byte{0x01, 0x02, 0x03}, now, 100000, proofs))
-	now, proofs, _, err = w.CalculateChallengeProof([]byte{0x01, 0x02, 0x03}, 3, nextSkew*12/10)
+	assert.True(t, w.VerifyChallengeProof([]byte{0x01, 0x02, 0x03}, now, 100000, [][]byte{proofs}))
+	now = time.Now().UnixMilli()
+	proofs, _, err = w.CalculateChallengeProof([]byte{0x01, 0x02, 0x03}, 0, nextSkew*12/10, now)
 	assert.NoError(t, err)
-	assert.True(t, w.VerifyChallengeProof([]byte{0x01, 0x02, 0x03}, now, nextSkew, proofs))
+	assert.True(t, w.VerifyChallengeProof([]byte{0x01, 0x02, 0x03}, now, nextSkew, [][]byte{proofs}))
 }

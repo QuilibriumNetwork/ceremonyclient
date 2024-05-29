@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"math/big"
 	"sync"
@@ -15,9 +16,12 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -68,6 +72,7 @@ type MasterClockConsensusEngine struct {
 	verifyTestCh                chan verifyChallenge
 	currentReceivingSyncPeers   int
 	currentReceivingSyncPeersMx sync.Mutex
+	engineConfig                *config.EngineConfig
 }
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
@@ -131,6 +136,7 @@ func NewMasterClockConsensusEngine(
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
 		verifyTestCh:        make(chan verifyChallenge),
+		engineConfig:        engineConfig,
 	}
 
 	e.addPeerManifestReport(e.pubSub.GetPeerID(), report)
@@ -241,6 +247,16 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 		time.Sleep(30 * time.Second)
 		difficultyMetric := int64(100000)
 		skew := (difficultyMetric * 12) / 10
+		parallelism := e.report.Cores - 1
+
+		if parallelism < 3 {
+			panic("invalid system configuration, minimum system configuration must be four cores")
+		}
+
+		clients, err := e.createParallelDataClients(int(parallelism))
+		if err != nil {
+			panic(err)
+		}
 
 		for {
 			head, err := e.masterTimeReel.Head()
@@ -250,7 +266,6 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 
 			e.report.MasterHeadFrame = head.FrameNumber
 			e.report.DifficultyMetric = difficultyMetric
-			parallelism := e.report.Cores - 1
 
 			challenge := binary.BigEndian.AppendUint64(
 				[]byte{},
@@ -258,15 +273,42 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			)
 			challenge = append(challenge, e.pubSub.GetPeerID()...)
 
-			ts, proofs, nextDifficultyMetric, err :=
-				e.frameProver.CalculateChallengeProof(
-					challenge,
-					parallelism,
-					skew,
-				)
-			if err != nil {
-				panic(err)
+			proofs := make([][]byte, parallelism)
+			nextMetrics := make([]int64, parallelism)
+
+			wg := sync.WaitGroup{}
+			wg.Add(int(parallelism))
+
+			ts := time.Now().UnixMilli()
+			for i := uint32(0); i < parallelism; i++ {
+				i := i
+				go func() {
+					resp, err :=
+						clients[i].CalculateChallengeProof(
+							context.Background(),
+							&protobufs.ChallengeProofRequest{
+								Challenge: challenge,
+								Core:      i,
+								Skew:      skew,
+								NowMs:     ts,
+							},
+						)
+					if err != nil {
+						panic(err)
+					}
+
+					proofs[i], nextMetrics[i] = resp.Output, resp.NextSkew
+					wg.Done()
+				}()
 			}
+			wg.Wait()
+			nextDifficultySum := uint64(0)
+			for i := 0; i < int(parallelism); i++ {
+				nextDifficultySum += uint64(nextMetrics[i])
+			}
+
+			nextDifficultyMetric := int64(nextDifficultySum / uint64(parallelism))
+
 			e.logger.Info(
 				"recalibrating difficulty metric",
 				zap.Int64("previous_difficulty_metric", difficultyMetric),
@@ -334,6 +376,64 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	return errChan
+}
+
+func (e *MasterClockConsensusEngine) createParallelDataClients(
+	paralellism int,
+) ([]protobufs.DataIPCServiceClient, error) {
+	e.logger.Info(
+		"connecting to data worker processes",
+		zap.Int("parallelism", paralellism),
+	)
+
+	if e.engineConfig.DataWorkerBaseListenMultiaddr == "" {
+		e.engineConfig.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	}
+
+	if e.engineConfig.DataWorkerBaseListenPort == 0 {
+		e.engineConfig.DataWorkerBaseListenPort = 40000
+	}
+
+	clients := make([]protobufs.DataIPCServiceClient, paralellism)
+
+	for i := 0; i < paralellism; i++ {
+		ma, err := multiaddr.NewMultiaddr(
+			fmt.Sprintf(
+				e.engineConfig.DataWorkerBaseListenMultiaddr,
+				int(e.engineConfig.DataWorkerBaseListenPort)+i,
+			),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		_, addr, err := mn.DialArgs(ma)
+		if err != nil {
+			panic(err)
+		}
+
+		conn, err := grpc.Dial(
+			addr,
+			grpc.WithTransportCredentials(
+				insecure.NewCredentials(),
+			),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallSendMsgSize(10*1024*1024),
+				grpc.MaxCallRecvMsgSize(10*1024*1024),
+			),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		clients[i] = protobufs.NewDataIPCServiceClient(conn)
+	}
+
+	e.logger.Info(
+		"connected to data worker processes",
+		zap.Int("parallelism", paralellism),
+	)
+	return clients, nil
 }
 
 func (e *MasterClockConsensusEngine) PerformValidation(
