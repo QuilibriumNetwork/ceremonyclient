@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"math/big"
-	"sync"
 	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
@@ -601,43 +600,31 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 
 func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	challenge []byte,
-	parallelism uint32,
+	core uint32,
 	skew int64,
-) (int64, [][]byte, int64, error) {
-	now := time.Now()
-	nowMs := now.UnixMilli()
+	nowMs int64,
+) ([]byte, int64, error) {
 	input := binary.BigEndian.AppendUint64([]byte{}, uint64(nowMs))
 	input = append(input, challenge...)
-	outputs := make([][]byte, parallelism)
-
-	wg := sync.WaitGroup{}
-	wg.Add(int(parallelism))
 
 	// 4.5 minutes = 270 seconds, one increment should be ten seconds
 	proofDuration := 270 * 1000
 	calibratedDifficulty := (int64(proofDuration) * 10000) / skew
-	for i := uint32(0); i < parallelism; i++ {
-		i := i
-		go func() {
-			instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
-			instanceInput = append(instanceInput, input...)
-			b := sha3.Sum256(instanceInput)
-			v := vdf.New(uint32(calibratedDifficulty), b)
+	instanceInput := binary.BigEndian.AppendUint32([]byte{}, core)
+	instanceInput = append(instanceInput, input...)
+	b := sha3.Sum256(instanceInput)
+	v := vdf.New(uint32(calibratedDifficulty), b)
 
-			v.Execute()
-			o := v.GetOutput()
+	v.Execute()
+	o := v.GetOutput()
 
-			outputs[i] = make([]byte, 516)
-			copy(outputs[i][:], o[:])
-			wg.Done()
-		}()
-	}
-
-	wg.Wait()
+	output := make([]byte, 516)
+	copy(output[:], o[:])
+	now := time.UnixMilli(nowMs)
 	after := time.Since(now)
 	nextSkew := (skew * after.Milliseconds()) / int64(proofDuration)
 
-	return nowMs, outputs, nextSkew, nil
+	return output, nextSkew, nil
 }
 
 func (w *WesolowskiFrameProver) VerifyChallengeProof(
