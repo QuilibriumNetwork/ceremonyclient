@@ -146,8 +146,8 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 	}
 
 	difficulty := m.engineConfig.Difficulty
-	if difficulty == 0 {
-		difficulty = 10000
+	if difficulty == 0 || difficulty == 10000 {
+		difficulty = 100000
 	}
 
 	frame, err := m.frameProver.CreateMasterGenesisFrame(

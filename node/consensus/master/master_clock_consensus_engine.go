@@ -20,6 +20,7 @@ import (
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -49,6 +50,7 @@ type MasterClockConsensusEngine struct {
 	state               consensus.EngineState
 	pubSub              p2p.PubSub
 	keyManager          keys.KeyManager
+	dataProver          crypto.InclusionProver
 	frameProver         crypto.FrameProver
 	lastFrameReceivedAt time.Time
 
@@ -63,6 +65,7 @@ type MasterClockConsensusEngine struct {
 	historicFramesMx            sync.Mutex
 	seenFrames                  []*protobufs.ClockFrame
 	historicFrames              []*protobufs.ClockFrame
+	dataProofStore              store.DataProofStore
 	clockStore                  store.ClockStore
 	masterTimeReel              *qtime.MasterTimeReel
 	peerInfoManager             p2p.PeerInfoManager
@@ -80,9 +83,11 @@ var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
 func NewMasterClockConsensusEngine(
 	engineConfig *config.EngineConfig,
 	logger *zap.Logger,
+	dataProofStore store.DataProofStore,
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
+	dataProver crypto.InclusionProver,
 	frameProver crypto.FrameProver,
 	masterTimeReel *qtime.MasterTimeReel,
 	peerInfoManager p2p.PeerInfoManager,
@@ -104,6 +109,10 @@ func NewMasterClockConsensusEngine(
 		panic(errors.New("pubsub is nil"))
 	}
 
+	if dataProver == nil {
+		panic(errors.New("data prover is nil"))
+	}
+
 	if frameProver == nil {
 		panic(errors.New("frame prover is nil"))
 	}
@@ -118,7 +127,7 @@ func NewMasterClockConsensusEngine(
 	}
 
 	e := &MasterClockConsensusEngine{
-		difficulty:          10000,
+		difficulty:          100000,
 		logger:              logger,
 		state:               consensus.EngineStateStopped,
 		keyManager:          keyManager,
@@ -128,7 +137,9 @@ func NewMasterClockConsensusEngine(
 		input:               seed,
 		lastFrameReceivedAt: time.Time{},
 		syncingStatus:       SyncStatusNotSyncing,
+		dataProofStore:      dataProofStore,
 		clockStore:          clockStore,
+		dataProver:          dataProver,
 		frameProver:         frameProver,
 		masterTimeReel:      masterTimeReel,
 		peerInfoManager:     peerInfoManager,
@@ -245,17 +256,72 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	go func() {
 		// Let it sit until we at least have a few more peers inbound
 		time.Sleep(30 * time.Second)
-		difficultyMetric := int64(100000)
-		skew := (difficultyMetric * 12) / 10
 		parallelism := e.report.Cores - 1
 
 		if parallelism < 3 {
 			panic("invalid system configuration, minimum system configuration must be four cores")
 		}
 
-		clients, err := e.createParallelDataClients(int(parallelism))
-		if err != nil {
+		var clients []protobufs.DataIPCServiceClient
+		if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+			clients, err = e.createParallelDataClientsFromList()
+			if err != nil {
+				panic(err)
+			}
+		} else {
+			clients, err = e.createParallelDataClientsFromBaseMultiaddr(
+				int(parallelism),
+			)
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		increment, _, previousOutput, err :=
+			e.dataProofStore.GetLatestDataTimeProof(e.pubSub.GetPeerID())
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			panic(err)
+		}
+
+		prevIndex := -1
+		prevHashes := []byte{}
+		hashes := []byte{}
+		previousPreviousCommitment := []byte{}
+		previousCommitment := []byte{}
+		prevProofs := [][]byte{}
+		proofs := [][]byte{}
+		commitment := []byte{}
+		skipStore := false
+
+		if err != nil && errors.Is(err, store.ErrNotFound) {
+			e.logger.Info("no state found, starting from genesis")
+			increment = 0
+			rootFrame, err := e.clockStore.GetMasterClockFrame(e.filter, 0)
+			if err != nil {
+				panic(err)
+			}
+
+			previousCommitment = rootFrame.Output
+		} else {
+			e.logger.Info("state found", zap.Uint32("increment", increment))
+			_, _, previousCommitment, _ = GetOutputs(previousOutput)
+			skipStore = true
+		}
+
+		commitment = previousCommitment
+
+		input := []byte{}
+		input = append(input, e.pubSub.GetPeerID()...)
+		input = append(input, previousCommitment...)
+		proofs = e.PerformTimeProof(input, parallelism, increment, clients)
+
+		polySize := 128
+		if parallelism > 2048 {
+			polySize = 65536
+		} else if parallelism > 1024 {
+			polySize = 2048
+		} else if parallelism > 128 {
+			polySize = 1024
 		}
 
 		for {
@@ -265,71 +331,92 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 			}
 
 			e.report.MasterHeadFrame = head.FrameNumber
-			e.report.DifficultyMetric = difficultyMetric
 
-			challenge := binary.BigEndian.AppendUint64(
-				[]byte{},
-				e.report.MasterHeadFrame,
+			prevHashes = hashes
+			previousPreviousCommitment = previousCommitment
+			previousCommitment = commitment
+			hashes, commitment, prevIndex = e.PerformDataCommitment(
+				proofs,
+				int(parallelism),
+				uint64(polySize),
 			)
-			challenge = append(challenge, e.pubSub.GetPeerID()...)
 
-			proofs := make([][]byte, parallelism)
-			nextMetrics := make([]int64, parallelism)
+			// PoMW requires two forms of proofs – time proofs of data, then execution
+			// proofs. In the multiproof case we also have a random selection portion
+			// of the execution proofs by issuing a challenge from the next proof,
+			// such that it generates a random choice of input from the prior. This
+			// allows recursive proof evaluation without requiring retention of all
+			// parallel proofs.
+			if len(prevProofs) != 0 {
+				if !skipStore {
+					e.report.Proof = []byte{}
+					e.report.Proof = binary.BigEndian.AppendUint32(
+						e.report.Proof,
+						uint32(prevIndex),
+					)
+					e.report.Increment = increment - 1
+					e.report.Challenge = previousPreviousCommitment
+					e.report.Proof = append(e.report.Proof, prevProofs[prevIndex]...)
 
-			wg := sync.WaitGroup{}
-			wg.Add(int(parallelism))
-
-			ts := time.Now().UnixMilli()
-			for i := uint32(0); i < parallelism; i++ {
-				i := i
-				go func() {
-					resp, err :=
-						clients[i].CalculateChallengeProof(
-							context.Background(),
-							&protobufs.ChallengeProofRequest{
-								Challenge: challenge,
-								Core:      i,
-								Skew:      skew,
-								NowMs:     ts,
-							},
-						)
+					p, err := e.dataProver.ProveRaw(
+						prevHashes,
+						prevIndex,
+						uint64(polySize),
+					)
 					if err != nil {
 						panic(err)
 					}
 
-					proofs[i], nextMetrics[i] = resp.Output, resp.NextSkew
-					wg.Done()
-				}()
-			}
-			wg.Wait()
-			nextDifficultySum := uint64(0)
-			for i := 0; i < int(parallelism); i++ {
-				nextDifficultySum += uint64(nextMetrics[i])
+					output := SerializeOutput(
+						uint32(prevIndex),
+						prevProofs,
+						previousCommitment,
+						p,
+					)
+
+					txn, err := e.dataProofStore.NewTransaction()
+					if err != nil {
+						panic(err)
+					}
+					e.logger.Info(
+						"storing proof",
+						zap.Uint32("increment", increment-1),
+					)
+					err = e.dataProofStore.PutDataTimeProof(
+						txn,
+						parallelism,
+						e.pubSub.GetPeerID(),
+						increment-1,
+						previousPreviousCommitment,
+						output,
+					)
+					if err != nil {
+						panic(err)
+					}
+
+					if err := txn.Commit(); err != nil {
+						panic(err)
+					}
+
+					e.logger.Info(
+						"broadcasting self-test info",
+						zap.Uint64("current_frame", e.report.MasterHeadFrame),
+					)
+
+					if err := e.publishMessage(e.filter, e.report); err != nil {
+						e.logger.Debug("error publishing message", zap.Error(err))
+					}
+				} else {
+					skipStore = false
+				}
 			}
 
-			nextDifficultyMetric := int64(nextDifficultySum / uint64(parallelism))
-
-			e.logger.Info(
-				"recalibrating difficulty metric",
-				zap.Int64("previous_difficulty_metric", difficultyMetric),
-				zap.Int64("next_difficulty_metric", nextDifficultyMetric),
-			)
-			difficultyMetric = nextDifficultyMetric
-			skew = (nextDifficultyMetric * 12) / 10
-
-			proof := binary.BigEndian.AppendUint64([]byte{}, uint64(ts))
-			for i := 0; i < len(proofs); i++ {
-				proof = append(proof, proofs[i]...)
-			}
-			e.report.Proof = proof
-			e.logger.Info(
-				"broadcasting self-test info",
-				zap.Uint64("current_frame", e.report.MasterHeadFrame),
-			)
-
-			if err := e.publishMessage(e.filter, e.report); err != nil {
-				e.logger.Debug("error publishing message", zap.Error(err))
-			}
+			increment++
+			input := []byte{}
+			input = append(input, e.pubSub.GetPeerID()...)
+			input = append(input, commitment...)
+			prevProofs = proofs
+			proofs = e.PerformTimeProof(input, parallelism, increment, clients)
 		}
 	}()
 
@@ -378,12 +465,163 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	return errChan
 }
 
-func (e *MasterClockConsensusEngine) createParallelDataClients(
-	paralellism int,
+func SerializeOutput(
+	previousIndex uint32,
+	previousOutputs [][]byte,
+	kzgCommitment []byte,
+	kzgProof []byte,
+) []byte {
+	serializedOutput := []byte{}
+	serializedOutput = binary.BigEndian.AppendUint32(
+		serializedOutput,
+		previousIndex,
+	)
+	serializedOutput = append(serializedOutput, previousOutputs[previousIndex]...)
+	serializedOutput = append(serializedOutput, kzgCommitment...)
+	serializedOutput = append(serializedOutput, kzgProof...)
+	return serializedOutput
+}
+
+func GetOutputs(output []byte) (
+	index uint32,
+	indexProof []byte,
+	kzgCommitment []byte,
+	kzgProof []byte,
+) {
+	index = binary.BigEndian.Uint32(output[:4])
+	indexProof = output[4:520]
+	kzgCommitment = output[520:594]
+	kzgProof = output[594:668]
+	return index, indexProof, kzgCommitment, kzgProof
+}
+
+func (e *MasterClockConsensusEngine) PerformTimeProof(
+	challenge []byte,
+	parallelism uint32,
+	increment uint32,
+	clients []protobufs.DataIPCServiceClient,
+) [][]byte {
+	proofs := make([][]byte, parallelism)
+	now := time.Now()
+
+	// Perform the VDFs:
+	wg := sync.WaitGroup{}
+	wg.Add(int(parallelism))
+
+	for i := uint32(0); i < parallelism; i++ {
+		i := i
+		go func() {
+			resp, err :=
+				clients[i].CalculateChallengeProof(
+					context.Background(),
+					&protobufs.ChallengeProofRequest{
+						Challenge: challenge,
+						Core:      i,
+						Increment: increment,
+					},
+				)
+			if err != nil {
+				panic(err)
+			}
+
+			proofs[i] = resp.Output
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	since := time.Since(now)
+
+	e.logger.Info(
+		"completed duration proof",
+		zap.Uint32("increment", increment),
+		zap.Duration("time_taken", since),
+	)
+
+	return proofs
+}
+
+func (e *MasterClockConsensusEngine) PerformDataCommitment(
+	proofs [][]byte,
+	parallelism int,
+	polySize uint64,
+) ([]byte, []byte, int) {
+	// Take the VDF outputs and generate some deterministic outputs to feed
+	// into a KZG commitment:
+	output := []byte{}
+	for i := 0; i < len(proofs); i++ {
+		h := sha3.Sum512(proofs[i])
+		output = append(output, h[:]...)
+	}
+
+	nextInput, err := e.dataProver.CommitRaw(output, polySize)
+	if err != nil {
+		panic(err)
+	}
+
+	inputHash := sha3.Sum256(nextInput)
+	inputHashBI := big.NewInt(0).SetBytes(inputHash[:])
+	prevIndex := int(inputHashBI.Mod(
+		inputHashBI,
+		big.NewInt(int64(parallelism)),
+	).Int64())
+
+	return output, nextInput, prevIndex
+}
+
+func (e *MasterClockConsensusEngine) createParallelDataClientsFromList() (
+	[]protobufs.DataIPCServiceClient,
+	error,
+) {
+	parallelism := len(e.engineConfig.DataWorkerMultiaddrs)
+
+	e.logger.Info(
+		"connecting to data worker processes",
+		zap.Int("parallelism", parallelism),
+	)
+
+	clients := make([]protobufs.DataIPCServiceClient, parallelism)
+
+	for i := 0; i < parallelism; i++ {
+		ma, err := multiaddr.NewMultiaddr(e.engineConfig.DataWorkerMultiaddrs[i])
+		if err != nil {
+			panic(err)
+		}
+
+		_, addr, err := mn.DialArgs(ma)
+		if err != nil {
+			panic(err)
+		}
+
+		conn, err := grpc.Dial(
+			addr,
+			grpc.WithTransportCredentials(
+				insecure.NewCredentials(),
+			),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallSendMsgSize(10*1024*1024),
+				grpc.MaxCallRecvMsgSize(10*1024*1024),
+			),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		clients[i] = protobufs.NewDataIPCServiceClient(conn)
+	}
+
+	e.logger.Info(
+		"connected to data worker processes",
+		zap.Int("parallelism", parallelism),
+	)
+	return clients, nil
+}
+
+func (e *MasterClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
+	parallelism int,
 ) ([]protobufs.DataIPCServiceClient, error) {
 	e.logger.Info(
 		"connecting to data worker processes",
-		zap.Int("parallelism", paralellism),
+		zap.Int("parallelism", parallelism),
 	)
 
 	if e.engineConfig.DataWorkerBaseListenMultiaddr == "" {
@@ -394,9 +632,9 @@ func (e *MasterClockConsensusEngine) createParallelDataClients(
 		e.engineConfig.DataWorkerBaseListenPort = 40000
 	}
 
-	clients := make([]protobufs.DataIPCServiceClient, paralellism)
+	clients := make([]protobufs.DataIPCServiceClient, parallelism)
 
-	for i := 0; i < paralellism; i++ {
+	for i := 0; i < parallelism; i++ {
 		ma, err := multiaddr.NewMultiaddr(
 			fmt.Sprintf(
 				e.engineConfig.DataWorkerBaseListenMultiaddr,
@@ -431,7 +669,7 @@ func (e *MasterClockConsensusEngine) createParallelDataClients(
 
 	e.logger.Info(
 		"connected to data worker processes",
-		zap.Int("parallelism", paralellism),
+		zap.Int("parallelism", parallelism),
 	)
 	return clients, nil
 }
@@ -481,11 +719,11 @@ func (e *MasterClockConsensusEngine) Stop(force bool) <-chan error {
 }
 
 type verifyChallenge struct {
-	peerID           []byte
-	challenge        []byte
-	timestamp        int64
-	difficultyMetric int64
-	proofs           [][]byte
+	peerID    []byte
+	challenge []byte
+	increment uint32
+	cores     uint32
+	proof     []byte
 }
 
 func (e *MasterClockConsensusEngine) performVerifyTest(
@@ -493,9 +731,9 @@ func (e *MasterClockConsensusEngine) performVerifyTest(
 ) {
 	if !e.frameProver.VerifyChallengeProof(
 		challenge.challenge,
-		challenge.timestamp,
-		challenge.difficultyMetric,
-		challenge.proofs,
+		challenge.increment,
+		binary.BigEndian.Uint32(challenge.proof[:4]),
+		challenge.proof[4:],
 	) {
 		e.logger.Warn(
 			"received invalid proof from peer",

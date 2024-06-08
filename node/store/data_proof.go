@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"math/big"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
@@ -27,6 +28,27 @@ type DataProofStore interface {
 		aggregateProof *protobufs.InclusionAggregateProof,
 		commitment []byte,
 	) error
+	GetDataTimeProof(
+		peerId []byte,
+		increment uint32,
+	) (difficulty, parallelism uint32, input, output []byte, err error)
+	GetTotalReward(
+		peerId []byte,
+	) (*big.Int, error)
+	PutDataTimeProof(
+		txn Transaction,
+		parallelism uint32,
+		peerId []byte,
+		increment uint32,
+		input []byte,
+		output []byte,
+	) error
+	GetLatestDataTimeProof(peerId []byte) (
+		increment uint32,
+		parallelism uint32,
+		output []byte,
+		err error,
+	)
 }
 
 var _ DataProofStore = (*PebbleDataProofStore)(nil)
@@ -47,10 +69,13 @@ func NewPebbleDataProofStore(
 }
 
 const (
-	DATA_PROOF           = 0x04
-	DATA_PROOF_METADATA  = 0x00
-	DATA_PROOF_INCLUSION = 0x01
-	DATA_PROOF_SEGMENT   = 0x02
+	DATA_PROOF             = 0x04
+	DATA_PROOF_METADATA    = 0x00
+	DATA_PROOF_INCLUSION   = 0x01
+	DATA_PROOF_SEGMENT     = 0x02
+	DATA_TIME_PROOF        = 0x05
+	DATA_TIME_PROOF_DATA   = 0x00
+	DATA_TIME_PROOF_LATEST = 0x01
 )
 
 func dataProofMetadataKey(filter []byte, commitment []byte) []byte {
@@ -79,6 +104,19 @@ func dataProofSegmentKey(
 	key := []byte{DATA_PROOF, DATA_PROOF_SEGMENT}
 	key = append(key, hash...)
 	key = append(key, filter...)
+	return key
+}
+
+func dataTimeProofKey(peerId []byte, increment uint32) []byte {
+	key := []byte{DATA_TIME_PROOF, DATA_TIME_PROOF_DATA}
+	key = append(key, peerId...)
+	key = binary.BigEndian.AppendUint32(key, increment)
+	return key
+}
+
+func dataTimeProofLatestKey(peerId []byte) []byte {
+	key := []byte{DATA_TIME_PROOF, DATA_TIME_PROOF_LATEST}
+	key = append(key, peerId...)
 	return key
 }
 
@@ -361,4 +399,171 @@ func (p *PebbleDataProofStore) PutAggregateProof(
 		aggregateProof,
 		commitment,
 	)
+}
+
+func (p *PebbleDataProofStore) GetDataTimeProof(
+	peerId []byte,
+	increment uint32,
+) (difficulty, parallelism uint32, input, output []byte, err error) {
+	data, closer, err := p.db.Get(dataTimeProofKey(peerId, increment))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			err = ErrNotFound
+			return
+		}
+		err = errors.Wrap(err, "get data time proof")
+		return
+	}
+
+	defer closer.Close()
+	if len(data) < 24 {
+		err = ErrInvalidData
+		return
+	}
+
+	difficulty = binary.BigEndian.Uint32(data[:4])
+	parallelism = binary.BigEndian.Uint32(data[4:8])
+	inputLen := binary.BigEndian.Uint64(data[8:16])
+
+	// Verify length of remaining data is at least equal to the input and next
+	// length prefix
+	if uint64(len(data[16:])) < inputLen+8 {
+		err = ErrInvalidData
+		return
+	}
+
+	input = make([]byte, inputLen)
+	copy(input[:], data[16:16+inputLen])
+
+	outputLen := binary.BigEndian.Uint64(data[16+inputLen : 16+inputLen+8])
+
+	// Verify length
+	if uint64(len(data[16+inputLen+8:])) < outputLen {
+		err = ErrInvalidData
+		return
+	}
+
+	output = make([]byte, outputLen)
+	copy(output[:], data[16+inputLen+8:])
+	return difficulty, parallelism, input, output, nil
+}
+
+func (p *PebbleDataProofStore) GetTotalReward(
+	peerId []byte,
+) (*big.Int, error) {
+	reward := big.NewInt(0)
+	prev, closer, err := p.db.Get(dataTimeProofLatestKey(peerId))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return big.NewInt(0), nil
+		}
+
+		return nil, errors.Wrap(err, "get total difficulty sum")
+	}
+
+	if len(prev) != 0 {
+		reward.SetBytes(prev[4:])
+
+		if err = closer.Close(); err != nil {
+			return nil, errors.Wrap(err, "get total difficulty sum")
+		}
+	}
+
+	return reward, nil
+}
+
+func (p *PebbleDataProofStore) PutDataTimeProof(
+	txn Transaction,
+	parallelism uint32,
+	peerId []byte,
+	increment uint32,
+	input []byte,
+	output []byte,
+) error {
+	// Now, for the assumptions.
+	// Rewards are calculated based off of a current average rate of growth such
+	// that we continue at the rate we have been, for the course of the next month
+	// and carry it to now it such that the greatest advantage gleaned is from
+	// upgrading on time, akin to a "difficulty bomb" in reverse, but locally
+	// calculated.
+	difficulty := 200000 - (increment / 4)
+
+	// Basis split on the estimated shard level for growth rate (in terms of
+	// units): 240 (QUIL) * 8000000000 (conversion factor) / 1600000 (shards)
+	//       = 1200000 units per reward interval per core
+	pomwBasis := big.NewInt(1200000)
+	reward := new(big.Int)
+	reward = reward.Mul(pomwBasis, big.NewInt(int64(parallelism)))
+
+	priorSum := big.NewInt(0)
+	prev, closer, err := p.db.Get(dataTimeProofLatestKey(peerId))
+	if err != nil && (!errors.Is(err, pebble.ErrNotFound) || increment != 0) {
+		return errors.Wrap(err, "put data time proof")
+	}
+
+	if len(prev) != 0 {
+		priorSum.SetBytes(prev[4:])
+		prevIncrement := binary.BigEndian.Uint32(prev[:4])
+
+		if err = closer.Close(); err != nil {
+			return errors.Wrap(err, "put data time proof")
+		}
+
+		if prevIncrement != increment-1 {
+			return errors.Wrap(errors.New("invalid increment"), "put data time proof")
+		}
+	}
+
+	data := []byte{}
+	data = binary.BigEndian.AppendUint32(data, difficulty)
+	data = binary.BigEndian.AppendUint32(data, parallelism)
+	data = binary.BigEndian.AppendUint64(data, uint64(len(input)))
+	data = append(data, input...)
+	data = binary.BigEndian.AppendUint64(data, uint64(len(output)))
+	data = append(data, output...)
+	err = txn.Set(dataTimeProofKey(peerId, increment), data)
+	if err != nil {
+		return errors.Wrap(err, "put data time proof")
+	}
+
+	latest := []byte{}
+	latest = binary.BigEndian.AppendUint32(latest, increment)
+
+	priorSum.Add(priorSum, reward)
+	latest = append(latest, priorSum.FillBytes(make([]byte, 32))...)
+
+	if err = txn.Set(dataTimeProofLatestKey(peerId), latest); err != nil {
+		return errors.Wrap(err, "put data time proof")
+	}
+
+	return nil
+}
+
+func (p *PebbleDataProofStore) GetLatestDataTimeProof(peerId []byte) (
+	increment uint32,
+	parallelism uint32,
+	output []byte,
+	err error,
+) {
+	prev, closer, err := p.db.Get(dataTimeProofLatestKey(peerId))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, 0, nil, ErrNotFound
+		}
+
+		return 0, 0, nil, errors.Wrap(err, "get latest data time proof")
+	}
+
+	if len(prev) < 4 {
+		return 0, 0, nil, ErrInvalidData
+	}
+
+	increment = binary.BigEndian.Uint32(prev[:4])
+	if err = closer.Close(); err != nil {
+		return 0, 0, nil, errors.Wrap(err, "get latest data time proof")
+	}
+
+	_, parallelism, _, output, err = p.GetDataTimeProof(peerId, increment)
+
+	return increment, parallelism, output, err
 }

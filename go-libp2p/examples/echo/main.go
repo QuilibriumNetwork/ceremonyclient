@@ -88,7 +88,7 @@ func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, er
 
 func getHostAddress(ha host.Host) string {
 	// Build host multiaddress
-	hostAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", ha.ID().Pretty()))
+	hostAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", ha.ID()))
 
 	// Now we can build a full multiaddress to reach this host
 	// by encapsulating both addresses:
@@ -124,18 +124,6 @@ func startListener(ctx context.Context, ha host.Host, listenPort int, insecure b
 func runSender(ctx context.Context, ha host.Host, targetPeer string) {
 	fullAddr := getHostAddress(ha)
 	log.Printf("I am %s\n", fullAddr)
-
-	// Set a stream handler on host A. /echo/1.0.0 is
-	// a user-defined protocol name.
-	ha.SetStreamHandler("/echo/1.0.0", func(s network.Stream) {
-		log.Println("sender received new stream")
-		if err := doEcho(s); err != nil {
-			log.Println(err)
-			s.Reset()
-		} else {
-			s.Close()
-		}
-	})
 
 	// Turn the targetPeer into a multiaddr.
 	maddr, err := ma.NewMultiaddr(targetPeer)

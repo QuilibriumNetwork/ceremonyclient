@@ -1,6 +1,9 @@
-.config*
+**/.config*
 **/.idea
 **/.vscode
 github.env
 Taskfile.yaml
 
+# Rust
+target
+vdf/generated

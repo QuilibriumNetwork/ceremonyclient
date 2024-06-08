@@ -7,13 +7,11 @@ option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 message ChallengeProofRequest {
   bytes challenge = 1;
   uint32 core = 2;
-  int64 skew = 3;
-  int64 now_ms = 4;
+  uint32 increment = 3;
 }
 
 message ChallengeProofResponse {
   bytes output = 1;
-  int64 next_skew = 2;
 }
 
 service DataIPCService {

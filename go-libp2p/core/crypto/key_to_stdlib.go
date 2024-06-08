@@ -28,15 +28,15 @@ func KeyPairFromStdKey(priv crypto.PrivateKey) (PrivKey, PubKey, error) {
 		pub, _ := pubIfc.(ed25519.PublicKey)
 		return &Ed25519PrivateKey{*p}, &Ed25519PublicKey{pub}, nil
 
-	case *secp256k1.PrivateKey:
-		sPriv := Secp256k1PrivateKey(*p)
-		sPub := Secp256k1PublicKey(*p.PubKey())
-		return &sPriv, &sPub, nil
-
 	case *ed448.PrivateKey:
 		pubIfc := p.Public()
 		pub, _ := pubIfc.(ed448.PublicKey)
 		return &Ed448PrivateKey{*p}, &Ed448PublicKey{pub}, nil
+
+	case *secp256k1.PrivateKey:
+		sPriv := Secp256k1PrivateKey(*p)
+		sPub := Secp256k1PublicKey(*p.PubKey())
+		return &sPriv, &sPub, nil
 
 	default:
 		return nil, nil, ErrBadKeyType
@@ -56,10 +56,10 @@ func PrivKeyToStdKey(priv PrivKey) (crypto.PrivateKey, error) {
 		return p.priv, nil
 	case *Ed25519PrivateKey:
 		return &p.k, nil
-	case *Secp256k1PrivateKey:
-		return p, nil
 	case *Ed448PrivateKey:
 		return &p.k, nil
+	case *Secp256k1PrivateKey:
+		return p, nil
 	default:
 		return nil, ErrBadKeyType
 	}
@@ -78,10 +78,10 @@ func PubKeyToStdKey(pub PubKey) (crypto.PublicKey, error) {
 		return p.pub, nil
 	case *Ed25519PublicKey:
 		return p.k, nil
-	case *Secp256k1PublicKey:
-		return p, nil
 	case *Ed448PublicKey:
 		return p.k, nil
+	case *Secp256k1PublicKey:
+		return p, nil
 	default:
 		return nil, ErrBadKeyType
 	}

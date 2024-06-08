@@ -234,8 +234,8 @@ func CreateGenesisState(
 	}
 
 	difficulty := engineConfig.Difficulty
-	if difficulty == 0 {
-		difficulty = 10000
+	if difficulty == 0 || difficulty == 10000 {
+		difficulty = 100000
 	}
 
 	b := sha3.Sum256(seed)

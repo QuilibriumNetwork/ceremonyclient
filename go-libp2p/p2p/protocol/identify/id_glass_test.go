@@ -12,6 +12,7 @@ import (
 	recordPb "github.com/libp2p/go-libp2p/core/record/pb"
 	blhost "github.com/libp2p/go-libp2p/p2p/host/blank"
 	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
+	ma "github.com/multiformats/go-multiaddr"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/stretchr/testify/assert"
@@ -172,4 +173,36 @@ func TestInvalidSignedPeerRecord(t *testing.T) {
 	cab, ok := h1.Peerstore().(peerstore.CertifiedAddrBook)
 	require.True(t, ok)
 	require.Nil(t, cab.GetPeerRecord(h2.ID()))
+}
+
+func TestIncomingAddrFilter(t *testing.T) {
+	lhAddr := ma.StringCast("/ip4/127.0.0.1/udp/123/quic-v1")
+	privAddr := ma.StringCast("/ip4/192.168.1.101/tcp/123")
+	pubAddr := ma.StringCast("/ip6/2001::1/udp/123/quic-v1")
+	pubDNSAddr := ma.StringCast("/dns/example.com/udp/123/quic-v1")
+	privDNSAddr := ma.StringCast("/dns4/localhost/udp/123/quic-v1")
+	tests := []struct {
+		output []ma.Multiaddr
+		remote ma.Multiaddr
+	}{
+		{
+			output: []ma.Multiaddr{lhAddr, privAddr, pubAddr, pubDNSAddr, privDNSAddr},
+			remote: lhAddr,
+		},
+		{
+			output: []ma.Multiaddr{privAddr, pubAddr, pubDNSAddr, privDNSAddr},
+			remote: privAddr,
+		},
+		{
+			output: []ma.Multiaddr{pubAddr, pubDNSAddr},
+			remote: pubAddr,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("remote:%s", tc.remote), func(t *testing.T) {
+			input := []ma.Multiaddr{lhAddr, privAddr, pubAddr, pubDNSAddr, privDNSAddr}
+			got := filterAddrs(input, tc.remote)
+			require.ElementsMatch(t, tc.output, got, "%s\n%s", tc.output, got)
+		})
+	}
 }

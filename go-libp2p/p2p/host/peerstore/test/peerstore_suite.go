@@ -144,7 +144,7 @@ func testGetStreamBeforePeerAdded(ps pstore.Peerstore) func(t *testing.T) {
 				t.Fatal("channel shouldnt be closed yet")
 			}
 			if a == nil {
-				t.Fatal("got a nil address, thats weird")
+				t.Fatal("got a nil address, that's weird")
 			}
 			count++
 			if received[a.String()] {
@@ -195,7 +195,7 @@ func testAddrStreamDuplicates(ps pstore.Peerstore) func(t *testing.T) {
 		var count int
 		for a := range ach {
 			if a == nil {
-				t.Fatal("got a nil address, thats weird")
+				t.Fatal("got a nil address, that's weird")
 			}
 			count++
 			if received[a.String()] {
@@ -337,11 +337,11 @@ func testMetadata(ps pstore.Peerstore) func(t *testing.T) {
 			for _, p := range pids {
 				v, err := ps.Get(p, "AgentVersion")
 				require.NoError(t, err)
-				require.Equal(t, v, "string")
+				require.Equal(t, "string", v)
 
 				v, err = ps.Get(p, "bar")
 				require.NoError(t, err)
-				require.Equal(t, v, 1)
+				require.Equal(t, 1, v)
 			}
 		})
 
@@ -359,7 +359,7 @@ func testMetadata(ps pstore.Peerstore) func(t *testing.T) {
 			// make sure that entries for otherP were not deleted
 			val, err := ps.Get(otherP, "AgentVersion")
 			require.NoError(t, err)
-			require.Equal(t, val, "v1")
+			require.Equal(t, "v1", val)
 		})
 	}
 }

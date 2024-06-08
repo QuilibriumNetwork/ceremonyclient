@@ -6,18 +6,16 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"math/big"
-	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
+	"source.quilibrium.com/quilibrium/monorepo/vdf"
 )
 
 type WesolowskiFrameProver struct {
@@ -42,9 +40,7 @@ func (w *WesolowskiFrameProver) ProveMasterClockFrame(
 	input = append(input, previousFrame.Output[:]...)
 
 	b := sha3.Sum256(input)
-	v := vdf.New(difficulty, b)
-	v.Execute()
-	o := v.GetOutput()
+	o := vdf.WesolowskiSolve(b, difficulty)
 
 	previousSelectorBytes := [516]byte{}
 	copy(previousSelectorBytes[:], previousFrame.Output[:516])
@@ -113,11 +109,10 @@ func (w *WesolowskiFrameProver) VerifyMasterClockFrame(
 	}
 
 	b := sha3.Sum256(input)
-	v := vdf.New(frame.Difficulty, b)
 	proof := [516]byte{}
 	copy(proof[:], frame.Output)
 
-	if !v.Verify(proof) {
+	if !vdf.WesolowskiVerify(b, frame.Difficulty, proof) {
 		w.logger.Error("invalid proof",
 			zap.Binary("filter", frame.Filter),
 			zap.Uint64("frame_number", frame.FrameNumber),
@@ -159,10 +154,7 @@ func (w *WesolowskiFrameProver) CreateMasterGenesisFrame(
 	error,
 ) {
 	b := sha3.Sum256(seed)
-	v := vdf.New(difficulty, b)
-
-	v.Execute()
-	o := v.GetOutput()
+	o := vdf.WesolowskiSolve(b, difficulty)
 	inputMessage := o[:]
 
 	w.logger.Debug("proving genesis frame")
@@ -178,10 +170,7 @@ func (w *WesolowskiFrameProver) CreateMasterGenesisFrame(
 	}
 
 	b = sha3.Sum256(input)
-	v = vdf.New(difficulty, b)
-
-	v.Execute()
-	o = v.GetOutput()
+	o = vdf.WesolowskiSolve(b, difficulty)
 
 	frame := &protobufs.ClockFrame{
 		Filter:      filter,
@@ -248,10 +237,7 @@ func (w *WesolowskiFrameProver) ProveDataClockFrame(
 	input = append(input, commitmentInput...)
 
 	b := sha3.Sum256(input)
-	v := vdf.New(difficulty, b)
-
-	v.Execute()
-	o := v.GetOutput()
+	o := vdf.WesolowskiSolve(b, difficulty)
 
 	// TODO: make this configurable for signing algorithms that allow
 	// user-supplied hash functions
@@ -341,10 +327,7 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 	}
 
 	b := sha3.Sum256(input)
-	v := vdf.New(difficulty, b)
-
-	v.Execute()
-	o := v.GetOutput()
+	o := vdf.WesolowskiSolve(b, difficulty)
 
 	commitments := []*protobufs.InclusionCommitment{}
 	for i, commit := range inclusionProof.InclusionCommitments {
@@ -438,7 +421,6 @@ func (w *WesolowskiFrameProver) VerifyDataClockFrame(
 	}
 
 	b := sha3.Sum256(input)
-	v := vdf.New(frame.Difficulty, b)
 	proof := [516]byte{}
 	copy(proof[:], frame.Output)
 
@@ -458,7 +440,7 @@ func (w *WesolowskiFrameProver) VerifyDataClockFrame(
 			)
 		}
 	}
-	if !v.Verify(proof) {
+	if !vdf.WesolowskiVerify(b, frame.Difficulty, proof) {
 		return errors.Wrap(
 			errors.New("invalid proof"),
 			"verify clock frame",
@@ -585,11 +567,10 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 	}
 
 	b := sha3.Sum256(input[:len(input)-516])
-	v := vdf.New(difficulty, b)
 	output := [516]byte{}
 	copy(output[:], input[len(input)-516:])
 
-	if v.Verify(output) {
+	if vdf.WesolowskiVerify(b, difficulty, output) {
 		w.logger.Debug("verification succeeded")
 		return true
 	} else {
@@ -601,76 +582,37 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	challenge []byte,
 	core uint32,
-	skew int64,
-	nowMs int64,
-) ([]byte, int64, error) {
-	input := binary.BigEndian.AppendUint64([]byte{}, uint64(nowMs))
-	input = append(input, challenge...)
+	increment uint32,
+) ([]byte, error) {
+	difficulty := 200000 - (increment / 4)
 
-	// 4.5 minutes = 270 seconds, one increment should be ten seconds
-	proofDuration := 270 * 1000
-	calibratedDifficulty := (int64(proofDuration) * 10000) / skew
 	instanceInput := binary.BigEndian.AppendUint32([]byte{}, core)
-	instanceInput = append(instanceInput, input...)
+	instanceInput = append(instanceInput, challenge...)
 	b := sha3.Sum256(instanceInput)
-	v := vdf.New(uint32(calibratedDifficulty), b)
-
-	v.Execute()
-	o := v.GetOutput()
+	o := vdf.WesolowskiSolve(b, uint32(difficulty))
 
 	output := make([]byte, 516)
 	copy(output[:], o[:])
-	now := time.UnixMilli(nowMs)
-	after := time.Since(now)
-	nextSkew := (skew * after.Milliseconds()) / int64(proofDuration)
 
-	return output, nextSkew, nil
+	return output, nil
 }
 
 func (w *WesolowskiFrameProver) VerifyChallengeProof(
 	challenge []byte,
-	timestamp int64,
-	assertedDifficulty int64,
-	proof [][]byte,
+	increment uint32,
+	core uint32,
+	proof []byte,
 ) bool {
-	input := binary.BigEndian.AppendUint64([]byte{}, uint64(timestamp))
-	input = append(input, challenge...)
+	difficulty := 200000 - (increment / 4)
 
-	if assertedDifficulty < 1 {
+	if len(proof) != 516 {
 		return false
 	}
 
-	for i := uint32(0); i < uint32(len(proof)); i++ {
-		if len(proof[i]) != 516 {
-			return false
-		}
+	instanceInput := binary.BigEndian.AppendUint32([]byte{}, core)
+	instanceInput = append(instanceInput, challenge...)
+	b := sha3.Sum256(instanceInput)
 
-		instanceInput := binary.BigEndian.AppendUint32([]byte{}, i)
-		instanceInput = append(instanceInput, input...)
-		b := sha3.Sum256(instanceInput)
-
-		// 4.5 minutes = 270 seconds, one increment should be ten seconds
-		proofDuration := 270 * 1000
-		skew := (assertedDifficulty * 12) / 10
-		calibratedDifficulty := (int64(proofDuration) * 10000) / skew
-
-		v := vdf.New(uint32(calibratedDifficulty), b)
-		check := v.Verify([516]byte(proof[i]))
-		if !check {
-			// TODO: Remove after 2024-05-28
-			if time.Now().Before(config.GetMinimumVersionCutoff()) {
-				calibratedDifficulty = (int64(proofDuration) / skew) * 10000
-
-				v = vdf.New(uint32(calibratedDifficulty), sha3.Sum256(input))
-				check = v.Verify([516]byte(proof[i]))
-				if !check {
-					return false
-				}
-			} else {
-				return false
-			}
-		}
-	}
-
-	return true
+	check := vdf.WesolowskiVerify(b, difficulty, [516]byte(proof))
+	return check
 }

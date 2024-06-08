@@ -1,6 +1,7 @@
 package blossomsub
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -9,12 +10,14 @@ import (
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/record"
+	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
 )
 
 const (
@@ -26,7 +29,7 @@ const (
 var (
 	BlossomSubD                                = 6
 	BlossomSubDlo                              = 5
-	BlossomSubDhi                              = 10
+	BlossomSubDhi                              = 12
 	BlossomSubDscore                           = 4
 	BlossomSubDout                             = 2
 	BlossomSubHistoryLength                    = 5
@@ -219,6 +222,7 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams) *BlossomSubRouter
 		lastpub:   make(map[string]int64),
 		gossip:    make(map[peer.ID][]*pb.ControlIHave),
 		control:   make(map[peer.ID]*pb.ControlMessage),
+		cab:       pstoremem.NewAddrBook(),
 		backoff:   make(map[string]map[peer.ID]time.Time),
 		peerhave:  make(map[peer.ID]int),
 		iasked:    make(map[peer.ID]int),
@@ -247,6 +251,7 @@ func DefaultBlossomSubRouter(h host.Host) *BlossomSubRouter {
 		iasked:    make(map[peer.ID]int),
 		outbound:  make(map[peer.ID]bool),
 		connect:   make(chan connectInfo, params.MaxPendingConnections),
+		cab:       pstoremem.NewAddrBook(),
 		mcache:    NewMessageCache(params.HistoryGossip, params.HistoryLength),
 		protos:    BlossomSubDefaultProtocols,
 		feature:   BlossomSubDefaultFeatures,
@@ -447,6 +452,7 @@ type BlossomSubRouter struct {
 	outbound map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff  map[string]map[peer.ID]time.Time // prune backoff
 	connect  chan connectInfo                 // px connection requests
+	cab      peerstore.AddrBook
 
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
@@ -525,6 +531,9 @@ func (bs *BlossomSubRouter) Attach(p *PubSub) {
 		go bs.connector()
 	}
 
+	// Manage our address book from events emitted by libp2p
+	go bs.manageAddrBook()
+
 	// connect to direct peers
 	if len(bs.direct) > 0 {
 		go func() {
@@ -535,6 +544,46 @@ func (bs *BlossomSubRouter) Attach(p *PubSub) {
 				bs.connect <- connectInfo{p: p}
 			}
 		}()
+	}
+}
+
+func (bs *BlossomSubRouter) manageAddrBook() {
+	sub, err := bs.p.host.EventBus().Subscribe([]interface{}{
+		&event.EvtPeerIdentificationCompleted{},
+		&event.EvtPeerConnectednessChanged{},
+	})
+	if err != nil {
+		log.Errorf("failed to subscribe to peer identification events: %v", err)
+		return
+	}
+	defer sub.Close()
+
+	for {
+		select {
+		case <-bs.p.ctx.Done():
+			return
+		case ev := <-sub.Out():
+			switch ev := ev.(type) {
+			case event.EvtPeerIdentificationCompleted:
+				if ev.SignedPeerRecord != nil {
+					cab, ok := peerstore.GetCertifiedAddrBook(bs.cab)
+					if ok {
+						ttl := peerstore.RecentlyConnectedAddrTTL
+						if bs.p.host.Network().Connectedness(ev.Peer) == network.Connected {
+							ttl = peerstore.ConnectedAddrTTL
+						}
+						_, err := cab.ConsumePeerRecord(ev.SignedPeerRecord, ttl)
+						if err != nil {
+							log.Warnf("failed to consume signed peer record: %v", err)
+						}
+					}
+				}
+			case event.EvtPeerConnectednessChanged:
+				if ev.Connectedness != network.Connected {
+					bs.cab.UpdateAddrs(ev.Peer, peerstore.ConnectedAddrTTL, peerstore.RecentlyConnectedAddrTTL)
+				}
+			}
+		}
 	}
 }
 
@@ -550,7 +599,7 @@ loop:
 	for _, c := range conns {
 		stat := c.Stat()
 
-		if stat.Transient {
+		if stat.Limited {
 			continue
 		}
 
@@ -968,7 +1017,7 @@ func (bs *BlossomSubRouter) connector() {
 			}
 
 			log.Debugf("connecting to %s", ci.p)
-			cab, ok := peerstore.GetCertifiedAddrBook(bs.p.host.Peerstore())
+			cab, ok := peerstore.GetCertifiedAddrBook(bs.cab)
 			if ok && ci.spr != nil {
 				_, err := cab.ConsumePeerRecord(ci.spr, peerstore.TempAddrTTL)
 				if err != nil {
@@ -977,7 +1026,7 @@ func (bs *BlossomSubRouter) connector() {
 			}
 
 			ctx, cancel := context.WithTimeout(bs.p.ctx, bs.params.ConnectionTimeout)
-			err := bs.p.host.Connect(ctx, peer.AddrInfo{ID: ci.p})
+			err := bs.p.host.Connect(ctx, peer.AddrInfo{ID: ci.p, Addrs: bs.cab.Addrs(ci.p)})
 			cancel()
 			if err != nil {
 				log.Debugf("error connecting to %s: %s", ci.p, err)
@@ -1188,20 +1237,20 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 		return
 	}
 
-	// If we're too big, fragment into multiple RPCs and send each sequentially
-	outRPCs, err := fragmentRPC(out, bs.p.maxMessageSize)
-	if err != nil {
-		bs.doDropRPC(out, p, fmt.Sprintf("unable to fragment RPC: %s", err))
-		return
-	}
-
+	// Potentially split the RPC into multiple RPCs that are below the max message size
+	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, *out)
 	for _, rpc := range outRPCs {
+		if rpc.Size() > bs.p.maxMessageSize {
+			// This should only happen if a single message/control is above the maxMessageSize.
+			bs.doDropRPC(out, p, fmt.Sprintf("Dropping oversized RPC. Size: %d, limit: %d. (Over by %d bytes)", rpc.Size(), bs.p.maxMessageSize, rpc.Size()-bs.p.maxMessageSize))
+			continue
+		}
 		bs.doSendRPC(rpc, p, mch)
 	}
 }
 
 func (bs *BlossomSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
-	log.Debugf("dropping message to peer %s: %s", p.Pretty(), reason)
+	log.Debugf("dropping message to peer %s: %s", p, reason)
 	bs.tracer.DropRPC(rpc, p)
 	// push control messages that need to be retried
 	ctl := rpc.GetControl()
@@ -1219,119 +1268,134 @@ func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
 	}
 }
 
-func fragmentRPC(rpc *RPC, limit int) ([]*RPC, error) {
-	if rpc.Size() < limit {
-		return []*RPC{rpc}, nil
+// appendOrMergeRPC appends the given RPCs to the slice, merging them if possible.
+// If any elem is too large to fit in a single RPC, it will be split into multiple RPCs.
+// If an RPC is too large and can't be split further (e.g. Message data is
+// bigger than the RPC limit), then it will be returned as an oversized RPC.
+// The caller should filter out oversized RPCs.
+func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
+	if len(elems) == 0 {
+		return slice
 	}
 
-	c := (rpc.Size() / limit) + 1
-	rpcs := make([]*RPC, 1, c)
-	rpcs[0] = &RPC{RPC: pb.RPC{}, from: rpc.from}
+	if len(slice) == 0 && len(elems) == 1 && elems[0].Size() < limit {
+		// Fast path: no merging needed and only one element
+		return append(slice, &elems[0])
+	}
 
-	// outRPC returns the current RPC message if it will fit sizeToAdd more bytes
-	// otherwise, it will create a new RPC message and add it to the list.
-	// if withCtl is true, the returned message will have a non-nil empty Control message.
-	outRPC := func(sizeToAdd int, withCtl bool) *RPC {
-		current := rpcs[len(rpcs)-1]
-		// check if we can fit the new data, plus an extra byte for the protobuf field tag
-		if current.Size()+sizeToAdd+1 < limit {
-			if withCtl && current.Control == nil {
-				current.Control = &pb.ControlMessage{}
+	out := slice
+	if len(out) == 0 {
+		out = append(out, &RPC{RPC: pb.RPC{}})
+		out[0].from = elems[0].from
+	}
+
+	for _, elem := range elems {
+		lastRPC := out[len(out)-1]
+
+		// Merge/Append publish messages
+		// TODO: Never merge messages. The current behavior is the same as the
+		// old behavior. In the future let's not merge messages. Since,
+		// it may increase message latency.
+		for _, msg := range elem.GetPublish() {
+			if lastRPC.Publish = append(lastRPC.Publish, msg); lastRPC.Size() > limit {
+				lastRPC.Publish = lastRPC.Publish[:len(lastRPC.Publish)-1]
+				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC.Publish = append(lastRPC.Publish, msg)
+				out = append(out, lastRPC)
 			}
-			return current
 		}
-		var ctl *pb.ControlMessage
-		if withCtl {
-			ctl = &pb.ControlMessage{}
+
+		// Merge/Append Subscriptions
+		for _, sub := range elem.GetSubscriptions() {
+			if lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub); lastRPC.Size() > limit {
+				lastRPC.Subscriptions = lastRPC.Subscriptions[:len(lastRPC.Subscriptions)-1]
+				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub)
+				out = append(out, lastRPC)
+			}
 		}
-		next := &RPC{RPC: pb.RPC{Control: ctl}, from: rpc.from}
-		rpcs = append(rpcs, next)
-		return next
+
+		// Merge/Append Control messages
+		if ctl := elem.GetControl(); ctl != nil {
+			if lastRPC.Control == nil {
+				lastRPC.Control = &pb.ControlMessage{}
+				if lastRPC.Size() > limit {
+					lastRPC.Control = nil
+					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					out = append(out, lastRPC)
+				}
+			}
+
+			for _, graft := range ctl.GetGraft() {
+				if lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft); lastRPC.Size() > limit {
+					lastRPC.Control.Graft = lastRPC.Control.Graft[:len(lastRPC.Control.Graft)-1]
+					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft)
+					out = append(out, lastRPC)
+				}
+			}
+
+			for _, prune := range ctl.GetPrune() {
+				if lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune); lastRPC.Size() > limit {
+					lastRPC.Control.Prune = lastRPC.Control.Prune[:len(lastRPC.Control.Prune)-1]
+					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune)
+					out = append(out, lastRPC)
+				}
+			}
+
+			for _, iwant := range ctl.GetIwant() {
+				if len(lastRPC.Control.Iwant) == 0 {
+					// Initialize with a single IWANT.
+					// For IWANTs we don't need more than a single one,
+					// since there are no bitmask IDs here.
+					newIWant := &pb.ControlIWant{}
+					if lastRPC.Control.Iwant = append(lastRPC.Control.Iwant, newIWant); lastRPC.Size() > limit {
+						lastRPC.Control.Iwant = lastRPC.Control.Iwant[:len(lastRPC.Control.Iwant)-1]
+						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+							Iwant: []*pb.ControlIWant{newIWant},
+						}}, from: elem.from}
+						out = append(out, lastRPC)
+					}
+				}
+				for _, msgID := range iwant.GetMessageIDs() {
+					if lastRPC.Control.Iwant[0].MessageIDs = append(lastRPC.Control.Iwant[0].MessageIDs, msgID); lastRPC.Size() > limit {
+						lastRPC.Control.Iwant[0].MessageIDs = lastRPC.Control.Iwant[0].MessageIDs[:len(lastRPC.Control.Iwant[0].MessageIDs)-1]
+						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+							Iwant: []*pb.ControlIWant{{MessageIDs: []string{msgID}}},
+						}}, from: elem.from}
+						out = append(out, lastRPC)
+					}
+				}
+			}
+
+			for _, ihave := range ctl.GetIhave() {
+				if len(lastRPC.Control.Ihave) == 0 ||
+					!bytes.Equal(lastRPC.Control.Ihave[len(lastRPC.Control.Ihave)-1].Bitmask, ihave.Bitmask) {
+					// Start a new IHAVE if we are referencing a new bitmask ID
+					newIhave := &pb.ControlIHave{Bitmask: ihave.Bitmask}
+					if lastRPC.Control.Ihave = append(lastRPC.Control.Ihave, newIhave); lastRPC.Size() > limit {
+						lastRPC.Control.Ihave = lastRPC.Control.Ihave[:len(lastRPC.Control.Ihave)-1]
+						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+							Ihave: []*pb.ControlIHave{newIhave},
+						}}, from: elem.from}
+						out = append(out, lastRPC)
+					}
+				}
+				for _, msgID := range ihave.GetMessageIDs() {
+					lastIHave := lastRPC.Control.Ihave[len(lastRPC.Control.Ihave)-1]
+					if lastIHave.MessageIDs = append(lastIHave.MessageIDs, msgID); lastRPC.Size() > limit {
+						lastIHave.MessageIDs = lastIHave.MessageIDs[:len(lastIHave.MessageIDs)-1]
+						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+							Ihave: []*pb.ControlIHave{{Bitmask: ihave.Bitmask, MessageIDs: []string{msgID}}},
+						}}, from: elem.from}
+						out = append(out, lastRPC)
+					}
+				}
+			}
+		}
 	}
 
-	for _, msg := range rpc.GetPublish() {
-		s := msg.Size()
-		// if an individual message is too large, we can't fragment it and have to fail entirely
-		if s > limit {
-			return nil, fmt.Errorf("message with len=%d exceeds limit %d", s, limit)
-		}
-		out := outRPC(s, false)
-		out.Publish = append(out.Publish, msg)
-	}
-
-	for _, sub := range rpc.GetSubscriptions() {
-		out := outRPC(sub.Size(), false)
-		out.Subscriptions = append(out.Subscriptions, sub)
-	}
-
-	ctl := rpc.GetControl()
-	if ctl == nil {
-		// if there were no control messages, we're done
-		return rpcs, nil
-	}
-	// if all the control messages fit into one RPC, we just add it to the end and return
-	ctlOut := &RPC{RPC: pb.RPC{Control: ctl}, from: rpc.from}
-	if ctlOut.Size() < limit {
-		rpcs = append(rpcs, ctlOut)
-		return rpcs, nil
-	}
-
-	// we need to split up the control messages into multiple RPCs
-	for _, graft := range ctl.Graft {
-		out := outRPC(graft.Size(), true)
-		out.Control.Graft = append(out.Control.Graft, graft)
-	}
-	for _, prune := range ctl.Prune {
-		out := outRPC(prune.Size(), true)
-		out.Control.Prune = append(out.Control.Prune, prune)
-	}
-
-	// An individual IWANT or IHAVE message could be larger than the limit if we have
-	// a lot of message IDs. fragmentMessageIds will split them into buckets that
-	// fit within the limit, with some overhead for the control messages themselves
-	for _, iwant := range ctl.Iwant {
-		const protobufOverhead = 6
-		idBuckets := fragmentMessageIds(iwant.MessageIDs, limit-protobufOverhead)
-		for _, ids := range idBuckets {
-			iwant := &pb.ControlIWant{MessageIDs: ids}
-			out := outRPC(iwant.Size(), true)
-			out.Control.Iwant = append(out.Control.Iwant, iwant)
-		}
-	}
-	for _, ihave := range ctl.Ihave {
-		const protobufOverhead = 6
-		idBuckets := fragmentMessageIds(ihave.MessageIDs, limit-protobufOverhead)
-		for _, ids := range idBuckets {
-			ihave := &pb.ControlIHave{MessageIDs: ids}
-			out := outRPC(ihave.Size(), true)
-			out.Control.Ihave = append(out.Control.Ihave, ihave)
-		}
-	}
-	return rpcs, nil
-}
-
-func fragmentMessageIds(msgIds []string, limit int) [][]string {
-	// account for two bytes of protobuf overhead per array element
-	const protobufOverhead = 2
-
-	out := [][]string{{}}
-	var currentBucket int
-	var bucketLen int
-	for i := 0; i < len(msgIds); i++ {
-		size := len(msgIds[i]) + protobufOverhead
-		if size > limit {
-			// pathological case where a single message ID exceeds the limit.
-			log.Warnf("message ID length %d exceeds limit %d, removing from outgoing gossip", size, limit)
-			continue
-		}
-		bucketLen += size
-		if bucketLen > limit {
-			out = append(out, []string{})
-			currentBucket++
-			bucketLen = size
-		}
-		out[currentBucket] = append(out[currentBucket], msgIds[i])
-	}
 	return out
 }
 

@@ -179,8 +179,8 @@ func NewCeremonyDataClockConsensusEngine(
 	}
 
 	difficulty := engineConfig.Difficulty
-	if difficulty == 0 {
-		difficulty = 10000
+	if difficulty == 0 || difficulty == 10000 {
+		difficulty = 100000
 	}
 
 	var statsClient protobufs.NodeStatsClient

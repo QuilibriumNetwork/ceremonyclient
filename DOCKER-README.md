@@ -6,9 +6,9 @@ The only requirements are `git` (to checkout the repository) and docker (to buil
 Golang does not have to be installed, the docker image build process uses a build stage that provides the
 correct Go environment and compiles the node down to one command.
 
-In the repository root folder, where the [Dockerfile](Dockerfile) file is, build the docker image:
+In the repository root folder, where the [Dockerfile.source](Dockerfile.source) file is, build the docker image:
 ```shell
-docker build --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.4.16 .
+docker build -f Dockerfile.source --build-arg GIT_COMMIT=$(git log -1 --format=%h) -t quilibrium -t quilibrium:1.4.16 .
 ```
 
 Use latest version instead of `1.4.16`.

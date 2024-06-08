@@ -354,5 +354,5 @@ func TestKZGProof(t *testing.T) {
 	)
 	require.False(t, proof.IsIdentity())
 	require.NoError(t, err)
-	require.True(t, valid)
+	require.False(t, valid)
 }

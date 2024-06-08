@@ -63,7 +63,7 @@ type relayFinder struct {
 	candidates                 map[peer.ID]*candidate
 	backoff                    map[peer.ID]time.Time
 	maybeConnectToRelayTrigger chan struct{} // cap: 1
-	// Any time _something_ hapens that might cause us to need new candidates.
+	// Any time _something_ happens that might cause us to need new candidates.
 	// This could be
 	// * the disconnection of a relay
 	// * the failed attempt to obtain a reservation with a current candidate
@@ -736,7 +736,7 @@ func (rf *relayFinder) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	for p := range rf.relays {
 		addrs := cleanupAddressSet(rf.host.Peerstore().Addrs(p))
 		relayAddrCnt += len(addrs)
-		circuit := ma.StringCast(fmt.Sprintf("/p2p/%s/p2p-circuit", p.Pretty()))
+		circuit := ma.StringCast(fmt.Sprintf("/p2p/%s/p2p-circuit", p))
 		for _, addr := range addrs {
 			pub := addr.Encapsulate(circuit)
 			raddrs = append(raddrs, pub)

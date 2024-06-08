@@ -16,6 +16,8 @@ type EngineConfig struct {
 	// system, base listen port of 40000 will listen on 40000, 40001, 40002)
 	DataWorkerBaseListenPort uint16 `yaml:"dataWorkerBaseListenPort"`
 	DataWorkerMemoryLimit    int64  `yaml:"dataWorkerMemoryLimit"`
+	// Alternative configuration path to manually specify data workers by multiaddr
+	DataWorkerMultiaddrs []string `yaml:"dataWorkerMultiaddrs"`
 
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -102,8 +103,8 @@ var (
 	)
 	signatureCheck = flag.Bool(
 		"signature-check",
-		true,
-		"enables or disables signature validation (default true)",
+		signatureCheckDefault(),
+		"enables or disables signature validation (default true or value of QUILIBRIUM_SIGNATURE_CHECK env var)",
 	)
 	core = flag.Int(
 		"core",
@@ -135,6 +136,20 @@ var signatories = []string{
 	"81d63a45f068629f568de812f18be5807bfe828a830097f09cf02330d6acd35e3607401df3fda08b03b68ea6e68afd506b23506b11e87a0f80",
 	"6e2872f73c4868c4286bef7bfe2f5479a41c42f4e07505efa4883c7950c740252e0eea78eef10c584b19b1dcda01f7767d3135d07c33244100",
 	"a114b061f8d35e3f3497c8c43d83ba6b4af67aa7b39b743b1b0a35f2d66110b5051dd3d86f69b57122a35b64e624b8180bee63b6152fce4280",
+}
+
+func signatureCheckDefault() bool {
+	envVarValue, envVarExists := os.LookupEnv("QUILIBRIUM_SIGNATURE_CHECK")
+	if envVarExists {
+		def, err := strconv.ParseBool(envVarValue)
+		if err == nil {
+			return def
+		} else {
+			fmt.Println("Invalid environment variable QUILIBRIUM_SIGNATURE_CHECK, must be 'true' or 'false'. Got: " + envVarValue)
+		}
+	}
+
+	return true
 }
 
 func main() {
@@ -206,6 +221,8 @@ func main() {
 
 			fmt.Println("Signature check passed")
 		}
+	} else {
+		fmt.Println("Signature check disabled, skipping...")
 	}
 
 	if *memprofile != "" {
@@ -273,9 +290,6 @@ func main() {
 		return
 	}
 
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
-
 	if !*dbConsole && *core == 0 {
 		printLogo()
 		printVersion()
@@ -320,6 +334,8 @@ func main() {
 	}
 
 	if *dhtOnly {
+		done := make(chan os.Signal, 1)
+		signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 		dht, err := app.NewDHTNode(nodeConfig)
 		if err != nil {
 			panic(err)
@@ -352,7 +368,7 @@ func main() {
 			nodeConfig.Engine.DataWorkerBaseListenPort = 40000
 		}
 
-		if *parentProcess == 0 {
+		if *parentProcess == 0 && len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
 			panic("parent process pid not specified")
 		}
 
@@ -365,6 +381,11 @@ func main() {
 			nodeConfig.Engine.DataWorkerBaseListenMultiaddr,
 			int(nodeConfig.Engine.DataWorkerBaseListenPort)+*core-1,
 		)
+
+		if len(nodeConfig.Engine.DataWorkerMultiaddrs) != 0 {
+			rpcMultiaddr = nodeConfig.Engine.DataWorkerMultiaddrs[*core-1]
+		}
+
 		srv, err := rpc.NewDataWorkerIPCServer(
 			rpcMultiaddr,
 			l,
@@ -384,12 +405,15 @@ func main() {
 	}
 
 	fmt.Println("Loading ceremony state and starting node...")
-	go spawnDataWorkers()
+	go spawnDataWorkers(nodeConfig)
 
 	kzg.Init()
 
 	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
+	RunMigrationIfNeeded(*configDirectory, nodeConfig)
 
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 	var node *app.Node
 	if *debug {
 		node, err = app.NewDebugNode(nodeConfig, report)
@@ -407,6 +431,7 @@ func main() {
 			nodeConfig.ListenGRPCMultiaddr,
 			nodeConfig.ListenRestMultiaddr,
 			node.GetLogger(),
+			node.GetDataProofStore(),
 			node.GetClockStore(),
 			node.GetKeyManager(),
 			node.GetPubSub(),
@@ -434,7 +459,14 @@ func main() {
 
 var dataWorkers []*exec.Cmd
 
-func spawnDataWorkers() {
+func spawnDataWorkers(nodeConfig *config.Config) {
+	if len(nodeConfig.Engine.DataWorkerMultiaddrs) != 0 {
+		fmt.Println(
+			"Data workers configured by multiaddr, be sure these are running...",
+		)
+		return
+	}
+
 	process, err := os.Executable()
 	if err != nil {
 		panic(err)
@@ -454,7 +486,7 @@ func spawnDataWorkers() {
 			args = append(args, os.Args[1:]...)
 			cmd := exec.Command(process, args...)
 			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			cmd.Stderr = os.Stdout
 			err := cmd.Start()
 			if err != nil {
 				panic(err)
@@ -497,6 +529,56 @@ func RunCompaction(clockStore *store.PebbleClockStore) {
 	fmt.Println("compaction complete")
 }
 
+func RunMigrationIfNeeded(
+	configDir string,
+	nodeConfig *config.Config,
+) {
+	shouldMigrate := false
+	migrationInfo := []byte{0x00, 0x00, 0x00}
+	_, err := os.Stat(filepath.Join(configDir, "MIGRATIONS"))
+	if err != nil && os.IsNotExist(err) {
+		fmt.Println("Migrations file not found, will perform migration...")
+		shouldMigrate = true
+	}
+
+	if !shouldMigrate {
+		migrationInfo, err = os.ReadFile(filepath.Join(configDir, "MIGRATIONS"))
+		if err != nil {
+			panic(err)
+		}
+
+		if len(migrationInfo) < 3 ||
+			!bytes.Equal(migrationInfo, []byte{0x01, 0x04, 0x013}) {
+			fmt.Println("Migrations file outdated, will perform migration...")
+			shouldMigrate = true
+		}
+	}
+
+	// If subsequent migrations arise, we will need to distinguish by version
+	if shouldMigrate {
+		fmt.Println("Running migration...")
+
+		// Easiest migration in the world.
+		err := os.RemoveAll(filepath.Join(configDir, "store"))
+		if err != nil {
+			fmt.Println("ERROR: Could not remove store, please be sure to do this before restarting the node.")
+			panic(err)
+		}
+
+		err = os.WriteFile(
+			filepath.Join(configDir, "MIGRATIONS"),
+			[]byte{0x01, 0x04, 0x13},
+			fs.FileMode(0600),
+		)
+		if err != nil {
+			fmt.Println("ERROR: Could not save migration file.")
+			panic(err)
+		}
+
+		fmt.Println("Migration completed.")
+	}
+}
+
 func RunSelfTestIfNeeded(
 	configDir string,
 	nodeConfig *config.Config,
@@ -504,6 +586,10 @@ func RunSelfTestIfNeeded(
 	logger, _ := zap.NewProduction()
 
 	cores := runtime.GOMAXPROCS(0)
+	if len(nodeConfig.Engine.DataWorkerMultiaddrs) != 0 {
+		cores = len(nodeConfig.Engine.DataWorkerMultiaddrs) + 1
+	}
+
 	memory := memory.TotalMemory()
 	d, err := os.Stat(filepath.Join(configDir, "store"))
 	if d == nil {
@@ -539,8 +625,8 @@ func RunSelfTestIfNeeded(
 
 	report := &protobufs.SelfTestReport{}
 	difficulty := nodeConfig.Engine.Difficulty
-	if difficulty == 0 {
-		difficulty = 10000
+	if difficulty == 0 || difficulty == 10000 {
+		difficulty = 100000
 	}
 	report.Difficulty = difficulty
 
@@ -756,8 +842,11 @@ func printBalance(config *config.Config) {
 		panic(err)
 	}
 
-	fmt.Println("Owned balance:", balance.Owned, "QUIL")
-	fmt.Println("Unconfirmed balance:", balance.UnconfirmedOwned, "QUIL")
+	// fmt.Println("Owned balance:", balance.Owned, "QUIL")
+	conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
+	r := new(big.Rat).SetFrac(balance.UnconfirmedOwned, conversionFactor)
+	fmt.Println("Note: Balance is strictly rewards earned with 1.4.19+, check https://www.quilibrium.com/rewards for more info about previous rewards.")
+	fmt.Println("Unclaimed balance:", r.FloatString(12), "QUIL")
 }
 
 func printPeerID(p2pConfig *config.P2PConfig) {
@@ -812,26 +901,26 @@ func printLogo() {
 	fmt.Println("                          ..---''''           ''''---..")
 	fmt.Println("                    .---''                             ''---.")
 	fmt.Println("                 .-'                                         '-.")
-	fmt.Println("             ..-'            ..--'''''''''''%######################")
-	fmt.Println("           .'           .--''                         #################")
-	fmt.Println("        .''         ..-'                                 ###############")
-	fmt.Println("       '           '                                        ##############")
-	fmt.Println("     ''         .''                                             ############&")
-	fmt.Println("    '         ''                                                 ############")
-	fmt.Println("   '         '                     ##########                     &###########")
-	fmt.Println("  '         '                    ##############                     ###########")
-	fmt.Println(" '         '                     ##############                      ##########&")
-	fmt.Println(" '        '                      ##############                       ##########")
-	fmt.Println("'        '                         ##########                         ##########")
-	fmt.Println("'        '                                                            ##########")
-	fmt.Println("'        '                                                            &#########")
-	fmt.Println("'        '                    #######      #######                    ##########")
-	fmt.Println("'        '                 &#########################                 ##########")
-	fmt.Println(" '        '              ##############% ##############              &##########")
-	fmt.Println(" '         '          &##############      ###############           ##########")
-	fmt.Println("  '         '       ###############           ##############%       ###########")
-	fmt.Println("   '         '.       ##########                ###############       ########")
-	fmt.Println("    '.         .         #####                     ##############%       ####")
+	fmt.Println("             ..-'            ..--''''''''''''''--..             '-..")
+	fmt.Println("           .'           .--''                      ''--.            ''.")
+	fmt.Println("        .''         ..-'                                ''-.           '.")
+	fmt.Println("       '           '                                        ''.          '.")
+	fmt.Println("     ''         .''                                            '.          '")
+	fmt.Println("    '         ''                                                 '.         '")
+	fmt.Println("   '         '                     ##########                      .         '")
+	fmt.Println("  '         '                    ##############                     '         '")
+	fmt.Println(" '         '                     ##############                      '        '")
+	fmt.Println(" '        '                      ##############                      '         '")
+	fmt.Println("'        '                         ##########                         '        '")
+	fmt.Println("'        '                                                            '        '")
+	fmt.Println("'        '                                                            '        '")
+	fmt.Println("'        '                    #######      #######                    '        '")
+	fmt.Println("'        '                 &#########################                 '        '")
+	fmt.Println("'         '              ##############% ##############              '         '")
+	fmt.Println(" '         '          &##############      ###############           '        '")
+	fmt.Println("  '         '       ###############           ##############%       '.        '")
+	fmt.Println("   '         '.       ##########                ###############       '-.    '")
+	fmt.Println("    '.         .         #####                     ##############%       '-.'")
 	fmt.Println("      '         '.                                   ###############")
 	fmt.Println("       '.         '..                                   ##############%")
 	fmt.Println("         '.          '-.                                  ###############")
@@ -850,5 +939,5 @@ func printVersion() {
 		patchString = fmt.Sprintf("-p%d", patch)
 	}
 	fmt.Println(" ")
-	fmt.Println("                       Quilibrium Node - v" + config.GetVersionString() + patchString + " – Nebula")
+	fmt.Println("                     Quilibrium Node - v" + config.GetVersionString() + patchString + " – Betelgeuse")
 }

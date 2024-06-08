@@ -47,13 +47,13 @@ func TestSimultaneousConnect(t *testing.T) {
 		ok, isClient, reason := GetSimultaneousConnect(serverCtx)
 		require.True(t, ok)
 		require.False(t, isClient)
-		require.Equal(t, reason, "foobar")
+		require.Equal(t, "foobar", reason)
 	})
 	t.Run("for the client", func(t *testing.T) {
 		serverCtx := WithSimultaneousConnect(context.Background(), true, "foo")
 		ok, isClient, reason := GetSimultaneousConnect(serverCtx)
 		require.True(t, ok)
 		require.True(t, isClient)
-		require.Equal(t, reason, "foo")
+		require.Equal(t, "foo", reason)
 	})
 }

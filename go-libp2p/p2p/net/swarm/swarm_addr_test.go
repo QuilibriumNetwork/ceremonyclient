@@ -2,6 +2,7 @@ package swarm_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"testing"
 
@@ -13,15 +14,15 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 	circuitv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 
-	"github.com/minio/sha256-simd"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multibase"
 	"github.com/multiformats/go-multihash"
+	"github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,10 +82,10 @@ func TestDialAddressSelection(t *testing.T) {
 	tcpTr, err := tcp.NewTCPTransport(nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, s.AddTransport(tcpTr))
-	reuse, err := quicreuse.NewConnManager([32]byte{})
+	reuse, err := quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
 	require.NoError(t, err)
 	defer reuse.Close()
-	quicTr, err := quic.NewTransport(priv, reuse, nil, nil, nil)
+	quicTr, err := libp2pquic.NewTransport(priv, reuse, nil, nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, s.AddTransport(quicTr))
 	webtransportTr, err := webtransport.New(priv, nil, reuse, nil, nil)
@@ -100,7 +101,7 @@ func TestDialAddressSelection(t *testing.T) {
 	require.NoError(t, s.AddTransport(circuitTr))
 
 	require.Equal(t, tcpTr, s.TransportForDialing(ma.StringCast("/ip4/127.0.0.1/tcp/1234")))
-	require.Equal(t, quicTr, s.TransportForDialing(ma.StringCast("/ip4/127.0.0.1/udp/1234/quic")))
+	require.Equal(t, quicTr, s.TransportForDialing(ma.StringCast("/ip4/127.0.0.1/udp/1234/quic-v1")))
 	require.Equal(t, circuitTr, s.TransportForDialing(ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic/p2p-circuit/p2p/%s", id))))
 	require.Equal(t, webtransportTr, s.TransportForDialing(ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/%s", certHash))))
 	require.Nil(t, s.TransportForDialing(ma.StringCast("/ip4/1.2.3.4")))
