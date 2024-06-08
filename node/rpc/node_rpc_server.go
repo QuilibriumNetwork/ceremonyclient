@@ -3,7 +3,6 @@ package rpc
 import (
 	"bytes"
 	"context"
-	"math/big"
 	"net/http"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -11,7 +10,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
@@ -21,12 +19,10 @@ import (
 	"google.golang.org/grpc/reflection"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
-	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 type RPCServer struct {
@@ -34,6 +30,7 @@ type RPCServer struct {
 	listenAddrGRPC   string
 	listenAddrHTTP   string
 	logger           *zap.Logger
+	dataProofStore   store.DataProofStore
 	clockStore       store.ClockStore
 	keyManager       keys.KeyManager
 	pubSub           p2p.PubSub
@@ -192,136 +189,142 @@ func (r *RPCServer) GetPeerInfo(
 	return resp, nil
 }
 
+// Only returns the active amounts earned under 1.4.19 until 2.0
 func (r *RPCServer) GetTokenInfo(
 	ctx context.Context,
 	req *protobufs.GetTokenInfoRequest,
 ) (*protobufs.TokenInfoResponse, error) {
-	provingKey, err := r.keyManager.GetRawKey(
-		"default-proving-key",
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
+	// provingKey, err := r.keyManager.GetRawKey(
+	// 	"default-proving-key",
+	// )
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "get token info")
+	// }
 
-	peerBytes := r.pubSub.GetPeerID()
-	peerAddr, err := poseidon.HashBytes(peerBytes)
-	if err != nil {
-		panic(err)
-	}
+	// peerBytes := r.pubSub.GetPeerID()
+	// peerAddr, err := poseidon.HashBytes(peerBytes)
+	// if err != nil {
+	// 	panic(err)
+	// }
 
-	addr, err := poseidon.HashBytes(provingKey.PublicKey)
-	if err != nil {
-		panic(err)
-	}
+	// addr, err := poseidon.HashBytes(provingKey.PublicKey)
+	// if err != nil {
+	// 	panic(err)
+	// }
 
-	addrBytes := addr.Bytes()
-	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+	// addrBytes := addr.Bytes()
+	// addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
 
-	peerAddrBytes := peerAddr.Bytes()
-	peerAddrBytes = append(make([]byte, 32-len(peerAddrBytes)), peerAddrBytes...)
+	// peerAddrBytes := peerAddr.Bytes()
+	// peerAddrBytes = append(make([]byte, 32-len(peerAddrBytes)), peerAddrBytes...)
 
-	frame, err := r.clockStore.GetLatestDataClockFrame(
-		append(
-			p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-			p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-		),
-		nil,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
+	// frame, err := r.clockStore.GetLatestDataClockFrame(
+	// 	append(
+	// 		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+	// 		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	// 	),
+	// 	nil,
+	// )
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "get token info")
+	// }
 
-	confirmed, err := application.MaterializeApplicationFromFrame(frame)
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
+	// confirmed, err := application.MaterializeApplicationFromFrame(frame)
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "get token info")
+	// }
 
-	confirmedTotal := new(big.Int)
-	ownedTotal := new(big.Int)
-	if confirmed.RewardTrie.Root == nil ||
-		(confirmed.RewardTrie.Root.External == nil &&
-			confirmed.RewardTrie.Root.Internal == nil) {
-		return &protobufs.TokenInfoResponse{
-			ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
-			UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
-			OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
-			UnconfirmedOwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
-		}, nil
-	}
+	// confirmedTotal := new(big.Int)
+	// ownedTotal := new(big.Int)
+	// if confirmed.RewardTrie.Root == nil ||
+	// 	(confirmed.RewardTrie.Root.External == nil &&
+	// 		confirmed.RewardTrie.Root.Internal == nil) {
+	// 	return &protobufs.TokenInfoResponse{
+	// 		ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
+	// 		UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
+	// 		OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
+	// 		UnconfirmedOwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
+	// 	}, nil
+	// }
 
-	limbs := []*tries.RewardInternalNode{}
-	if confirmed.RewardTrie.Root.Internal != nil {
-		limbs = append(limbs, confirmed.RewardTrie.Root.Internal)
-	} else {
-		confirmedTotal = confirmedTotal.Add(
-			confirmedTotal,
-			new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
-		)
-		if bytes.Equal(
-			confirmed.RewardTrie.Root.External.Key,
-			addrBytes,
-		) {
-			ownedTotal = ownedTotal.Add(
-				ownedTotal,
-				new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
-			)
-		}
-	}
+	// limbs := []*tries.RewardInternalNode{}
+	// if confirmed.RewardTrie.Root.Internal != nil {
+	// 	limbs = append(limbs, confirmed.RewardTrie.Root.Internal)
+	// } else {
+	// 	confirmedTotal = confirmedTotal.Add(
+	// 		confirmedTotal,
+	// 		new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
+	// 	)
+	// 	if bytes.Equal(
+	// 		confirmed.RewardTrie.Root.External.Key,
+	// 		addrBytes,
+	// 	) {
+	// 		ownedTotal = ownedTotal.Add(
+	// 			ownedTotal,
+	// 			new(big.Int).SetUint64(confirmed.RewardTrie.Root.External.Total),
+	// 		)
+	// 	}
+	// }
 
-	for len(limbs) != 0 {
-		nextLimbs := []*tries.RewardInternalNode{}
-		for _, limb := range limbs {
-			for _, child := range limb.Child {
-				child := child
-				if child.Internal != nil {
-					nextLimbs = append(nextLimbs, child.Internal)
-				} else {
-					confirmedTotal = confirmedTotal.Add(
-						confirmedTotal,
-						new(big.Int).SetUint64(child.External.Total),
-					)
-					if bytes.Equal(
-						child.External.Key,
-						addrBytes,
-					) {
-						ownedTotal = ownedTotal.Add(
-							ownedTotal,
-							new(big.Int).SetUint64(child.External.Total),
-						)
-					}
-					if bytes.Equal(
-						child.External.Key,
-						peerAddrBytes,
-					) {
-						ownedTotal = ownedTotal.Add(
-							ownedTotal,
-							new(big.Int).SetUint64(child.External.Total),
-						)
-					}
-				}
-			}
-		}
-		limbs = nextLimbs
-	}
+	// for len(limbs) != 0 {
+	// 	nextLimbs := []*tries.RewardInternalNode{}
+	// 	for _, limb := range limbs {
+	// 		for _, child := range limb.Child {
+	// 			child := child
+	// 			if child.Internal != nil {
+	// 				nextLimbs = append(nextLimbs, child.Internal)
+	// 			} else {
+	// 				confirmedTotal = confirmedTotal.Add(
+	// 					confirmedTotal,
+	// 					new(big.Int).SetUint64(child.External.Total),
+	// 				)
+	// 				if bytes.Equal(
+	// 					child.External.Key,
+	// 					addrBytes,
+	// 				) {
+	// 					ownedTotal = ownedTotal.Add(
+	// 						ownedTotal,
+	// 						new(big.Int).SetUint64(child.External.Total),
+	// 					)
+	// 				}
+	// 				if bytes.Equal(
+	// 					child.External.Key,
+	// 					peerAddrBytes,
+	// 				) {
+	// 					ownedTotal = ownedTotal.Add(
+	// 						ownedTotal,
+	// 						new(big.Int).SetUint64(child.External.Total),
+	// 					)
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// 	limbs = nextLimbs
+	// }
 
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "get token info")
+	// }
 
 	// 1 QUIL = 0x1DCD65000 units
-	conversionFactor, ok := new(big.Int).SetString("1DCD65000", 16)
-	if !ok {
-		return nil, errors.Wrap(err, "get token info")
+	// conversionFactor, ok := new(big.Int).SetString("1DCD65000", 16)
+	// if !ok {
+	// 	return nil, errors.Wrap(err, "get token info")
+	// }
+
+	total, err := r.dataProofStore.GetTotalReward(r.pubSub.GetPeerID())
+	if err != nil {
+		panic(err)
 	}
 
-	confirmedTotal = confirmedTotal.Mul(confirmedTotal, conversionFactor)
-	ownedTotal = ownedTotal.Mul(ownedTotal, conversionFactor)
+	// confirmedTotal = confirmedTotal.Mul(confirmedTotal, conversionFactor)
+	// ownedTotal = ownedTotal.Mul(ownedTotal, conversionFactor)
 
 	return &protobufs.TokenInfoResponse{
-		ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
-		UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
-		OwnedTokens:            ownedTotal.FillBytes(make([]byte, 32)),
-		UnconfirmedOwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
+		// ConfirmedTokenSupply:   confirmedTotal.FillBytes(make([]byte, 32)),
+		// UnconfirmedTokenSupply: confirmedTotal.FillBytes(make([]byte, 32)),
+		// OwnedTokens: ownedTotal.FillBytes(make([]byte, 32)),
+		UnconfirmedOwnedTokens: total.FillBytes(make([]byte, 32)),
 	}, nil
 }
 
@@ -336,6 +339,7 @@ func NewRPCServer(
 	listenAddrGRPC string,
 	listenAddrHTTP string,
 	logger *zap.Logger,
+	dataProofStore store.DataProofStore,
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
@@ -346,6 +350,7 @@ func NewRPCServer(
 		listenAddrGRPC:   listenAddrGRPC,
 		listenAddrHTTP:   listenAddrHTTP,
 		logger:           logger,
+		dataProofStore:   dataProofStore,
 		clockStore:       clockStore,
 		keyManager:       keyManager,
 		pubSub:           pubSub,

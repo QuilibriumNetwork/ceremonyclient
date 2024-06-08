@@ -37,7 +37,6 @@ var (
 		1: "Ed25519",
 		2: "Secp256k1",
 		3: "ECDSA",
-		4: "Ed448",
 	}
 	KeyType_value = map[string]int32{
 		"RSA":       0,

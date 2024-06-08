@@ -1,27 +1,28 @@
 package app
 
 import (
-	"bytes"
 	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
-	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 type Node struct {
-	logger      *zap.Logger
-	clockStore  store.ClockStore
-	keyManager  keys.KeyManager
-	pubSub      p2p.PubSub
-	execEngines map[string]execution.ExecutionEngine
-	engine      consensus.ConsensusEngine
+	logger         *zap.Logger
+	dataProofStore store.DataProofStore
+	clockStore     store.ClockStore
+	keyManager     keys.KeyManager
+	pubSub         p2p.PubSub
+	execEngines    map[string]execution.ExecutionEngine
+	engine         consensus.ConsensusEngine
 }
 
 type DHTNode struct {
@@ -40,6 +41,7 @@ func newDHTNode(
 
 func newNode(
 	logger *zap.Logger,
+	dataProofStore store.DataProofStore,
 	clockStore store.ClockStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
@@ -54,6 +56,7 @@ func newNode(
 
 	return &Node{
 		logger,
+		dataProofStore,
 		clockStore,
 		keyManager,
 		pubSub,
@@ -62,78 +65,115 @@ func newNode(
 	}, nil
 }
 
-func (n *Node) RunRepair() {
-	intrinsicFilter := append(
-		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-	)
-	n.logger.Info("check store and repair if needed, this may take a few minutes")
-	proverTrie := &tries.RollingFrecencyCritbitTrie{}
-	head, err := n.clockStore.GetLatestDataClockFrame(intrinsicFilter, proverTrie)
-	if err == nil && head != nil {
-		for head != nil && head.FrameNumber != 0 {
-			prev := head
-			head, err = n.clockStore.GetStagedDataClockFrame(
-				intrinsicFilter,
-				head.FrameNumber-1,
-				head.ParentSelector,
-				true,
-			)
-			if err != nil {
-				panic(err)
-			}
-			compare, _, err := n.clockStore.GetDataClockFrame(
-				intrinsicFilter,
-				prev.FrameNumber-1,
-				true,
-			)
-			if err != nil {
-				panic(err)
-			}
-			if !bytes.Equal(head.Output, compare.Output) {
-				n.logger.Warn(
-					"repairing frame",
-					zap.Uint64("frame_number", head.FrameNumber),
-				)
-				head, err = n.clockStore.GetStagedDataClockFrame(
-					intrinsicFilter,
-					prev.FrameNumber-1,
-					prev.ParentSelector,
-					true,
-				)
-				if err != nil {
-					panic(err)
-				}
+func (n *Node) VerifyProofIntegrity() {
+	i, _, _, e := n.dataProofStore.GetLatestDataTimeProof(n.pubSub.GetPeerID())
+	if e != nil {
+		panic(e)
+	}
+	dataProver := crypto.NewKZGInclusionProver(n.logger)
+	wesoProver := crypto.NewWesolowskiFrameProver(n.logger)
 
-				txn, err := n.clockStore.NewTransaction()
-				if err != nil {
-					panic(err)
-				}
+	for j := int(i); j >= 0; j-- {
+		fmt.Println(j)
+		_, _, input, o, err := n.dataProofStore.GetDataTimeProof(n.pubSub.GetPeerID(), uint32(j))
+		if err != nil {
+			panic(err)
+		}
+		idx, idxProof, idxCommit, idxKP := master.GetOutputs(o)
 
-				selector, err := head.GetSelector()
-				if err != nil {
-					panic(err)
-				}
+		ip := sha3.Sum512(idxProof)
 
-				err = n.clockStore.CommitDataClockFrame(
-					intrinsicFilter,
-					head.FrameNumber,
-					selector.FillBytes(make([]byte, 32)),
-					proverTrie,
-					txn,
-					true,
-				)
-				if err != nil {
-					panic(err)
-				}
+		v, err := dataProver.VerifyRaw(ip[:], idxCommit, int(idx), idxKP, 128)
+		if err != nil {
+			panic(err)
+		}
 
-				if err = txn.Commit(); err != nil {
-					panic(err)
-				}
-			}
+		if !v {
+			panic("bad kzg proof")
+		}
+		wp := []byte{}
+		wp = append(wp, n.pubSub.GetPeerID()...)
+		wp = append(wp, input...)
+		fmt.Printf("%x\n", wp)
+		v = wesoProver.VerifyChallengeProof(wp, uint32(j), idx, idxProof)
+		if !v {
+			panic("bad weso proof")
 		}
 	}
-	n.logger.Info("check complete")
+}
+
+func (n *Node) RunRepair() {
+	// intrinsicFilter := append(
+	// 	p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
+	// 	p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
+	// )
+	// n.logger.Info("check store and repair if needed, this may take a few minutes")
+	// proverTrie := &tries.RollingFrecencyCritbitTrie{}
+	// head, err := n.clockStore.GetLatestDataClockFrame(intrinsicFilter, proverTrie)
+	// if err == nil && head != nil {
+	// 	for head != nil && head.FrameNumber != 0 {
+	// 		prev := head
+	// 		head, err = n.clockStore.GetStagedDataClockFrame(
+	// 			intrinsicFilter,
+	// 			head.FrameNumber-1,
+	// 			head.ParentSelector,
+	// 			true,
+	// 		)
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
+	// 		compare, _, err := n.clockStore.GetDataClockFrame(
+	// 			intrinsicFilter,
+	// 			prev.FrameNumber-1,
+	// 			true,
+	// 		)
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
+	// 		if !bytes.Equal(head.Output, compare.Output) {
+	// 			n.logger.Warn(
+	// 				"repairing frame",
+	// 				zap.Uint64("frame_number", head.FrameNumber),
+	// 			)
+	// 			head, err = n.clockStore.GetStagedDataClockFrame(
+	// 				intrinsicFilter,
+	// 				prev.FrameNumber-1,
+	// 				prev.ParentSelector,
+	// 				true,
+	// 			)
+	// 			if err != nil {
+	// 				panic(err)
+	// 			}
+
+	// 			txn, err := n.clockStore.NewTransaction()
+	// 			if err != nil {
+	// 				panic(err)
+	// 			}
+
+	// 			selector, err := head.GetSelector()
+	// 			if err != nil {
+	// 				panic(err)
+	// 			}
+
+	// 			err = n.clockStore.CommitDataClockFrame(
+	// 				intrinsicFilter,
+	// 				head.FrameNumber,
+	// 				selector.FillBytes(make([]byte, 32)),
+	// 				proverTrie,
+	// 				txn,
+	// 				true,
+	// 			)
+	// 			if err != nil {
+	// 				panic(err)
+	// 			}
+
+	// 			if err = txn.Commit(); err != nil {
+	// 				panic(err)
+	// 			}
+	// 		}
+	// 	}
+	// }
+	// n.logger.Info("check complete")
 }
 
 func (d *DHTNode) Start() {
@@ -171,6 +211,10 @@ func (n *Node) GetLogger() *zap.Logger {
 
 func (n *Node) GetClockStore() store.ClockStore {
 	return n.clockStore
+}
+
+func (n *Node) GetDataProofStore() store.DataProofStore {
+	return n.dataProofStore
 }
 
 func (n *Node) GetKeyManager() keys.KeyManager {

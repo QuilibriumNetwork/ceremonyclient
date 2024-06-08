@@ -46,7 +46,7 @@ func createPeer(t *testing.T) (peer.ID, ic.PrivKey) {
 	require.NoError(t, err)
 	id, err := peer.IDFromPrivateKey(priv)
 	require.NoError(t, err)
-	t.Logf("using a %s key: %s", priv.Type(), id.Pretty())
+	t.Logf("using a %s key: %s", priv.Type(), id)
 	return id, priv
 }
 
@@ -121,7 +121,7 @@ func TestHandshakeSucceeds(t *testing.T) {
 		b := make([]byte, 6)
 		_, err = clientConn.Read(b)
 		require.NoError(t, err)
-		require.Equal(t, string(b), "foobar")
+		require.Equal(t, "foobar", string(b))
 	}
 
 	// Use standard transports with default TLS configuration
@@ -245,21 +245,21 @@ func TestHandshakeWithNextProtoSucceeds(t *testing.T) {
 		}
 		defer serverConn.Close()
 
-		require.Equal(t, clientConn.LocalPeer(), clientID)
-		require.Equal(t, serverConn.LocalPeer(), serverID)
-		require.Equal(t, clientConn.RemotePeer(), serverID)
-		require.Equal(t, serverConn.RemotePeer(), clientID)
+		require.Equal(t, clientID, clientConn.LocalPeer())
+		require.Equal(t, serverID, serverConn.LocalPeer())
+		require.Equal(t, serverID, clientConn.RemotePeer())
+		require.Equal(t, clientID, serverConn.RemotePeer())
 		require.True(t, clientConn.RemotePublicKey().Equals(serverKey.GetPublic()), "server public key mismatch")
 		require.True(t, serverConn.RemotePublicKey().Equals(clientKey.GetPublic()), "client public key mismatch")
-		require.Equal(t, clientConn.ConnState().StreamMultiplexer, expectedMuxer)
-		require.Equal(t, clientConn.ConnState().UsedEarlyMuxerNegotiation, expectedMuxer != "")
+		require.Equal(t, expectedMuxer, clientConn.ConnState().StreamMultiplexer)
+		require.Equal(t, expectedMuxer != "", clientConn.ConnState().UsedEarlyMuxerNegotiation)
 		// exchange some data
 		_, err = serverConn.Write([]byte("foobar"))
 		require.NoError(t, err)
 		b := make([]byte, 6)
 		_, err = clientConn.Read(b)
 		require.NoError(t, err)
-		require.Equal(t, string(b), "foobar")
+		require.Equal(t, "foobar", string(b))
 	}
 
 	// Iterate through the StreamMultiplexer combinations.
@@ -376,7 +376,10 @@ func TestPeerIDMismatch(t *testing.T) {
 		thirdPartyID, _ := createPeer(t)
 		_, err = clientTransport.SecureOutbound(context.Background(), clientInsecureConn, thirdPartyID)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "peer IDs don't match")
+		var mismatchErr sec.ErrPeerIDMismatch
+		require.ErrorAs(t, err, &mismatchErr)
+		require.Equal(t, mismatchErr.Expected, thirdPartyID)
+		require.Equal(t, mismatchErr.Actual, serverID)
 
 		var serverErr error
 		select {
@@ -392,8 +395,8 @@ func TestPeerIDMismatch(t *testing.T) {
 		clientInsecureConn, serverInsecureConn := connect(t)
 
 		errChan := make(chan error)
+		thirdPartyID, _ := createPeer(t)
 		go func() {
-			thirdPartyID, _ := createPeer(t)
 			// expect the wrong peer ID
 			_, err := serverTransport.SecureInbound(context.Background(), serverInsecureConn, thirdPartyID)
 			errChan <- err
@@ -412,7 +415,10 @@ func TestPeerIDMismatch(t *testing.T) {
 			t.Fatal("expected handshake to return on the server side")
 		}
 		require.Error(t, serverErr)
-		require.Contains(t, serverErr.Error(), "peer IDs don't match")
+		var mismatchErr sec.ErrPeerIDMismatch
+		require.ErrorAs(t, serverErr, &mismatchErr)
+		require.Equal(t, mismatchErr.Expected, thirdPartyID)
+		require.Equal(t, mismatchErr.Actual, clientTransport.localPeer)
 	})
 }
 

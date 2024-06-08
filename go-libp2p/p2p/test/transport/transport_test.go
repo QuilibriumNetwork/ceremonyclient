@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,10 +21,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/sec"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+
+	"github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -130,6 +137,21 @@ var transportsToTest = []TransportTestCase{
 			return h
 		},
 	},
+	{
+		Name: "WebRTC",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.Transport(libp2pwebrtc.New))
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
+			} else {
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/webrtc-direct"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
 }
 
 func TestPing(t *testing.T) {
@@ -225,7 +247,7 @@ func TestLotsOfDataManyStreams(t *testing.T) {
 	// 64k buffer
 	const bufSize = 64 << 10
 	sendBuf := [bufSize]byte{}
-	const totalStreams = 512
+	const totalStreams = 500
 	const parallel = 8
 	// Total sends are > 20MiB
 	require.Greater(t, len(sendBuf)*totalStreams, 20<<20)
@@ -357,8 +379,20 @@ func TestMoreStreamsThanOurLimits(t *testing.T) {
 	const streamCount = 1024
 	for _, tc := range transportsToTest {
 		t.Run(tc.Name, func(t *testing.T) {
-			listener := tc.HostGenerator(t, TransportTestCaseOpts{})
-			dialer := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			if strings.Contains(tc.Name, "WebRTC") {
+				t.Skip("This test potentially exhausts the uint16 WebRTC stream ID space.")
+			}
+			listenerLimits := rcmgr.PartialLimitConfig{
+				PeerDefault: rcmgr.ResourceLimits{
+					Streams:         32,
+					StreamsInbound:  16,
+					StreamsOutbound: 16,
+				},
+			}
+			r, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(listenerLimits.Build(rcmgr.DefaultLimits.AutoScale())))
+			require.NoError(t, err)
+			listener := tc.HostGenerator(t, TransportTestCaseOpts{ResourceManager: r})
+			dialer := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true, NoRcmgr: true})
 			defer listener.Close()
 			defer dialer.Close()
 
@@ -370,101 +404,133 @@ func TestMoreStreamsThanOurLimits(t *testing.T) {
 			var handledStreams atomic.Int32
 			var sawFirstErr atomic.Bool
 
-			semaphore := make(chan struct{}, streamCount)
-			// Start with a single stream at a time. If that works, we'll increase the number of concurrent streams.
-			semaphore <- struct{}{}
+			workQueue := make(chan struct{}, streamCount)
+			for i := 0; i < streamCount; i++ {
+				workQueue <- struct{}{}
+			}
+			close(workQueue)
 
 			listener.SetStreamHandler("echo", func(s network.Stream) {
+				// Wait a bit so that we have more parallel streams open at the same time
+				time.Sleep(time.Millisecond * 10)
 				io.Copy(s, s)
 				s.Close()
 			})
 
 			wg := sync.WaitGroup{}
-			wg.Add(streamCount)
 			errCh := make(chan error, 1)
 			var completedStreams atomic.Int32
-			for i := 0; i < streamCount; i++ {
-				go func() {
-					<-semaphore
-					var didErr bool
-					defer wg.Done()
-					defer completedStreams.Add(1)
-					defer func() {
-						select {
-						case semaphore <- struct{}{}:
-						default:
-						}
-						if !didErr && !sawFirstErr.Load() {
-							// No error! We can add one more stream to our concurrency limit.
-							select {
-							case semaphore <- struct{}{}:
-							default:
-							}
-						}
-					}()
 
-					var s network.Stream
-					var err error
-					// maxRetries is an arbitrary retry amount if there's any error.
-					maxRetries := streamCount * 4
-					shouldRetry := func(err error) bool {
-						didErr = true
-						sawFirstErr.Store(true)
-						maxRetries--
-						if maxRetries == 0 || len(errCh) > 0 {
-							select {
-							case errCh <- errors.New("max retries exceeded"):
-							default:
-							}
-							return false
-						}
-						return true
+			const maxWorkerCount = streamCount
+			workerCount := 4
+
+			var startWorker func(workerIdx int)
+			startWorker = func(workerIdx int) {
+				wg.Add(1)
+				defer wg.Done()
+				for {
+					_, ok := <-workQueue
+					if !ok {
+						return
 					}
 
-					for {
-						s, err = dialer.NewStream(context.Background(), listener.ID(), "echo")
-						if err != nil {
-							if shouldRetry(err) {
+					// Inline function so we can use defer
+					func() {
+						var didErr bool
+						defer completedStreams.Add(1)
+						defer func() {
+							// Only the first worker adds more workers
+							if workerIdx == 0 && !didErr && !sawFirstErr.Load() {
+								nextWorkerCount := workerCount * 2
+								if nextWorkerCount < maxWorkerCount {
+									for i := workerCount; i < nextWorkerCount; i++ {
+										go startWorker(i)
+									}
+									workerCount = nextWorkerCount
+								}
+							}
+						}()
+
+						var s network.Stream
+						var err error
+						// maxRetries is an arbitrary retry amount if there's any error.
+						maxRetries := streamCount * 4
+						shouldRetry := func(err error) bool {
+							didErr = true
+							sawFirstErr.Store(true)
+							maxRetries--
+							if maxRetries == 0 || len(errCh) > 0 {
+								select {
+								case errCh <- errors.New("max retries exceeded"):
+								default:
+								}
+								return false
+							}
+							return true
+						}
+
+						for {
+							s, err = dialer.NewStream(context.Background(), listener.ID(), "echo")
+							if err != nil {
+								if shouldRetry(err) {
+									time.Sleep(50 * time.Millisecond)
+									continue
+								}
+								t.Logf("opening stream failed: %v", err)
+								return
+							}
+							err = func(s network.Stream) error {
+								defer s.Close()
+								err = s.SetDeadline(time.Now().Add(100 * time.Millisecond))
+								if err != nil {
+									return err
+								}
+
+								_, err = s.Write([]byte("hello"))
+								if err != nil {
+									return err
+								}
+
+								err = s.CloseWrite()
+								if err != nil {
+									return err
+								}
+
+								b, err := io.ReadAll(s)
+								if err != nil {
+									return err
+								}
+								if !bytes.Equal(b, []byte("hello")) {
+									return errors.New("received data does not match sent data")
+								}
+								handledStreams.Add(1)
+
+								return nil
+							}(s)
+							if err != nil && shouldRetry(err) {
 								time.Sleep(50 * time.Millisecond)
 								continue
 							}
+							return
 						}
-						err = func(s network.Stream) error {
-							defer s.Close()
-							_, err = s.Write([]byte("hello"))
-							if err != nil {
-								return err
-							}
-
-							err = s.CloseWrite()
-							if err != nil {
-								return err
-							}
-
-							b, err := io.ReadAll(s)
-							if err != nil {
-								return err
-							}
-							if !bytes.Equal(b, []byte("hello")) {
-								return errors.New("received data does not match sent data")
-							}
-							handledStreams.Add(1)
-
-							return nil
-						}(s)
-						if err != nil && shouldRetry(err) {
-							time.Sleep(50 * time.Millisecond)
-							continue
-						}
-						return
-					}
-				}()
+					}()
+				}
 			}
+
+			// Create any initial parallel workers
+			for i := 1; i < workerCount; i++ {
+				go startWorker(i)
+			}
+
+			// Start the first worker
+			startWorker(0)
+
 			wg.Wait()
 			close(errCh)
 
 			require.NoError(t, <-errCh)
 			require.Equal(t, streamCount, int(handledStreams.Load()))
+			require.True(t, sawFirstErr.Load(), "Expected to see an error from the peer")
 		})
 	}
 }
@@ -552,8 +618,8 @@ func TestStreamReadDeadline(t *testing.T) {
 			_, err = s.Read([]byte{0})
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "deadline")
-			nerr, ok := err.(net.Error)
-			require.True(t, ok, "expected a net.Error")
+			var nerr net.Error
+			require.ErrorAs(t, err, &nerr, "expected a net.Error")
 			require.True(t, nerr.Timeout(), "expected net.Error.Timeout() == true")
 			// now test that the stream is still usable
 			s.SetReadDeadline(time.Time{})
@@ -563,6 +629,62 @@ func TestStreamReadDeadline(t *testing.T) {
 			_, err = s.Read(b)
 			require.Equal(t, "foobar", string(b))
 			require.NoError(t, err)
+		})
+	}
+}
+
+func TestDiscoverPeerIDFromSecurityNegotiation(t *testing.T) {
+	// extracts the peerID of the dialed peer from the error
+	extractPeerIDFromError := func(inputErr error) (peer.ID, error) {
+		var dialErr *swarm.DialError
+		if !errors.As(inputErr, &dialErr) {
+			return "", inputErr
+		}
+		innerErr := dialErr.DialErrors[0].Cause
+
+		var peerIDMismatchErr sec.ErrPeerIDMismatch
+		if errors.As(innerErr, &peerIDMismatchErr) {
+			return peerIDMismatchErr.Actual, nil
+		}
+
+		return "", inputErr
+	}
+
+	for _, tc := range transportsToTest {
+		t.Run(tc.Name, func(t *testing.T) {
+			h1 := tc.HostGenerator(t, TransportTestCaseOpts{})
+			h2 := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			defer h1.Close()
+			defer h2.Close()
+
+			// runs a test to verify we can extract the peer ID from a target with just its address
+			t.Helper()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// Use a bogus peer ID so that when we connect to the target we get an error telling
+			// us the targets real peer ID
+			bogusPeerId, err := peer.Decode("QmadAdJ3f63JyNs65X7HHzqDwV53ynvCcKtNFvdNaz3nhk")
+			require.NoError(t, err, "the hard coded bogus peerID is invalid")
+
+			ai := &peer.AddrInfo{
+				ID:    bogusPeerId,
+				Addrs: []multiaddr.Multiaddr{h1.Addrs()[0]},
+			}
+
+			// Try connecting with the bogus peer ID
+			err = h2.Connect(ctx, *ai)
+			require.Error(t, err, "somehow we successfully connected to a bogus peerID!")
+
+			// Extract the actual peer ID from the error
+			newPeerId, err := extractPeerIDFromError(err)
+			require.NoError(t, err)
+			ai.ID = newPeerId
+			// Make sure the new ID is what we expected
+			require.Equal(t, h1.ID(), ai.ID)
+
+			// and just to double-check try connecting again to make sure it works
+			require.NoError(t, h2.Connect(ctx, *ai))
 		})
 	}
 }

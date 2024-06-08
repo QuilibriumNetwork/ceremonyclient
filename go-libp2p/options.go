@@ -349,7 +349,7 @@ func EnableAutoRelayWithPeerSource(peerSource autorelay.PeerSource, opts ...auto
 // forcing the local node to believe it is reachable externally.
 func ForceReachabilityPublic() Option {
 	return func(cfg *Config) error {
-		public := network.Reachability(network.ReachabilityPublic)
+		public := network.ReachabilityPublic
 		cfg.AutoNATConfig.ForceReachability = &public
 		return nil
 	}
@@ -359,7 +359,7 @@ func ForceReachabilityPublic() Option {
 // forceing the local node to believe it is behind a NAT and not reachable externally.
 func ForceReachabilityPrivate() Option {
 	return func(cfg *Config) error {
-		private := network.Reachability(network.ReachabilityPrivate)
+		private := network.ReachabilityPrivate
 		cfg.AutoNATConfig.ForceReachability = &private
 		return nil
 	}
@@ -579,6 +579,7 @@ func PrometheusRegisterer(reg prometheus.Registerer) Option {
 // DialRanker configures libp2p to use d as the dial ranker. To enable smart
 // dialing use `swarm.DefaultDialRanker`. use `swarm.NoDelayDialRanker` to
 // disable smart dialing.
+//
 // Deprecated: use SwarmOpts(swarm.WithDialRanker(d)) instead
 func DialRanker(d network.DialRanker) Option {
 	return func(cfg *Config) error {
@@ -594,6 +595,17 @@ func DialRanker(d network.DialRanker) Option {
 func SwarmOpts(opts ...swarm.Option) Option {
 	return func(cfg *Config) error {
 		cfg.SwarmOpts = opts
+		return nil
+	}
+}
+
+// DisableIdentifyAddressDiscovery disables address discovery using peer provided observed addresses
+// in identify. If you know your public addresses upfront, the recommended way is to use
+// AddressFactory to provide the external adddress to the host and use this option to disable
+// discovery from identify.
+func DisableIdentifyAddressDiscovery() Option {
+	return func(cfg *Config) error {
+		cfg.DisableIdentifyAddressDiscovery = true
 		return nil
 	}
 }

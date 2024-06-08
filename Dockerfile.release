@@ -1,0 +1,55 @@
+FROM golang:1.20.14-alpine3.19 as build
+
+ARG NODE_VERSION
+ARG MAX_KEY_ID
+
+ENV GOEXPERIMENT=arenas
+
+WORKDIR /opt/ceremonyclient
+
+COPY . .
+
+RUN cp "node/node-${NODE_VERSION}-linux-amd64" "node/node"
+RUN cp "node/node-${NODE_VERSION}-linux-amd64.dgst" "node/node.dgst"
+RUN for i in $(seq 1 ${MAX_KEY_ID}); do \
+      if [ -f node/node-${NODE_VERSION}-linux-amd64.dgst.sig.${i} ]; then \
+        cp "node/node-${NODE_VERSION}-linux-amd64.dgst.sig.${i}" "node/node.dgst.sig.${i}"; \
+      fi \
+    done
+
+WORKDIR /opt/ceremonyclient/client
+
+RUN go build -o qclient ./main.go
+
+RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.1
+
+FROM alpine:3.19
+
+ARG NODE_VERSION
+ARG GIT_REPO
+ARG GIT_BRANCH
+ARG GIT_COMMIT
+
+ENV GOEXPERIMENT=arenas
+
+LABEL org.opencontainers.image.title="Quilibrium Network Node"
+LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
+LABEL org.opencontainers.image.vendor=Quilibrium
+LABEL org.opencontainers.image.url=https://quilibrium.com/
+LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
+LABEL org.opencontainers.image.source=$GIT_REPO
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+
+COPY --from=build /opt/ceremonyclient/node/node /usr/local/bin
+COPY --from=build /opt/ceremonyclient/node/node.dgst /usr/local/bin
+COPY --from=build /opt/ceremonyclient/node/node.dgst.sig.* /usr/local/bin
+
+COPY --from=build /opt/ceremonyclient/client/qclient /usr/local/bin
+
+COPY --from=build /go/bin/grpcurl /usr/local/bin
+
+WORKDIR /root
+
+ENTRYPOINT ["node"]

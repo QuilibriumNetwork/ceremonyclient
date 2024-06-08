@@ -225,8 +225,8 @@ func (d *DataTimeReel) createGenesisFrame() (
 	}
 
 	difficulty := d.engineConfig.Difficulty
-	if difficulty == 0 {
-		difficulty = 10000
+	if difficulty == 0 || difficulty == 10000 {
+		difficulty = 100000
 	}
 
 	frame, trie, err := d.frameProver.CreateDataGenesisFrame(

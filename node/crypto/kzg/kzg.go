@@ -413,14 +413,14 @@ func Init() {
 	modulus := make([]byte, 73)
 	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
-	sizes := []int64{16, 128, 1024, 65536}
+	sizes := []int64{16, 128, 1024, 2048, 65536}
 
 	wg = errgroup.Group{}
 	wg.SetLimit(runtime.NumCPU())
-	root := make([]curves.PairingScalar, 4)
-	roots := make([][]curves.PairingScalar, 4)
-	reverseRoots := make([][]curves.PairingScalar, 4)
-	ffts := make([][]curves.PairingPoint, 4)
+	root := make([]curves.PairingScalar, 5)
+	roots := make([][]curves.PairingScalar, 5)
+	reverseRoots := make([][]curves.PairingScalar, 5)
+	ffts := make([][]curves.PairingPoint, 5)
 
 	for idx, i := range sizes {
 		i := i

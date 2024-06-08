@@ -1,0 +1,4 @@
+namespace vdf {
+    sequence<u8> wesolowski_solve(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty);
+    boolean wesolowski_verify(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty, [ByRef] sequence<u8> alleged_solution);
+};

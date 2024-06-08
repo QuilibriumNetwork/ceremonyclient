@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/transport"
+	"golang.org/x/exp/slices"
 
 	logging "github.com/ipfs/go-log/v2"
 	ma "github.com/multiformats/go-multiaddr"
@@ -136,8 +137,8 @@ func WithIPv6BlackHoleConfig(enabled bool, n, min int) Option {
 // communication. The Chan sends/receives Messages, which note the
 // destination or source Peer.
 type Swarm struct {
-	nextConnID   uint64 // guarded by atomic
-	nextStreamID uint64 // guarded by atomic
+	nextConnID   atomic.Uint64
+	nextStreamID atomic.Uint64
 
 	// Close refcount. This allows us to fully wait for the swarm to be torn
 	// down before continuing.
@@ -172,6 +173,11 @@ type Swarm struct {
 		m map[network.Notifiee]struct{}
 	}
 
+	directConnNotifs struct {
+		sync.Mutex
+		m map[peer.ID][]chan struct{}
+	}
+
 	transports struct {
 		sync.RWMutex
 		m map[int]transport.Transport
@@ -197,9 +203,10 @@ type Swarm struct {
 
 	dialRanker network.DialRanker
 
-	udpBlackHoleConfig  blackHoleConfig
-	ipv6BlackHoleConfig blackHoleConfig
-	bhd                 *blackHoleDetector
+	udpBlackHoleConfig        blackHoleConfig
+	ipv6BlackHoleConfig       blackHoleConfig
+	bhd                       *blackHoleDetector
+	connectednessEventEmitter *connectednessEventEmitter
 }
 
 // NewSwarm constructs a Swarm.
@@ -231,6 +238,8 @@ func NewSwarm(local peer.ID, peers peerstore.Peerstore, eventBus event.Bus, opts
 	s.listeners.m = make(map[transport.Listener]struct{})
 	s.transports.m = make(map[int]transport.Transport)
 	s.notifs.m = make(map[network.Notifiee]struct{})
+	s.directConnNotifs.m = make(map[peer.ID][]chan struct{})
+	s.connectednessEventEmitter = newConnectednessEventEmitter(s.Connectedness, emitter)
 
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
@@ -247,7 +256,6 @@ func NewSwarm(local peer.ID, peers peerstore.Peerstore, eventBus event.Bus, opts
 	s.backf.init(s.ctx)
 
 	s.bhd = newBlackHoleDetector(s.udpBlackHoleConfig, s.ipv6BlackHoleConfig, s.metricsTracer)
-
 	return s, nil
 }
 
@@ -256,10 +264,13 @@ func (s *Swarm) Close() error {
 	return nil
 }
 
+// Done returns a channel that is closed when the swarm is closed.
+func (s *Swarm) Done() <-chan struct{} {
+	return s.ctx.Done()
+}
+
 func (s *Swarm) close() {
 	s.ctxCancel()
-
-	s.emitter.Close()
 
 	// Prevents new connections and/or listeners from being added to the swarm.
 	s.listeners.Lock()
@@ -274,9 +285,10 @@ func (s *Swarm) close() {
 
 	// Lots of goroutines but we might as well do this in parallel. We want to shut down as fast as
 	// possible.
-
+	s.refs.Add(len(listeners))
 	for l := range listeners {
 		go func(l transport.Listener) {
+			defer s.refs.Done()
 			if err := l.Close(); err != nil && err != transport.ErrListenerClosed {
 				log.Errorf("error when shutting down listener: %s", err)
 			}
@@ -295,6 +307,8 @@ func (s *Swarm) close() {
 
 	// Wait for everything to finish.
 	s.refs.Wait()
+	s.connectednessEventEmitter.Close()
+	s.emitter.Close()
 
 	// Now close out any transports (if necessary). Do this after closing
 	// all connections/listeners.
@@ -337,13 +351,14 @@ func (s *Swarm) addConn(tc transport.CapableConn, dir network.Direction) (*Conn,
 	}
 	stat.Direction = dir
 	stat.Opened = time.Now()
+	isLimited := stat.Limited
 
 	// Wrap and register the connection.
 	c := &Conn{
 		conn:  tc,
 		swarm: s,
 		stat:  stat,
-		id:    atomic.AddUint64(&s.nextConnID, 1),
+		id:    s.nextConnID.Add(1),
 	}
 
 	// we ONLY check upgraded connections here so we can send them a Disconnect message.
@@ -353,7 +368,7 @@ func (s *Swarm) addConn(tc transport.CapableConn, dir network.Direction) (*Conn,
 			// TODO Send disconnect with reason here
 			err := tc.Close()
 			if err != nil {
-				log.Warnf("failed to close connection with peer %s and addr %s; err: %s", p.Pretty(), addr, err)
+				log.Warnf("failed to close connection with peer %s and addr %s; err: %s", p, addr, err)
 			}
 			return nil, ErrGaterDisallowedConnection
 		}
@@ -377,28 +392,34 @@ func (s *Swarm) addConn(tc transport.CapableConn, dir network.Direction) (*Conn,
 	}
 
 	c.streams.m = make(map[*Stream]struct{})
-	isFirstConnection := len(s.conns.m[p]) == 0
 	s.conns.m[p] = append(s.conns.m[p], c)
-
 	// Add two swarm refs:
 	// * One will be decremented after the close notifications fire in Conn.doClose
 	// * The other will be decremented when Conn.start exits.
 	s.refs.Add(2)
-
 	// Take the notification lock before releasing the conns lock to block
 	// Disconnect notifications until after the Connect notifications done.
+	// This lock also ensures that swarm.refs.Wait() exits after we have
+	// enqueued the peer connectedness changed notification.
+	// TODO: Fix this fragility by taking a swarm ref for dial worker loop
 	c.notifyLk.Lock()
 	s.conns.Unlock()
 
-	// Emit event after releasing `s.conns` lock so that a consumer can still
-	// use swarm methods that need the `s.conns` lock.
-	if isFirstConnection {
-		s.emitter.Emit(event.EvtPeerConnectednessChanged{
-			Peer:          p,
-			Connectedness: network.Connected,
-		})
-	}
+	s.connectednessEventEmitter.AddConn(p)
 
+	if !isLimited {
+		// Notify goroutines waiting for a direct connection
+		//
+		// Go routines interested in waiting for direct connection first acquire this lock
+		// and then acquire s.conns.RLock. Do not acquire this lock before conns.Unlock to
+		// prevent deadlock.
+		s.directConnNotifs.Lock()
+		for _, ch := range s.directConnNotifs.m[p] {
+			close(ch)
+		}
+		delete(s.directConnNotifs.m, p)
+		s.directConnNotifs.Unlock()
+	}
 	s.notifyAll(func(f network.Notifiee) {
 		f.Connected(s, c)
 	})
@@ -429,54 +450,110 @@ func (s *Swarm) StreamHandler() network.StreamHandler {
 
 // NewStream creates a new stream on any available connection to peer, dialing
 // if necessary.
+// Use network.WithAllowLimitedConn to open a stream over a limited(relayed)
+// connection.
 func (s *Swarm) NewStream(ctx context.Context, p peer.ID) (network.Stream, error) {
 	log.Debugf("[%s] opening stream to peer [%s]", s.local, p)
 
 	// Algorithm:
 	// 1. Find the best connection, otherwise, dial.
-	// 2. Try opening a stream.
-	// 3. If the underlying connection is, in fact, closed, close the outer
+	// 2. If the best connection is limited, wait for a direct conn via conn
+	//    reversal or hole punching.
+	// 3. Try opening a stream.
+	// 4. If the underlying connection is, in fact, closed, close the outer
 	//    connection and try again. We do this in case we have a closed
 	//    connection but don't notice it until we actually try to open a
 	//    stream.
 	//
-	// Note: We only dial once.
-	//
 	// TODO: Try all connections even if we get an error opening a stream on
 	// a non-closed connection.
-	dials := 0
+	numDials := 0
 	for {
-		// will prefer direct connections over relayed connections for opening streams
-		c, err := s.bestAcceptableConnToPeer(ctx, p)
-		if err != nil {
-			return nil, err
-		}
-
+		c := s.bestConnToPeer(p)
 		if c == nil {
-			if nodial, _ := network.GetNoDial(ctx); nodial {
+			if nodial, _ := network.GetNoDial(ctx); !nodial {
+				numDials++
+				if numDials > DialAttempts {
+					return nil, errors.New("max dial attempts exceeded")
+				}
+				var err error
+				c, err = s.dialPeer(ctx, p)
+				if err != nil {
+					return nil, err
+				}
+			} else {
 				return nil, network.ErrNoConn
 			}
+		}
 
-			if dials >= DialAttempts {
-				return nil, errors.New("max dial attempts exceeded")
-			}
-			dials++
-
+		limitedAllowed, _ := network.GetAllowLimitedConn(ctx)
+		if !limitedAllowed && c.Stat().Limited {
 			var err error
-			c, err = s.dialPeer(ctx, p)
+			c, err = s.waitForDirectConn(ctx, p)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		s, err := c.NewStream(ctx)
+		str, err := c.NewStream(ctx)
 		if err != nil {
 			if c.conn.IsClosed() {
 				continue
 			}
 			return nil, err
 		}
-		return s, nil
+		return str, nil
+	}
+}
+
+// waitForDirectConn waits for a direct connection established through hole punching or connection reversal.
+func (s *Swarm) waitForDirectConn(ctx context.Context, p peer.ID) (*Conn, error) {
+	s.directConnNotifs.Lock()
+	c := s.bestConnToPeer(p)
+	if c == nil {
+		s.directConnNotifs.Unlock()
+		return nil, network.ErrNoConn
+	} else if !c.Stat().Limited {
+		s.directConnNotifs.Unlock()
+		return c, nil
+	}
+
+	// Wait for limited connection to upgrade to a direct connection either by
+	// connection reversal or hole punching.
+	ch := make(chan struct{})
+	s.directConnNotifs.m[p] = append(s.directConnNotifs.m[p], ch)
+	s.directConnNotifs.Unlock()
+
+	// apply the DialPeer timeout
+	ctx, cancel := context.WithTimeout(ctx, network.GetDialPeerTimeout(ctx))
+	defer cancel()
+
+	// Wait for notification.
+	select {
+	case <-ctx.Done():
+		// Remove ourselves from the notification list
+		s.directConnNotifs.Lock()
+		defer s.directConnNotifs.Unlock()
+
+		s.directConnNotifs.m[p] = slices.DeleteFunc(
+			s.directConnNotifs.m[p],
+			func(c chan struct{}) bool { return c == ch },
+		)
+		if len(s.directConnNotifs.m[p]) == 0 {
+			delete(s.directConnNotifs.m, p)
+		}
+		return nil, ctx.Err()
+	case <-ch:
+		// We do not need to remove ourselves from the list here as the notifier
+		// clears the map entry
+		c := s.bestConnToPeer(p)
+		if c == nil {
+			return nil, network.ErrNoConn
+		}
+		if c.Stat().Limited {
+			return nil, network.ErrLimitedConn
+		}
+		return c, nil
 	}
 }
 
@@ -495,11 +572,11 @@ func (s *Swarm) ConnsToPeer(p peer.ID) []network.Conn {
 }
 
 func isBetterConn(a, b *Conn) bool {
-	// If one is transient and not the other, prefer the non-transient connection.
-	aTransient := a.Stat().Transient
-	bTransient := b.Stat().Transient
-	if aTransient != bTransient {
-		return !aTransient
+	// If one is limited and not the other, prefer the unlimited connection.
+	aLimited := a.Stat().Limited
+	bLimited := b.Stat().Limited
+	if aLimited != bLimited {
+		return !aLimited
 	}
 
 	// If one is direct and not the other, prefer the direct connection.
@@ -548,26 +625,17 @@ func (s *Swarm) bestConnToPeer(p peer.ID) *Conn {
 	return best
 }
 
-// - Returns the best "acceptable" connection, if available.
-// - Returns nothing if no such connection exists, but if we should try dialing anyways.
-// - Returns an error if no such connection exists, but we should not try dialing.
-func (s *Swarm) bestAcceptableConnToPeer(ctx context.Context, p peer.ID) (*Conn, error) {
+// bestAcceptableConnToPeer returns the best acceptable connection, considering the passed in ctx.
+// If network.WithForceDirectDial is used, it only returns a direct connections, ignoring
+// any limited (relayed) connections to the peer.
+func (s *Swarm) bestAcceptableConnToPeer(ctx context.Context, p peer.ID) *Conn {
 	conn := s.bestConnToPeer(p)
-	if conn == nil {
-		return nil, nil
-	}
 
 	forceDirect, _ := network.GetForceDirectDial(ctx)
 	if forceDirect && !isDirectConn(conn) {
-		return nil, nil
+		return nil
 	}
-
-	useTransient, _ := network.GetUseTransient(ctx)
-	if useTransient || !conn.Stat().Transient {
-		return conn, nil
-	}
-
-	return nil, network.ErrTransientConn
+	return conn
 }
 
 func isDirectConn(c *Conn) bool {
@@ -579,8 +647,28 @@ func isDirectConn(c *Conn) bool {
 // To check if we have an open connection, use `s.Connectedness(p) ==
 // network.Connected`.
 func (s *Swarm) Connectedness(p peer.ID) network.Connectedness {
-	if s.bestConnToPeer(p) != nil {
-		return network.Connected
+	s.conns.RLock()
+	defer s.conns.RUnlock()
+
+	return s.connectednessUnlocked(p)
+}
+
+// connectednessUnlocked returns the connectedness of a peer.
+func (s *Swarm) connectednessUnlocked(p peer.ID) network.Connectedness {
+	var haveLimited bool
+	for _, c := range s.conns.m[p] {
+		if c.IsClosed() {
+			// These will be garbage collected soon
+			continue
+		}
+		if c.Stat().Limited {
+			haveLimited = true
+		} else {
+			return network.Connected
+		}
+	}
+	if haveLimited {
+		return network.Limited
 	}
 	return network.NotConnected
 }
@@ -678,24 +766,7 @@ func (s *Swarm) removeConn(c *Conn) {
 	p := c.RemotePeer()
 
 	s.conns.Lock()
-
 	cs := s.conns.m[p]
-
-	if len(cs) == 1 {
-		delete(s.conns.m, p)
-		s.conns.Unlock()
-
-		// Emit event after releasing `s.conns` lock so that a consumer can still
-		// use swarm methods that need the `s.conns` lock.
-		s.emitter.Emit(event.EvtPeerConnectednessChanged{
-			Peer:          p,
-			Connectedness: network.NotConnected,
-		})
-		return
-	}
-
-	defer s.conns.Unlock()
-
 	for i, ci := range cs {
 		if ci == c {
 			// NOTE: We're intentionally preserving order.
@@ -707,6 +778,10 @@ func (s *Swarm) removeConn(c *Conn) {
 			break
 		}
 	}
+	if len(s.conns.m[p]) == 0 {
+		delete(s.conns.m, p)
+	}
+	s.conns.Unlock()
 }
 
 // String returns a string representation of Network.
