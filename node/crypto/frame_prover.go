@@ -54,13 +54,12 @@ type FrameProver interface {
 	CalculateChallengeProof(
 		challenge []byte,
 		core uint32,
-		skew int64,
-		nowMs int64,
-	) ([]byte, int64, error)
+		increment uint32,
+	) ([]byte, error)
 	VerifyChallengeProof(
 		challenge []byte,
-		timestamp int64,
-		assertedDifficulty int64,
-		proof [][]byte,
+		increment uint32,
+		core uint32,
+		proof []byte,
 	) bool
 }

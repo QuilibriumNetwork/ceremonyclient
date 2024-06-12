@@ -8,3 +8,7 @@ ceremony-client
 .env.signers
 .task
 node-tmp-*
+build
+
+# Rust
+target

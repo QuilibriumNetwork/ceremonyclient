@@ -14,7 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds/pb"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
 
-	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/arc/v2"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	logging "github.com/ipfs/go-log/v2"
@@ -202,7 +202,7 @@ func NewAddrBook(ctx context.Context, store ds.Batching, opts Options) (ab *dsAd
 	}
 
 	if opts.CacheSize > 0 {
-		if ab.cache, err = lru.NewARC[peer.ID, *addrsRecord](int(opts.CacheSize)); err != nil {
+		if ab.cache, err = arc.NewARC[peer.ID, *addrsRecord](int(opts.CacheSize)); err != nil {
 			return nil, err
 		}
 	} else {
@@ -362,7 +362,7 @@ func (ab *dsAddrBook) storeSignedPeerRecord(p peer.ID, envelope *record.Envelope
 func (ab *dsAddrBook) GetPeerRecord(p peer.ID) *record.Envelope {
 	pr, err := ab.loadRecord(p, true, false)
 	if err != nil {
-		log.Errorf("unable to load record for peer %s: %v", p.Pretty(), err)
+		log.Errorf("unable to load record for peer %s: %v", p, err)
 		return nil
 	}
 	pr.RLock()
@@ -372,7 +372,7 @@ func (ab *dsAddrBook) GetPeerRecord(p peer.ID) *record.Envelope {
 	}
 	state, _, err := record.ConsumeEnvelope(pr.CertifiedRecord.Raw, peer.PeerRecordEnvelopeDomain)
 	if err != nil {
-		log.Errorf("error unmarshaling stored signed peer record for peer %s: %v", p.Pretty(), err)
+		log.Errorf("error unmarshaling stored signed peer record for peer %s: %v", p, err)
 		return nil
 	}
 	return state
@@ -398,7 +398,7 @@ func (ab *dsAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Duratio
 func (ab *dsAddrBook) UpdateAddrs(p peer.ID, oldTTL time.Duration, newTTL time.Duration) {
 	pr, err := ab.loadRecord(p, true, false)
 	if err != nil {
-		log.Errorf("failed to update ttls for peer %s: %s\n", p.Pretty(), err)
+		log.Errorf("failed to update ttls for peer %s: %s\n", p, err)
 		return
 	}
 
@@ -423,7 +423,7 @@ func (ab *dsAddrBook) UpdateAddrs(p peer.ID, oldTTL time.Duration, newTTL time.D
 func (ab *dsAddrBook) Addrs(p peer.ID) []ma.Multiaddr {
 	pr, err := ab.loadRecord(p, true, true)
 	if err != nil {
-		log.Warn("failed to load peerstore entry for peer %v while querying addrs, err: %v", p, err)
+		log.Warnf("failed to load peerstore entry for peer %s while querying addrs, err: %v", p, err)
 		return nil
 	}
 
@@ -466,7 +466,7 @@ func (ab *dsAddrBook) ClearAddrs(p peer.ID) {
 
 	key := addrBookBase.ChildString(b32.RawStdEncoding.EncodeToString([]byte(p)))
 	if err := ab.ds.Delete(context.TODO(), key); err != nil {
-		log.Errorf("failed to clear addresses for peer %s: %v", p.Pretty(), err)
+		log.Errorf("failed to clear addresses for peer %s: %v", p, err)
 	}
 }
 
@@ -477,7 +477,7 @@ func (ab *dsAddrBook) setAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Duratio
 
 	pr, err := ab.loadRecord(p, true, false)
 	if err != nil {
-		return fmt.Errorf("failed to load peerstore entry for peer %v while setting addrs, err: %v", p, err)
+		return fmt.Errorf("failed to load peerstore entry for peer %s while setting addrs, err: %v", p, err)
 	}
 
 	pr.Lock()

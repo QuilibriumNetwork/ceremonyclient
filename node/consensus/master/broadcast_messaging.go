@@ -129,10 +129,7 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		return nil
 	}
 
-	// minimum proof size is one timestamp, one vdf proof, must match one fewer
-	// than core count
-	if len(report.Proof) < 516+8 ||
-		((len(report.Proof)-8)/516) != int(report.Cores-1) {
+	if len(report.Proof) != 520 {
 		e.logger.Warn(
 			"received invalid proof from peer",
 			zap.String("peer_id", peer.ID(peerID).String()),
@@ -173,17 +170,9 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		}
 
 		proof := report.Proof
-		timestamp := binary.BigEndian.Uint64(proof[:8])
-		proof = proof[8:]
-
-		// Ignore outdated reports, give 3 minutes + proof time for propagation
-		// delay
-		if int64(timestamp) < (time.Now().UnixMilli() - (480 * 1000)) {
-			return nil
-		}
-
-		challenge := binary.BigEndian.AppendUint64([]byte{}, report.MasterHeadFrame)
+		challenge := []byte{}
 		challenge = append(challenge, peerID...)
+		challenge = append(challenge, report.Challenge...)
 
 		proofs := make([][]byte, (len(report.Proof)-8)/516)
 		for i := 0; i < len(proofs); i++ {
@@ -191,11 +180,11 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		}
 		go func() {
 			e.verifyTestCh <- verifyChallenge{
-				peerID:           peerID,
-				challenge:        challenge,
-				timestamp:        int64(timestamp),
-				difficultyMetric: report.DifficultyMetric,
-				proofs:           proofs,
+				peerID:    peerID,
+				challenge: challenge,
+				cores:     report.Cores,
+				increment: report.Increment,
+				proof:     proof,
 			}
 		}()
 

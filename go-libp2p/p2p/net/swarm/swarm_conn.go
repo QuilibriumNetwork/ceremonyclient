@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ic "github.com/libp2p/go-libp2p/core/crypto"
@@ -49,7 +48,7 @@ func (c *Conn) IsClosed() bool {
 
 func (c *Conn) ID() string {
 	// format: <first 10 chars of peer id>-<global conn ordinal>
-	return fmt.Sprintf("%s-%d", c.RemotePeer().Pretty()[0:10], c.id)
+	return fmt.Sprintf("%s-%d", c.RemotePeer().String()[:10], c.id)
 }
 
 // Close closes this connection.
@@ -74,6 +73,11 @@ func (c *Conn) doClose() {
 
 	c.err = c.conn.Close()
 
+	// Send the connectedness event after closing the connection.
+	// This ensures that both remote connection close and local connection
+	// close events are sent after the underlying transport connection is closed.
+	c.swarm.connectednessEventEmitter.RemoveConn(c.RemotePeer())
+
 	// This is just for cleaning up state. The connection has already been closed.
 	// We *could* optimize this but it really isn't worth it.
 	for s := range streams {
@@ -86,10 +90,11 @@ func (c *Conn) doClose() {
 		c.notifyLk.Lock()
 		defer c.notifyLk.Unlock()
 
+		// Only notify for disconnection if we notified for connection
 		c.swarm.notifyAll(func(f network.Notifiee) {
 			f.Disconnected(c.swarm, c)
 		})
-		c.swarm.refs.Done() // taken in Swarm.addConn
+		c.swarm.refs.Done()
 	}()
 }
 
@@ -109,7 +114,6 @@ func (c *Conn) start() {
 	go func() {
 		defer c.swarm.refs.Done()
 		defer c.Close()
-
 		for {
 			ts, err := c.conn.AcceptStream()
 			if err != nil {
@@ -137,6 +141,7 @@ func (c *Conn) start() {
 				if h := c.swarm.StreamHandler(); h != nil {
 					h(s)
 				}
+				s.completeAcceptStreamGoroutine()
 			}()
 		}
 	}()
@@ -147,9 +152,9 @@ func (c *Conn) String() string {
 		"<swarm.Conn[%T] %s (%s) <-> %s (%s)>",
 		c.conn.Transport(),
 		c.conn.LocalMultiaddr(),
-		c.conn.LocalPeer().Pretty(),
+		c.conn.LocalPeer(),
 		c.conn.RemoteMultiaddr(),
-		c.conn.RemotePeer().Pretty(),
+		c.conn.RemotePeer(),
 	)
 }
 
@@ -193,9 +198,9 @@ func (c *Conn) Stat() network.ConnStats {
 
 // NewStream returns a new Stream from this connection
 func (c *Conn) NewStream(ctx context.Context) (network.Stream, error) {
-	if c.Stat().Transient {
-		if useTransient, _ := network.GetUseTransient(ctx); !useTransient {
-			return nil, network.ErrTransientConn
+	if c.Stat().Limited {
+		if useLimited, _ := network.GetAllowLimitedConn(ctx); !useLimited {
+			return nil, network.ErrLimitedConn
 		}
 	}
 
@@ -238,7 +243,8 @@ func (c *Conn) addStream(ts network.MuxedStream, dir network.Direction, scope ne
 			Direction: dir,
 			Opened:    time.Now(),
 		},
-		id: atomic.AddUint64(&c.swarm.nextStreamID, 1),
+		id:                             c.swarm.nextStreamID.Add(1),
+		acceptStreamGoroutineCompleted: dir != network.DirInbound,
 	}
 	c.stat.NumStreams++
 	c.streams.m[s] = struct{}{}

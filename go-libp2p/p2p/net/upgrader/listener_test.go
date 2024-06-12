@@ -18,10 +18,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/net/upgrader"
 
-	"github.com/golang/mock/gomock"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 func createListener(t *testing.T, u transport.Upgrader) transport.Listener {
@@ -112,7 +112,7 @@ func TestConnectionsClosedIfNotAccepted(t *testing.T) {
 	}
 
 	time.Sleep(timeout)
-	require.Nil(<-errCh)
+	require.NoError(<-errCh)
 }
 
 func TestFailedUpgradeOnListen(t *testing.T) {

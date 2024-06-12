@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -45,31 +46,31 @@ func NewConfig(configPath string) (*Config, error) {
 }
 
 var BootstrapPeers = []string{
-	"/dns/bootstrap.quilibrium.com/udp/8336/quic/p2p/Qme3g6rJWuz8HVXxpDb7aV2hiFq8bZJNqxMmwzmASzfq1M",
-	"/dns/quaalude.quilibrium.com/udp/8336/quic/p2p/QmYruNcruYNgyTKeUqJSxjbuTFYWYDw2r5df9YKMGWCRKA",
-	"/dns/quecifer.quilibrium.com/udp/8336/quic/p2p/QmdWF9bGTH5mwJXkxrG859HA5r34MxXtMSTuEikSMDSESv",
-	"/dns/quantum.quilibrium.com/udp/8336/quic/p2p/QmbmVeKnSWK9HHAQHSS714XU3gx77TrS356JmHmKFj7q7M",
-	"/dns/quidditas.quilibrium.com/udp/8336/quic/p2p/QmR1rF5E9zAob9FZyMF7uTUM27D7GYtX9RaiSsNY9UP72J",
-	"/dns/quillon.quilibrium.com/udp/8336/quic/p2p/QmWgHv6z3tyimW4JvrvYRgsJEimgV7J2xbE7QEpFNPvAnB",
-	"/dns/quidditch.quilibrium.com/udp/8336/quic/p2p/QmbZEGuinaCndj4XLb6fteZmjmP3C1Tsgijmc5BGuUk8Ma",
-	"/dns/quagmire.quilibrium.com/udp/8336/quic/p2p/QmaQ9KAaKtqXhYSQ5ARQNnn8B8474cWGvvD6PgJ4gAtMrx",
-	"/ip4/204.186.74.46/udp/8316/quic/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
-	"/ip4/103.219.170.9/udp/8336/quic/p2p/QmfEdMfmdhNoYuGVhhw5LBApHHG1rbVAHXwGWpW8s9bXeg",
-	"/ip4/185.143.102.84/udp/8336/quic/p2p/Qmce68gLLq9eMdwCcmd1ptfoC2nVoe861LF1cjdVHC2DwK",
-	"/ip4/65.109.17.13/udp/8336/quic/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
-	"/ip4/65.108.194.84/udp/8336/quic/p2p/QmP8C7g9ZRiWzhqN2AgFu5onS6HwHzR6Vv1TCHxAhnCSnq",
-	"/dns/quil.dfcnodes.eu/udp/8336/quic/p2p/QmQaFmbYVrKSwoen5UQdaqyDq4QhXfSSLDVnYpYD4SF9tX",
-	"/ip4/87.98.167.207/udp/8336/quic/p2p/QmafiAXLu1JWktyfzDtD67i78GRBYCfQ4doTfq7pp7wfQ1",
-	"/ip4/216.244.76.122/udp/8336/quic/p2p/QmUSbMytVBUYiiGE266aZHrHrP17vLx5UJFd7o74HkDoaV",
-	"/ip4/216.244.79.194/udp/8336/quic/p2p/QmQn3bWk5aqaNSv9dwPjBg4qdeGBGNEB72tvuhgEc64Ki5",
+	"/dns/bootstrap.quilibrium.com/udp/8336/quic-v1/p2p/Qme3g6rJWuz8HVXxpDb7aV2hiFq8bZJNqxMmwzmASzfq1M",
+	"/dns/quaalude.quilibrium.com/udp/8336/quic-v1/p2p/QmYruNcruYNgyTKeUqJSxjbuTFYWYDw2r5df9YKMGWCRKA",
+	"/dns/quecifer.quilibrium.com/udp/8336/quic-v1/p2p/QmdWF9bGTH5mwJXkxrG859HA5r34MxXtMSTuEikSMDSESv",
+	"/dns/quantum.quilibrium.com/udp/8336/quic-v1/p2p/QmbmVeKnSWK9HHAQHSS714XU3gx77TrS356JmHmKFj7q7M",
+	"/dns/quidditas.quilibrium.com/udp/8336/quic-v1/p2p/QmR1rF5E9zAob9FZyMF7uTUM27D7GYtX9RaiSsNY9UP72J",
+	"/dns/quillon.quilibrium.com/udp/8336/quic-v1/p2p/QmWgHv6z3tyimW4JvrvYRgsJEimgV7J2xbE7QEpFNPvAnB",
+	"/dns/quidditch.quilibrium.com/udp/8336/quic-v1/p2p/QmbZEGuinaCndj4XLb6fteZmjmP3C1Tsgijmc5BGuUk8Ma",
+	"/dns/quagmire.quilibrium.com/udp/8336/quic-v1/p2p/QmaQ9KAaKtqXhYSQ5ARQNnn8B8474cWGvvD6PgJ4gAtMrx",
+	"/ip4/204.186.74.46/udp/8316/quic-v1/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
+	"/ip4/103.219.170.9/udp/8336/quic-v1/p2p/QmfEdMfmdhNoYuGVhhw5LBApHHG1rbVAHXwGWpW8s9bXeg",
+	"/ip4/185.143.102.84/udp/8336/quic-v1/p2p/Qmce68gLLq9eMdwCcmd1ptfoC2nVoe861LF1cjdVHC2DwK",
+	"/ip4/65.109.17.13/udp/8336/quic-v1/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
+	"/ip4/65.108.194.84/udp/8336/quic-v1/p2p/QmP8C7g9ZRiWzhqN2AgFu5onS6HwHzR6Vv1TCHxAhnCSnq",
+	"/dns/quil.dfcnodes.eu/udp/8336/quic-v1/p2p/QmQaFmbYVrKSwoen5UQdaqyDq4QhXfSSLDVnYpYD4SF9tX",
+	"/ip4/87.98.167.207/udp/8336/quic-v1/p2p/QmafiAXLu1JWktyfzDtD67i78GRBYCfQ4doTfq7pp7wfQ1",
+	"/ip4/216.244.76.122/udp/8336/quic-v1/p2p/QmUSbMytVBUYiiGE266aZHrHrP17vLx5UJFd7o74HkDoaV",
+	"/ip4/216.244.79.194/udp/8336/quic-v1/p2p/QmQn3bWk5aqaNSv9dwPjBg4qdeGBGNEB72tvuhgEc64Ki5",
 	// purged peers (keep your node online to return to this list)
-	// "/ip4/204.186.74.47/udp/8317/quic/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
-	// "/ip4/186.233.184.181/udp/8336/quic/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
-	// "/dns/quil.zanshindojo.org/udp/8336/quic/p2p/QmXbbmtS5D12rEc4HWiHWr6e83SCE4jeThPP4VJpAQPvXq",
-	// "/ip4/144.76.104.93/udp/8336/quic/p2p/QmZejZ8DBGQ6foX9recW73GA6TqL6hCMX9ETWWW1Fb8xtx",
-	// "/ip4/207.246.81.38/udp/8336/quic/p2p/QmPBYgDy7snHon7PAn8nv1shApQBQz1iHb2sBBS8QSgQwW",
-	// "/dns/abyssia.fr/udp/8336/quic/p2p/QmS7C1UhN8nvzLJgFFf1uspMRrXjJqThHNN6AyEXp6oVUB",
-	// "/ip4/51.15.18.247/udp/8336/quic/p2p/QmYVaHXdFmHFeTa6oPixgjMVag6Ex7gLjE559ejJddwqzu",
+	// "/ip4/204.186.74.47/udp/8317/quic-v1/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
+	// "/ip4/186.233.184.181/udp/8336/quic-v1/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
+	// "/dns/quil.zanshindojo.org/udp/8336/quic-v1/p2p/QmXbbmtS5D12rEc4HWiHWr6e83SCE4jeThPP4VJpAQPvXq",
+	// "/ip4/144.76.104.93/udp/8336/quic-v1/p2p/QmZejZ8DBGQ6foX9recW73GA6TqL6hCMX9ETWWW1Fb8xtx",
+	// "/ip4/207.246.81.38/udp/8336/quic-v1/p2p/QmPBYgDy7snHon7PAn8nv1shApQBQz1iHb2sBBS8QSgQwW",
+	// "/dns/abyssia.fr/udp/8336/quic-v1/p2p/QmS7C1UhN8nvzLJgFFf1uspMRrXjJqThHNN6AyEXp6oVUB",
+	// "/ip4/51.15.18.247/udp/8336/quic-v1/p2p/QmYVaHXdFmHFeTa6oPixgjMVag6Ex7gLjE559ejJddwqzu",
 }
 
 func LoadConfig(configPath string, proverKey string) (*Config, error) {
@@ -112,7 +113,7 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 			},
 		},
 		P2P: &P2PConfig{
-			ListenMultiaddr: "/ip4/0.0.0.0/udp/8336/quic",
+			ListenMultiaddr: "/ip4/0.0.0.0/udp/8336/quic-v1",
 			BootstrapPeers:  BootstrapPeers,
 			PeerPrivKey:     "",
 			Network:         0,
@@ -222,12 +223,24 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 		config.Engine.GenesisSeed = genesisSeed
 	}
 
+	// upgrade quic string to quic-v1
+	if strings.HasSuffix(config.P2P.ListenMultiaddr, "/quic") {
+		config.P2P.ListenMultiaddr += "-v1"
+	}
+
 	// Slight trick here to get people on the latest bootstrap list –
 	// if it's empty, always use latest, if it has the Q bootstrap node, always
 	// use latest.
 	if len(config.P2P.BootstrapPeers) == 0 ||
 		config.P2P.BootstrapPeers[0][:30] == "/dns/bootstrap.quilibrium.com/" {
 		config.P2P.BootstrapPeers = BootstrapPeers
+	} else {
+		peers := make([]string, len(config.P2P.BootstrapPeers))
+		for i, p := range config.P2P.BootstrapPeers {
+			// upgrade quic strings to quic-v1
+			peers[i] = strings.Replace(p, "/quic/", "/quic-v1/", 1)
+		}
+		config.P2P.BootstrapPeers = peers
 	}
 
 	return config, nil

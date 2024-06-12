@@ -61,7 +61,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE_PREFIX = "quilibrium-1.4.18-nebula-"
+var ANNOUNCE_PREFIX = "quilibrium-1.4.19-betelgeuse-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -341,7 +341,8 @@ func initDHT(
 	if isBootstrapPeer {
 		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
 	} else {
-		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeAuto))
+		// until libp2p gets their shit together, set this as a client only:
+		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeClient))
 	}
 	if err != nil {
 		panic(err)
@@ -583,18 +584,18 @@ func discoverPeers(
 				continue
 			}
 
-			logger.Debug("found peer", zap.String("peer_id", peer.ID.Pretty()))
+			logger.Debug("found peer", zap.String("peer_id", peer.ID.String()))
 			err := h.Connect(ctx, peer)
 			if err != nil {
 				logger.Debug(
 					"error while connecting to blossomsub peer",
-					zap.String("peer_id", peer.ID.Pretty()),
+					zap.String("peer_id", peer.ID.String()),
 					zap.Error(err),
 				)
 			} else {
 				logger.Debug(
 					"connected to peer",
-					zap.String("peer_id", peer.ID.Pretty()),
+					zap.String("peer_id", peer.ID.String()),
 				)
 			}
 		}

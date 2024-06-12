@@ -1,6 +1,6 @@
 
 <h1 align="center">
-  <a href="libp2p.io"><img width="250" src="https://github.com/libp2p/libp2p/blob/master/logo/black-bg-2.png?raw=true" alt="libp2p hex logo" /></a>
+  <a href="https://libp2p.io/"><img width="250" src="https://github.com/libp2p/libp2p/blob/master/logo/black-bg-2.png?raw=true" alt="libp2p hex logo" /></a>
 </h1>
 
 <h3 align="center">The Go implementation of the libp2p Networking Stack.</h3>
@@ -18,6 +18,7 @@
 - [Roadmap](#roadmap)
 - [Usage](#usage)
   - [Examples](#examples)
+  - [Dashboards](#dashboards)
 - [Contribute](#contribute)
   - [Supported Go Versions](#supported-go-versions)
 - [Notable Users](#notable-users)
@@ -54,6 +55,13 @@ import "github.com/libp2p/go-libp2p"
 
 Examples can be found in the [examples folder](examples).
 
+## Dashboards
+
+We provide prebuilt Grafana dashboards so that applications can better monitor libp2p in production.
+You can find the [dashboard JSON files here](https://github.com/libp2p/go-libp2p/tree/master/dashboards).
+
+We also have live [Public Dashboards](https://github.com/libp2p/go-libp2p/tree/master/dashboards/README.md#public-dashboards) that you can check out to see real time monitoring in action.
+
 
 # Contribute
 
@@ -75,7 +83,7 @@ There's a few things you can do right now to help out:
 ## Supported Go Versions
 
 We test against and support the two most recent major releases of Go. This is
-informed by Go's own [security policy](https://go.dev/security).
+informed by Go's own [security policy](https://go.dev/doc/security/policy).
 
 # Notable Users
 Some notable users of go-libp2p are:

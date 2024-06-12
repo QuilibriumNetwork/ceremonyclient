@@ -11,6 +11,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"runtime/debug"
@@ -18,6 +19,7 @@ import (
 
 	ic "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/sec"
 )
 
 const certValidityPeriod = 100 * 365 * 24 * time.Hour // ~100 years
@@ -40,6 +42,7 @@ type Identity struct {
 // IdentityConfig is used to configure an Identity
 type IdentityConfig struct {
 	CertTemplate *x509.Certificate
+	KeyLogWriter io.Writer
 }
 
 // IdentityOption transforms an IdentityConfig to apply optional settings.
@@ -49,6 +52,18 @@ type IdentityOption func(r *IdentityConfig)
 func WithCertTemplate(template *x509.Certificate) IdentityOption {
 	return func(c *IdentityConfig) {
 		c.CertTemplate = template
+	}
+}
+
+// WithKeyLogWriter optionally specifies a destination for TLS master secrets
+// in NSS key log format that can be used to allow external programs
+// such as Wireshark to decrypt TLS connections.
+// See https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format.
+// Use of KeyLogWriter compromises security and should only be
+// used for debugging.
+func WithKeyLogWriter(w io.Writer) IdentityOption {
+	return func(c *IdentityConfig) {
+		c.KeyLogWriter = w
 	}
 }
 
@@ -82,6 +97,7 @@ func NewIdentity(privKey ic.PrivKey, opts ...IdentityOption) (*Identity, error) 
 			},
 			NextProtos:             []string{alpn},
 			SessionTicketsDisabled: true,
+			KeyLogWriter:           config.KeyLogWriter,
 		},
 	}, nil
 }
@@ -129,7 +145,7 @@ func (i *Identity) ConfigForPeer(remote peer.ID) (*tls.Config, <-chan ic.PubKey)
 			if err != nil {
 				peerID = peer.ID(fmt.Sprintf("(not determined: %s)", err.Error()))
 			}
-			return fmt.Errorf("peer IDs don't match: expected %s, got %s", remote, peerID)
+			return sec.ErrPeerIDMismatch{Expected: remote, Actual: peerID}
 		}
 		keyCh <- pubKey
 		return nil

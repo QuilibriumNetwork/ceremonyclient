@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"net"
 	"sort"
 	"testing"
@@ -65,7 +66,7 @@ func TestAddrsForDial(t *testing.T) {
 	ps.AddAddr(otherPeer, ma.StringCast("/dns4/example.com/tcp/1234/wss"), time.Hour)
 
 	ctx := context.Background()
-	mas, err := s.addrsForDial(ctx, otherPeer)
+	mas, _, err := s.addrsForDial(ctx, otherPeer)
 	require.NoError(t, err)
 
 	require.NotZero(t, len(mas))
@@ -110,10 +111,10 @@ func TestDedupAddrsForDial(t *testing.T) {
 	ps.AddAddr(otherPeer, ma.StringCast("/ip4/1.2.3.4/tcp/1234"), time.Hour)
 
 	ctx := context.Background()
-	mas, err := s.addrsForDial(ctx, otherPeer)
+	mas, _, err := s.addrsForDial(ctx, otherPeer)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, len(mas))
+	require.Len(t, mas, 1)
 }
 
 func newTestSwarmWithResolver(t *testing.T, resolver *madns.Resolver) *Swarm {
@@ -138,7 +139,7 @@ func newTestSwarmWithResolver(t *testing.T, resolver *madns.Resolver) *Swarm {
 	err = s.AddTransport(tpt)
 	require.NoError(t, err)
 
-	connmgr, err := quicreuse.NewConnManager(quic.StatelessResetKey{})
+	connmgr, err := quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
 	require.NoError(t, err)
 	quicTpt, err := libp2pquic.NewTransport(priv, connmgr, nil, nil, &network.NullResourceManager{})
 	require.NoError(t, err)
@@ -166,8 +167,8 @@ func TestAddrResolution(t *testing.T) {
 	addr1 := ma.StringCast("/dnsaddr/example.com")
 	addr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123")
 
-	p2paddr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.Pretty())
-	p2paddr3 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p2.Pretty())
+	p2paddr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
+	p2paddr3 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p2.String())
 
 	backend := &madns.MockResolver{
 		TXT: map[string][]string{"_dnsaddr.example.com": {
@@ -183,7 +184,7 @@ func TestAddrResolution(t *testing.T) {
 
 	tctx, cancel := context.WithTimeout(ctx, time.Millisecond*100)
 	defer cancel()
-	mas, err := s.addrsForDial(tctx, p1)
+	mas, _, err := s.addrsForDial(tctx, p1)
 	require.NoError(t, err)
 
 	require.Len(t, mas, 1)
@@ -196,23 +197,16 @@ func TestAddrResolution(t *testing.T) {
 }
 
 func TestAddrResolutionRecursive(t *testing.T) {
-	ctx := context.Background()
+	p1 := test.RandPeerIDFatal(t)
+	p2 := test.RandPeerIDFatal(t)
 
-	p1, err := test.RandPeerID()
-	if err != nil {
-		t.Error(err)
-	}
-	p2, err := test.RandPeerID()
-	if err != nil {
-		t.Error(err)
-	}
 	addr1 := ma.StringCast("/dnsaddr/example.com")
 	addr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123")
-	p2paddr1 := ma.StringCast("/dnsaddr/example.com/p2p/" + p1.Pretty())
-	p2paddr2 := ma.StringCast("/dnsaddr/example.com/p2p/" + p2.Pretty())
-	p2paddr1i := ma.StringCast("/dnsaddr/foo.example.com/p2p/" + p1.Pretty())
-	p2paddr2i := ma.StringCast("/dnsaddr/bar.example.com/p2p/" + p2.Pretty())
-	p2paddr1f := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.Pretty())
+	p2paddr1 := ma.StringCast("/dnsaddr/example.com/p2p/" + p1.String())
+	p2paddr2 := ma.StringCast("/dnsaddr/example.com/p2p/" + p2.String())
+	p2paddr1i := ma.StringCast("/dnsaddr/foo.example.com/p2p/" + p1.String())
+	p2paddr2i := ma.StringCast("/dnsaddr/bar.example.com/p2p/" + p2.String())
+	p2paddr1f := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
 
 	backend := &madns.MockResolver{
 		TXT: map[string][]string{
@@ -220,28 +214,22 @@ func TestAddrResolutionRecursive(t *testing.T) {
 				"dnsaddr=" + p2paddr1i.String(),
 				"dnsaddr=" + p2paddr2i.String(),
 			},
-			"_dnsaddr.foo.example.com": {
-				"dnsaddr=" + p2paddr1f.String(),
-			},
-			"_dnsaddr.bar.example.com": {
-				"dnsaddr=" + p2paddr2i.String(),
-			},
+			"_dnsaddr.foo.example.com": {"dnsaddr=" + p2paddr1f.String()},
+			"_dnsaddr.bar.example.com": {"dnsaddr=" + p2paddr2i.String()},
 		},
 	}
 	resolver, err := madns.NewResolver(madns.WithDefaultResolver(backend))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	s := newTestSwarmWithResolver(t, resolver)
 
 	pi1, err := peer.AddrInfoFromP2pAddr(p2paddr1)
 	require.NoError(t, err)
 
-	tctx, cancel := context.WithTimeout(ctx, time.Millisecond*100)
+	tctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
 	defer cancel()
 	s.Peerstore().AddAddrs(pi1.ID, pi1.Addrs, peerstore.TempAddrTTL)
-	_, err = s.addrsForDial(tctx, p1)
+	_, _, err = s.addrsForDial(tctx, p1)
 	require.NoError(t, err)
 
 	addrs1 := s.Peerstore().Addrs(pi1.ID)
@@ -253,7 +241,7 @@ func TestAddrResolutionRecursive(t *testing.T) {
 	require.NoError(t, err)
 
 	s.Peerstore().AddAddrs(pi2.ID, pi2.Addrs, peerstore.TempAddrTTL)
-	_, err = s.addrsForDial(tctx, p2)
+	_, _, err = s.addrsForDial(tctx, p2)
 	// This never resolves to a good address
 	require.Equal(t, ErrNoGoodAddresses, err)
 
@@ -262,19 +250,50 @@ func TestAddrResolutionRecursive(t *testing.T) {
 	require.Contains(t, addrs2, addr1)
 }
 
+// see https://github.com/libp2p/go-libp2p/issues/2562
+func TestAddrResolutionRecursiveTransportSpecific(t *testing.T) {
+	p := test.RandPeerIDFatal(t)
+
+	backend := &madns.MockResolver{
+		IP: map[string][]net.IPAddr{
+			"sub.example.com": {net.IPAddr{IP: net.IPv4(1, 2, 3, 4)}},
+		},
+		TXT: map[string][]string{
+			"_dnsaddr.example.com": {"dnsaddr=/dns4/sub.example.com/tcp/443/wss/p2p/" + p.String()},
+		},
+	}
+	resolver, err := madns.NewResolver(madns.WithDefaultResolver(backend))
+	require.NoError(t, err)
+
+	s := newTestSwarmWithResolver(t, resolver)
+	pi1, err := peer.AddrInfoFromP2pAddr(ma.StringCast("/dnsaddr/example.com/p2p/" + p.String()))
+	require.NoError(t, err)
+
+	tctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+	s.Peerstore().AddAddrs(pi1.ID, pi1.Addrs, peerstore.TempAddrTTL)
+	addrs, _, err := s.addrsForDial(tctx, p)
+	require.NoError(t, err)
+	require.Len(t, addrs, 1)
+	require.Equal(t, "/ip4/1.2.3.4/tcp/443/tls/sni/sub.example.com/ws", addrs[0].String())
+}
+
 func TestAddrsForDialFiltering(t *testing.T) {
-	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic")
+	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
 	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
 	wt1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
 
-	q2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic")
+	q2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
 	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
 	wt2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1/webtransport/")
 
-	q3 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic")
+	q3 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
 
 	t1 := ma.StringCast("/ip4/1.2.3.4/tcp/1")
 	ws1 := ma.StringCast("/ip4/1.2.3.4/tcp/1/ws")
+
+	unSpecQ := ma.StringCast("/ip4/0.0.0.0/udp/2/quic-v1")
+	unSpecT := ma.StringCast("/ip6/::/tcp/2/")
 
 	resolver, err := madns.NewResolver(madns.WithDefaultResolver(&madns.MockResolver{}))
 	require.NoError(t, err)
@@ -306,6 +325,11 @@ func TestAddrsForDialFiltering(t *testing.T) {
 			input:  append([]ma.Multiaddr{q1}, ourAddrs...),
 			output: []ma.Multiaddr{q1},
 		},
+		{
+			name:   "unspecified-filtered",
+			input:  []ma.Multiaddr{q1v1, t1, unSpecQ, unSpecT},
+			output: []ma.Multiaddr{q1v1, t1},
+		},
 	}
 
 	ctx := context.Background()
@@ -315,7 +339,7 @@ func TestAddrsForDialFiltering(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s.Peerstore().ClearAddrs(p1)
 			s.Peerstore().AddAddrs(p1, tc.input, peerstore.PermanentAddrTTL)
-			result, err := s.addrsForDial(ctx, p1)
+			result, _, err := s.addrsForDial(ctx, p1)
 			require.NoError(t, err)
 			sort.Slice(result, func(i, j int) bool { return bytes.Compare(result[i].Bytes(), result[j].Bytes()) < 0 })
 			sort.Slice(tc.output, func(i, j int) bool { return bytes.Compare(tc.output[i].Bytes(), tc.output[j].Bytes()) < 0 })
@@ -342,8 +366,9 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 	n := 3
 	s.bhd.ipv6 = &blackHoleFilter{n: n, minSuccesses: 1, name: "IPv6"}
 
-	// all dials to the address will fail. RFC6666 Discard Prefix
-	addr := ma.StringCast("/ip6/0100::1/tcp/54321/")
+	// All dials to this addr will fail.
+	// manet.IsPublic is aggressive for IPv6 addresses. Use a NAT64 address.
+	addr := ma.StringCast("/ip6/64:ff9b::1.2.3.4/tcp/54321/")
 
 	p, err := test.RandPeerID()
 	if err != nil {
@@ -366,10 +391,10 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	conn, err := s.DialPeer(ctx, p)
-	if conn != nil {
-		t.Fatalf("expected dial to be blocked")
-	}
-	if err != ErrNoGoodAddresses {
+	require.Nil(t, conn)
+	var de *DialError
+	if !errors.As(err, &de) {
 		t.Fatalf("expected to receive an error of type *DialError, got %s of type %T", err, err)
 	}
+	require.ErrorIs(t, err, ErrDialRefusedBlackHole)
 }

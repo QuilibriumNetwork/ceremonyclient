@@ -157,6 +157,10 @@ message SelfTestReport {
   uint64 master_head_frame = 15;
   // A challenge proof
   bytes proof = 16;
+  // The challenge, minus the peer id
+  bytes challenge = 17;
+  // The increment value
+  uint32 increment = 18;
 }
 
 message ValidationMessage {
@@ -220,6 +224,8 @@ message PeerManifest {
   uint64 master_head_frame = 16;
   // The last time seen tick
   int64 last_seen = 17;
+  // The increment of the node
+  uint32 increment = 18;
 }
 
 message PeerManifestsResponse {

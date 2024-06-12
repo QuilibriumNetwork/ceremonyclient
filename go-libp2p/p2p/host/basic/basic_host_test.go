@@ -377,7 +377,7 @@ func TestHostProtoPreknowledge(t *testing.T) {
 
 	// This test implicitly relies on 1 connection. If a background identify
 	// completes after we set the stream handler below things break
-	require.Equal(t, 1, len(h1.Network().ConnsToPeer(h2.ID())))
+	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), 1)
 
 	// wait for identify handshake to finish completely
 	select {
@@ -469,7 +469,7 @@ func TestNewStreamResolve(t *testing.T) {
 			break
 		}
 	}
-	assert.NotEqual(t, dialAddr, "")
+	assert.NotEqual(t, "", dialAddr)
 
 	// Add the DNS multiaddr to h1's peerstore.
 	maddr, err := ma.NewMultiaddr(dialAddr)
@@ -506,7 +506,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "bar")
+		assert.Equal(t, "bar", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -527,7 +527,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "foo")
+		assert.Equal(t, "foo", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -839,6 +839,11 @@ func TestInferWebtransportAddrsFromQuic(t *testing.T) {
 			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
 		},
 		{
+			name: "Happy Path With CertHashes",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+		},
+		{
 			name: "Already discovered",
 			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
 			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
@@ -877,9 +882,6 @@ func TestInferWebtransportAddrsFromQuic(t *testing.T) {
 			sort.StringSlice(tc.in).Sort()
 			sort.StringSlice(tc.out).Sort()
 			min := make([]ma.Multiaddr, 0, len(tc.in))
-			sort.Slice(tc.in, func(i, j int) bool {
-				return tc.in[i] < tc.in[j]
-			})
 			for _, addr := range tc.in {
 				min = append(min, ma.StringCast(addr))
 			}
@@ -893,4 +895,56 @@ func TestInferWebtransportAddrsFromQuic(t *testing.T) {
 
 	}
 
+}
+
+func TestTrimHostAddrList(t *testing.T) {
+	type testCase struct {
+		name      string
+		in        []ma.Multiaddr
+		threshold int
+		out       []ma.Multiaddr
+	}
+
+	tcpPublic := ma.StringCast("/ip4/1.1.1.1/tcp/1")
+	quicPublic := ma.StringCast("/ip4/1.1.1.1/udp/1/quic-v1")
+
+	tcpPrivate := ma.StringCast("/ip4/192.168.1.1/tcp/1")
+	quicPrivate := ma.StringCast("/ip4/192.168.1.1/udp/1/quic-v1")
+
+	tcpLocal := ma.StringCast("/ip4/127.0.0.1/tcp/1")
+	quicLocal := ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1")
+
+	testCases := []testCase{
+		{
+			name:      "Public preferred over private",
+			in:        []ma.Multiaddr{tcpPublic, quicPrivate},
+			threshold: len(tcpLocal.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic},
+		},
+		{
+			name:      "Public and private preffered over local",
+			in:        []ma.Multiaddr{tcpPublic, tcpPrivate, quicLocal},
+			threshold: len(tcpPublic.Bytes()) + len(tcpPrivate.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic, tcpPrivate},
+		},
+		{
+			name:      "quic preferred over tcp",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic},
+			threshold: len(quicPublic.Bytes()),
+			out:       []ma.Multiaddr{quicPublic},
+		},
+		{
+			name:      "no filtering on large threshold",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
+			threshold: 10000,
+			out:       []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trimHostAddrList(tc.in, tc.threshold)
+			require.ElementsMatch(t, got, tc.out)
+		})
+	}
 }

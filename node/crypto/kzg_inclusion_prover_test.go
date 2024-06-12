@@ -70,3 +70,21 @@ func TestKZGVerifyFrame(t *testing.T) {
 	err = inclusionProver.VerifyFrame(frame)
 	assert.NoError(t, err)
 }
+
+func TestKZGInclusionProverRawFuncs(t *testing.T) {
+	kzg.TestInit("./kzg/ceremony.json")
+	data := make([]byte, 65536)
+	rand.Read(data)
+
+	l, _ := zap.NewProduction()
+	inclusionProver := crypto.NewKZGInclusionProver(l)
+	c, err := inclusionProver.CommitRaw(data, 1024)
+	assert.NoError(t, err)
+
+	p, err := inclusionProver.ProveRaw(data, 3, 1024)
+	assert.NoError(t, err)
+
+	v, err := inclusionProver.VerifyRaw(data[64*4:64*5], c, 3, p, 1024)
+	assert.NoError(t, err)
+	assert.True(t, v)
+}

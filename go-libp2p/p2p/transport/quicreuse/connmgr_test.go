@@ -39,18 +39,6 @@ func checkClosed(t *testing.T, cm *ConnManager) {
 	require.Eventually(t, func() bool { return !isGarbageCollectorRunning() }, 200*time.Millisecond, 10*time.Millisecond)
 }
 
-func TestListenQUICDraft29Disabled(t *testing.T) {
-	cm, err := NewConnManager([32]byte{}, DisableDraft29(), DisableReuseport())
-	require.NoError(t, err)
-	defer cm.Close()
-	_, err = cm.ListenQUIC(ma.StringCast("/ip4/127.0.0.1/udp/0/quic"), &tls.Config{}, nil)
-	require.EqualError(t, err, "can't listen on `/quic` multiaddr (QUIC draft 29 version) when draft 29 support is disabled")
-	ln, err := cm.ListenQUIC(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{"proto"}}, nil)
-	require.NoError(t, err)
-	require.NoError(t, ln.Close())
-	require.False(t, isGarbageCollectorRunning())
-}
-
 func TestListenOnSameProto(t *testing.T) {
 	t.Run("with reuseport", func(t *testing.T) {
 		testListenOnSameProto(t, true)
@@ -66,7 +54,7 @@ func testListenOnSameProto(t *testing.T, enableReuseport bool) {
 	if !enableReuseport {
 		opts = append(opts, DisableReuseport())
 	}
-	cm, err := NewConnManager([32]byte{}, opts...)
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, opts...)
 	require.NoError(t, err)
 	defer checkClosed(t, cm)
 	defer cm.Close()
@@ -95,7 +83,7 @@ func TestConnectionPassedToQUICForListening(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows. Windows doesn't support these optimizations")
 	}
-	cm, err := NewConnManager([32]byte{}, DisableReuseport())
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, DisableReuseport())
 	require.NoError(t, err)
 	defer cm.Close()
 
@@ -119,7 +107,7 @@ func TestConnectionPassedToQUICForListening(t *testing.T) {
 func TestAcceptErrorGetCleanedUp(t *testing.T) {
 	raddr := ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")
 
-	cm, err := NewConnManager([32]byte{}, DisableReuseport())
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, DisableReuseport())
 	require.NoError(t, err)
 	defer cm.Close()
 
@@ -155,7 +143,7 @@ func TestConnectionPassedToQUICForDialing(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows. Windows doesn't support these optimizations")
 	}
-	cm, err := NewConnManager([32]byte{}, DisableReuseport())
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, DisableReuseport())
 	require.NoError(t, err)
 	defer cm.Close()
 
@@ -230,7 +218,7 @@ func testListener(t *testing.T, enableReuseport bool) {
 	if !enableReuseport {
 		opts = append(opts, DisableReuseport())
 	}
-	cm, err := NewConnManager([32]byte{}, opts...)
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, opts...)
 	require.NoError(t, err)
 
 	id1, tlsConf1 := getTLSConfForProto(t, "proto1")

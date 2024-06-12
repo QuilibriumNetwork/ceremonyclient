@@ -176,7 +176,7 @@ func (k *KZGInclusionProver) ProveAggregate(
 				return nil, errors.Wrap(err, "prove aggregate")
 			}
 
-			for i := 0; i < 128-len(poly); i++ {
+			for i := 0; i < 1024-len(poly); i++ {
 				poly = append(
 					poly,
 					curves.BLS48581G1().Scalar.Zero().(curves.PairingScalar),
@@ -188,7 +188,7 @@ func (k *KZGInclusionProver) ProveAggregate(
 				*curves.BLS48581(
 					curves.BLS48581G1().NewGeneratorPoint(),
 				),
-				128,
+				1024,
 				false,
 			)
 			if err != nil {
@@ -387,7 +387,7 @@ func (k *KZGInclusionProver) VerifyFrame(
 					return errors.Wrap(err, "verify frame")
 				}
 
-				for i := 0; i < 128-len(poly); i++ {
+				for i := 0; i < 1024-len(poly); i++ {
 					poly = append(
 						poly,
 						curves.BLS48581G1().Scalar.Zero().(curves.PairingScalar),
@@ -399,7 +399,7 @@ func (k *KZGInclusionProver) VerifyFrame(
 					*curves.BLS48581(
 						curves.BLS48581G1().NewGeneratorPoint(),
 					),
-					128,
+					1024,
 					false,
 				)
 				if err != nil {
@@ -459,6 +459,122 @@ func (k *KZGInclusionProver) VerifyFrame(
 	}
 
 	return nil
+}
+
+func (k *KZGInclusionProver) CommitRaw(
+	data []byte,
+	polySize uint64,
+) ([]byte, error) {
+	poly, err := k.prover.BytesToPolynomial(data)
+	if err != nil {
+		return nil, errors.Wrap(err, "commit raw")
+	}
+	for i := len(poly); i < int(polySize); i++ {
+		poly = append(poly, curves.BLS48581G1().NewScalar().(curves.PairingScalar))
+	}
+
+	commit, err := k.prover.Commit(poly)
+	if err != nil {
+		return nil, errors.Wrap(err, "commit raw")
+	}
+
+	return commit.ToAffineCompressed(), nil
+}
+
+func (k *KZGInclusionProver) ProveRaw(
+	data []byte,
+	index int,
+	polySize uint64,
+) ([]byte, error) {
+	poly, err := k.prover.BytesToPolynomial(data)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove raw")
+	}
+	for i := len(poly); i < int(polySize); i++ {
+		poly = append(poly, curves.BLS48581G1().NewScalar().(curves.PairingScalar))
+	}
+
+	z := kzg.RootsOfUnityBLS48581[polySize][index]
+
+	evalPoly, err := kzg.FFT(
+		poly,
+		*curves.BLS48581(
+			curves.BLS48581G1().NewGeneratorPoint(),
+		),
+		polySize,
+		true,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove raw")
+	}
+
+	divisors := make([]curves.PairingScalar, 2)
+	divisors[0] = (&curves.ScalarBls48581{}).Zero().Sub(z).(*curves.ScalarBls48581)
+	divisors[1] = (&curves.ScalarBls48581{}).One().(*curves.ScalarBls48581)
+
+	a := make([]curves.PairingScalar, len(evalPoly))
+	for i := 0; i < len(a); i++ {
+		a[i] = evalPoly[i].Clone().(*curves.ScalarBls48581)
+	}
+
+	// Adapted from Feist's amortized proofs:
+	aPos := len(a) - 1
+	bPos := len(divisors) - 1
+	diff := aPos - bPos
+	out := make([]curves.PairingScalar, diff+1, diff+1)
+	for diff >= 0 {
+		out[diff] = a[aPos].Div(divisors[bPos]).(*curves.ScalarBls48581)
+		for i := bPos; i >= 0; i-- {
+			a[diff+i] = a[diff+i].Sub(
+				out[diff].Mul(divisors[i]),
+			).(*curves.ScalarBls48581)
+		}
+		aPos -= 1
+		diff -= 1
+	}
+
+	proof, err := k.prover.PointLinearCombination(
+		kzg.CeremonyBLS48581G1[:polySize-1],
+		out,
+	)
+
+	if err != nil {
+		return nil, errors.Wrap(err, "prove raw")
+	}
+
+	return proof.ToAffineCompressed(), nil
+}
+
+func (k *KZGInclusionProver) VerifyRaw(
+	data []byte,
+	commit []byte,
+	index int,
+	proof []byte,
+	polySize uint64,
+) (bool, error) {
+	z := kzg.RootsOfUnityBLS48581[polySize][index]
+
+	y, err := curves.BLS48581G1().NewScalar().SetBytes(data)
+	if err != nil {
+		return false, errors.Wrap(err, "verify raw")
+	}
+
+	c, err := curves.BLS48581G1().Point.FromAffineCompressed(commit)
+	if err != nil {
+		return false, errors.Wrap(err, "verify raw")
+	}
+
+	p, err := curves.BLS48581G1().Point.FromAffineCompressed(proof)
+	if err != nil {
+		return false, errors.Wrap(err, "verify raw")
+	}
+
+	return k.prover.Verify(
+		c.(curves.PairingPoint),
+		z,
+		y.(curves.PairingScalar),
+		p.(curves.PairingPoint),
+	), nil
 }
 
 var _ InclusionProver = (*KZGInclusionProver)(nil)

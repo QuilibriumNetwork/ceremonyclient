@@ -7,14 +7,6 @@ services:
   node:
     image: ${QUILIBRIUM_IMAGE_NAME:-quilibrium}
     restart: unless-stopped
-    command: ["--signature-check=false"]
-    deploy:
-      resources:
-        limits:
-          memory: '32G'
-        reservations:
-          cpus: '12'
-          memory: '16G'
     environment:
       - DEFAULT_LISTEN_GRPC_MULTIADDR=/ip4/0.0.0.0/tcp/8337
       - DEFAULT_LISTEN_REST_MULTIADDR=/ip4/0.0.0.0/tcp/8338
@@ -28,7 +20,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 1m
+      start_period: 15m
     volumes:
       - ./.config:/root/.config
     logging:
