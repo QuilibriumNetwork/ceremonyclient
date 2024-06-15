@@ -15,6 +15,7 @@
 members = [
     "crates/vdf",
     "crates/classgroup",
+    "crates/bls48581",
 ]
 
 [profile.release]

@@ -35,6 +35,7 @@ tasks:
     desc: Build the Quilibrium node binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
     cmds:
       - vdf/generate.sh
+      - bls48581/generate.sh
       - node/build.sh -o build/arm64_macos/node
 
   build_node_arm64_linux:

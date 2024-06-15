@@ -511,20 +511,37 @@ func (e *MasterClockConsensusEngine) PerformTimeProof(
 	for i := uint32(0); i < parallelism; i++ {
 		i := i
 		go func() {
-			resp, err :=
-				clients[i].CalculateChallengeProof(
-					context.Background(),
-					&protobufs.ChallengeProofRequest{
-						Challenge: challenge,
-						Core:      i,
-						Increment: increment,
-					},
-				)
-			if err != nil {
-				panic(err)
-			}
+			for j := 3; j > 0; j-- {
+				resp, err :=
+					clients[i].CalculateChallengeProof(
+						context.Background(),
+						&protobufs.ChallengeProofRequest{
+							Challenge: challenge,
+							Core:      i,
+							Increment: increment,
+						},
+					)
+				if err != nil {
+					if j == 1 || len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+						panic(err)
+					}
+					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+						e.logger.Error(
+							"client failed, reconnecting after 50ms",
+							zap.Uint32("client", i),
+						)
+						time.Sleep(50 * time.Millisecond)
+						clients[i], err = e.createParallelDataClientsFromListAndIndex(i)
+						if err != nil {
+							panic(err)
+						}
+					}
+					continue
+				}
 
-			proofs[i] = resp.Output
+				proofs[i] = resp.Output
+				break
+			}
 			wg.Done()
 		}()
 	}
@@ -566,6 +583,45 @@ func (e *MasterClockConsensusEngine) PerformDataCommitment(
 	).Int64())
 
 	return output, nextInput, prevIndex
+}
+
+func (e *MasterClockConsensusEngine) createParallelDataClientsFromListAndIndex(
+	index uint32,
+) (
+	protobufs.DataIPCServiceClient,
+	error,
+) {
+	ma, err := multiaddr.NewMultiaddr(e.engineConfig.DataWorkerMultiaddrs[index])
+	if err != nil {
+		panic(err)
+	}
+
+	_, addr, err := mn.DialArgs(ma)
+	if err != nil {
+		panic(err)
+	}
+
+	conn, err := grpc.Dial(
+		addr,
+		grpc.WithTransportCredentials(
+			insecure.NewCredentials(),
+		),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(10*1024*1024),
+			grpc.MaxCallRecvMsgSize(10*1024*1024),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	client := protobufs.NewDataIPCServiceClient(conn)
+
+	e.logger.Info(
+		"connected to data worker process",
+		zap.Uint32("client", index),
+	)
+	return client, nil
 }
 
 func (e *MasterClockConsensusEngine) createParallelDataClientsFromList() (

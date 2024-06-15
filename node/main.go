@@ -27,10 +27,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 
 	"github.com/cloudflare/circl/sign/ed448"
@@ -214,7 +211,7 @@ func main() {
 				count++
 			}
 
-			if count < len(signatories)/2 {
+			if count < len(signatories)/2+len(signatories)%2 {
 				fmt.Printf("Quorum on signatures not met")
 				os.Exit(1)
 			}
@@ -420,6 +417,7 @@ func main() {
 	} else {
 		node, err = app.NewNode(nodeConfig, report)
 	}
+
 	if err != nil {
 		panic(err)
 	}
@@ -507,26 +505,6 @@ func stopDataWorkers() {
 			)
 		}
 	}
-}
-
-// Reintroduce at a later date
-func RunCompaction(clockStore *store.PebbleClockStore) {
-	intrinsicFilter := append(
-		p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-		p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-	)
-	fmt.Println("running compaction")
-
-	if err := clockStore.Compact(
-		intrinsicFilter,
-	); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			fmt.Println("missing compaction data, skipping for now", zap.Error(err))
-		} else {
-			panic(err)
-		}
-	}
-	fmt.Println("compaction complete")
 }
 
 func RunMigrationIfNeeded(
@@ -664,16 +642,11 @@ func RunSelfTestIfNeeded(
 	rand.Read(p128bytes)
 	rand.Read(p1024bytes)
 	rand.Read(p65536bytes)
-	kzgProver := kzg.DefaultKZGProver()
-
-	p16, _ := kzgProver.BytesToPolynomial(p16bytes)
-	p128, _ := kzgProver.BytesToPolynomial(p128bytes)
-	p1024, _ := kzgProver.BytesToPolynomial(p1024bytes)
-	p65536, _ := kzgProver.BytesToPolynomial(p65536bytes)
+	kzgProver := qcrypto.NewKZGInclusionProver(logger)
 
 	logger.Info("generating 16 degree commitment metric")
 	start = time.Now().UnixMilli()
-	c16, err := kzgProver.Commit(p16)
+	_, err = kzgProver.CommitRaw(p16bytes, 16)
 	if err != nil {
 		panic(err)
 	}
@@ -682,7 +655,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 128 degree commitment metric")
 	start = time.Now().UnixMilli()
-	c128, err := kzgProver.Commit(p128)
+	_, err = kzgProver.CommitRaw(p128bytes, 128)
 	if err != nil {
 		panic(err)
 	}
@@ -691,7 +664,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 1024 degree commitment metric")
 	start = time.Now().UnixMilli()
-	c1024, err := kzgProver.Commit(p1024)
+	_, err = kzgProver.CommitRaw(p1024bytes, 1024)
 	if err != nil {
 		panic(err)
 	}
@@ -700,7 +673,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 65536 degree commitment metric")
 	start = time.Now().UnixMilli()
-	c65536, err := kzgProver.Commit(p65536)
+	_, err = kzgProver.CommitRaw(p65536bytes, 65536)
 	if err != nil {
 		panic(err)
 	}
@@ -709,7 +682,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 16 degree proof metric")
 	start = time.Now().UnixMilli()
-	_, err = kzgProver.Prove(p16, c16, p16[0])
+	_, err = kzgProver.ProveRaw(p16bytes, 0, 16)
 	if err != nil {
 		panic(err)
 	}
@@ -718,7 +691,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 128 degree proof metric")
 	start = time.Now().UnixMilli()
-	_, err = kzgProver.Prove(p128, c128, p128[0])
+	_, err = kzgProver.ProveRaw(p128bytes, 0, 128)
 	if err != nil {
 		panic(err)
 	}
@@ -727,7 +700,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 1024 degree proof metric")
 	start = time.Now().UnixMilli()
-	_, err = kzgProver.Prove(p1024, c1024, p1024[0])
+	_, err = kzgProver.ProveRaw(p1024bytes, 0, 1024)
 	if err != nil {
 		panic(err)
 	}
@@ -736,7 +709,7 @@ func RunSelfTestIfNeeded(
 
 	logger.Info("generating 65536 degree proof metric")
 	start = time.Now().UnixMilli()
-	_, err = kzgProver.Prove(p65536, c65536, p65536[0])
+	_, err = kzgProver.ProveRaw(p65536bytes, 0, 65536)
 	if err != nil {
 		panic(err)
 	}

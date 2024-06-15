@@ -1,0 +1,6 @@
+namespace bls48581 {
+    void init();
+    sequence<u8> commit_raw([ByRef] sequence<u8> data, u64 poly_size);
+    sequence<u8> prove_raw([ByRef] sequence<u8> data, u64 index, u64 poly_size);
+    boolean verify_raw([ByRef] sequence<u8> data, [ByRef] sequence<u8> commit, u64 index, [ByRef] sequence<u8> proof, u64 poly_size);
+};
