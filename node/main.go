@@ -417,7 +417,7 @@ func main() {
 	} else {
 		node, err = app.NewNode(nodeConfig, report)
 	}
-	node.VerifyProofIntegrity()
+
 	if err != nil {
 		panic(err)
 	}
