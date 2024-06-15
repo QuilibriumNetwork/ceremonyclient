@@ -7,6 +7,8 @@ toolchain go1.22.1
 // A necessary hack until source.quilibrium.com is open to all
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
 
+replace source.quilibrium.com/quilibrium/monorepo/bls48581 => ../bls48581
+
 replace source.quilibrium.com/quilibrium/monorepo/vdf => ../vdf
 
 replace github.com/libp2p/go-libp2p => ../go-libp2p
@@ -25,6 +27,7 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0
 	google.golang.org/protobuf v1.34.1
 	gopkg.in/yaml.v2 v2.4.0
+	source.quilibrium.com/quilibrium/monorepo/bls48581 v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/nekryptology v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/vdf v0.0.0-00010101000000-000000000000

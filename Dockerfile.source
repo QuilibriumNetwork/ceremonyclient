@@ -27,6 +27,10 @@ COPY . .
 WORKDIR /opt/ceremonyclient/vdf
 RUN ./generate.sh
 
+## Generate Rust bindings for BLS48581
+WORKDIR /opt/ceremonyclient/bls48581
+RUN ./generate.sh
+
 # Build and install the node
 WORKDIR /opt/ceremonyclient/node
 

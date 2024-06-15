@@ -11,7 +11,7 @@ BINARIES_DIR="$ROOT_DIR/target/release"
 
 # Link the native VDF and execute tests
 pushd "$NODE_DIR" > /dev/null
-	CGO_LDFLAGS="-L$BINARIES_DIR -lvdf -ldl" \
+	CGO_LDFLAGS="-L$BINARIES_DIR -lvdf -lbls48581 -ldl" \
 	CGO_ENABLED=1 \
 	GOEXPERIMENT=arenas \
   go test "$@"

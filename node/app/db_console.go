@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -23,10 +22,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony/application"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
 var (
@@ -538,167 +534,6 @@ func (m model) View() string {
 				"\t\tType: %s\n",
 				m.frame.AggregateProofs[i].InclusionCommitments[0].TypeUrl,
 			)
-			switch m.frame.AggregateProofs[i].InclusionCommitments[0].TypeUrl {
-			case protobufs.IntrinsicExecutionOutputType:
-				explorerContent += "Application: Ceremony\n"
-				app, err := application.MaterializeApplicationFromFrame(m.frame)
-				if err != nil {
-					explorerContent += "Error: " + err.Error() + "\n"
-					continue
-				}
-
-				total := new(big.Int)
-				if app.RewardTrie.Root == nil ||
-					(app.RewardTrie.Root.External == nil &&
-						app.RewardTrie.Root.Internal == nil) {
-					explorerContent += "Total Rewards: 0 QUIL\n"
-					continue
-				}
-
-				limbs := []*tries.RewardInternalNode{}
-				if app.RewardTrie.Root.Internal != nil {
-					limbs = append(limbs, app.RewardTrie.Root.Internal)
-				} else {
-					total = total.Add(
-						total,
-						new(big.Int).SetUint64(app.RewardTrie.Root.External.Total),
-					)
-				}
-
-				for len(limbs) != 0 {
-					nextLimbs := []*tries.RewardInternalNode{}
-					for _, limb := range limbs {
-						for _, child := range limb.Child {
-							child := child
-							if child.Internal != nil {
-								nextLimbs = append(nextLimbs, child.Internal)
-							} else {
-								total = total.Add(
-									total,
-									new(big.Int).SetUint64(child.External.Total),
-								)
-							}
-						}
-					}
-					limbs = nextLimbs
-				}
-
-				explorerContent += "Total Rewards: " + total.String() + " QUIL\n"
-
-				state := app.LobbyState.String()
-				explorerContent += "Round State: " + state + "\n"
-
-				switch app.LobbyState {
-				case application.CEREMONY_APPLICATION_STATE_OPEN:
-					explorerContent += "Joins: \n"
-
-					for _, join := range app.LobbyJoins {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							join.PublicKeySignatureEd448.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Preferred Next Round Participants: \n"
-
-					for _, next := range app.NextRoundPreferredParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							next.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += fmt.Sprintf(
-						"State Transition Counter: %d\n",
-						app.StateCount,
-					)
-				case application.CEREMONY_APPLICATION_STATE_IN_PROGRESS:
-					explorerContent += fmt.Sprintf("Sub-Round: %d\n", app.RoundCount)
-					explorerContent += "Participants: \n"
-
-					for _, active := range app.ActiveParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							active.PublicKeySignatureEd448.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Latest Seen: \n"
-
-					for _, latest := range app.LatestSeenProverAttestations {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							latest.SeenProverKey.KeyValue,
-						) + " seen by " + base64.StdEncoding.EncodeToString(
-							latest.ProverSignature.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Dropped: \n"
-
-					for _, dropped := range app.DroppedParticipantAttestations {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							dropped.DroppedProverKey.KeyValue,
-						) + " confirmed by " + base64.StdEncoding.EncodeToString(
-							dropped.ProverSignature.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Preferred Next Round Participants: \n"
-
-					for _, next := range app.NextRoundPreferredParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							next.KeyValue,
-						) + "\n"
-					}
-				case application.CEREMONY_APPLICATION_STATE_FINALIZING:
-					explorerContent += fmt.Sprintf(
-						"Confirmed Shares: %d\n",
-						len(app.TranscriptShares),
-					)
-					explorerContent += "Participants: \n"
-
-					for _, active := range app.ActiveParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							active.PublicKeySignatureEd448.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Latest Seen: \n"
-
-					for _, latest := range app.LatestSeenProverAttestations {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							latest.SeenProverKey.KeyValue,
-						) + " seen by " + base64.StdEncoding.EncodeToString(
-							latest.ProverSignature.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Dropped: \n"
-
-					for _, dropped := range app.DroppedParticipantAttestations {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							dropped.DroppedProverKey.KeyValue,
-						) + " confirmed by " + base64.StdEncoding.EncodeToString(
-							dropped.ProverSignature.PublicKey.KeyValue,
-						) + "\n"
-					}
-
-					explorerContent += "Preferred Next Round Participants: \n"
-
-					for _, next := range app.NextRoundPreferredParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							next.KeyValue,
-						) + "\n"
-					}
-				case application.CEREMONY_APPLICATION_STATE_VALIDATING:
-					explorerContent += fmt.Sprintf(
-						"G1 Powers: %d\n", len(app.UpdatedTranscript.G1Powers),
-					)
-					explorerContent += "Preferred Next Round Participants: \n"
-					for _, next := range app.NextRoundPreferredParticipants {
-						explorerContent += "\t" + base64.StdEncoding.EncodeToString(
-							next.KeyValue,
-						) + "\n"
-					}
-				}
-			}
 		}
 	} else {
 		explorerContent = logoVersion(physicalWidth - 34)
@@ -761,10 +596,6 @@ func consoleModel(
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 			}),
-			hex.EncodeToString(append(
-				p2p.GetBloomFilter(application.CEREMONY_ADDRESS, 256, 3),
-				p2p.GetBloomFilterIndices(application.CEREMONY_ADDRESS, 65536, 24)...,
-			)),
 		},
 		cursor:           0,
 		conn:             conn,

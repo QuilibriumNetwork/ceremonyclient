@@ -11,7 +11,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/ceremony"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -77,7 +76,6 @@ var engineSet = wire.NewSet(
 	crypto.NewKZGInclusionProver,
 	wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)),
 	time.NewMasterTimeReel,
-	ceremony.NewCeremonyExecutionEngine,
 )
 
 var consensusSet = wire.NewSet(
