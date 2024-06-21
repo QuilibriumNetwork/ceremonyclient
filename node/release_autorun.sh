@@ -36,8 +36,8 @@ is_process_running() {
 }
 
 kill_process() {
-    local process_count=$(ps -ef | grep "node-$version" | grep -v grep | wc -l)
-    local process_pids=$(ps -ef | grep "node-$version" | grep -v grep | awk '{print $2}' | xargs)
+    local process_count=$(ps -ef | grep -E "node-.*-(darwin|linux)-(amd64|arm64)" | grep -v grep | wc -l)
+    local process_pids=$(ps -ef | grep -E "node-.*-(darwin|linux)-(amd64|arm64)" | grep -v grep | awk '{print $2}' | xargs)
 
     if [ $process_count -gt 0 ]; then
         echo "killing processes $process_pids"
