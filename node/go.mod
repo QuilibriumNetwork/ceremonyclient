@@ -34,7 +34,10 @@ require (
 )
 
 require (
+	github.com/deiu/gon3 v0.0.0-20230411081920-f0f8f879f597 // indirect
+	github.com/deiu/rdf2go v0.0.0-20240619132609-81222e324bb9 // indirect
 	github.com/hashicorp/golang-lru/arc/v2 v2.0.7 // indirect
+	github.com/linkeddata/gojsonld v0.0.0-20170418210642-4f5db6791326 // indirect
 	github.com/pion/datachannel v1.5.6 // indirect
 	github.com/pion/dtls/v2 v2.2.11 // indirect
 	github.com/pion/ice/v2 v2.3.24 // indirect
@@ -51,6 +54,7 @@ require (
 	github.com/pion/transport/v2 v2.2.5 // indirect
 	github.com/pion/turn/v2 v2.1.6 // indirect
 	github.com/pion/webrtc/v3 v3.2.40 // indirect
+	github.com/rychipman/easylex v0.0.0-20160129204217-49ee7767142f // indirect
 	go.opentelemetry.io/otel v1.14.0 // indirect
 	go.opentelemetry.io/otel/trace v1.14.0 // indirect
 	go.uber.org/mock v0.4.0 // indirect

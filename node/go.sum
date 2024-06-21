@@ -90,6 +90,10 @@ github.com/decred/dcrd/crypto/blake256 v1.0.1/go.mod h1:2OfgNZ5wDpcsFmHmCK5gZTPc
 github.com/decred/dcrd/dcrec/secp256k1/v4 v4.3.0 h1:rpfIENRNNilwHwZeG5+P150SMrnNEcHYvcCuK6dPZSg=
 github.com/decred/dcrd/dcrec/secp256k1/v4 v4.3.0/go.mod h1:v57UDF4pDQJcEfFUCRop3lJL149eHGSe9Jvczhzjo/0=
 github.com/decred/dcrd/lru v1.0.0/go.mod h1:mxKOwFd7lFjN2GZYsiz/ecgqR6kkYAl+0pz0tEMk218=
+github.com/deiu/gon3 v0.0.0-20230411081920-f0f8f879f597 h1:xKCSqM+c9FjQIr0Qacn9m7x0kv/opDWGr/nvCowFCok=
+github.com/deiu/gon3 v0.0.0-20230411081920-f0f8f879f597/go.mod h1:r8Pv5x6dxChq4mb1ZqzTyK3y9w8wDzWt55XAJpfSq34=
+github.com/deiu/rdf2go v0.0.0-20240619132609-81222e324bb9 h1:xs255gi9FPRuCW+Ud8lQOBXBGHqM8cqqmoRfGokK3f0=
+github.com/deiu/rdf2go v0.0.0-20240619132609-81222e324bb9/go.mod h1:d+9YsU6N5OuirjLEOp23T2/+S7OLByerfuv1f89iy90=
 github.com/docker/go-units v0.4.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
 github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
 github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
@@ -291,6 +295,8 @@ github.com/libp2p/go-reuseport v0.4.0 h1:nR5KU7hD0WxXCJbmw7r2rhRYruNRl2koHw8fQsc
 github.com/libp2p/go-reuseport v0.4.0/go.mod h1:ZtI03j/wO5hZVDFo2jKywN6bYKWLOy8Se6DrI2E1cLU=
 github.com/libp2p/go-yamux/v4 v4.0.1 h1:FfDR4S1wj6Bw2Pqbc8Uz7pCxeRBPbwsBbEdfwiCypkQ=
 github.com/libp2p/go-yamux/v4 v4.0.1/go.mod h1:NWjl8ZTLOGlozrXSOZ/HlfG++39iKNnM5wwmtQP1YB4=
+github.com/linkeddata/gojsonld v0.0.0-20170418210642-4f5db6791326 h1:YP3lfXXYiQV5MKeUqVnxRP5uuMQTLPx+PGYm1UBoU98=
+github.com/linkeddata/gojsonld v0.0.0-20170418210642-4f5db6791326/go.mod h1:nfqkuSNlsk1bvti/oa7TThx4KmRMBmSxf3okHI9wp3E=
 github.com/lucasb-eyer/go-colorful v1.2.0 h1:1nnpGOrhyZZuNyfu1QjKiUICQ74+3FNCN69Aj6K7nkY=
 github.com/lucasb-eyer/go-colorful v1.2.0/go.mod h1:R4dSotOR9KMtayYi1e77YzuveK+i7ruzyGqttikkLy0=
 github.com/lunixbochs/vtclean v1.0.0/go.mod h1:pHhQNgMf3btfWnGBVipUOjRYhoOsdGqdm/+2c2E2WMI=
@@ -464,6 +470,8 @@ github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjR
 github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
 github.com/russross/blackfriday v1.5.2/go.mod h1:JO/DiYxRf+HjHt06OyowR9PTA263kcR/rfWxYHBV53g=
 github.com/russross/blackfriday/v2 v2.0.1/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+github.com/rychipman/easylex v0.0.0-20160129204217-49ee7767142f h1:L2/fBPABieQnQzfV40k2Zw7IcvZbt0CN5TgwUl8zDCs=
+github.com/rychipman/easylex v0.0.0-20160129204217-49ee7767142f/go.mod h1:MZ2GRTcqmve6EoSbErWgCR+Ash4p8Gc5esHe8MDErss=
 github.com/sergi/go-diff v1.0.0/go.mod h1:0CfEIISq7TuYL3j771MWULgwwjU+GofnZX9QAmXWZgo=
 github.com/shurcooL/component v0.0.0-20170202220835-f88ec8f54cc4/go.mod h1:XhFIlyj5a1fBNx5aJTbKoIq0mNaPvOagO+HjB3EtxrY=
 github.com/shurcooL/events v0.0.0-20181021180414-410e4ca65f48/go.mod h1:5u70Mqkb5O5cxEA8nxTsgrgLehJeAw6Oc4Ab1c/P1HM=
