@@ -14,7 +14,7 @@ func GetMinimumVersion() []byte {
 }
 
 func GetVersion() []byte {
-	return []byte{0x01, 0x04, 0x13}
+	return []byte{0x01, 0x04, 0x14}
 }
 
 func GetVersionString() string {
@@ -22,12 +22,19 @@ func GetVersionString() string {
 }
 
 func FormatVersion(version []byte) string {
-	return fmt.Sprintf(
-		"%d.%d.%d",
-		version[0], version[1], version[2],
-	)
+	if len(version) == 3 {
+		return fmt.Sprintf(
+			"%d.%d.%d",
+			version[0], version[1], version[2],
+		)
+	} else {
+		return fmt.Sprintf(
+			"%d.%d.%d-p%d",
+			version[0], version[1], version[2], version[3],
+		)
+	}
 }
 
 func GetPatchNumber() byte {
-	return 0x01
+	return 0x00
 }

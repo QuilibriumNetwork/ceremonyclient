@@ -56,9 +56,11 @@ var storeSet = wire.NewSet(
 	store.NewPebbleClockStore,
 	store.NewPebbleKeyStore,
 	store.NewPebbleDataProofStore,
+	store.NewPeerstoreDatastore,
 	wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)),
 	wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)),
 	wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)),
+	wire.Bind(new(store.Peerstore), new(*store.PeerstoreDatastore)),
 )
 
 var pubSubSet = wire.NewSet(
@@ -89,6 +91,7 @@ var consensusSet = wire.NewSet(
 func NewDHTNode(*config.Config) (*DHTNode, error) {
 	panic(wire.Build(
 		debugLoggerSet,
+		storeSet,
 		pubSubSet,
 		newDHTNode,
 	))
