@@ -22,7 +22,7 @@ replace github.com/cockroachdb/pebble => ../pebble
 require (
 	filippo.io/edwards25519 v1.0.0-rc.1
 	github.com/cockroachdb/pebble v0.0.0-20231210175920-b4d301aeb46a
-	github.com/libp2p/go-libp2p v0.31.0
+	github.com/libp2p/go-libp2p v0.35.1
 	github.com/libp2p/go-libp2p-gostream v0.6.0
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0
 	google.golang.org/protobuf v1.34.1
@@ -34,6 +34,7 @@ require (
 )
 
 require (
+	github.com/hashicorp/golang-lru/arc/v2 v2.0.7 // indirect
 	github.com/pion/datachannel v1.5.6 // indirect
 	github.com/pion/dtls/v2 v2.2.11 // indirect
 	github.com/pion/ice/v2 v2.3.24 // indirect

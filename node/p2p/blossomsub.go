@@ -22,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
 	"github.com/mr-tron/base58"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
@@ -32,6 +33,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type BlossomSub struct {
@@ -61,7 +63,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE_PREFIX = "quilibrium-1.4.19-betelgeuse-"
+var ANNOUNCE_PREFIX = "quilibrium-1.4.20-solstice-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -85,6 +87,7 @@ func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
+	peerstore store.Peerstore,
 	logger *zap.Logger,
 ) *BlossomSub {
 	ctx := context.Background()
@@ -122,6 +125,13 @@ func NewBlossomSub(
 
 		opts = append(opts, libp2p.Identity(privKey))
 	}
+
+	ps, err := pstoreds.NewPeerstore(ctx, peerstore, pstoreds.DefaultOpts())
+	if err != nil {
+		panic(err)
+	}
+
+	opts = append(opts, libp2p.Peerstore(ps))
 
 	bs := &BlossomSub{
 		ctx:             ctx,
@@ -182,7 +192,7 @@ func NewBlossomSub(
 			BehaviourPenaltyDecay:       .5,
 			DecayInterval:               10 * time.Second,
 			DecayToZero:                 .1,
-			RetainScore:                 5 * time.Minute,
+			RetainScore:                 60 * time.Minute,
 			AppSpecificScore: func(p peer.ID) float64 {
 				return float64(bs.GetPeerScore([]byte(p)))
 			},
@@ -199,13 +209,13 @@ func NewBlossomSub(
 
 	params := mergeDefaults(p2pConfig)
 	rt := blossomsub.NewBlossomSubRouter(h, params)
-	ps, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
+	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)
 	}
 
 	peerID := h.ID()
-	bs.ps = ps
+	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = h
 	bs.signKey = privKey

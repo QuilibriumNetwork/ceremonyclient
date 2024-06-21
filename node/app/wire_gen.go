@@ -24,8 +24,14 @@ import (
 
 func NewDHTNode(configConfig *config.Config) (*DHTNode, error) {
 	p2PConfig := configConfig.P2P
+	dbConfig := configConfig.DB
+	pebbleDB := store.NewPebbleDB(dbConfig)
+	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
+	if err != nil {
+		return nil, err
+	}
 	zapLogger := debugLogger()
-	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
 	dhtNode, err := newDHTNode(blossomSub)
 	if err != nil {
 		return nil, err
@@ -42,7 +48,11 @@ func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTes
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
-	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
+	if err != nil {
+		return nil, err
+	}
+	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
 	engineConfig := configConfig.Engine
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
@@ -65,7 +75,11 @@ func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestRepo
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
-	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
+	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
+	if err != nil {
+		return nil, err
+	}
+	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
 	engineConfig := configConfig.Engine
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
@@ -125,7 +139,7 @@ var debugLoggerSet = wire.NewSet(
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))
 
-var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)))
+var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, store.NewPeerstoreDatastore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)), wire.Bind(new(store.Peerstore), new(*store.PeerstoreDatastore)))
 
 var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewInMemoryPeerInfoManager, p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)), wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)))
 

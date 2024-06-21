@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	// BlossomSubID_v12 is the protocol ID for version 1.2.0 of the BlossomSub protocol.
-	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.0")
+	// BlossomSubID_v12 is the protocol ID for version 1.2.1 of the BlossomSub protocol.
+	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.1")
 )
 
 // Defines the default BlossomSub parameters.
@@ -52,7 +52,7 @@ var (
 	BlossomSubOpportunisticGraftPeers          = 2
 	BlossomSubGraftFloodThreshold              = 10 * time.Second
 	BlossomSubMaxIHaveLength                   = 5000
-	BlossomSubMaxIHaveMessages                 = 100
+	BlossomSubMaxIHaveMessages                 = 10
 	BlossomSubIWantFollowupTime                = 3 * time.Second
 )
 

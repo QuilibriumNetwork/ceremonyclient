@@ -158,7 +158,9 @@ func (r *RPCServer) GetNodeInfo(
 		PeerId:    peerID.String(),
 		MaxFrame:  r.masterClock.GetFrame().GetFrameNumber(),
 		PeerScore: uint64(peerScore),
-		Version:   config.GetVersion(),
+		Version: append(
+			append([]byte{}, config.GetVersion()...), config.GetPatchNumber(),
+		),
 	}, nil
 }
 

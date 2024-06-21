@@ -89,7 +89,7 @@ func (n *Node) VerifyProofIntegrity() {
 		}
 
 		if !v {
-			panic("bad kzg proof")
+			panic(fmt.Sprintf("bad kzg proof at increment %d", i))
 		}
 		wp := []byte{}
 		wp = append(wp, n.pubSub.GetPeerID()...)
@@ -97,7 +97,7 @@ func (n *Node) VerifyProofIntegrity() {
 		fmt.Printf("%x\n", wp)
 		v = wesoProver.VerifyChallengeProof(wp, uint32(j), idx, idxProof)
 		if !v {
-			panic("bad weso proof")
+			panic(fmt.Sprintf("bad weso proof at increment %d", i))
 		}
 	}
 }
