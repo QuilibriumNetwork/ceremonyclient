@@ -1,23 +1,21 @@
 #!/bin/bash
 
-start_process() {
-    version=$(cat config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d")
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if [[ $(uname -m) == "aarch64"* ]]; then
-            ./node-$version-linux-arm64 &
-            main_process_id=$!
-        else
-            ./node-$version-linux-amd64 &
-            main_process_id=$!
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        ./node-$version-darwin-arm64 &
-        main_process_id=$!
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    release_os="linux"
+    if [[ $(uname -m) == "aarch64"* ]]; then
+        release_arch="arm64"
     else
-        echo "unsupported OS for releases, please build from source"
-        exit 1
+        release_arch="amd64"
     fi
+else
+    release_os="darwin"
+    release_arch="arm64"
+fi
 
+start_process() {
+    chmod +x ./node-$version-$release_os-$release_arch
+    ./node-$version-$release_os-$release_arch &
+    main_process_id=$!
     echo "process started with PID $main_process_id"
 }
 
@@ -27,8 +25,8 @@ is_process_running() {
 }
 
 kill_process() {
-    local process_count=$(ps -ef | grep "node-$version" | grep -v grep | wc -l)
-    local process_pids=$(ps -ef | grep "node-$version" | grep -v grep | awk '{print $2}' | xargs)
+    local process_count=$(ps -ef | grep -E "node-.*-(darwin|linux)-(amd64|arm64)" | grep -v grep | wc -l)
+    local process_pids=$(ps -ef | grep -E "node-.*-(darwin|linux)-(amd64|arm64)" | grep -v grep | awk '{print $2}' | xargs)
 
     if [ $process_count -gt 0 ]; then
         echo "killing processes $process_pids"
@@ -38,19 +36,26 @@ kill_process() {
     fi
 }
 
+fetch() {
+    files=$(curl https://releases.quilibrium.com/release | grep $release_os-$release_arch)
+    new_release=false
+
+    for file in $files; do
+        version=$(echo "$file" | cut -d '-' -f 2)
+        if ! test -f "./$file"; then
+            curl "https://releases.quilibrium.com/$file" > "$file"
+            new_release=true
+        fi
+    done
+}
+
 git_update_manager() {
     while true; do
-        git fetch
+        fetch
 
-        local_head=$(git rev-parse HEAD)
-        remote_head=$(git rev-parse @{u})
-
-        if [ "$local_head" != "$remote_head" ]; then
+        if $new_release; then
             updating=true
             kill_process
-
-            git pull
-
             start_process
             updating=false
         fi
@@ -70,12 +75,12 @@ crash_detector() {
     done
 }
 
-kill_process
-
-start_process
-
 # Initialize updating flag
 updating=false
+
+fetch
+kill_process
+start_process
 
 # Run git_update_manager and crash_detector in parallel
 git_update_manager &
