@@ -47,22 +47,17 @@ fetch() {
             new_release=true
         fi
     done
-    echo $new_release
 }
 
 git_update_manager() {
     while true; do
-        new_release=$(fetch)
-        git fetch
-        local_head=$(git rev-parse HEAD)
-        remote_head=$(git rev-parse @{u})
+        fetch
 
-        if [ "$new_release" == "true" ] || [ "$local_head" != "$remote_head" ]; then
+        if $new_release; then
             updating=true
+            git fetch
+            git pull
             kill_process
-            if [ "$local_head" != "$remote_head" ]; then
-                git pull
-            fi
             start_process
             updating=false
         fi
@@ -85,7 +80,7 @@ crash_detector() {
 # Initialize updating flag
 updating=false
 
-new_release=$(fetch)
+fetch
 kill_process
 start_process
 
