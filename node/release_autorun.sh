@@ -13,20 +13,9 @@ else
 fi
 
 start_process() {
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        chmod +x ./node-$version-$release_os-$release_arch
-        ./node-$version-$release_os-$release_arch &
-        main_process_id=$!
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "./node-$version-$release_os-$release_arch"
-        chmod +x ./node-$version-$release_os-$release_arch
-        ./node-$version-$release_os-$release_arch &
-        main_process_id=$!
-    else
-        echo "unsupported OS for releases, please build from source"
-        exit 1
-    fi
-
+    chmod +x ./node-$version-$release_os-$release_arch
+    ./node-$version-$release_os-$release_arch &
+    main_process_id=$!
     echo "process started with PID $main_process_id"
 }
 
@@ -60,25 +49,42 @@ fetch() {
     done
 }
 
+git_update_manager() {
+    while true; do
+        fetch
+
+        if $new_release; then
+            updating=true
+            git fetch
+            git pull
+            kill_process
+            start_process
+            updating=false
+        fi
+
+        sleep 43200
+    done
+}
+
+crash_detector() {
+    while true; do
+        if ! is_process_running && [ "$updating" != true ]; then
+            echo "process crashed or stopped. restarting..."
+            start_process
+        fi
+
+        sleep 300
+    done
+}
+
+# Initialize updating flag
+updating=false
+
 fetch
-
 kill_process
-
 start_process
 
-while true; do
-    if ! is_process_running; then
-        echo "process crashed or stopped. restarting..."
-        start_process
-    fi
-
-    fetch
-
-    if $new_release; then
-        kill_process
-
-        start_process
-    fi
-
-    sleep 43200
-done
+# Run git_update_manager and crash_detector in parallel
+git_update_manager &
+crash_detector &
+wait
