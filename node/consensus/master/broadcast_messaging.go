@@ -92,16 +92,17 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		info.DifficultyMetric = report.DifficultyMetric
 		info.MasterHeadFrame = report.MasterHeadFrame
 
-		if info.Bandwidth <= 1048576 {
+		if info.Bandwidth == 0 {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
 				defer cancel()
 				ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
 				select {
 				case <-ch:
-					go func() {
-						e.bandwidthTestCh <- peerID
-					}()
+					select {
+					case e.bandwidthTestCh <- peerID:
+					default:
+					}
 				case <-ctx.Done():
 				}
 			}()
@@ -116,15 +117,16 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		for i := 0; i < len(proofs); i++ {
 			proofs[i] = proof[i*516 : (i+1)*516]
 		}
-		go func() {
-			e.verifyTestCh <- verifyChallenge{
-				peerID:    peerID,
-				challenge: challenge,
-				cores:     report.Cores,
-				increment: report.Increment,
-				proof:     proof,
-			}
-		}()
+		select {
+		case e.verifyTestCh <- verifyChallenge{
+			peerID:    peerID,
+			challenge: challenge,
+			cores:     report.Cores,
+			increment: report.Increment,
+			proof:     proof,
+		}:
+		default:
+		}
 
 		return nil
 	}
