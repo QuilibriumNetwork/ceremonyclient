@@ -438,6 +438,7 @@ func main() {
 	}
 
 	repair(*configDirectory, node)
+	runtime.GOMAXPROCS(1)
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(

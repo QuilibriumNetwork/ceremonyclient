@@ -146,7 +146,7 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
-		verifyTestCh:        make(chan verifyChallenge),
+		verifyTestCh:        make(chan verifyChallenge, 120000),
 		engineConfig:        engineConfig,
 	}
 
@@ -403,8 +403,10 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 						zap.Uint64("current_frame", e.report.MasterHeadFrame),
 					)
 
-					if err := e.publishMessage(e.filter, e.report); err != nil {
-						e.logger.Debug("error publishing message", zap.Error(err))
+					if increment%30 == 0 {
+						if err := e.publishMessage(e.filter, e.report); err != nil {
+							e.logger.Debug("error publishing message", zap.Error(err))
+						}
 					}
 				} else {
 					skipStore = false
