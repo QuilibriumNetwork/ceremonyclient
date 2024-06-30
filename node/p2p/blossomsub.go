@@ -85,6 +85,16 @@ func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	return id
 }
 
+type realclock struct{}
+
+func (rc realclock) Now() time.Time {
+	return time.Now()
+}
+
+func (rc realclock) After(d time.Duration) <-chan time.Time {
+	return time.After(d)
+}
+
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
 	peerstore store.Peerstore,
@@ -126,7 +136,14 @@ func NewBlossomSub(
 		opts = append(opts, libp2p.Identity(privKey))
 	}
 
-	ps, err := pstoreds.NewPeerstore(ctx, peerstore, pstoreds.DefaultOpts())
+	ps, err := pstoreds.NewPeerstore(ctx, peerstore, pstoreds.Options{
+		CacheSize:           120000,
+		MaxProtocols:        1024,
+		GCPurgeInterval:     2 * time.Hour,
+		GCLookaheadInterval: 0,
+		GCInitialDelay:      60 * time.Second,
+		Clock:               realclock{},
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -208,7 +225,7 @@ func NewBlossomSub(
 		}))
 
 	params := mergeDefaults(p2pConfig)
-	rt := blossomsub.NewBlossomSubRouter(h, params)
+	rt := blossomsub.NewBlossomSubRouter(h, params, ps)
 	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)

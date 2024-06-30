@@ -227,7 +227,7 @@ func main() {
 		fmt.Println("Signature check disabled, skipping...")
 	}
 
-	if *memprofile != "" {
+	if *memprofile != "" && *core == 0 {
 		go func() {
 			for {
 				time.Sleep(5 * time.Minute)
@@ -241,7 +241,7 @@ func main() {
 		}()
 	}
 
-	if *cpuprofile != "" {
+	if *cpuprofile != "" && *core == 0 {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
 			log.Fatal(err)
@@ -438,6 +438,7 @@ func main() {
 	}
 
 	repair(*configDirectory, node)
+	runtime.GOMAXPROCS(1)
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(

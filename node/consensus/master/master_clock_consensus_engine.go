@@ -146,7 +146,7 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
-		verifyTestCh:        make(chan verifyChallenge),
+		verifyTestCh:        make(chan verifyChallenge, 4),
 		engineConfig:        engineConfig,
 	}
 
@@ -192,29 +192,14 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	go func() {
 		for {
 			select {
-			case newFrame := <-e.frameValidationCh:
-				head, err := e.masterTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
-				if head.FrameNumber > newFrame.FrameNumber ||
-					newFrame.FrameNumber-head.FrameNumber > 128 {
-					e.logger.Debug(
-						"frame out of range, ignoring",
-						zap.Uint64("number", newFrame.FrameNumber),
-					)
-					continue
-				}
-
-				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
-					e.logger.Error("could not verify clock frame", zap.Error(err))
-					continue
-				}
-
-				e.masterTimeReel.Insert(newFrame, false)
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
 			case verifyTest := <-e.verifyTestCh:
 				e.performVerifyTest(verifyTest)
 			}
@@ -398,13 +383,14 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 						panic(err)
 					}
 
-					e.logger.Info(
-						"broadcasting self-test info",
-						zap.Uint64("current_frame", e.report.MasterHeadFrame),
-					)
-
-					if err := e.publishMessage(e.filter, e.report); err != nil {
-						e.logger.Debug("error publishing message", zap.Error(err))
+					if increment%30 == 0 {
+						e.logger.Info(
+							"broadcasting self-test info",
+							zap.Uint64("current_frame", e.report.MasterHeadFrame),
+						)
+						if err := e.publishMessage(e.filter, e.report); err != nil {
+							e.logger.Debug("error publishing message", zap.Error(err))
+						}
 					}
 				} else {
 					skipStore = false
