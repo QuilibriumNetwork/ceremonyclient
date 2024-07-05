@@ -23,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
@@ -150,6 +151,19 @@ func NewBlossomSub(
 
 	opts = append(opts, libp2p.Peerstore(ps))
 
+	if p2pConfig.LowWatermarkConnections != 0 &&
+		p2pConfig.HighWatermarkConnections != 0 {
+		cm, err := connmgr.NewConnManager(
+			int(p2pConfig.LowWatermarkConnections),
+			int(p2pConfig.HighWatermarkConnections),
+			connmgr.WithEmergencyTrim(true),
+		)
+		if err != nil {
+			panic(err)
+		}
+		opts = append(opts, libp2p.ConnectionManager(cm))
+	}
+
 	bs := &BlossomSub{
 		ctx:             ctx,
 		logger:          logger,
@@ -189,11 +203,6 @@ func NewBlossomSub(
 	}
 
 	blossomOpts := []blossomsub.Option{}
-	if isBootstrapPeer {
-		blossomOpts = append(blossomOpts,
-			blossomsub.WithPeerExchange(true),
-		)
-	}
 
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
