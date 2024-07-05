@@ -725,11 +725,11 @@ func logoVersion(width int) string {
 		out += "                          ''---..              ...---''               ##\n"
 		out += "                                 ''----------''\n"
 		out += " \n"
-		out += "                       Quilibrium Node - v" + config.GetVersionString() + " – Solstice\n"
+		out += "                       Quilibrium Node - v" + config.GetVersionString() + " – Centauri\n"
 		out += " \n"
 		out += "                                   DB Console\n"
 	} else {
-		out = "Quilibrium Node - v" + config.GetVersionString() + " – Solstice - DB Console\n"
+		out = "Quilibrium Node - v" + config.GetVersionString() + " – Centauri - DB Console\n"
 	}
 	return out
 }

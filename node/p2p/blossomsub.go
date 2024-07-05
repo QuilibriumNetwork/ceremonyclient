@@ -64,7 +64,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE_PREFIX = "quilibrium-1.4.20-solstice-"
+var ANNOUNCE_PREFIX = "quilibrium-1.4.21-centauri-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
