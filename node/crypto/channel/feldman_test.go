@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	crypto "source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
 )
 
 func TestFeldman(t *testing.T) {

@@ -49,35 +49,18 @@ fn recurse_fft(
     fft_width: u64,
     inverse: bool,
 ) {
+  let M = &big::BIG::new_ints(&rom::CURVE_ORDER);
   let roots = if inverse {
     &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
   } else {
     &bls::singleton().RootsOfUnityBLS48581[&fft_width]
   };
 
-  if out.len() <= 16 {
-    let l = out.len() as u64;
-    for i in 0..l {
-      let mut last = big::BIG::modmul(
-        &values[offset as usize],
-        &roots[0],
-        &big::BIG::new_ints(&rom::CURVE_ORDER),
-      );
-
-      for j in 1..l {
-        let mid = big::BIG::modmul(
-          &values[(offset + j * stride) as usize],
-          &roots[((i * j) % l) as usize * roots_stride as usize],
-          &big::BIG::new_ints(&rom::CURVE_ORDER),
-        );
-        last = big::BIG::modadd(
-          &last,
-          &mid,
-          &big::BIG::new_ints(&rom::CURVE_ORDER),
-        );
-      }
-      out[i as usize] = last;
-    }
+  if out.len() == 1 {
+    // optimization: we're working in bls48-581, the first roots of unity
+    // value is always 1 no matter the fft width, so we can skip the
+    // multiplication:
+    out[0] = values[offset as usize].clone();
     return;
   }
 
@@ -107,26 +90,26 @@ fn recurse_fft(
 
   // cha cha now, y'all
   for i in 0..half {
-      let mul = big::BIG::modmul(
-        &out[(i + half) as usize],
-        &roots[(i * roots_stride) as usize],
-        &big::BIG::new_ints(&rom::CURVE_ORDER),
-      );
-      let mul_add = big::BIG::modadd(
-        &out[i as usize],
-        &mul,
-        &big::BIG::new_ints(&rom::CURVE_ORDER),
-      );
-      out[(i + half) as usize] = big::BIG::modadd(
-        &out[i as usize],
-        &big::BIG::modneg(&mul, &big::BIG::new_ints(&rom::CURVE_ORDER)),
-        &big::BIG::new_ints(&rom::CURVE_ORDER),
-      );
-      out[i as usize] = mul_add;
+    let mul = big::BIG::modmul(
+      &out[(i + half) as usize],
+      &roots[(i * roots_stride) as usize],
+      &big::BIG::new_ints(&rom::CURVE_ORDER),
+    );
+    let mul_add = big::BIG::modadd(
+      &out[i as usize],
+      &mul,
+      &big::BIG::new_ints(&rom::CURVE_ORDER),
+    );
+    out[(i + half) as usize] = big::BIG::modadd(
+      &out[i as usize],
+      &big::BIG::modneg(&mul, &big::BIG::new_ints(&rom::CURVE_ORDER)),
+      &big::BIG::new_ints(&rom::CURVE_ORDER),
+    );
+    out[i as usize] = mul_add;
   }
 }
 
-fn fft(
+pub fn fft(
   values: &[big::BIG],
   fft_width: u64,
   inverse: bool,
@@ -183,21 +166,8 @@ fn recurse_fft_g1(
     &bls::singleton().RootsOfUnityBLS48581[&fft_width]
   };
 
-  if out.len() <= 16 {
-    let l = out.len() as u64;
-    for i in 0..l {
-      let mut last = ecp::ECP::mul(&values[offset as usize].clone(), &roots[0]);
-
-      for j in 1..l {
-        let mid = ecp::ECP::mul(
-          &values[(offset + j * stride) as usize].clone(),
-          &roots[((i * j) % l) as usize * roots_stride as usize],
-        );
-        &last.add(&mid);
-      }
-
-      out[i as usize] = last.clone();
-    }
+  if out.len() == 1 {
+    out[0] = values[offset as usize].clone();
     return;
   }
 
@@ -227,7 +197,9 @@ fn recurse_fft_g1(
 
   // cha cha now, y'all
   for i in 0..half {
-    let mul = out[(i + half) as usize].clone().mul(&roots[(i * roots_stride) as usize].clone());
+    let mul = out[(i + half) as usize].clone().mul(
+      &roots[(i * roots_stride) as usize].clone(),
+    );
     let mut mul_add = out[i as usize].clone();
     mul_add.add(&mul.clone());
     out[(i + half) as usize] = out[i as usize].clone();
@@ -236,7 +208,7 @@ fn recurse_fft_g1(
   }
 }
 
-fn fft_g1(
+pub fn fft_g1(
   values: &[ecp::ECP],
   fft_width: u64,
   inverse: bool,
@@ -291,7 +263,7 @@ fn bytes_to_polynomial(
   let size = bytes.len() / 64;
   let trunc_last = bytes.len() % 64 > 0;
 
-  let mut poly = Vec::new();
+  let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
 
   for i in 0..size {
     let scalar = big::BIG::frombytes(&bytes[i * 64..(i + 1) * 64]);
@@ -306,8 +278,8 @@ fn bytes_to_polynomial(
   return poly;
 }
 
-fn point_linear_combination(
-  points: &Vec<&ecp::ECP>,
+pub fn point_linear_combination(
+  points: &[ecp::ECP],
   scalars: &Vec<big::BIG>,
 ) -> Result<ecp::ECP, Box<dyn Error>> {
   if points.len() != scalars.len() {
@@ -318,14 +290,7 @@ fn point_linear_combination(
     ).into());
   }
 
-  let mut result = ecp::ECP::new();
-
-  for (i, point) in points.iter().enumerate() {
-    let c = point.clone();
-    let p = c.mul(&scalars[i]);
-    
-    &result.add(&p);
-  }
+  let result = ecp::ECP::muln(points.len(), points, scalars.as_slice());
 
   Ok(result)
 }
@@ -362,7 +327,7 @@ pub fn commit_raw(
     poly.push(big::BIG::new());
   }
   match point_linear_combination(
-		&bls::singleton().FFTBLS48581[&poly_size].iter().collect(),
+		&bls::singleton().FFTBLS48581[&poly_size],
 		&poly,
 	) {
     Ok(commit) => {
@@ -440,7 +405,7 @@ pub fn prove_raw(
       }
     
       match point_linear_combination(
-        &bls::singleton().CeremonyBLS48581G1[..(poly_size as usize - 1)].iter().collect(),
+        &bls::singleton().CeremonyBLS48581G1[..(poly_size as usize - 1)],
         &out,
       ) {
         Ok(proof) => {
@@ -483,4 +448,29 @@ pub fn verify_raw(
 
 pub fn init() {
   bls::singleton();
+}
+
+#[cfg(test)]
+mod tests {
+    use ecp::ECP;
+
+    use super::*;
+
+    #[test]
+    fn fft_matches_fft_g1_when_raised() {
+      init();
+      let mut rand = rand::RAND::new();
+      let mut v = vec![big::BIG::new(); 16];
+      let mut vp = vec![ECP::new(); 16];
+      for i in 0..16 {
+        v[i] = big::BIG::random(&mut rand);
+        vp[i] = ECP::generator().mul(&v[i]);
+      }
+      let scalars = fft(v.as_slice(), 16, false).unwrap();
+      let points = fft_g1(vp.as_slice(), 16, false).unwrap();
+      for (i, s) in scalars.iter().enumerate() {
+        let sp = ECP::generator().mul(&s);
+        assert!(points[i].equals(&sp));
+      }
+    }
 }

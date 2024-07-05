@@ -933,5 +933,5 @@ func printVersion() {
 		patchString = fmt.Sprintf("-p%d", patch)
 	}
 	fmt.Println(" ")
-	fmt.Println("                      Quilibrium Node - v" + config.GetVersionString() + patchString + " – Solstice")
+	fmt.Println("                      Quilibrium Node - v" + config.GetVersionString() + patchString + " – Centauri")
 }
