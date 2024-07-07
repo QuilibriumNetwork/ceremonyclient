@@ -25,7 +25,6 @@ type Config struct {
 	ListenGRPCMultiaddr string        `yaml:"listenGrpcMultiaddr"`
 	ListenRestMultiaddr string        `yaml:"listenRESTMultiaddr"`
 	LogFile             string        `yaml:"logFile"`
-	CPUMax	            int           `yaml:"cpu"` 
 }
 
 func NewConfig(configPath string) (*Config, error) {
