@@ -22,4 +22,7 @@ type EngineConfig struct {
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
 	Difficulty uint32 `yaml:"difficulty"`
+
+	// Sets the max number of workers. If this is higher than the system's limit, use the system's maximum cores
+	MaxWorkers           int    `yaml:"maxWorkers"`
 }
