@@ -487,8 +487,8 @@ func spawnDataWorkers(nodeConfig *config.Config) {
 	}
 
 	cores := runtime.GOMAXPROCS(0)
-	if nodeConfig.CPUMax != 0 && runtime.GOMAXPROCS(0) > nodeConfig.CPUMax {
-	    	cores = nodeConfig.CPUMax
+	if nodeConfig.Engine.MaxWorkers != 0 && nodeConfig.Engine.MaxWorkers < cores {
+		cores = nodeConfig.Engine.MaxWorkers
 	}
 	dataWorkers = make([]*exec.Cmd, cores-1)
 	fmt.Printf("Spawning %d data workers...\n", cores-1)
