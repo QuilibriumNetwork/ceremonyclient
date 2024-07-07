@@ -25,11 +25,13 @@ Be sure to follow the PATH export given by the installer.
 
 Build the Rust VDF implementation by navigating to the vdf folder, and run `./generate.sh`.
 
+Build the `bls48581` implementation by navigating to `bls48581` folder, and run `./generate.sh`.
+
 ### Node
 
 Because of the Rust interop, be sure you follow the above steps for the VDF before proceeding to this. Navigate to the node folder, and run (making sure to update the path for the repo):
 
-    CGO_LDFLAGS="-L/path/to/ceremonyclient/target/release -lvdf -ldl -lm" \
+    CGO_LDFLAGS="-L/path/to/ceremonyclient/target/release -lvdf -lbls48581 -ldl -lm" \
         CGO_ENABLED=1 \
         GOEXPERIMENT=arenas \
         go run ./... --signature-check=false
