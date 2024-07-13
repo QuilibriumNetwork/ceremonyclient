@@ -228,8 +228,374 @@ message PeerManifest {
   uint32 increment = 18;
 }
 
+message OriginatedAccountRef {
+  bytes address = 1;
+}
+
+message ImplicitAccount {
+  uint32 implicit_type = 1;
+  bytes address = 2;
+  bytes domain = 3;
+}
+
+message AccountRef {
+  oneof account {
+    OriginatedAccountRef originated_account = 1;
+    ImplicitAccount implicit_account = 2;
+  }
+}
+
+message AccountAllowanceRef {
+  bytes address = 1;
+}
+
+message CoinAllowanceRef {
+  bytes address = 1;
+}
+
+message CoinRef {
+  bytes address = 1;
+}
+
+message PendingTransactionRef {
+  bytes address = 1;
+}
+
+message KeyRef {
+  bytes address = 1;
+}
+
+message Signature {
+  uint32 signature_type = 1;
+  bytes signature = 2;
+  KeyRef key = 3;
+}
+
 message PeerManifestsResponse {
   repeated PeerManifest peer_manifests = 1;
+}
+
+message AcceptPendingTransactionRequest {
+  PendingTransactionRef pending_transaction = 1;
+  Signature signature = 2;
+}
+
+message AllowAccountRequest {
+  AccountRef of_account = 1;
+  AccountRef permitted_account = 2;
+  repeated string permitted_operations = 3;
+  AccountAllowanceRef allowance = 4;
+  Signature signature = 5;
+}
+
+message AllowCoinRequest {
+  CoinRef of_coin = 1;
+  AccountRef permitted_account = 2;
+  repeated string permitted_operations = 3;
+  AccountAllowanceRef account_allowance = 4;
+  CoinAllowanceRef coin_allowance = 5;
+  Signature signature = 6;
+}
+
+message BalanceAccountRequest {
+  AccountRef account = 1;
+  AccountAllowanceRef allowance = 2;
+  Signature signature = 3;
+}
+
+message CoinsAccountRequest {
+  AccountRef account = 1;
+  AccountAllowanceRef allowance = 2;
+  Signature signature = 3;
+}
+
+message PendingTransactionsAccountRequest {
+  AccountRef account = 1;
+  AccountAllowanceRef allowance = 2;
+  Signature signature = 3;
+}
+
+message IntersectCoinRequest {
+  repeated bytes addresses = 1;
+  AccountAllowanceRef account_allowance = 2;
+  CoinAllowanceRef coin_allowance = 3;
+  CoinRef of_coin = 4;
+}
+
+message MergeCoinRequest {
+  repeated CoinRef coins = 1;
+  AccountAllowanceRef account_allowance = 2;
+  repeated CoinAllowanceRef coin_allowances = 3;
+  Signature signature = 4;
+}
+
+message MintCoinRequest {
+  repeated bytes proofs = 1;
+  AccountAllowanceRef allowance = 2;
+  Signature signature = 3;
+}
+
+message MutualReceiveCoinRequest {
+  AccountRef to_account = 1;
+  AccountAllowanceRef allowance = 2;
+  Signature signature = 3;
+}
+
+message MutualTransferCoinRequest {
+  bytes rendezvous = 1;
+  CoinRef of_coin = 2;
+  AccountAllowanceRef account_allowance = 3;
+  CoinAllowanceRef coin_allowance = 4;
+  Signature signature = 5;
+}
+
+message RevokeAccountRequest {
+  AccountRef of_account = 1;
+  AccountAllowanceRef revoked_allowance = 2;
+  AccountAllowanceRef allowance = 3;
+  Signature signature = 4;
+}
+
+message RevokeCoinRequest {
+  CoinRef of_coin = 1;
+  CoinAllowanceRef revoked_allowance = 2;
+  AccountAllowanceRef account_allowance = 3;
+  CoinAllowanceRef coin_allowance = 4;
+  Signature signature = 5;
+}
+
+message SplitCoinRequest {
+  CoinRef of_coin = 1;
+  repeated bytes amounts = 2;
+  AccountAllowanceRef account_allowance = 3;
+  CoinAllowanceRef coin_allowance = 4;
+  Signature signature = 5;
+}
+
+message TransferCoinRequest {
+  AccountRef to_account = 1;
+  AccountRef refund_account = 2;
+  CoinRef of_coin = 3;
+  int64 expiry = 4;
+  AccountAllowanceRef account_allowance = 5;
+  CoinAllowanceRef coin_allowance = 6;
+  Signature signature = 7;
+}
+
+message ApprovePendingTransactionRequest {
+  PendingTransactionRef pending_transaction = 1;
+  AccountAllowanceRef account_allowance = 2;
+  Signature signature = 3;
+}
+
+message RejectPendingTransactionRequest {
+  PendingTransactionRef pending_transaction = 1;
+  AccountAllowanceRef account_allowance = 2;
+  Signature signature = 3;
+}
+
+message InlineKey {
+  bytes ref = 1;
+  bytes key = 2;
+}
+
+message KeyRing {
+  repeated InlineKey keys = 1;
+}
+
+message Confirmation {
+  bytes message_id = 1;
+  bytes proof = 2;
+}
+
+message DeliveryData {
+  InlineKey shared_key = 1;
+  Confirmation confirmation = 2;
+}
+
+message DeliveryMethod {
+  uint32 delivery_type = 1;
+  bytes address = 2;
+}
+
+message DecryptableAllowAccountRequest {
+  AllowAccountRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableBalanceAccountRequest {
+  BalanceAccountRequest request = 1;
+  KeyRing key_ring = 2;
+}
+
+message DecryptableCoinsAccountRequest {
+  CoinsAccountRequest request = 1;
+  KeyRing key_ring = 2;
+}
+
+message DecryptableRevokeAccountRequest {
+  RevokeAccountRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptablePendingTransactionsAccountRequest {
+  PendingTransactionsAccountRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableAllowCoinRequest {
+  AllowCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableIntersectCoinRequest {
+  IntersectCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableMergeCoinRequest {
+  MergeCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableMintCoinRequest {
+  MintCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableMutualReceiveCoinRequest {
+  MutualReceiveCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableMutualTransferCoinRequest {
+  MutualTransferCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableRevokeCoinRequest {
+  RevokeCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableSplitCoinRequest {
+  SplitCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableTransferCoinRequest {
+  TransferCoinRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableApprovePendingTransactionRequest {
+  ApprovePendingTransactionRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message DecryptableRejectPendingTransactionRequest {
+  RejectPendingTransactionRequest request = 1;
+  KeyRing key_ring = 2;
+  DeliveryMethod delivery_method = 3;
+}
+
+message CoinInfo {
+  CoinRef coin = 1;
+  bytes balance = 2;
+}
+
+message PendingTransactionInfo {
+  PendingTransactionRef pending_transaction = 1;
+  CoinInfo coin = 2;
+  AccountRef refund_account = 3;
+}
+
+message AllowAccountResponse {
+  AccountAllowanceRef allowance = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message BalanceAccountResponse {
+  bytes balance = 1;
+}
+
+message CoinsAccountResponse {
+  repeated CoinInfo coins = 1;
+}
+
+message PendingTransactionsAccountResponse {
+  repeated PendingTransactionInfo pending_transactions = 1;
+}
+
+message RevokeAccountResponse {
+  repeated DeliveryData deliveries = 1;
+}
+
+message AllowCoinResponse {
+  CoinAllowanceRef allowance = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message IntersectCoinResponse {
+  bool intersects = 1;
+}
+
+message MergeCoinResponse {
+  CoinRef coin = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message MintCoinResponse {
+  repeated CoinInfo coins = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message MutualReceiveCoinResponse {
+  uint32 status = 1;
+  bytes rendezvous = 2;
+  CoinRef coin = 3;
+  repeated DeliveryData deliveries = 4;
+}
+
+message MutualTransferCoinResponse {
+  uint32 status = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message RevokeCoinResponse {
+  repeated DeliveryData deliveries = 1;
+}
+
+message SplitCoinResponse {
+  repeated CoinRef coins = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message TransferCoinResponse {
+  PendingTransactionRef pending_transaction = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message ApprovePendingTransactionResponse {
+  CoinRef coin = 1;
+  repeated DeliveryData deliveries = 2;
+}
+
+message RejectPendingTransactionResponse {
+  repeated DeliveryData deliveries = 2;
 }
 
 service NodeService {
@@ -240,6 +606,31 @@ service NodeService {
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
   rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
   rpc GetPeerManifests(GetPeerManifestsRequest) returns (PeerManifestsResponse);
+}
+
+service AccountService {
+  rpc Allow(DecryptableAllowAccountRequest) returns (AllowAccountResponse);
+  rpc GetBalance(DecryptableBalanceAccountRequest) returns (BalanceAccountResponse);
+  rpc ListCoins(DecryptableCoinsAccountRequest) returns (CoinsAccountResponse);
+  rpc ListPendingTransactions(DecryptablePendingTransactionsAccountRequest) returns (PendingTransactionsAccountResponse);
+  rpc Revoke(DecryptableRevokeAccountRequest) returns (RevokeAccountResponse);
+}
+
+service CoinService {
+  rpc Allow(DecryptableAllowCoinRequest) returns (AllowCoinResponse);
+  rpc Intersect(DecryptableIntersectCoinRequest) returns (IntersectCoinResponse);
+  rpc Merge(DecryptableMergeCoinRequest) returns (MergeCoinResponse);
+  rpc Mint(DecryptableMintCoinRequest) returns (MintCoinResponse);
+  rpc MutualReceive(DecryptableMutualReceiveCoinRequest) returns (stream MutualReceiveCoinResponse);
+  rpc MutualTransfer(DecryptableMutualTransferCoinRequest) returns (stream MutualTransferCoinResponse);
+  rpc Revoke(DecryptableRevokeCoinRequest) returns (RevokeCoinResponse);
+  rpc Split(DecryptableSplitCoinRequest) returns (SplitCoinResponse);
+  rpc Transfer(DecryptableTransferCoinRequest) returns (TransferCoinResponse);
+}
+
+service TransactionService {
+  rpc Approve(DecryptableApprovePendingTransactionRequest) returns (ApprovePendingTransactionResponse);
+  rpc Reject(DecryptableRejectPendingTransactionRequest) returns (RejectPendingTransactionResponse);
 }
 
 service NodeStats {
