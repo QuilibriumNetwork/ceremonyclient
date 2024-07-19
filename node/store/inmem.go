@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"math/rand"
@@ -92,6 +93,24 @@ func (i *InMemKVDBIterator) Next() bool {
 	return found
 }
 
+func (i *InMemKVDBIterator) Last() bool {
+	if !i.open {
+		return false
+	}
+	i.db.storeMx.Lock()
+	found := false
+	final := sort.SearchStrings(i.db.sortedKeys, string(i.end))
+	if len(i.db.sortedKeys) == final ||
+		!bytes.Equal([]byte(i.db.sortedKeys[final]), i.end) {
+		final--
+	}
+	i.pos = final
+	found = true
+	i.db.storeMx.Unlock()
+
+	return found
+}
+
 func (i *InMemKVDBIterator) Prev() bool {
 	if !i.open {
 		return false
@@ -162,6 +181,26 @@ func (i *InMemKVDBIterator) SeekLT(lt []byte) bool {
 	return found
 }
 
+func (t *InMemKVDBTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	if !t.db.open {
+		return nil, nil, errors.New("inmem db closed")
+	}
+
+	for _, c := range t.changes {
+		if bytes.Equal(c.key, key) {
+			return c.value, io.NopCloser(nil), nil
+		}
+	}
+
+	t.db.storeMx.Lock()
+	b, ok := t.db.store[string(key)]
+	t.db.storeMx.Unlock()
+	if !ok {
+		return nil, nil, pebble.ErrNotFound
+	}
+	return b, io.NopCloser(nil), nil
+}
+
 func (t *InMemKVDBTransaction) Set(key []byte, value []byte) error {
 	if !t.db.open {
 		return errors.New("inmem db closed")
@@ -210,6 +249,23 @@ func (t *InMemKVDBTransaction) Delete(key []byte) error {
 	})
 
 	return nil
+}
+
+func (t *InMemKVDBTransaction) NewIter(lowerBound []byte, upperBound []byte) (
+	Iterator,
+	error,
+) {
+	if !t.db.open {
+		return nil, errors.New("inmem db closed")
+	}
+
+	return &InMemKVDBIterator{
+		open:  true,
+		db:    t.db,
+		start: lowerBound,
+		end:   upperBound,
+		pos:   -1,
+	}, nil
 }
 
 func (t *InMemKVDBTransaction) Abort() error {

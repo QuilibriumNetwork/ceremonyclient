@@ -486,6 +486,812 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	AccountService_Allow_FullMethodName                   = "/quilibrium.node.node.pb.AccountService/Allow"
+	AccountService_GetBalance_FullMethodName              = "/quilibrium.node.node.pb.AccountService/GetBalance"
+	AccountService_ListCoins_FullMethodName               = "/quilibrium.node.node.pb.AccountService/ListCoins"
+	AccountService_ListPendingTransactions_FullMethodName = "/quilibrium.node.node.pb.AccountService/ListPendingTransactions"
+	AccountService_Revoke_FullMethodName                  = "/quilibrium.node.node.pb.AccountService/Revoke"
+)
+
+// AccountServiceClient is the client API for AccountService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type AccountServiceClient interface {
+	Allow(ctx context.Context, in *DecryptableAllowAccountRequest, opts ...grpc.CallOption) (*AllowAccountResponse, error)
+	GetBalance(ctx context.Context, in *DecryptableBalanceAccountRequest, opts ...grpc.CallOption) (*BalanceAccountResponse, error)
+	ListCoins(ctx context.Context, in *DecryptableCoinsAccountRequest, opts ...grpc.CallOption) (*CoinsAccountResponse, error)
+	ListPendingTransactions(ctx context.Context, in *DecryptablePendingTransactionsAccountRequest, opts ...grpc.CallOption) (*PendingTransactionsAccountResponse, error)
+	Revoke(ctx context.Context, in *DecryptableRevokeAccountRequest, opts ...grpc.CallOption) (*RevokeAccountResponse, error)
+}
+
+type accountServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewAccountServiceClient(cc grpc.ClientConnInterface) AccountServiceClient {
+	return &accountServiceClient{cc}
+}
+
+func (c *accountServiceClient) Allow(ctx context.Context, in *DecryptableAllowAccountRequest, opts ...grpc.CallOption) (*AllowAccountResponse, error) {
+	out := new(AllowAccountResponse)
+	err := c.cc.Invoke(ctx, AccountService_Allow_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *accountServiceClient) GetBalance(ctx context.Context, in *DecryptableBalanceAccountRequest, opts ...grpc.CallOption) (*BalanceAccountResponse, error) {
+	out := new(BalanceAccountResponse)
+	err := c.cc.Invoke(ctx, AccountService_GetBalance_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *accountServiceClient) ListCoins(ctx context.Context, in *DecryptableCoinsAccountRequest, opts ...grpc.CallOption) (*CoinsAccountResponse, error) {
+	out := new(CoinsAccountResponse)
+	err := c.cc.Invoke(ctx, AccountService_ListCoins_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *accountServiceClient) ListPendingTransactions(ctx context.Context, in *DecryptablePendingTransactionsAccountRequest, opts ...grpc.CallOption) (*PendingTransactionsAccountResponse, error) {
+	out := new(PendingTransactionsAccountResponse)
+	err := c.cc.Invoke(ctx, AccountService_ListPendingTransactions_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *accountServiceClient) Revoke(ctx context.Context, in *DecryptableRevokeAccountRequest, opts ...grpc.CallOption) (*RevokeAccountResponse, error) {
+	out := new(RevokeAccountResponse)
+	err := c.cc.Invoke(ctx, AccountService_Revoke_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AccountServiceServer is the server API for AccountService service.
+// All implementations must embed UnimplementedAccountServiceServer
+// for forward compatibility
+type AccountServiceServer interface {
+	Allow(context.Context, *DecryptableAllowAccountRequest) (*AllowAccountResponse, error)
+	GetBalance(context.Context, *DecryptableBalanceAccountRequest) (*BalanceAccountResponse, error)
+	ListCoins(context.Context, *DecryptableCoinsAccountRequest) (*CoinsAccountResponse, error)
+	ListPendingTransactions(context.Context, *DecryptablePendingTransactionsAccountRequest) (*PendingTransactionsAccountResponse, error)
+	Revoke(context.Context, *DecryptableRevokeAccountRequest) (*RevokeAccountResponse, error)
+	mustEmbedUnimplementedAccountServiceServer()
+}
+
+// UnimplementedAccountServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedAccountServiceServer struct {
+}
+
+func (UnimplementedAccountServiceServer) Allow(context.Context, *DecryptableAllowAccountRequest) (*AllowAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Allow not implemented")
+}
+func (UnimplementedAccountServiceServer) GetBalance(context.Context, *DecryptableBalanceAccountRequest) (*BalanceAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetBalance not implemented")
+}
+func (UnimplementedAccountServiceServer) ListCoins(context.Context, *DecryptableCoinsAccountRequest) (*CoinsAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListCoins not implemented")
+}
+func (UnimplementedAccountServiceServer) ListPendingTransactions(context.Context, *DecryptablePendingTransactionsAccountRequest) (*PendingTransactionsAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPendingTransactions not implemented")
+}
+func (UnimplementedAccountServiceServer) Revoke(context.Context, *DecryptableRevokeAccountRequest) (*RevokeAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Revoke not implemented")
+}
+func (UnimplementedAccountServiceServer) mustEmbedUnimplementedAccountServiceServer() {}
+
+// UnsafeAccountServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AccountServiceServer will
+// result in compilation errors.
+type UnsafeAccountServiceServer interface {
+	mustEmbedUnimplementedAccountServiceServer()
+}
+
+func RegisterAccountServiceServer(s grpc.ServiceRegistrar, srv AccountServiceServer) {
+	s.RegisterService(&AccountService_ServiceDesc, srv)
+}
+
+func _AccountService_Allow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableAllowAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServiceServer).Allow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AccountService_Allow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServiceServer).Allow(ctx, req.(*DecryptableAllowAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AccountService_GetBalance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableBalanceAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServiceServer).GetBalance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AccountService_GetBalance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServiceServer).GetBalance(ctx, req.(*DecryptableBalanceAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AccountService_ListCoins_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableCoinsAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServiceServer).ListCoins(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AccountService_ListCoins_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServiceServer).ListCoins(ctx, req.(*DecryptableCoinsAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AccountService_ListPendingTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptablePendingTransactionsAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServiceServer).ListPendingTransactions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AccountService_ListPendingTransactions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServiceServer).ListPendingTransactions(ctx, req.(*DecryptablePendingTransactionsAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AccountService_Revoke_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableRevokeAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServiceServer).Revoke(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AccountService_Revoke_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServiceServer).Revoke(ctx, req.(*DecryptableRevokeAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AccountService_ServiceDesc is the grpc.ServiceDesc for AccountService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AccountService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.node.pb.AccountService",
+	HandlerType: (*AccountServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Allow",
+			Handler:    _AccountService_Allow_Handler,
+		},
+		{
+			MethodName: "GetBalance",
+			Handler:    _AccountService_GetBalance_Handler,
+		},
+		{
+			MethodName: "ListCoins",
+			Handler:    _AccountService_ListCoins_Handler,
+		},
+		{
+			MethodName: "ListPendingTransactions",
+			Handler:    _AccountService_ListPendingTransactions_Handler,
+		},
+		{
+			MethodName: "Revoke",
+			Handler:    _AccountService_Revoke_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "node.proto",
+}
+
+const (
+	CoinService_Allow_FullMethodName          = "/quilibrium.node.node.pb.CoinService/Allow"
+	CoinService_Intersect_FullMethodName      = "/quilibrium.node.node.pb.CoinService/Intersect"
+	CoinService_Merge_FullMethodName          = "/quilibrium.node.node.pb.CoinService/Merge"
+	CoinService_Mint_FullMethodName           = "/quilibrium.node.node.pb.CoinService/Mint"
+	CoinService_MutualReceive_FullMethodName  = "/quilibrium.node.node.pb.CoinService/MutualReceive"
+	CoinService_MutualTransfer_FullMethodName = "/quilibrium.node.node.pb.CoinService/MutualTransfer"
+	CoinService_Revoke_FullMethodName         = "/quilibrium.node.node.pb.CoinService/Revoke"
+	CoinService_Split_FullMethodName          = "/quilibrium.node.node.pb.CoinService/Split"
+	CoinService_Transfer_FullMethodName       = "/quilibrium.node.node.pb.CoinService/Transfer"
+)
+
+// CoinServiceClient is the client API for CoinService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type CoinServiceClient interface {
+	Allow(ctx context.Context, in *DecryptableAllowCoinRequest, opts ...grpc.CallOption) (*AllowCoinResponse, error)
+	Intersect(ctx context.Context, in *DecryptableIntersectCoinRequest, opts ...grpc.CallOption) (*IntersectCoinResponse, error)
+	Merge(ctx context.Context, in *DecryptableMergeCoinRequest, opts ...grpc.CallOption) (*MergeCoinResponse, error)
+	Mint(ctx context.Context, in *DecryptableMintCoinRequest, opts ...grpc.CallOption) (*MintCoinResponse, error)
+	MutualReceive(ctx context.Context, in *DecryptableMutualReceiveCoinRequest, opts ...grpc.CallOption) (CoinService_MutualReceiveClient, error)
+	MutualTransfer(ctx context.Context, in *DecryptableMutualTransferCoinRequest, opts ...grpc.CallOption) (CoinService_MutualTransferClient, error)
+	Revoke(ctx context.Context, in *DecryptableRevokeCoinRequest, opts ...grpc.CallOption) (*RevokeCoinResponse, error)
+	Split(ctx context.Context, in *DecryptableSplitCoinRequest, opts ...grpc.CallOption) (*SplitCoinResponse, error)
+	Transfer(ctx context.Context, in *DecryptableTransferCoinRequest, opts ...grpc.CallOption) (*TransferCoinResponse, error)
+}
+
+type coinServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCoinServiceClient(cc grpc.ClientConnInterface) CoinServiceClient {
+	return &coinServiceClient{cc}
+}
+
+func (c *coinServiceClient) Allow(ctx context.Context, in *DecryptableAllowCoinRequest, opts ...grpc.CallOption) (*AllowCoinResponse, error) {
+	out := new(AllowCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Allow_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) Intersect(ctx context.Context, in *DecryptableIntersectCoinRequest, opts ...grpc.CallOption) (*IntersectCoinResponse, error) {
+	out := new(IntersectCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Intersect_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) Merge(ctx context.Context, in *DecryptableMergeCoinRequest, opts ...grpc.CallOption) (*MergeCoinResponse, error) {
+	out := new(MergeCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Merge_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) Mint(ctx context.Context, in *DecryptableMintCoinRequest, opts ...grpc.CallOption) (*MintCoinResponse, error) {
+	out := new(MintCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Mint_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) MutualReceive(ctx context.Context, in *DecryptableMutualReceiveCoinRequest, opts ...grpc.CallOption) (CoinService_MutualReceiveClient, error) {
+	stream, err := c.cc.NewStream(ctx, &CoinService_ServiceDesc.Streams[0], CoinService_MutualReceive_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &coinServiceMutualReceiveClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type CoinService_MutualReceiveClient interface {
+	Recv() (*MutualReceiveCoinResponse, error)
+	grpc.ClientStream
+}
+
+type coinServiceMutualReceiveClient struct {
+	grpc.ClientStream
+}
+
+func (x *coinServiceMutualReceiveClient) Recv() (*MutualReceiveCoinResponse, error) {
+	m := new(MutualReceiveCoinResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *coinServiceClient) MutualTransfer(ctx context.Context, in *DecryptableMutualTransferCoinRequest, opts ...grpc.CallOption) (CoinService_MutualTransferClient, error) {
+	stream, err := c.cc.NewStream(ctx, &CoinService_ServiceDesc.Streams[1], CoinService_MutualTransfer_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &coinServiceMutualTransferClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type CoinService_MutualTransferClient interface {
+	Recv() (*MutualTransferCoinResponse, error)
+	grpc.ClientStream
+}
+
+type coinServiceMutualTransferClient struct {
+	grpc.ClientStream
+}
+
+func (x *coinServiceMutualTransferClient) Recv() (*MutualTransferCoinResponse, error) {
+	m := new(MutualTransferCoinResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *coinServiceClient) Revoke(ctx context.Context, in *DecryptableRevokeCoinRequest, opts ...grpc.CallOption) (*RevokeCoinResponse, error) {
+	out := new(RevokeCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Revoke_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) Split(ctx context.Context, in *DecryptableSplitCoinRequest, opts ...grpc.CallOption) (*SplitCoinResponse, error) {
+	out := new(SplitCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Split_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coinServiceClient) Transfer(ctx context.Context, in *DecryptableTransferCoinRequest, opts ...grpc.CallOption) (*TransferCoinResponse, error) {
+	out := new(TransferCoinResponse)
+	err := c.cc.Invoke(ctx, CoinService_Transfer_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CoinServiceServer is the server API for CoinService service.
+// All implementations must embed UnimplementedCoinServiceServer
+// for forward compatibility
+type CoinServiceServer interface {
+	Allow(context.Context, *DecryptableAllowCoinRequest) (*AllowCoinResponse, error)
+	Intersect(context.Context, *DecryptableIntersectCoinRequest) (*IntersectCoinResponse, error)
+	Merge(context.Context, *DecryptableMergeCoinRequest) (*MergeCoinResponse, error)
+	Mint(context.Context, *DecryptableMintCoinRequest) (*MintCoinResponse, error)
+	MutualReceive(*DecryptableMutualReceiveCoinRequest, CoinService_MutualReceiveServer) error
+	MutualTransfer(*DecryptableMutualTransferCoinRequest, CoinService_MutualTransferServer) error
+	Revoke(context.Context, *DecryptableRevokeCoinRequest) (*RevokeCoinResponse, error)
+	Split(context.Context, *DecryptableSplitCoinRequest) (*SplitCoinResponse, error)
+	Transfer(context.Context, *DecryptableTransferCoinRequest) (*TransferCoinResponse, error)
+	mustEmbedUnimplementedCoinServiceServer()
+}
+
+// UnimplementedCoinServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedCoinServiceServer struct {
+}
+
+func (UnimplementedCoinServiceServer) Allow(context.Context, *DecryptableAllowCoinRequest) (*AllowCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Allow not implemented")
+}
+func (UnimplementedCoinServiceServer) Intersect(context.Context, *DecryptableIntersectCoinRequest) (*IntersectCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Intersect not implemented")
+}
+func (UnimplementedCoinServiceServer) Merge(context.Context, *DecryptableMergeCoinRequest) (*MergeCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Merge not implemented")
+}
+func (UnimplementedCoinServiceServer) Mint(context.Context, *DecryptableMintCoinRequest) (*MintCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Mint not implemented")
+}
+func (UnimplementedCoinServiceServer) MutualReceive(*DecryptableMutualReceiveCoinRequest, CoinService_MutualReceiveServer) error {
+	return status.Errorf(codes.Unimplemented, "method MutualReceive not implemented")
+}
+func (UnimplementedCoinServiceServer) MutualTransfer(*DecryptableMutualTransferCoinRequest, CoinService_MutualTransferServer) error {
+	return status.Errorf(codes.Unimplemented, "method MutualTransfer not implemented")
+}
+func (UnimplementedCoinServiceServer) Revoke(context.Context, *DecryptableRevokeCoinRequest) (*RevokeCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Revoke not implemented")
+}
+func (UnimplementedCoinServiceServer) Split(context.Context, *DecryptableSplitCoinRequest) (*SplitCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Split not implemented")
+}
+func (UnimplementedCoinServiceServer) Transfer(context.Context, *DecryptableTransferCoinRequest) (*TransferCoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Transfer not implemented")
+}
+func (UnimplementedCoinServiceServer) mustEmbedUnimplementedCoinServiceServer() {}
+
+// UnsafeCoinServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CoinServiceServer will
+// result in compilation errors.
+type UnsafeCoinServiceServer interface {
+	mustEmbedUnimplementedCoinServiceServer()
+}
+
+func RegisterCoinServiceServer(s grpc.ServiceRegistrar, srv CoinServiceServer) {
+	s.RegisterService(&CoinService_ServiceDesc, srv)
+}
+
+func _CoinService_Allow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableAllowCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Allow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Allow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Allow(ctx, req.(*DecryptableAllowCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_Intersect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableIntersectCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Intersect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Intersect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Intersect(ctx, req.(*DecryptableIntersectCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_Merge_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableMergeCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Merge(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Merge_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Merge(ctx, req.(*DecryptableMergeCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_Mint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableMintCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Mint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Mint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Mint(ctx, req.(*DecryptableMintCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_MutualReceive_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(DecryptableMutualReceiveCoinRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(CoinServiceServer).MutualReceive(m, &coinServiceMutualReceiveServer{stream})
+}
+
+type CoinService_MutualReceiveServer interface {
+	Send(*MutualReceiveCoinResponse) error
+	grpc.ServerStream
+}
+
+type coinServiceMutualReceiveServer struct {
+	grpc.ServerStream
+}
+
+func (x *coinServiceMutualReceiveServer) Send(m *MutualReceiveCoinResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _CoinService_MutualTransfer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(DecryptableMutualTransferCoinRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(CoinServiceServer).MutualTransfer(m, &coinServiceMutualTransferServer{stream})
+}
+
+type CoinService_MutualTransferServer interface {
+	Send(*MutualTransferCoinResponse) error
+	grpc.ServerStream
+}
+
+type coinServiceMutualTransferServer struct {
+	grpc.ServerStream
+}
+
+func (x *coinServiceMutualTransferServer) Send(m *MutualTransferCoinResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _CoinService_Revoke_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableRevokeCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Revoke(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Revoke_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Revoke(ctx, req.(*DecryptableRevokeCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_Split_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableSplitCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Split(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Split_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Split(ctx, req.(*DecryptableSplitCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoinService_Transfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableTransferCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoinServiceServer).Transfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoinService_Transfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoinServiceServer).Transfer(ctx, req.(*DecryptableTransferCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// CoinService_ServiceDesc is the grpc.ServiceDesc for CoinService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var CoinService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.node.pb.CoinService",
+	HandlerType: (*CoinServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Allow",
+			Handler:    _CoinService_Allow_Handler,
+		},
+		{
+			MethodName: "Intersect",
+			Handler:    _CoinService_Intersect_Handler,
+		},
+		{
+			MethodName: "Merge",
+			Handler:    _CoinService_Merge_Handler,
+		},
+		{
+			MethodName: "Mint",
+			Handler:    _CoinService_Mint_Handler,
+		},
+		{
+			MethodName: "Revoke",
+			Handler:    _CoinService_Revoke_Handler,
+		},
+		{
+			MethodName: "Split",
+			Handler:    _CoinService_Split_Handler,
+		},
+		{
+			MethodName: "Transfer",
+			Handler:    _CoinService_Transfer_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "MutualReceive",
+			Handler:       _CoinService_MutualReceive_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "MutualTransfer",
+			Handler:       _CoinService_MutualTransfer_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "node.proto",
+}
+
+const (
+	TransactionService_Approve_FullMethodName = "/quilibrium.node.node.pb.TransactionService/Approve"
+	TransactionService_Reject_FullMethodName  = "/quilibrium.node.node.pb.TransactionService/Reject"
+)
+
+// TransactionServiceClient is the client API for TransactionService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type TransactionServiceClient interface {
+	Approve(ctx context.Context, in *DecryptableApprovePendingTransactionRequest, opts ...grpc.CallOption) (*ApprovePendingTransactionResponse, error)
+	Reject(ctx context.Context, in *DecryptableRejectPendingTransactionRequest, opts ...grpc.CallOption) (*RejectPendingTransactionResponse, error)
+}
+
+type transactionServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewTransactionServiceClient(cc grpc.ClientConnInterface) TransactionServiceClient {
+	return &transactionServiceClient{cc}
+}
+
+func (c *transactionServiceClient) Approve(ctx context.Context, in *DecryptableApprovePendingTransactionRequest, opts ...grpc.CallOption) (*ApprovePendingTransactionResponse, error) {
+	out := new(ApprovePendingTransactionResponse)
+	err := c.cc.Invoke(ctx, TransactionService_Approve_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transactionServiceClient) Reject(ctx context.Context, in *DecryptableRejectPendingTransactionRequest, opts ...grpc.CallOption) (*RejectPendingTransactionResponse, error) {
+	out := new(RejectPendingTransactionResponse)
+	err := c.cc.Invoke(ctx, TransactionService_Reject_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TransactionServiceServer is the server API for TransactionService service.
+// All implementations must embed UnimplementedTransactionServiceServer
+// for forward compatibility
+type TransactionServiceServer interface {
+	Approve(context.Context, *DecryptableApprovePendingTransactionRequest) (*ApprovePendingTransactionResponse, error)
+	Reject(context.Context, *DecryptableRejectPendingTransactionRequest) (*RejectPendingTransactionResponse, error)
+	mustEmbedUnimplementedTransactionServiceServer()
+}
+
+// UnimplementedTransactionServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedTransactionServiceServer struct {
+}
+
+func (UnimplementedTransactionServiceServer) Approve(context.Context, *DecryptableApprovePendingTransactionRequest) (*ApprovePendingTransactionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Approve not implemented")
+}
+func (UnimplementedTransactionServiceServer) Reject(context.Context, *DecryptableRejectPendingTransactionRequest) (*RejectPendingTransactionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Reject not implemented")
+}
+func (UnimplementedTransactionServiceServer) mustEmbedUnimplementedTransactionServiceServer() {}
+
+// UnsafeTransactionServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TransactionServiceServer will
+// result in compilation errors.
+type UnsafeTransactionServiceServer interface {
+	mustEmbedUnimplementedTransactionServiceServer()
+}
+
+func RegisterTransactionServiceServer(s grpc.ServiceRegistrar, srv TransactionServiceServer) {
+	s.RegisterService(&TransactionService_ServiceDesc, srv)
+}
+
+func _TransactionService_Approve_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableApprovePendingTransactionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionServiceServer).Approve(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionService_Approve_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionServiceServer).Approve(ctx, req.(*DecryptableApprovePendingTransactionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TransactionService_Reject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecryptableRejectPendingTransactionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionServiceServer).Reject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionService_Reject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionServiceServer).Reject(ctx, req.(*DecryptableRejectPendingTransactionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// TransactionService_ServiceDesc is the grpc.ServiceDesc for TransactionService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var TransactionService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.node.pb.TransactionService",
+	HandlerType: (*TransactionServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Approve",
+			Handler:    _TransactionService_Approve_Handler,
+		},
+		{
+			MethodName: "Reject",
+			Handler:    _TransactionService_Reject_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "node.proto",
+}
+
+const (
 	NodeStats_PutNodeInfo_FullMethodName = "/quilibrium.node.node.pb.NodeStats/PutNodeInfo"
 	NodeStats_PutPeerInfo_FullMethodName = "/quilibrium.node.node.pb.NodeStats/PutPeerInfo"
 )

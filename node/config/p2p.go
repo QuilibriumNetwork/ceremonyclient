@@ -38,4 +38,6 @@ type P2PConfig struct {
 	TraceLogFile              string        `yaml:"traceLogFile"`
 	MinPeers                  int           `yaml:"minPeers"`
 	Network                   uint8         `yaml:"network"`
+	LowWatermarkConnections   uint          `yaml:"lowWatermarkConnections"`
+	HighWatermarkConnections  uint          `yaml:"highWatermarkConnections"`
 }

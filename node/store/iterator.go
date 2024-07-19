@@ -11,6 +11,7 @@ type Iterator interface {
 	Value() []byte
 	Close() error
 	SeekLT([]byte) bool
+	Last() bool
 }
 
 type TypedIterator[T proto.Message] interface {

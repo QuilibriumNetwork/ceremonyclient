@@ -113,6 +113,11 @@ var (
 		0,
 		"specifies the parent process pid for a data worker",
 	)
+	integrityCheck = flag.Bool(
+		"integrity-check",
+		false,
+		"runs an integrity check on the store, helpful for confirming backups are not corrupted (defaults to false)",
+	)
 )
 
 var signatories = []string{
@@ -222,7 +227,7 @@ func main() {
 		fmt.Println("Signature check disabled, skipping...")
 	}
 
-	if *memprofile != "" {
+	if *memprofile != "" && *core == 0 {
 		go func() {
 			for {
 				time.Sleep(5 * time.Minute)
@@ -236,7 +241,7 @@ func main() {
 		}()
 	}
 
-	if *cpuprofile != "" {
+	if *cpuprofile != "" && *core == 0 {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
 			log.Fatal(err)
@@ -402,7 +407,10 @@ func main() {
 	}
 
 	fmt.Println("Loading ceremony state and starting node...")
-	go spawnDataWorkers(nodeConfig)
+
+	if !*integrityCheck {
+		go spawnDataWorkers(nodeConfig)
+	}
 
 	kzg.Init()
 
@@ -422,7 +430,15 @@ func main() {
 		panic(err)
 	}
 
+	if *integrityCheck {
+		fmt.Println("Running integrity check...")
+		node.VerifyProofIntegrity()
+		fmt.Println("Integrity check passed!")
+		return
+	}
+
 	repair(*configDirectory, node)
+	runtime.GOMAXPROCS(1)
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
@@ -477,20 +493,25 @@ func spawnDataWorkers(nodeConfig *config.Config) {
 	for i := 1; i <= cores-1; i++ {
 		i := i
 		go func() {
-			args := []string{
-				fmt.Sprintf("--core=%d", i),
-				fmt.Sprintf("--parent-process=%d", os.Getpid()),
-			}
-			args = append(args, os.Args[1:]...)
-			cmd := exec.Command(process, args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stdout
-			err := cmd.Start()
-			if err != nil {
-				panic(err)
-			}
+			for {
+				args := []string{
+					fmt.Sprintf("--core=%d", i),
+					fmt.Sprintf("--parent-process=%d", os.Getpid()),
+				}
+				args = append(args, os.Args[1:]...)
+				cmd := exec.Command(process, args...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stdout
+				err := cmd.Start()
+				if err != nil {
+					panic(err)
+				}
 
-			dataWorkers[i-1] = cmd
+				dataWorkers[i-1] = cmd
+				cmd.Wait()
+				time.Sleep(25 * time.Millisecond)
+				fmt.Printf("Data worker %d stopped, restarting...\n", i)
+			}
 		}()
 	}
 }
@@ -912,5 +933,5 @@ func printVersion() {
 		patchString = fmt.Sprintf("-p%d", patch)
 	}
 	fmt.Println(" ")
-	fmt.Println("                     Quilibrium Node - v" + config.GetVersionString() + patchString + " – Betelgeuse")
+	fmt.Println("                      Quilibrium Node - v" + config.GetVersionString() + patchString + " – Centauri")
 }

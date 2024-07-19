@@ -146,7 +146,7 @@ func NewMasterClockConsensusEngine(
 		report:              report,
 		frameValidationCh:   make(chan *protobufs.ClockFrame),
 		bandwidthTestCh:     make(chan []byte),
-		verifyTestCh:        make(chan verifyChallenge),
+		verifyTestCh:        make(chan verifyChallenge, 4),
 		engineConfig:        engineConfig,
 	}
 
@@ -192,29 +192,14 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	go func() {
 		for {
 			select {
-			case newFrame := <-e.frameValidationCh:
-				head, err := e.masterTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
-				if head.FrameNumber > newFrame.FrameNumber ||
-					newFrame.FrameNumber-head.FrameNumber > 128 {
-					e.logger.Debug(
-						"frame out of range, ignoring",
-						zap.Uint64("number", newFrame.FrameNumber),
-					)
-					continue
-				}
-
-				if err := e.frameProver.VerifyMasterClockFrame(newFrame); err != nil {
-					e.logger.Error("could not verify clock frame", zap.Error(err))
-					continue
-				}
-
-				e.masterTimeReel.Insert(newFrame, false)
 			case peerId := <-e.bandwidthTestCh:
 				e.performBandwidthTest(peerId)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
 			case verifyTest := <-e.verifyTestCh:
 				e.performVerifyTest(verifyTest)
 			}
@@ -398,13 +383,14 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 						panic(err)
 					}
 
-					e.logger.Info(
-						"broadcasting self-test info",
-						zap.Uint64("current_frame", e.report.MasterHeadFrame),
-					)
-
-					if err := e.publishMessage(e.filter, e.report); err != nil {
-						e.logger.Debug("error publishing message", zap.Error(err))
+					if increment%30 == 0 {
+						e.logger.Info(
+							"broadcasting self-test info",
+							zap.Uint64("current_frame", e.report.MasterHeadFrame),
+						)
+						if err := e.publishMessage(e.filter, e.report); err != nil {
+							e.logger.Debug("error publishing message", zap.Error(err))
+						}
 					}
 				} else {
 					skipStore = false
@@ -421,39 +407,18 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
-		newFrameCh := e.masterTimeReel.NewFrameCh()
-
 		for e.state < consensus.EngineStateStopping {
-			var err error
-			select {
-			case frame := <-newFrameCh:
-				currentFrame := frame
-				latestFrame := frame
-				if latestFrame, err = e.collect(currentFrame); err != nil {
-					e.logger.Error("could not collect", zap.Error(err))
-					latestFrame = currentFrame
-					continue
-				}
-				if latestFrame, err = e.prove(latestFrame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					latestFrame = currentFrame
-				}
-				if err = e.publishProof(latestFrame); err != nil {
-					e.logger.Error("could not publish", zap.Error(err))
-				}
-			case <-time.After(20 * time.Second):
-				frame, err := e.masterTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
+			frame, err := e.masterTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
 
-				if frame, err = e.prove(frame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					continue
-				}
-				if err = e.publishProof(frame); err != nil {
-					e.logger.Error("could not publish", zap.Error(err))
-				}
+			if frame, err = e.prove(frame); err != nil {
+				e.logger.Error("could not prove", zap.Error(err))
+				continue
+			}
+			if err = e.publishProof(frame); err != nil {
+				e.logger.Error("could not publish", zap.Error(err))
 			}
 		}
 	}()
@@ -511,7 +476,7 @@ func (e *MasterClockConsensusEngine) PerformTimeProof(
 	for i := uint32(0); i < parallelism; i++ {
 		i := i
 		go func() {
-			for j := 3; j > 0; j-- {
+			for j := 3; j >= 0; j-- {
 				resp, err :=
 					clients[i].CalculateChallengeProof(
 						context.Background(),
@@ -522,7 +487,7 @@ func (e *MasterClockConsensusEngine) PerformTimeProof(
 						},
 					)
 				if err != nil {
-					if j == 1 || len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+					if j == 0 {
 						panic(err)
 					}
 					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
@@ -533,7 +498,18 @@ func (e *MasterClockConsensusEngine) PerformTimeProof(
 						time.Sleep(50 * time.Millisecond)
 						clients[i], err = e.createParallelDataClientsFromListAndIndex(i)
 						if err != nil {
-							panic(err)
+							e.logger.Error("failed to reconnect", zap.Error(err))
+						}
+					} else if len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+						e.logger.Error(
+							"client failed, reconnecting after 50ms",
+							zap.Uint32("client", i),
+						)
+						time.Sleep(50 * time.Millisecond)
+						clients[i], err =
+							e.createParallelDataClientsFromBaseMultiaddrAndIndex(i)
+						if err != nil {
+							e.logger.Error("failed to reconnect", zap.Error(err))
 						}
 					}
 					continue
@@ -593,12 +569,12 @@ func (e *MasterClockConsensusEngine) createParallelDataClientsFromListAndIndex(
 ) {
 	ma, err := multiaddr.NewMultiaddr(e.engineConfig.DataWorkerMultiaddrs[index])
 	if err != nil {
-		panic(err)
+		return nil, errors.Wrap(err, "create parallel data client")
 	}
 
 	_, addr, err := mn.DialArgs(ma)
 	if err != nil {
-		panic(err)
+		return nil, errors.Wrap(err, "create parallel data client")
 	}
 
 	conn, err := grpc.Dial(
@@ -612,7 +588,66 @@ func (e *MasterClockConsensusEngine) createParallelDataClientsFromListAndIndex(
 		),
 	)
 	if err != nil {
-		panic(err)
+		return nil, errors.Wrap(err, "create parallel data client")
+	}
+
+	client := protobufs.NewDataIPCServiceClient(conn)
+
+	e.logger.Info(
+		"connected to data worker process",
+		zap.Uint32("client", index),
+	)
+	return client, nil
+}
+
+func (
+	e *MasterClockConsensusEngine,
+) createParallelDataClientsFromBaseMultiaddrAndIndex(
+	index uint32,
+) (
+	protobufs.DataIPCServiceClient,
+	error,
+) {
+	e.logger.Info(
+		"re-connecting to data worker process",
+		zap.Uint32("client", index),
+	)
+
+	if e.engineConfig.DataWorkerBaseListenMultiaddr == "" {
+		e.engineConfig.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	}
+
+	if e.engineConfig.DataWorkerBaseListenPort == 0 {
+		e.engineConfig.DataWorkerBaseListenPort = 40000
+	}
+
+	ma, err := multiaddr.NewMultiaddr(
+		fmt.Sprintf(
+			e.engineConfig.DataWorkerBaseListenMultiaddr,
+			int(e.engineConfig.DataWorkerBaseListenPort)+int(index),
+		),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "create parallel data client")
+	}
+
+	_, addr, err := mn.DialArgs(ma)
+	if err != nil {
+		return nil, errors.Wrap(err, "create parallel data client")
+	}
+
+	conn, err := grpc.Dial(
+		addr,
+		grpc.WithTransportCredentials(
+			insecure.NewCredentials(),
+		),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(10*1024*1024),
+			grpc.MaxCallRecvMsgSize(10*1024*1024),
+		),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "create parallel data client")
 	}
 
 	client := protobufs.NewDataIPCServiceClient(conn)

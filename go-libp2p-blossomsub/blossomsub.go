@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	// BlossomSubID_v12 is the protocol ID for version 1.2.0 of the BlossomSub protocol.
-	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.0")
+	// BlossomSubID_v12 is the protocol ID for version 1.2.1 of the BlossomSub protocol.
+	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.1")
 )
 
 // Defines the default BlossomSub parameters.
@@ -52,7 +52,7 @@ var (
 	BlossomSubOpportunisticGraftPeers          = 2
 	BlossomSubGraftFloodThreshold              = 10 * time.Second
 	BlossomSubMaxIHaveLength                   = 5000
-	BlossomSubMaxIHaveMessages                 = 100
+	BlossomSubMaxIHaveMessages                 = 10
 	BlossomSubIWantFollowupTime                = 3 * time.Second
 )
 
@@ -214,7 +214,7 @@ func NewBlossomSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, 
 }
 
 // NewBlossomSubRouter returns a new BlossomSubRouter with custom parameters.
-func NewBlossomSubRouter(h host.Host, params BlossomSubParams) *BlossomSubRouter {
+func NewBlossomSubRouter(h host.Host, params BlossomSubParams, addrBook peerstore.AddrBook) *BlossomSubRouter {
 	return &BlossomSubRouter{
 		peers:     make(map[peer.ID]protocol.ID),
 		mesh:      make(map[string]map[peer.ID]struct{}),
@@ -222,7 +222,7 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams) *BlossomSubRouter
 		lastpub:   make(map[string]int64),
 		gossip:    make(map[peer.ID][]*pb.ControlIHave),
 		control:   make(map[peer.ID]*pb.ControlMessage),
-		cab:       pstoremem.NewAddrBook(),
+		cab:       addrBook,
 		backoff:   make(map[string]map[peer.ID]time.Time),
 		peerhave:  make(map[peer.ID]int),
 		iasked:    make(map[peer.ID]int),

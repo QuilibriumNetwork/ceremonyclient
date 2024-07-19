@@ -22,6 +22,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
@@ -32,6 +34,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type BlossomSub struct {
@@ -61,7 +64,7 @@ var BITMASK_ALL = []byte{
 // While we iterate through these next phases, we're going to aggressively
 // enforce keeping updated. This will be achieved through announce strings
 // that will vary with each update
-var ANNOUNCE_PREFIX = "quilibrium-1.4.19-betelgeuse-"
+var ANNOUNCE_PREFIX = "quilibrium-1.4.21-centauri-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -83,8 +86,19 @@ func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	return id
 }
 
+type realclock struct{}
+
+func (rc realclock) Now() time.Time {
+	return time.Now()
+}
+
+func (rc realclock) After(d time.Duration) <-chan time.Time {
+	return time.After(d)
+}
+
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
+	peerstore store.Peerstore,
 	logger *zap.Logger,
 ) *BlossomSub {
 	ctx := context.Background()
@@ -121,6 +135,33 @@ func NewBlossomSub(
 		}
 
 		opts = append(opts, libp2p.Identity(privKey))
+	}
+
+	ps, err := pstoreds.NewPeerstore(ctx, peerstore, pstoreds.Options{
+		CacheSize:           120000,
+		MaxProtocols:        1024,
+		GCPurgeInterval:     2 * time.Hour,
+		GCLookaheadInterval: 0,
+		GCInitialDelay:      60 * time.Second,
+		Clock:               realclock{},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	opts = append(opts, libp2p.Peerstore(ps))
+
+	if p2pConfig.LowWatermarkConnections != 0 &&
+		p2pConfig.HighWatermarkConnections != 0 {
+		cm, err := connmgr.NewConnManager(
+			int(p2pConfig.LowWatermarkConnections),
+			int(p2pConfig.HighWatermarkConnections),
+			connmgr.WithEmergencyTrim(true),
+		)
+		if err != nil {
+			panic(err)
+		}
+		opts = append(opts, libp2p.ConnectionManager(cm))
 	}
 
 	bs := &BlossomSub{
@@ -162,11 +203,6 @@ func NewBlossomSub(
 	}
 
 	blossomOpts := []blossomsub.Option{}
-	if isBootstrapPeer {
-		blossomOpts = append(blossomOpts,
-			blossomsub.WithPeerExchange(true),
-		)
-	}
 
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
@@ -182,7 +218,7 @@ func NewBlossomSub(
 			BehaviourPenaltyDecay:       .5,
 			DecayInterval:               10 * time.Second,
 			DecayToZero:                 .1,
-			RetainScore:                 5 * time.Minute,
+			RetainScore:                 60 * time.Minute,
 			AppSpecificScore: func(p peer.ID) float64 {
 				return float64(bs.GetPeerScore([]byte(p)))
 			},
@@ -198,14 +234,14 @@ func NewBlossomSub(
 		}))
 
 	params := mergeDefaults(p2pConfig)
-	rt := blossomsub.NewBlossomSubRouter(h, params)
-	ps, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
+	rt := blossomsub.NewBlossomSubRouter(h, params, ps)
+	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)
 	}
 
 	peerID := h.ID()
-	bs.ps = ps
+	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = h
 	bs.signKey = privKey

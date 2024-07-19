@@ -1,4 +1,4 @@
-# Quilibrium - Betelgeuse
+# Quilibrium - Solstice
 
 Quilibrium is a decentralized alternative to platform as a service providers.
 This release is part of the phases of the Dusk release, which finalizes with

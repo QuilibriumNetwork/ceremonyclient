@@ -37,14 +37,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	}
 
 	switch any.TypeUrl {
-	case protobufs.ClockFrameType:
-		if err := e.handleClockFrameData(
-			message.From,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-		return nil
 	case protobufs.SelfTestReportType:
 		if err := e.handleSelfTestReport(
 			message.From,
@@ -56,60 +48,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	}
 
 	return errors.Wrap(errors.New("invalid message"), "handle message")
-}
-
-func (e *MasterClockConsensusEngine) handleClockFrameData(
-	peerID []byte,
-	any *anypb.Any,
-) error {
-	frame := &protobufs.ClockFrame{}
-	if err := any.UnmarshalTo(frame); err != nil {
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	head, err := e.masterTimeReel.Head()
-	if err != nil {
-		panic(err)
-	}
-
-	if frame.FrameNumber < head.FrameNumber {
-		return nil
-	}
-
-	if e.difficulty != frame.Difficulty {
-		e.logger.Debug(
-			"frame difficulty mismatched",
-			zap.Uint32("difficulty", frame.Difficulty),
-		)
-		return errors.Wrap(
-			errors.New("frame difficulty"),
-			"handle clock frame data",
-		)
-	}
-
-	e.logger.Debug(
-		"got clock frame",
-		zap.Binary("sender", peerID),
-		zap.Binary("filter", frame.Filter),
-		zap.Uint64("frame_number", frame.FrameNumber),
-		zap.Int("proof_count", len(frame.AggregateProofs)),
-	)
-
-	go func() {
-		select {
-		case e.frameValidationCh <- frame:
-		default:
-			e.logger.Debug(
-				"dropped frame due to overwhelmed queue",
-				zap.Binary("sender", peerID),
-				zap.Binary("filter", frame.Filter),
-				zap.Uint64("frame_number", frame.FrameNumber),
-				zap.Int("proof_count", len(frame.AggregateProofs)),
-			)
-		}
-	}()
-
-	return nil
 }
 
 func (e *MasterClockConsensusEngine) handleSelfTestReport(
@@ -154,16 +92,17 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		info.DifficultyMetric = report.DifficultyMetric
 		info.MasterHeadFrame = report.MasterHeadFrame
 
-		if info.Bandwidth <= 1048576 {
+		if info.Bandwidth == 0 {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
 				defer cancel()
 				ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
 				select {
 				case <-ch:
-					go func() {
-						e.bandwidthTestCh <- peerID
-					}()
+					select {
+					case e.bandwidthTestCh <- peerID:
+					default:
+					}
 				case <-ctx.Done():
 				}
 			}()
@@ -178,15 +117,16 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		for i := 0; i < len(proofs); i++ {
 			proofs[i] = proof[i*516 : (i+1)*516]
 		}
-		go func() {
-			e.verifyTestCh <- verifyChallenge{
-				peerID:    peerID,
-				challenge: challenge,
-				cores:     report.Cores,
-				increment: report.Increment,
-				proof:     proof,
-			}
-		}()
+		select {
+		case e.verifyTestCh <- verifyChallenge{
+			peerID:    peerID,
+			challenge: challenge,
+			cores:     report.Cores,
+			increment: report.Increment,
+			proof:     proof,
+		}:
+		default:
+		}
 
 		return nil
 	}
@@ -252,7 +192,6 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	return nil
 }
 
-// This does not publish any longer, frames strictly are picked up from sync
 func (e *MasterClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {

@@ -88,14 +88,20 @@ func (p *PebbleDB) CompactAll() error {
 var _ KVDB = (*PebbleDB)(nil)
 
 type Transaction interface {
+	Get(key []byte) ([]byte, io.Closer, error)
 	Set(key []byte, value []byte) error
 	Commit() error
 	Delete(key []byte) error
 	Abort() error
+	NewIter(lowerBound []byte, upperBound []byte) (Iterator, error)
 }
 
 type PebbleTransaction struct {
 	b *pebble.Batch
+}
+
+func (t *PebbleTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	return t.b.Get(key)
 }
 
 func (t *PebbleTransaction) Set(key []byte, value []byte) error {
@@ -112,6 +118,16 @@ func (t *PebbleTransaction) Delete(key []byte) error {
 
 func (t *PebbleTransaction) Abort() error {
 	return t.b.Close()
+}
+
+func (t *PebbleTransaction) NewIter(lowerBound []byte, upperBound []byte) (
+	Iterator,
+	error,
+) {
+	return t.b.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
 }
 
 var _ Transaction = (*PebbleTransaction)(nil)
