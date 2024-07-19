@@ -64,6 +64,7 @@ var BootstrapPeers = []string{
 	"/ip4/70.36.102.32/udp/8336/quic-v1/p2p/QmYriGRXCUiwFodqSoS4GgEcD7UVyxXPeCgQKmYne3iLSF",
 	"/ip4/204.12.220.2/udp/8336/quic-v1/p2p/QmRw5Tw4p5v2vLPvVSAkQEiRPQGnWk9HM4xiSvgxF82CCw",
 	"/ip4/209.159.149.14/udp/8336/quic-v1/p2p/Qmcq4Lmw45tbodvdRWZ8iGgy3rUcR3dikHTj1fBXP8VJqv",
+	"/ip4/34.87.85.78/udp/8336/quic-v1/p2p/QmTGguT5XhtvZZwTLnNQTN8Bg9eUm1THWEneXXHGhMDPrz",
 	"/dns/bravo-1.qcommander.sh/udp/8336/quic-v1/p2p/QmWFK1gVuhEqZdr8phTo3QbyLwjYmyivx31Zubqt7oR4XB",
 	// purged peers (keep your node online to return to this list)
 	// "/ip4/204.186.74.47/udp/8317/quic-v1/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
