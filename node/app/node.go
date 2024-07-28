@@ -70,6 +70,7 @@ func (n *Node) VerifyProofIntegrity() {
 	if e != nil {
 		panic(e)
 	}
+
 	dataProver := crypto.NewKZGInclusionProver(n.logger)
 	wesoProver := crypto.NewWesolowskiFrameProver(n.logger)
 
@@ -79,6 +80,7 @@ func (n *Node) VerifyProofIntegrity() {
 		if err != nil {
 			panic(err)
 		}
+
 		idx, idxProof, idxCommit, idxKP := master.GetOutputs(o)
 
 		ip := sha3.Sum512(idxProof)
@@ -89,7 +91,7 @@ func (n *Node) VerifyProofIntegrity() {
 		}
 
 		if !v {
-			panic(fmt.Sprintf("bad kzg proof at increment %d", i))
+			panic(fmt.Sprintf("bad kzg proof at increment %d", j))
 		}
 		wp := []byte{}
 		wp = append(wp, n.pubSub.GetPeerID()...)
@@ -97,7 +99,7 @@ func (n *Node) VerifyProofIntegrity() {
 		fmt.Printf("%x\n", wp)
 		v = wesoProver.VerifyChallengeProof(wp, uint32(j), idx, idxProof)
 		if !v {
-			panic(fmt.Sprintf("bad weso proof at increment %d", i))
+			panic(fmt.Sprintf("bad weso proof at increment %d", j))
 		}
 	}
 }

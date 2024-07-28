@@ -28,6 +28,7 @@ import (
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 
 	"github.com/cloudflare/circl/sign/ed448"
@@ -532,32 +533,48 @@ func RunMigrationIfNeeded(
 	configDir string,
 	nodeConfig *config.Config,
 ) {
-	shouldMigrate := false
+	shouldMigrate13 := false
+	shouldMigrate15 := false
 	migrationInfo := []byte{0x00, 0x00, 0x00}
 	_, err := os.Stat(filepath.Join(configDir, "MIGRATIONS"))
 	if err != nil && os.IsNotExist(err) {
 		fmt.Println("Migrations file not found, will perform migration...")
-		shouldMigrate = true
+		shouldMigrate13 = true
+		shouldMigrate15 = true
 	}
 
-	if !shouldMigrate {
+	if !shouldMigrate13 {
 		migrationInfo, err = os.ReadFile(filepath.Join(configDir, "MIGRATIONS"))
 		if err != nil {
 			panic(err)
 		}
 
 		if len(migrationInfo) < 3 ||
-			!bytes.Equal(migrationInfo, []byte{0x01, 0x04, 0x013}) {
+			(!bytes.Equal(migrationInfo, []byte{0x01, 0x04, 0x013}) &&
+				!bytes.Equal(migrationInfo, []byte{0x01, 0x04, 0x15})) {
 			fmt.Println("Migrations file outdated, will perform migration...")
-			shouldMigrate = true
+			shouldMigrate13 = true
+			shouldMigrate15 = true
 		}
 	}
 
-	// If subsequent migrations arise, we will need to distinguish by version
-	if shouldMigrate {
-		fmt.Println("Running migration...")
+	if !shouldMigrate15 {
+		migrationInfo, err = os.ReadFile(filepath.Join(configDir, "MIGRATIONS"))
+		if err != nil {
+			panic(err)
+		}
 
-		// Easiest migration in the world.
+		if len(migrationInfo) < 3 ||
+			!bytes.Equal(migrationInfo, []byte{0x01, 0x04, 0x15}) {
+			fmt.Println("Migrations file outdated, will perform migration...")
+			shouldMigrate13 = false
+			shouldMigrate15 = true
+		}
+	}
+
+	if shouldMigrate13 {
+		fmt.Println("Running 1.4.19 migration...")
+
 		err := os.RemoveAll(filepath.Join(configDir, "store"))
 		if err != nil {
 			fmt.Println("ERROR: Could not remove store, please be sure to do this before restarting the node.")
@@ -567,6 +584,40 @@ func RunMigrationIfNeeded(
 		err = os.WriteFile(
 			filepath.Join(configDir, "MIGRATIONS"),
 			[]byte{0x01, 0x04, 0x13},
+			fs.FileMode(0600),
+		)
+		if err != nil {
+			fmt.Println("ERROR: Could not save migration file.")
+			panic(err)
+		}
+
+		fmt.Println("Migration completed.")
+	}
+
+	if shouldMigrate15 {
+		fmt.Println("Running 1.4.21.1 migration...")
+
+		db := store.NewPebbleDB(nodeConfig.DB)
+		logger, _ := zap.NewProduction()
+		proofStore := store.NewPebbleDataProofStore(db, logger)
+		peerId := getPeerID(nodeConfig.P2P)
+		increment, _, _, err := proofStore.GetLatestDataTimeProof([]byte(peerId))
+		if err != nil && (!errors.Is(err, store.ErrNotFound) || increment != 0) {
+			panic(err)
+		}
+
+		if increment > 699999 {
+			err := proofStore.RewindToIncrement([]byte(peerId), 699999)
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		db.Close()
+
+		err = os.WriteFile(
+			filepath.Join(configDir, "MIGRATIONS"),
+			[]byte{0x01, 0x04, 0x15},
 			fs.FileMode(0600),
 		)
 		if err != nil {
@@ -843,7 +894,7 @@ func printBalance(config *config.Config) {
 	fmt.Println("Unclaimed balance:", r.FloatString(12), "QUIL")
 }
 
-func printPeerID(p2pConfig *config.P2PConfig) {
+func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 	if err != nil {
 		panic(errors.Wrap(err, "error unmarshaling peerkey"))
@@ -859,6 +910,12 @@ func printPeerID(p2pConfig *config.P2PConfig) {
 	if err != nil {
 		panic(errors.Wrap(err, "error getting peer id"))
 	}
+
+	return id
+}
+
+func printPeerID(p2pConfig *config.P2PConfig) {
+	id := getPeerID(p2pConfig)
 
 	fmt.Println("Peer ID: " + id.String())
 }
