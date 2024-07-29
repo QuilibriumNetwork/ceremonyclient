@@ -585,6 +585,9 @@ func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	increment uint32,
 ) ([]byte, error) {
 	difficulty := 200000 - (increment / 4)
+	if difficulty < 25000 || increment > 800000 {
+		difficulty = 25000
+	}
 
 	instanceInput := binary.BigEndian.AppendUint32([]byte{}, core)
 	instanceInput = append(instanceInput, challenge...)
@@ -604,6 +607,9 @@ func (w *WesolowskiFrameProver) VerifyChallengeProof(
 	proof []byte,
 ) bool {
 	difficulty := 200000 - (increment / 4)
+	if difficulty < 25000 || increment > 800000 {
+		difficulty = 25000
+	}
 
 	if len(proof) != 516 {
 		return false
