@@ -34,13 +34,11 @@ message ControlMessage {
 
 message ControlIHave {
 	bytes bitmask = 1;
-	// implementors from other languages should use bytes here - go protobuf emits invalid utf8 strings
-	repeated string messageIDs = 2;
+	repeated bytes messageIDs = 2;
 }
 
 message ControlIWant {
-	// implementors from other languages should use bytes here - go protobuf emits invalid utf8 strings
-	repeated string messageIDs = 1;
+	repeated bytes messageIDs = 1;
 }
 
 message ControlGraft {

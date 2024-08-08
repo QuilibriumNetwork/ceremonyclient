@@ -105,7 +105,7 @@ type deliveryRecord struct {
 }
 
 type deliveryEntry struct {
-	id     string
+	id     []byte
 	expire time.Time
 	next   *deliveryEntry
 }
@@ -837,8 +837,8 @@ func (ps *peerScore) DropRPC(rpc *RPC, p peer.ID) {}
 func (ps *peerScore) UndeliverableMessage(msg *Message) {}
 
 // message delivery records
-func (d *messageDeliveries) getRecord(id string) *deliveryRecord {
-	rec, ok := d.records[id]
+func (d *messageDeliveries) getRecord(id []byte) *deliveryRecord {
+	rec, ok := d.records[string(id)]
 	if ok {
 		return rec
 	}
@@ -846,7 +846,7 @@ func (d *messageDeliveries) getRecord(id string) *deliveryRecord {
 	now := time.Now()
 
 	rec = &deliveryRecord{peers: make(map[peer.ID]struct{}), firstSeen: now}
-	d.records[id] = rec
+	d.records[string(id)] = rec
 
 	entry := &deliveryEntry{id: id, expire: now.Add(d.seenMsgTTL)}
 	if d.tail != nil {
@@ -867,7 +867,7 @@ func (d *messageDeliveries) gc() {
 
 	now := time.Now()
 	for d.head != nil && now.After(d.head.expire) {
-		delete(d.records, d.head.id)
+		delete(d.records, string(d.head.id))
 		d.head = d.head.next
 	}
 

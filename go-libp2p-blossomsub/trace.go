@@ -336,6 +336,24 @@ func (t *pubsubTracer) UndeliverableMessage(msg *Message) {
 	for _, tr := range t.raw {
 		tr.UndeliverableMessage(msg)
 	}
+
+	if t.tracer == nil {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	evt := &pb.TraceEvent{
+		Type:      pb.TraceEvent_UNDELIVERABLE_MESSAGE.Enum(),
+		PeerID:    []byte(t.pid),
+		Timestamp: &now,
+		UndeliverableMessage: &pb.TraceEvent_UndeliverableMessage{
+			MessageID:    []byte(t.idGen.ID(msg)),
+			Bitmask:      msg.Bitmask,
+			ReceivedFrom: []byte(msg.ReceivedFrom),
+		},
+	}
+
+	t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) traceRPCMeta(rpc *RPC) *pb.TraceEvent_RPCMeta {

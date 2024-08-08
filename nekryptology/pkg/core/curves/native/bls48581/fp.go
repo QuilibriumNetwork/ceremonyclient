@@ -22,11 +22,7 @@
 
 package bls48581
 
-import (
-	"arena"
-
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581/ext"
-)
+import "source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581/ext"
 
 type FP struct {
 	x   *BIG
@@ -35,119 +31,84 @@ type FP struct {
 
 /* Constructors */
 
-func NewFP(mem *arena.Arena) *FP {
-	if mem != nil {
-		F := arena.New[FP](mem)
-		F.x = NewBIG(mem)
-		F.XES = 1
-		return F
-	} else {
-		F := new(FP)
-		F.x = NewBIG(nil)
-		F.XES = 1
-		return F
-	}
+func NewFP() *FP {
+	F := new(FP)
+	F.x = NewBIG()
+	F.XES = 1
+	return F
 }
 
-func NewFPint(a int, mem *arena.Arena) *FP {
-	if mem != nil {
-		F := arena.New[FP](mem)
-		if a < 0 {
-			m := NewBIGints(Modulus, mem)
-			m.inc(a)
-			m.norm()
-			F.x = NewBIGcopy(m, mem)
-		} else {
-			F.x = NewBIGint(a, mem)
-		}
-		F.nres(mem)
-		return F
+func NewFPint(a int) *FP {
+	F := new(FP)
+	if a < 0 {
+		m := NewBIGints(Modulus)
+		m.inc(a)
+		m.norm()
+		F.x = NewBIGcopy(m)
 	} else {
-		F := new(FP)
-		if a < 0 {
-			m := NewBIGints(Modulus, nil)
-			m.inc(a)
-			m.norm()
-			F.x = NewBIGcopy(m, nil)
-		} else {
-			F.x = NewBIGint(a, nil)
-		}
-		F.nres(nil)
-		return F
+		F.x = NewBIGint(a)
 	}
+	F.nres()
+	return F
 }
 
-func NewFPbig(a *BIG, mem *arena.Arena) *FP {
-	if mem != nil {
-		F := arena.New[FP](mem)
-		F.x = NewBIGcopy(a, mem)
-		F.nres(mem)
-		return F
-	} else {
-		F := new(FP)
-		F.x = NewBIGcopy(a, nil)
-		F.nres(nil)
-		return F
-	}
+func NewFPbig(a *BIG) *FP {
+	F := new(FP)
+	F.x = NewBIGcopy(a)
+	F.nres()
+	return F
 }
 
-func NewFPcopy(a *FP, mem *arena.Arena) *FP {
-	if mem != nil {
-		F := arena.New[FP](mem)
-		F.x = NewBIGcopy(a.x, mem)
-		F.XES = a.XES
-		return F
-	} else {
-		F := new(FP)
-		F.x = NewBIGcopy(a.x, nil)
-		F.XES = a.XES
-		return F
-	}
+func NewFPcopy(a *FP) *FP {
+	F := new(FP)
+	F.x = NewBIGcopy(a.x)
+	F.XES = a.XES
+	return F
 }
 
 func NewFPrand(rng *ext.RAND) *FP {
-	m := NewBIGints(Modulus, nil)
+	m := NewBIGints(Modulus)
 	w := Randomnum(m, rng)
-	F := NewFPbig(w, nil)
+	F := NewFPbig(w)
 	return F
 }
 
 func (F *FP) ToString() string {
-	F.reduce(nil)
-	return F.Redc(nil).ToString()
+	F.reduce()
+	return F.Redc().ToString()
 }
 
 /* convert to Montgomery n-residue form */
-func (F *FP) nres(mem *arena.Arena) {
+func (F *FP) nres() {
 	if MODTYPE != PSEUDO_MERSENNE && MODTYPE != GENERALISED_MERSENNE {
-		r := NewBIGints(R2modp, mem)
-		d := mul(F.x, r, mem)
-		F.x.copy(mod(d, mem))
+		r := NewBIGints(R2modp)
+		d := mul(F.x, r)
+		F.x.copy(mod(d))
 		F.XES = 2
 	} else {
-		md := NewBIGints(Modulus, mem)
-		F.x.Mod(md, mem)
+		md := NewBIGints(Modulus)
+		F.x.Mod(md)
 		F.XES = 1
 	}
 }
 
 /* convert back to regular form */
-func (F *FP) Redc(mem *arena.Arena) *BIG {
+func (F *FP) Redc() *BIG {
 	if MODTYPE != PSEUDO_MERSENNE && MODTYPE != GENERALISED_MERSENNE {
-		d := NewDBIGscopy(F.x, mem)
-		return mod(d, mem)
+		d := NewDBIGscopy(F.x)
+		return mod(d)
 	} else {
-		r := NewBIGcopy(F.x, mem)
+		r := NewBIGcopy(F.x)
 		return r
 	}
 }
 
 /* reduce a DBIG to a BIG using the appropriate form of the modulus */
 
-func mod(d *DBIG, mem *arena.Arena) *BIG {
+func mod(d *DBIG) *BIG {
 	if MODTYPE == PSEUDO_MERSENNE {
-		t := d.split(MODBITS, mem)
-		b := NewBIGdcopy(d, mem)
+		t := d.split(MODBITS)
+		b := NewBIGdcopy(d)
 
 		v := t.pmul(int(MConst))
 
@@ -167,7 +128,7 @@ func mod(d *DBIG, mem *arena.Arena) *BIG {
 			d.w[NLEN+i-1] = bot
 			d.w[NLEN+i] += top
 		}
-		b := NewBIG(mem)
+		b := NewBIG()
 
 		for i := 0; i < NLEN; i++ {
 			b.w[i] = d.w[NLEN+i]
@@ -177,14 +138,14 @@ func mod(d *DBIG, mem *arena.Arena) *BIG {
 	}
 
 	if MODTYPE == GENERALISED_MERSENNE { // GoldiLocks only
-		t := d.split(MODBITS, mem)
-		b := NewBIGdcopy(d, mem)
+		t := d.split(MODBITS)
+		b := NewBIGdcopy(d)
 		b.Add(t)
-		dd := NewDBIGscopy(t, mem)
+		dd := NewDBIGscopy(t)
 		dd.shl(MODBITS / 2)
 
-		tt := dd.split(MODBITS, mem)
-		lo := NewBIGdcopy(dd, mem)
+		tt := dd.split(MODBITS)
+		lo := NewBIGdcopy(dd)
 		b.Add(tt)
 		b.Add(lo)
 		b.norm()
@@ -202,10 +163,10 @@ func mod(d *DBIG, mem *arena.Arena) *BIG {
 	}
 
 	if MODTYPE == NOT_SPECIAL {
-		md := NewBIGints(Modulus, mem)
-		return monty(md, MConst, d, mem)
+		md := NewBIGints(Modulus)
+		return monty(md, MConst, d)
 	}
-	return NewBIG(mem)
+	return NewBIG()
 }
 
 // find appoximation to quotient of a/m
@@ -228,9 +189,9 @@ func quo(n *BIG, m *BIG) int {
 }
 
 /* reduce this mod Modulus */
-func (F *FP) reduce(mem *arena.Arena) {
-	m := NewBIGints(Modulus, mem)
-	r := NewBIGints(Modulus, mem)
+func (F *FP) reduce() {
+	m := NewBIGints(Modulus)
+	r := NewBIGints(Modulus)
 	var sb uint
 	F.x.norm()
 
@@ -256,49 +217,43 @@ func (F *FP) reduce(mem *arena.Arena) {
 }
 
 /* test this=0? */
-func (F *FP) IsZero(mem *arena.Arena) bool {
-	W := NewFPcopy(F, mem)
-	W.reduce(mem)
+func (F *FP) IsZero() bool {
+	W := NewFPcopy(F)
+	W.reduce()
 	return W.x.IsZero()
 }
 
 func (F *FP) IsOne() bool {
-	mem := arena.NewArena()
-	defer mem.Free()
-	W := NewFPcopy(F, mem)
-	W.reduce(mem)
-	T := NewFPint(1, mem)
+	W := NewFPcopy(F)
+	W.reduce()
+	T := NewFPint(1)
 	return W.Equals(T)
 }
 
 func (F *FP) islarger() int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	if F.IsZero(mem) {
+	if F.IsZero() {
 		return 0
 	}
-	sx := NewBIGints(Modulus, mem)
-	fx := F.Redc(mem)
+	sx := NewBIGints(Modulus)
+	fx := F.Redc()
 	sx.Sub(fx)
 	sx.norm()
 	return Comp(fx, sx)
 }
 
 func (F *FP) ToBytes(b []byte) {
-	F.Redc(nil).ToBytes(b)
+	F.Redc().ToBytes(b)
 }
 
 func FP_fromBytes(b []byte) *FP {
 	t := FromBytes(b)
-	return NewFPbig(t, nil)
+	return NewFPbig(t)
 }
 
 func (F *FP) isunity() bool {
-	mem := arena.NewArena()
-	defer mem.Free()
-	W := NewFPcopy(F, mem)
-	W.reduce(mem)
-	return W.Redc(mem).isunity()
+	W := NewFPcopy(F)
+	W.reduce()
+	return W.Redc().isunity()
 }
 
 /* copy from FP b */
@@ -315,27 +270,25 @@ func (F *FP) zero() {
 
 /* set this=1 */
 func (F *FP) one() {
-	mem := arena.NewArena()
-	defer mem.Free()
 	F.x.one()
-	F.nres(mem)
+	F.nres()
 }
 
 /* return sign */
-func (F *FP) sign(mem *arena.Arena) int {
+func (F *FP) sign() int {
 	if BIG_ENDIAN_SIGN {
-		m := NewBIGints(Modulus, mem)
+		m := NewBIGints(Modulus)
 		m.dec(1)
 		m.fshr(1)
-		n := NewFPcopy(F, mem)
-		n.reduce(mem)
-		w := n.Redc(mem)
+		n := NewFPcopy(F)
+		n.reduce()
+		w := n.Redc()
 		cp := Comp(w, m)
 		return ((cp + 1) & 2) >> 1
 	} else {
-		W := NewFPcopy(F, mem)
-		W.reduce(mem)
-		return W.Redc(mem).parity()
+		W := NewFPcopy(F)
+		W.reduce()
+		return W.Redc().parity()
 	}
 }
 
@@ -362,20 +315,20 @@ func (F *FP) cmove(b *FP, d int) {
 }
 
 /* this*=b mod Modulus */
-func (F *FP) Mul(b *FP, mem *arena.Arena) {
+func (F *FP) Mul(b *FP) {
 
 	if int64(F.XES)*int64(b.XES) > int64(FEXCESS) {
-		F.reduce(mem)
+		F.reduce()
 	}
 
-	d := mul(F.x, b.x, mem)
-	F.x.copy(mod(d, mem))
+	d := mul(F.x, b.x)
+	F.x.copy(mod(d))
 	F.XES = 2
 }
 
 /* this = -this mod Modulus */
-func (F *FP) Neg(mem *arena.Arena) {
-	m := NewBIGints(Modulus, mem)
+func (F *FP) Neg() {
+	m := NewBIGints(Modulus)
 	sb := logb2(uint32(F.XES - 1))
 
 	m.fshl(sb)
@@ -383,12 +336,12 @@ func (F *FP) Neg(mem *arena.Arena) {
 
 	F.XES = (1 << sb) + 1
 	if F.XES > FEXCESS {
-		F.reduce(mem)
+		F.reduce()
 	}
 }
 
 /* this*=c mod Modulus, where c is a small int */
-func (F *FP) imul(c int, mem *arena.Arena) {
+func (F *FP) imul(c int) {
 	//	F.norm()
 	s := false
 	if c < 0 {
@@ -397,60 +350,60 @@ func (F *FP) imul(c int, mem *arena.Arena) {
 	}
 
 	if MODTYPE == PSEUDO_MERSENNE || MODTYPE == GENERALISED_MERSENNE {
-		d := F.x.pxmul(c, mem)
-		F.x.copy(mod(d, mem))
+		d := F.x.pxmul(c)
+		F.x.copy(mod(d))
 		F.XES = 2
 	} else {
 		if F.XES*int32(c) <= FEXCESS {
 			F.x.pmul(c)
 			F.XES *= int32(c)
 		} else {
-			n := NewFPint(c, mem)
-			F.Mul(n, mem)
+			n := NewFPint(c)
+			F.Mul(n)
 		}
 	}
 	if s {
-		F.Neg(mem)
+		F.Neg()
 		F.norm()
 	}
 }
 
 /* this*=this mod Modulus */
-func (F *FP) Sqr(mem *arena.Arena) {
+func (F *FP) Sqr() {
 	if int64(F.XES)*int64(F.XES) > int64(FEXCESS) {
-		F.reduce(mem)
+		F.reduce()
 	}
-	d := sqr(F.x, mem)
-	F.x.copy(mod(d, mem))
+	d := sqr(F.x)
+	F.x.copy(mod(d))
 	F.XES = 2
 }
 
 /* this+=b */
-func (F *FP) Add(b *FP, mem *arena.Arena) {
+func (F *FP) Add(b *FP) {
 	F.x.Add(b.x)
 	F.XES += b.XES
 	if F.XES > FEXCESS {
-		F.reduce(mem)
+		F.reduce()
 	}
 }
 
 /* this-=b */
-func (F *FP) Sub(b *FP, mem *arena.Arena) {
-	n := NewFPcopy(b, mem)
-	n.Neg(mem)
-	F.Add(n, mem)
+func (F *FP) Sub(b *FP) {
+	n := NewFPcopy(b)
+	n.Neg()
+	F.Add(n)
 }
 
-func (F *FP) rsub(b *FP, mem *arena.Arena) {
-	F.Neg(mem)
-	F.Add(b, mem)
+func (F *FP) rsub(b *FP) {
+	F.Neg()
+	F.Add(b)
 }
 
 /* this/=2 mod Modulus */
-func (F *FP) div2(mem *arena.Arena) {
-	p := NewBIGints(Modulus, mem)
+func (F *FP) div2() {
+	p := NewBIGints(Modulus)
 	pr := F.x.parity()
-	w := NewBIGcopy(F.x, mem)
+	w := NewBIGcopy(F.x)
 	F.x.fshr(1)
 	w.Add(p)
 	w.norm()
@@ -460,22 +413,18 @@ func (F *FP) div2(mem *arena.Arena) {
 
 /* return jacobi symbol (this/Modulus) */
 func (F *FP) jacobi() int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	w := F.Redc(mem)
-	p := NewBIGints(Modulus, mem)
+	w := F.Redc()
+	p := NewBIGints(Modulus)
 	return w.Jacobi(p)
 }
 
 /* return TRUE if this==a */
 func (F *FP) Equals(a *FP) bool {
-	mem := arena.NewArena()
-	defer mem.Free()
-	f := NewFPcopy(F, mem)
-	s := NewFPcopy(a, mem)
+	f := NewFPcopy(F)
+	s := NewFPcopy(a)
 
-	s.reduce(mem)
-	f.reduce(mem)
+	s.reduce()
+	f.reduce()
 	if Comp(s.x, f.x) == 0 {
 		return true
 	}
@@ -483,22 +432,20 @@ func (F *FP) Equals(a *FP) bool {
 }
 
 func (F *FP) Comp(a *FP) int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	f := NewFPcopy(F, mem)
-	s := NewFPcopy(a, mem)
+	f := NewFPcopy(F)
+	s := NewFPcopy(a)
 
-	s.reduce(mem)
-	f.reduce(mem)
+	s.reduce()
+	f.reduce()
 
 	return Comp(s.x, f.x)
 }
 
-func (F *FP) pow(e *BIG, mem *arena.Arena) *FP {
+func (F *FP) pow(e *BIG) *FP {
 	var tb []*FP
 	var w [1 + (NLEN*int(BASEBITS)+3)/4]int8
 	F.norm()
-	t := NewBIGcopy(e, mem)
+	t := NewBIGcopy(e)
 	t.norm()
 	nb := 1 + (t.nbits()+3)/4
 
@@ -509,51 +456,51 @@ func (F *FP) pow(e *BIG, mem *arena.Arena) *FP {
 		w[i] = int8(lsbs)
 		t.fshr(4)
 	}
-	tb = append(tb, NewFPint(1, mem))
-	tb = append(tb, NewFPcopy(F, mem))
+	tb = append(tb, NewFPint(1))
+	tb = append(tb, NewFPcopy(F))
 	for i := 2; i < 16; i++ {
-		tb = append(tb, NewFPcopy(tb[i-1], mem))
-		tb[i].Mul(F, mem)
+		tb = append(tb, NewFPcopy(tb[i-1]))
+		tb[i].Mul(F)
 	}
-	r := NewFPcopy(tb[w[nb-1]], mem)
+	r := NewFPcopy(tb[w[nb-1]])
 	for i := nb - 2; i >= 0; i-- {
-		r.Sqr(mem)
-		r.Sqr(mem)
-		r.Sqr(mem)
-		r.Sqr(mem)
-		r.Mul(tb[w[i]], mem)
+		r.Sqr()
+		r.Sqr()
+		r.Sqr()
+		r.Sqr()
+		r.Mul(tb[w[i]])
 	}
-	r.reduce(mem)
+	r.reduce()
 	return r
 }
 
 // See https://eprint.iacr.org/2018/1038
 // return this^(p-3)/4 or this^(p-5)/8
-func (F *FP) fpow(mem *arena.Arena) *FP {
+func (F *FP) fpow() *FP {
 	ac := [11]int{1, 2, 3, 6, 12, 15, 30, 60, 120, 240, 255}
-	xp := arena.MakeSlice[*FP](mem, 11, 11)
+	var xp []*FP
 	// phase 1
-	xp[0] = NewFPcopy(F, mem)
-	xp[1] = NewFPcopy(F, mem)
-	xp[1].Sqr(mem)
-	xp[2] = NewFPcopy(xp[1], mem)
-	xp[2].Mul(F, mem)
-	xp[3] = NewFPcopy(xp[2], mem)
-	xp[3].Sqr(mem)
-	xp[4] = NewFPcopy(xp[3], mem)
-	xp[4].Sqr(mem)
-	xp[5] = NewFPcopy(xp[4], mem)
-	xp[5].Mul(xp[2], mem)
-	xp[6] = NewFPcopy(xp[5], mem)
-	xp[6].Sqr(mem)
-	xp[7] = NewFPcopy(xp[6], mem)
-	xp[7].Sqr(mem)
-	xp[8] = NewFPcopy(xp[7], mem)
-	xp[8].Sqr(mem)
-	xp[9] = NewFPcopy(xp[8], mem)
-	xp[9].Sqr(mem)
-	xp[10] = NewFPcopy(xp[9], mem)
-	xp[10].Mul(xp[5], mem)
+	xp = append(xp, NewFPcopy(F))
+	xp = append(xp, NewFPcopy(F))
+	xp[1].Sqr()
+	xp = append(xp, NewFPcopy(xp[1]))
+	xp[2].Mul(F)
+	xp = append(xp, NewFPcopy(xp[2]))
+	xp[3].Sqr()
+	xp = append(xp, NewFPcopy(xp[3]))
+	xp[4].Sqr()
+	xp = append(xp, NewFPcopy(xp[4]))
+	xp[5].Mul(xp[2])
+	xp = append(xp, NewFPcopy(xp[5]))
+	xp[6].Sqr()
+	xp = append(xp, NewFPcopy(xp[6]))
+	xp[7].Sqr()
+	xp = append(xp, NewFPcopy(xp[7]))
+	xp[8].Sqr()
+	xp = append(xp, NewFPcopy(xp[8]))
+	xp[9].Sqr()
+	xp = append(xp, NewFPcopy(xp[9]))
+	xp[10].Mul(xp[5])
 	var n, c int
 
 	e := int(PM1D2)
@@ -582,7 +529,7 @@ func (F *FP) fpow(mem *arena.Arena) *FP {
 	k := w - c
 
 	i := 10
-	key := NewFP(mem)
+	key := NewFP()
 
 	if k != 0 {
 		for ac[i] > k {
@@ -597,7 +544,7 @@ func (F *FP) fpow(mem *arena.Arena) *FP {
 		if ac[i] > k {
 			continue
 		}
-		key.Mul(xp[i], mem)
+		key.Mul(xp[i])
 		k -= ac[i]
 	}
 	// phase 2
@@ -608,19 +555,19 @@ func (F *FP) fpow(mem *arena.Arena) *FP {
 	j := 3
 	m := 8
 	nw := n - bw
-	t := NewFP(mem)
+	t := NewFP()
 	for 2*m < nw {
 		t.copy(xp[j])
 		j++
 		for i = 0; i < m; i++ {
-			t.Sqr(mem)
+			t.Sqr()
 		}
 		xp[j].copy(xp[j-1])
-		xp[j].Mul(t, mem)
+		xp[j].Mul(t)
 		m *= 2
 	}
 	lo := nw - m
-	r := NewFPcopy(xp[j], mem)
+	r := NewFPcopy(xp[j])
 
 	for lo != 0 {
 		m /= 2
@@ -631,86 +578,84 @@ func (F *FP) fpow(mem *arena.Arena) *FP {
 		lo -= m
 		t.copy(r)
 		for i = 0; i < m; i++ {
-			t.Sqr(mem)
+			t.Sqr()
 		}
 		r.copy(t)
-		r.Mul(xp[j], mem)
+		r.Mul(xp[j])
 	}
 	// phase 3
 	if bw != 0 {
 		for i = 0; i < bw; i++ {
-			r.Sqr(mem)
+			r.Sqr()
 		}
-		r.Mul(key, mem)
+		r.Mul(key)
 	}
 
 	if MODTYPE == GENERALISED_MERSENNE { // Goldilocks ONLY
 		key.copy(r)
-		r.Sqr(mem)
-		r.Mul(F, mem)
+		r.Sqr()
+		r.Mul(F)
 		for i = 0; i < n+1; i++ {
-			r.Sqr(mem)
+			r.Sqr()
 		}
-		r.Mul(key, mem)
+		r.Mul(key)
 	}
 	for nd > 0 {
-		r.Sqr(mem)
+		r.Sqr()
 		nd--
 	}
 	return r
 }
 
 // calculates r=x^(p-1-2^e)/2^{e+1) where 2^e|p-1
-func (F *FP) progen(mem *arena.Arena) {
+func (F *FP) progen() {
 	if MODTYPE == PSEUDO_MERSENNE || MODTYPE == GENERALISED_MERSENNE {
-		F.copy(F.fpow(mem))
+		F.copy(F.fpow())
 		return
 	}
 	e := uint(PM1D2)
-	m := NewBIGints(Modulus, mem)
+	m := NewBIGints(Modulus)
 	m.dec(1)
 	m.shr(e)
 	m.dec(1)
 	m.fshr(1)
-	F.copy(F.pow(m, mem))
+	F.copy(F.pow(m))
 }
 
 /* this=1/this mod Modulus */
-func (F *FP) Invert(h *FP, mem *arena.Arena) {
+func (F *FP) Invert(h *FP) {
 	e := int(PM1D2)
 	F.norm()
-	s := NewFPcopy(F, mem)
+	s := NewFPcopy(F)
 	for i := 0; i < e-1; i++ {
-		s.Sqr(mem)
-		s.Mul(F, mem)
+		s.Sqr()
+		s.Mul(F)
 	}
 	if h == nil {
-		F.progen(mem)
+		F.progen()
 	} else {
 		F.copy(h)
 	}
 	for i := 0; i <= e; i++ {
-		F.Sqr(mem)
+		F.Sqr()
 	}
-	F.Mul(s, mem)
-	F.reduce(mem)
+	F.Mul(s)
+	F.reduce()
 }
 
 /* test for Quadratic residue */
 func (F *FP) qr(h *FP) int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	r := NewFPcopy(F, mem)
+	r := NewFPcopy(F)
 	e := int(PM1D2)
-	r.progen(mem)
+	r.progen()
 	if h != nil {
 		h.copy(r)
 	}
 
-	r.Sqr(mem)
-	r.Mul(F, mem)
+	r.Sqr()
+	r.Mul(F)
 	for i := 0; i < e-1; i++ {
-		r.Sqr(mem)
+		r.Sqr()
 	}
 
 	if r.isunity() {
@@ -721,29 +666,29 @@ func (F *FP) qr(h *FP) int {
 }
 
 /* return sqrt(this) mod Modulus */
-func (F *FP) Sqrt(h *FP, mem *arena.Arena) *FP {
+func (F *FP) Sqrt(h *FP) *FP {
 	e := int(PM1D2)
-	g := NewFPcopy(F, mem)
+	g := NewFPcopy(F)
 	if h == nil {
-		g.progen(mem)
+		g.progen()
 	} else {
 		g.copy(h)
 	}
 
-	m := NewBIGints(ROI, mem)
-	v := NewFPbig(m, mem)
+	m := NewBIGints(ROI)
+	v := NewFPbig(m)
 
-	t := NewFPcopy(g, mem)
-	t.Sqr(mem)
-	t.Mul(F, mem)
+	t := NewFPcopy(g)
+	t.Sqr()
+	t.Mul(F)
 
-	r := NewFPcopy(F, mem)
-	r.Mul(g, mem)
-	b := NewFPcopy(t, mem)
+	r := NewFPcopy(F)
+	r.Mul(g)
+	b := NewFPcopy(t)
 
 	for k := e; k > 1; k-- {
 		for j := 1; j < k-1; j++ {
-			b.Sqr(mem)
+			b.Sqr()
 		}
 		var u int
 		if b.isunity() {
@@ -752,43 +697,41 @@ func (F *FP) Sqrt(h *FP, mem *arena.Arena) *FP {
 			u = 1
 		}
 		g.copy(r)
-		g.Mul(v, mem)
+		g.Mul(v)
 		r.cmove(g, u)
-		v.Sqr(mem)
+		v.Sqr()
 		g.copy(t)
-		g.Mul(v, mem)
+		g.Mul(v)
 		t.cmove(g, u)
 		b.copy(t)
 	}
-	sgn := r.sign(mem)
-	nr := NewFPcopy(r, mem)
-	nr.Neg(mem)
+	sgn := r.sign()
+	nr := NewFPcopy(r)
+	nr.Neg()
 	nr.norm()
 	r.cmove(nr, sgn)
 	return r
 }
 
 func (F *FP) invsqrt(i *FP, s *FP) int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	h := NewFP(mem)
+	h := NewFP()
 	qr := F.qr(h)
-	s.copy(F.Sqrt(h, mem))
+	s.copy(F.Sqrt(h))
 	i.copy(F)
-	i.Invert(h, mem)
+	i.Invert(h)
 	return qr
 }
 
 // Two for the price of one  - See Hamburg https://eprint.iacr.org/2012/309.pdf
 // Calculate Invert of i and square root of s, return QR
 func FP_tpo(i *FP, s *FP) int {
-	w := NewFPcopy(s, nil)
-	t := NewFPcopy(i, nil)
-	w.Mul(i, nil)
-	t.Mul(w, nil)
+	w := NewFPcopy(s)
+	t := NewFPcopy(i)
+	w.Mul(i)
+	t.Mul(w)
 	qr := t.invsqrt(i, s)
-	i.Mul(w, nil)
-	s.Mul(i, nil)
+	i.Mul(w)
+	s.Mul(i)
 	return qr
 }
 

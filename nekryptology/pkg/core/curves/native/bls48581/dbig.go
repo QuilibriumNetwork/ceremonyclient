@@ -22,45 +22,32 @@
 package bls48581
 
 import (
-	"arena"
 	"strconv"
 )
 
 //import "fmt"
 
-func NewDBIG(mem *arena.Arena) *DBIG {
+func NewDBIG() *DBIG {
 	var b *DBIG
-	if mem != nil {
-		b = arena.New[DBIG](mem)
-	} else {
-		b = new(DBIG)
-	}
+	b = new(DBIG)
 	for i := 0; i < DNLEN; i++ {
 		b.w[i] = 0
 	}
 	return b
 }
 
-func NewDBIGcopy(x *DBIG, mem *arena.Arena) *DBIG {
+func NewDBIGcopy(x *DBIG) *DBIG {
 	var b *DBIG
-	if mem != nil {
-		b = arena.New[DBIG](mem)
-	} else {
-		b = new(DBIG)
-	}
+	b = new(DBIG)
 	for i := 0; i < DNLEN; i++ {
 		b.w[i] = x.w[i]
 	}
 	return b
 }
 
-func NewDBIGscopy(x *BIG, mem *arena.Arena) *DBIG {
+func NewDBIGscopy(x *BIG) *DBIG {
 	var b *DBIG
-	if mem != nil {
-		b = arena.New[DBIG](mem)
-	} else {
-		b = new(DBIG)
-	}
+	b = new(DBIG)
 	for i := 0; i < NLEN-1; i++ {
 		b.w[i] = x.w[i]
 	}
@@ -85,8 +72,8 @@ func (r *DBIG) norm() {
 }
 
 /* split DBIG at position n, return higher half, keep lower half */
-func (r *DBIG) split(n uint, mem *arena.Arena) *BIG {
-	t := NewBIG(mem)
+func (r *DBIG) split(n uint) *BIG {
+	t := NewBIG()
 	m := n % BASEBITS
 	carry := r.w[DNLEN-1] << (BASEBITS - m)
 
@@ -191,11 +178,11 @@ func (r *DBIG) shr(k uint) {
 	}
 }
 
-func (r *DBIG) ctmod(m *BIG, bd uint, mem *arena.Arena) *BIG {
+func (r *DBIG) ctmod(m *BIG, bd uint) *BIG {
 	k := bd
 	r.norm()
-	c := NewDBIGscopy(m, mem)
-	dr := NewDBIG(mem)
+	c := NewDBIGscopy(m)
+	dr := NewDBIG()
 
 	c.shl(k)
 
@@ -210,25 +197,25 @@ func (r *DBIG) ctmod(m *BIG, bd uint, mem *arena.Arena) *BIG {
 		k -= 1
 		c.shr(1)
 	}
-	return NewBIGdcopy(r, mem)
+	return NewBIGdcopy(r)
 }
 
 /* reduces this DBIG mod a BIG, and returns the BIG */
-func (r *DBIG) Mod(m *BIG, mem *arena.Arena) *BIG {
+func (r *DBIG) Mod(m *BIG) *BIG {
 	k := r.nbits() - m.nbits()
 	if k < 0 {
 		k = 0
 	}
-	return r.ctmod(m, uint(k), mem)
+	return r.ctmod(m, uint(k))
 }
 
-func (r *DBIG) ctdiv(m *BIG, bd uint, mem *arena.Arena) *BIG {
+func (r *DBIG) ctdiv(m *BIG, bd uint) *BIG {
 	k := bd
-	c := NewDBIGscopy(m, mem)
-	a := NewBIGint(0, mem)
-	e := NewBIGint(1, mem)
-	sr := NewBIG(mem)
-	dr := NewDBIG(mem)
+	c := NewDBIGscopy(m)
+	a := NewBIGint(0)
+	e := NewBIGint(1)
+	sr := NewBIG()
+	dr := NewDBIG()
 	r.norm()
 
 	c.shl(k)
@@ -255,12 +242,12 @@ func (r *DBIG) ctdiv(m *BIG, bd uint, mem *arena.Arena) *BIG {
 }
 
 /* return this/c */
-func (r *DBIG) div(m *BIG, mem *arena.Arena) *BIG {
+func (r *DBIG) div(m *BIG) *BIG {
 	k := r.nbits() - m.nbits()
 	if k < 0 {
 		k = 0
 	}
-	return r.ctdiv(m, uint(k), mem)
+	return r.ctdiv(m, uint(k))
 }
 
 /* Convert to Hex String */
@@ -277,7 +264,7 @@ func (r *DBIG) toString() string {
 	}
 
 	for i := len - 1; i >= 0; i-- {
-		b := NewDBIGcopy(r, nil)
+		b := NewDBIGcopy(r)
 
 		b.shr(uint(i * 4))
 		s += strconv.FormatInt(int64(b.w[0]&15), 16)
@@ -288,7 +275,7 @@ func (r *DBIG) toString() string {
 /* return number of bits */
 func (r *DBIG) nbits() int {
 	k := DNLEN - 1
-	t := NewDBIGcopy(r, nil)
+	t := NewDBIGcopy(r)
 	t.norm()
 	for k >= 0 && t.w[k] == 0 {
 		k--
@@ -307,7 +294,7 @@ func (r *DBIG) nbits() int {
 
 /* convert from byte array to BIG */
 func DBIG_fromBytes(b []byte) *DBIG {
-	m := NewDBIG(nil)
+	m := NewDBIG()
 	for i := 0; i < len(b); i++ {
 		m.shl(8)
 		m.w[0] += Chunk(int(b[i] & 0xff))

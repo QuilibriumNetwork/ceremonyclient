@@ -21,98 +21,111 @@
 
 package bls48581
 
-import (
-	"arena"
-)
-
 //import "fmt"
 
 // Point doubling for pairings
-func dbl(A *ECP8, AA *FP8, BB *FP8, CC *FP8, mem *arena.Arena) {
-	CC.copy(A.getx())               //X
-	YY := NewFP8copy(A.gety(), mem) //Y
-	BB.copy(A.getz())               //Z
-	AA.copy(YY)                     //Y
-	AA.Mul(BB, mem)                 //YZ
-	CC.Sqr(mem)                     //X^2
-	YY.Sqr(mem)                     //Y^2
-	BB.Sqr(mem)                     //Z^2
+func dbl(A *ECP8, AA *FP8, BB *FP8, CC *FP8) {
+	CC.copy(A.getx())          //X
+	YY := NewFP8copy(A.gety()) //Y
+	BB.copy(A.getz())          //Z
+	AA.copy(YY)                //Y
+	AA.Mul(BB)                 //YZ
+	CC.Sqr()                   //X^2
+	YY.Sqr()                   //Y^2
+	BB.Sqr()                   //Z^2
 
-	AA.Add(AA, mem)
-	AA.Neg(mem)
+	AA.Add(AA)
+	AA.Neg()
 	AA.norm() //-2AA
-	AA.times_i(mem)
+	AA.times_i()
 
 	sb := 3 * CURVE_B_I
-	BB.imul(sb, mem)
-	CC.imul(3, mem)
-	YY.times_i(mem)
-	CC.times_i(mem)
-	BB.Sub(YY, mem)
+	BB.imul(sb)
+	CC.imul(3)
+	if SEXTIC_TWIST == D_TYPE {
+		YY.times_i()
+		CC.times_i()
+	}
+	if SEXTIC_TWIST == M_TYPE {
+		BB.times_i()
+	}
+	BB.Sub(YY)
 	BB.norm()
 
-	A.Dbl(mem)
+	A.Dbl()
 }
 
 // Point addition for pairings
-func add(A *ECP8, B *ECP8, AA *FP8, BB *FP8, CC *FP8, mem *arena.Arena) {
-	AA.copy(A.getx())               // X1
-	CC.copy(A.gety())               // Y1
-	T1 := NewFP8copy(A.getz(), mem) // Z1
-	BB.copy(A.getz())               // Z1
+func add(A *ECP8, B *ECP8, AA *FP8, BB *FP8, CC *FP8) {
+	AA.copy(A.getx())          // X1
+	CC.copy(A.gety())          // Y1
+	T1 := NewFP8copy(A.getz()) // Z1
+	BB.copy(A.getz())          // Z1
 
-	T1.Mul(B.gety(), mem) // T1=Z1.Y2
-	BB.Mul(B.getx(), mem) // T2=Z1.X2
+	T1.Mul(B.gety()) // T1=Z1.Y2
+	BB.Mul(B.getx()) // T2=Z1.X2
 
-	AA.Sub(BB, mem)
+	AA.Sub(BB)
 	AA.norm() // X1=X1-Z1.X2
-	CC.Sub(T1, mem)
+	CC.Sub(T1)
 	CC.norm() // Y1=Y1-Z1.Y2
 
 	T1.copy(AA) // T1=X1-Z1.X2
 
-	T1.Mul(B.gety(), mem) // T1=(X1-Z1.X2).Y2
+	if SEXTIC_TWIST == M_TYPE {
+		AA.times_i()
+		AA.norm()
+	}
 
-	BB.copy(CC)           // T2=Y1-Z1.Y2
-	BB.Mul(B.getx(), mem) // T2=(Y1-Z1.Y2).X2
-	BB.Sub(T1, mem)
+	T1.Mul(B.gety()) // T1=(X1-Z1.X2).Y2
+
+	BB.copy(CC)      // T2=Y1-Z1.Y2
+	BB.Mul(B.getx()) // T2=(Y1-Z1.Y2).X2
+	BB.Sub(T1)
 	BB.norm() // T2=(Y1-Z1.Y2).X2 - (X1-Z1.X2).Y2
-	CC.Neg(mem)
+	CC.Neg()
 	CC.norm() // Y1=-(Y1-Z1.Y2).Xs
 
-	A.Add(B, mem)
+	A.Add(B)
 }
 
-func line(A *ECP8, B *ECP8, Qx *FP, Qy *FP, mem *arena.Arena) *FP48 {
-	AA := NewFP8(mem)
-	BB := NewFP8(mem)
-	CC := NewFP8(mem)
+func line(A *ECP8, B *ECP8, Qx *FP, Qy *FP) *FP48 {
+	AA := NewFP8()
+	BB := NewFP8()
+	CC := NewFP8()
 
 	var a *FP16
 	var b *FP16
 	var c *FP16
 
 	if A == B {
-		dbl(A, AA, BB, CC, mem)
+		dbl(A, AA, BB, CC)
 	} else {
-		add(A, B, AA, BB, CC, mem)
+		add(A, B, AA, BB, CC)
 	}
-	CC.tmul(Qx, mem)
-	AA.tmul(Qy, mem)
+	CC.tmul(Qx)
+	AA.tmul(Qy)
 
-	a = NewFP16fp8s(AA, BB, mem)
+	a = NewFP16fp8s(AA, BB)
 
-	b = NewFP16fp8(CC, mem) // L(0,1) | L(0,0) | L(1,0)
-	c = NewFP16(mem)
+	if SEXTIC_TWIST == D_TYPE {
+		b = NewFP16fp8(CC) // L(0,1) | L(0,0) | L(1,0)
+		c = NewFP16()
+	}
+	if SEXTIC_TWIST == M_TYPE {
+		b = NewFP16()
+		c = NewFP16fp8(CC)
+		c.times_i()
+	}
 
-	r := NewFP48fp16s(a, b, c, mem)
+	r := NewFP48fp16s(a, b, c)
 	r.stype = FP_SPARSER
 	return r
 }
 
 /* prepare ate parameter, n=6u+2 (BN) or n=u (BLS), n3=3*n */
-func lbits(n3 *BIG, n *BIG, mem *arena.Arena) int {
-	n.copy(NewBIGints(CURVE_Bnx, mem))
+func lbits(n3 *BIG, n *BIG) int {
+	n.copy(NewBIGints(CURVE_Bnx))
 	n3.copy(n)
 	n3.pmul(3)
 	n3.norm()
@@ -120,38 +133,40 @@ func lbits(n3 *BIG, n *BIG, mem *arena.Arena) int {
 }
 
 /* prepare for multi-pairing */
-func Initmp(mem *arena.Arena) []*FP48 {
+func Initmp() []*FP48 {
 	var r []*FP48
 	for i := ATE_BITS - 1; i >= 0; i-- {
-		r = append(r, NewFP48int(1, mem))
+		r = append(r, NewFP48int(1))
 	}
 	return r
 }
 
 /* basic Miller loop */
-func Miller(r []*FP48, mem *arena.Arena) *FP48 {
-	res := NewFP48int(1, mem)
+func Miller(r []*FP48) *FP48 {
+	res := NewFP48int(1)
 	for i := ATE_BITS - 1; i >= 1; i-- {
-		res.Sqr(mem)
-		res.ssmul(r[i], mem)
+		res.Sqr()
+		res.ssmul(r[i])
 		r[i].zero()
 	}
 
-	res.conj(mem)
-	res.ssmul(r[0], mem)
+	if SIGN_OF_X == NEGATIVEX {
+		res.conj()
+	}
+	res.ssmul(r[0])
 	r[0].zero()
 	return res
 }
 
 // Store precomputed line details in an FP8
 func pack(AA *FP8, BB *FP8, CC *FP8) *FP16 {
-	i := NewFP8copy(CC, nil)
-	i.Invert(nil, nil)
-	a := NewFP8copy(AA, nil)
-	a.Mul(i, nil)
-	b := NewFP8copy(BB, nil)
-	b.Mul(i, nil)
-	return NewFP16fp8s(a, b, nil)
+	i := NewFP8copy(CC)
+	i.Invert(nil)
+	a := NewFP8copy(AA)
+	a.Mul(i)
+	b := NewFP8copy(BB)
+	b.Mul(i)
+	return NewFP16fp8s(a, b)
 }
 
 // Unpack G2 line function details and include G1
@@ -160,45 +175,52 @@ func unpack(T *FP16, Qx *FP, Qy *FP) *FP48 {
 	var b *FP16
 	var c *FP16
 
-	a = NewFP16copy(T, nil)
-	a.geta().tmul(Qy, nil)
-	t := NewFP8fp(Qx, nil)
-	b = NewFP16fp8(t, nil)
-	c = NewFP16(nil)
-	v := NewFP48fp16s(a, b, c, nil)
+	a = NewFP16copy(T)
+	a.geta().tmul(Qy)
+	t := NewFP8fp(Qx)
+	if SEXTIC_TWIST == D_TYPE {
+		b = NewFP16fp8(t)
+		c = NewFP16()
+	}
+	if SEXTIC_TWIST == M_TYPE {
+		b = NewFP16()
+		c = NewFP16fp8(t)
+		c.times_i()
+	}
+	v := NewFP48fp16s(a, b, c)
 	v.stype = FP_SPARSEST
 	return v
 }
 
 func precomp(GV *ECP8) []*FP16 {
-	n := NewBIG(nil)
-	n3 := NewBIG(nil)
-	AA := NewFP8(nil)
-	BB := NewFP8(nil)
-	CC := NewFP8(nil)
+	n := NewBIG()
+	n3 := NewBIG()
+	AA := NewFP8()
+	BB := NewFP8()
+	CC := NewFP8()
 	var bt int
-	P := NewECP8(nil)
+	P := NewECP8()
 	P.Copy(GV)
 
-	A := NewECP8(nil)
+	A := NewECP8()
 	A.Copy(P)
-	MP := NewECP8(nil)
+	MP := NewECP8()
 	MP.Copy(P)
-	MP.Neg(nil)
+	MP.Neg()
 
-	nb := lbits(n3, n, nil)
+	nb := lbits(n3, n)
 	var T []*FP16
 
 	for i := nb - 2; i >= 1; i-- {
-		dbl(A, AA, BB, CC, nil)
+		dbl(A, AA, BB, CC)
 		T = append(T, pack(AA, BB, CC))
 		bt = n3.bit(i) - n.bit(i)
 		if bt == 1 {
-			add(A, P, AA, BB, CC, nil)
+			add(A, P, AA, BB, CC)
 			T = append(T, pack(AA, BB, CC))
 		}
 		if bt == -1 {
-			add(A, MP, AA, BB, CC, nil)
+			add(A, MP, AA, BB, CC)
 			T = append(T, pack(AA, BB, CC))
 		}
 	}
@@ -206,22 +228,22 @@ func precomp(GV *ECP8) []*FP16 {
 }
 
 func Another_pc(r []*FP48, T []*FP16, QV *ECP) {
-	n := NewBIG(nil)
-	n3 := NewBIG(nil)
+	n := NewBIG()
+	n3 := NewBIG()
 	var lv, lv2 *FP48
 	var bt, j int
 
-	if QV.Is_infinity(nil) {
+	if QV.Is_infinity() {
 		return
 	}
 
-	Q := NewECP(nil)
+	Q := NewECP()
 	Q.Copy(QV)
-	Q.Affine(nil)
-	Qx := NewFPcopy(Q.getx(), nil)
-	Qy := NewFPcopy(Q.gety(), nil)
+	Q.Affine()
+	Qx := NewFPcopy(Q.getx())
+	Qy := NewFPcopy(Q.gety())
 
-	nb := lbits(n3, n, nil)
+	nb := lbits(n3, n)
 	j = 0
 	for i := nb - 2; i >= 1; i-- {
 		lv = unpack(T[j], Qx, Qy)
@@ -230,452 +252,625 @@ func Another_pc(r []*FP48, T []*FP16, QV *ECP) {
 		if bt == 1 {
 			lv2 = unpack(T[j], Qx, Qy)
 			j += 1
-			lv.smul(lv2, nil)
+			lv.smul(lv2)
 		}
 		if bt == -1 {
 			lv2 = unpack(T[j], Qx, Qy)
 			j += 1
-			lv.smul(lv2, nil)
+			lv.smul(lv2)
 		}
-		r[i].ssmul(lv, nil)
+		r[i].ssmul(lv)
 	}
 }
 
 /* Accumulate another set of line functions for n-pairing */
-func Another(r []*FP48, P1 *ECP8, Q1 *ECP, mem *arena.Arena) {
-	n := NewBIG(mem)
-	n3 := NewBIG(mem)
+func Another(r []*FP48, P1 *ECP8, Q1 *ECP) {
+	n := NewBIG()
+	n3 := NewBIG()
 	var lv, lv2 *FP48
 
-	if Q1.Is_infinity(mem) {
+	if Q1.Is_infinity() {
 		return
 	}
 	// P is needed in affine form for line function, Q for (Qx,Qy) extraction
-	P := NewECP8(mem)
+	P := NewECP8()
 	P.Copy(P1)
-	Q := NewECP(mem)
+	Q := NewECP()
 	Q.Copy(Q1)
 
-	P.Affine(mem)
-	Q.Affine(mem)
+	P.Affine()
+	Q.Affine()
 
-	Qx := NewFPcopy(Q.getx(), mem)
-	Qy := NewFPcopy(Q.gety(), mem)
+	Qx := NewFPcopy(Q.getx())
+	Qy := NewFPcopy(Q.gety())
 
-	A := NewECP8(mem)
+	A := NewECP8()
 	A.Copy(P)
 
-	MP := NewECP8(mem)
+	MP := NewECP8()
 	MP.Copy(P)
-	MP.Neg(mem)
+	MP.Neg()
 
-	nb := lbits(n3, n, mem)
+	nb := lbits(n3, n)
 
 	for i := nb - 2; i >= 1; i-- {
-		lv = line(A, A, Qx, Qy, mem)
+		lv = line(A, A, Qx, Qy)
 
 		bt := n3.bit(i) - n.bit(i)
 		if bt == 1 {
-			lv2 = line(A, P, Qx, Qy, mem)
-			lv.smul(lv2, mem)
+			lv2 = line(A, P, Qx, Qy)
+			lv.smul(lv2)
 		}
 		if bt == -1 {
-			lv2 = line(A, MP, Qx, Qy, mem)
-			lv.smul(lv2, mem)
+			lv2 = line(A, MP, Qx, Qy)
+			lv.smul(lv2)
 		}
-		r[i].ssmul(lv, mem)
+		r[i].ssmul(lv)
 	}
 }
 
 /* Optimal R-ate pairing */
 func Ate(P1 *ECP8, Q1 *ECP) *FP48 {
-	n := NewBIG(nil)
-	n3 := NewBIG(nil)
+	n := NewBIG()
+	n3 := NewBIG()
 	var lv, lv2 *FP48
 
-	if Q1.Is_infinity(nil) {
-		return NewFP48int(1, nil)
+	if Q1.Is_infinity() {
+		return NewFP48int(1)
 	}
 
-	P := NewECP8(nil)
+	P := NewECP8()
 	P.Copy(P1)
-	P.Affine(nil)
-	Q := NewECP(nil)
+	P.Affine()
+	Q := NewECP()
 	Q.Copy(Q1)
-	Q.Affine(nil)
+	Q.Affine()
 
-	Qx := NewFPcopy(Q.getx(), nil)
-	Qy := NewFPcopy(Q.gety(), nil)
+	Qx := NewFPcopy(Q.getx())
+	Qy := NewFPcopy(Q.gety())
 
-	A := NewECP8(nil)
-	r := NewFP48int(1, nil)
+	A := NewECP8()
+	r := NewFP48int(1)
 
 	A.Copy(P)
-	NP := NewECP8(nil)
+	NP := NewECP8()
 	NP.Copy(P)
-	NP.Neg(nil)
+	NP.Neg()
 
-	nb := lbits(n3, n, nil)
+	nb := lbits(n3, n)
 
 	for i := nb - 2; i >= 1; i-- {
-		r.Sqr(nil)
-		lv = line(A, A, Qx, Qy, nil)
+		r.Sqr()
+		lv = line(A, A, Qx, Qy)
 
 		bt := n3.bit(i) - n.bit(i)
 		if bt == 1 {
-			lv2 = line(A, P, Qx, Qy, nil)
-			lv.smul(lv2, nil)
+			lv2 = line(A, P, Qx, Qy)
+			lv.smul(lv2)
 		}
 		if bt == -1 {
-			lv2 = line(A, NP, Qx, Qy, nil)
-			lv.smul(lv2, nil)
+			lv2 = line(A, NP, Qx, Qy)
+			lv.smul(lv2)
 		}
-		r.ssmul(lv, nil)
+		r.ssmul(lv)
 	}
 
-	r.conj(nil)
+	if SIGN_OF_X == NEGATIVEX {
+		r.conj()
+	}
 
 	return r
 }
 
 /* Optimal R-ate double pairing e(P,Q).e(R,S) */
 func Ate2(P1 *ECP8, Q1 *ECP, R1 *ECP8, S1 *ECP) *FP48 {
-	n := NewBIG(nil)
-	n3 := NewBIG(nil)
+	n := NewBIG()
+	n3 := NewBIG()
 	var lv, lv2 *FP48
 
-	if Q1.Is_infinity(nil) {
+	if Q1.Is_infinity() {
 		return Ate(R1, S1)
 	}
-	if S1.Is_infinity(nil) {
+	if S1.Is_infinity() {
 		return Ate(P1, Q1)
 	}
 
-	P := NewECP8(nil)
+	P := NewECP8()
 	P.Copy(P1)
-	P.Affine(nil)
-	Q := NewECP(nil)
+	P.Affine()
+	Q := NewECP()
 	Q.Copy(Q1)
-	Q.Affine(nil)
-	R := NewECP8(nil)
+	Q.Affine()
+	R := NewECP8()
 	R.Copy(R1)
-	R.Affine(nil)
-	S := NewECP(nil)
+	R.Affine()
+	S := NewECP()
 	S.Copy(S1)
-	S.Affine(nil)
+	S.Affine()
 
-	Qx := NewFPcopy(Q.getx(), nil)
-	Qy := NewFPcopy(Q.gety(), nil)
-	Sx := NewFPcopy(S.getx(), nil)
-	Sy := NewFPcopy(S.gety(), nil)
+	Qx := NewFPcopy(Q.getx())
+	Qy := NewFPcopy(Q.gety())
+	Sx := NewFPcopy(S.getx())
+	Sy := NewFPcopy(S.gety())
 
-	A := NewECP8(nil)
-	B := NewECP8(nil)
-	r := NewFP48int(1, nil)
+	A := NewECP8()
+	B := NewECP8()
+	r := NewFP48int(1)
 
 	A.Copy(P)
 	B.Copy(R)
-	NP := NewECP8(nil)
+	NP := NewECP8()
 	NP.Copy(P)
-	NP.Neg(nil)
-	NR := NewECP8(nil)
+	NP.Neg()
+	NR := NewECP8()
 	NR.Copy(R)
-	NR.Neg(nil)
+	NR.Neg()
 
-	nb := lbits(n3, n, nil)
+	nb := lbits(n3, n)
 
 	for i := nb - 2; i >= 1; i-- {
-		r.Sqr(nil)
-		lv = line(A, A, Qx, Qy, nil)
-		lv2 = line(B, B, Sx, Sy, nil)
-		lv.smul(lv2, nil)
-		r.ssmul(lv, nil)
+		r.Sqr()
+		lv = line(A, A, Qx, Qy)
+		lv2 = line(B, B, Sx, Sy)
+		lv.smul(lv2)
+		r.ssmul(lv)
 		bt := n3.bit(i) - n.bit(i)
 		if bt == 1 {
-			lv = line(A, P, Qx, Qy, nil)
-			lv2 = line(B, R, Sx, Sy, nil)
-			lv.smul(lv2, nil)
-			r.ssmul(lv, nil)
+			lv = line(A, P, Qx, Qy)
+			lv2 = line(B, R, Sx, Sy)
+			lv.smul(lv2)
+			r.ssmul(lv)
 		}
 		if bt == -1 {
-			lv = line(A, NP, Qx, Qy, nil)
-			lv2 = line(B, NR, Sx, Sy, nil)
-			lv.smul(lv2, nil)
-			r.ssmul(lv, nil)
+			lv = line(A, NP, Qx, Qy)
+			lv2 = line(B, NR, Sx, Sy)
+			lv.smul(lv2)
+			r.ssmul(lv)
 		}
 	}
 
-	r.conj(nil)
+	if SIGN_OF_X == NEGATIVEX {
+		r.conj()
+	}
 
 	return r
 }
 
 /* final exponentiation - keep separate for multi-pairings and to avoid thrashing stack */
 func Fexp(m *FP48) *FP48 {
-	mem := arena.NewArena()
-	f := NewFP2bigs(NewBIGints(Fra, mem), NewBIGints(Frb, mem), mem)
-	x := NewBIGints(CURVE_Bnx, mem)
-	r := NewFP48copy(m, nil)
+	f := NewFP2bigs(NewBIGints(Fra), NewBIGints(Frb))
+	x := NewBIGints(CURVE_Bnx)
+	r := NewFP48copy(m)
 	//	var t1, t2 *FP48
 
 	/* Easy part of final exp */
-	lv := NewFP48copy(r, mem)
+	lv := NewFP48copy(r)
 
-	lv.Invert(mem)
-	r.conj(mem)
+	lv.Invert()
+	r.conj()
 
-	r.Mul(lv, mem)
+	r.Mul(lv)
 	lv.Copy(r)
-	r.frob(f, 8, mem)
-	r.Mul(lv, mem)
+	r.frob(f, 8)
+	r.Mul(lv)
 
 	/* Hard part of final exp */
 	// See https://eprint.iacr.org/2020/875.pdf
-	y1 := NewFP48copy(r, mem)
-	y1.uSqr(mem)
-	y1.Mul(r, mem) // y1=r^3
+	y1 := NewFP48copy(r)
+	y1.uSqr()
+	y1.Mul(r) // y1=r^3
 
-	y0 := NewFP48copy(r.Pow(x, mem), mem)
-	y0.conj(mem)
-	t0 := NewFP48copy(r, mem)
-	t0.conj(mem)
+	y0 := NewFP48copy(r.Pow(x))
+	if SIGN_OF_X == NEGATIVEX {
+		y0.conj()
+	}
+	t0 := NewFP48copy(r)
+	t0.conj()
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
-	y0.Copy(r.Pow(x, mem))
-	y0.conj(mem)
+	y0.Copy(r.Pow(x))
+	if SIGN_OF_X == NEGATIVEX {
+		y0.conj()
+	}
 	t0.Copy(r)
-	t0.conj(mem)
+	t0.conj()
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
 	// ^(x+p)
-	y0.Copy(r.Pow(x, mem))
-	y0.conj(mem)
+	y0.Copy(r.Pow(x))
+	if SIGN_OF_X == NEGATIVEX {
+		y0.conj()
+	}
 	t0.Copy(r)
-	t0.frob(f, 1, mem)
+	t0.frob(f, 1)
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
 	// ^(x^2+p^2)
-	y0.Copy(r.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
+	y0.Copy(r.Pow(x))
+	y0.Copy(y0.Pow(x))
 	t0.Copy(r)
-	t0.frob(f, 2, mem)
+	t0.frob(f, 2)
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
 	// ^(x^4+p^4)
-	y0.Copy(r.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
+	y0.Copy(r.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
 	t0.Copy(r)
-	t0.frob(f, 4, mem)
+	t0.frob(f, 4)
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
 	// ^(x^8+p^8-1)
-	y0.Copy(r.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
-	y0.Copy(y0.Pow(x, mem))
+	y0.Copy(r.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
+	y0.Copy(y0.Pow(x))
 	t0.Copy(r)
-	t0.frob(f, 8, mem)
-	y0.Mul(t0, mem)
+	t0.frob(f, 8)
+	y0.Mul(t0)
 	t0.Copy(r)
-	t0.conj(mem)
+	t0.conj()
 	r.Copy(y0)
-	r.Mul(t0, mem)
+	r.Mul(t0)
 
-	r.Mul(y1, mem)
-	r.reduce(mem)
-	mem.Free()
+	r.Mul(y1)
+	r.reduce()
 
+	/*
+		// Ghamman & Fouotsa Method
+
+		t7 := NewFP48copy(r)
+		t7.usqr()
+
+		if x.parity() == 1 {
+			t2 = r.Pow(x)
+			t1 = NewFP48copy(t2)
+			t1.usqr()
+			t2 = t2.Pow(x)
+		} else {
+			t1 = t7.Pow(x)
+			x.fshr(1)
+			t2 = t1.Pow(x)
+			x.fshl(1)
+		}
+
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3 := NewFP48copy(t1)
+		t3.conj()
+		t2.Mul(t3)
+		t2.Mul(r)
+
+		r.Mul(t7)
+
+		t1 = t2.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+		t3.Copy(t1)
+		t3.frob(f, 14)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 13)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 12)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 11)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 10)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 9)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 8)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t2)
+		t3.conj()
+		t1.Mul(t3)
+		t3.Copy(t1)
+		t3.frob(f, 7)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 6)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 5)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 4)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 3)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 2)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		t3.Copy(t1)
+		t3.frob(f, 1)
+		r.Mul(t3)
+		t1 = t1.Pow(x)
+		if SIGN_OF_X == NEGATIVEX {
+			t1.conj()
+		}
+
+		r.Mul(t1)
+		t2.frob(f, 15)
+		r.Mul(t2)
+
+		r.reduce()
+	*/
 	return r
 }
 
 /* GLV method */
-func glv(ee *BIG, mem *arena.Arena) []*BIG {
+func glv(ee *BIG) []*BIG {
 	var u []*BIG
 
-	q := NewBIGints(CURVE_Order, mem)
-	x := NewBIGints(CURVE_Bnx, mem)
+	q := NewBIGints(CURVE_Order)
+	x := NewBIGints(CURVE_Bnx)
 	x2 := smul(x, x)
 	x = smul(x2, x2)
 	x2 = smul(x, x)
 	bd := uint(q.nbits() - x2.nbits())
-	u = append(u, NewBIGcopy(ee, mem))
-	u[0].ctmod(x2, bd, mem)
-	u = append(u, NewBIGcopy(ee, mem))
-	u[1].ctdiv(x2, bd, mem)
+	u = append(u, NewBIGcopy(ee))
+	u[0].ctmod(x2, bd)
+	u = append(u, NewBIGcopy(ee))
+	u[1].ctdiv(x2, bd)
 	u[1].rsub(q)
 	return u
 }
 
 /* Galbraith & Scott Method */
-func gs(ee *BIG, mem *arena.Arena) []*BIG {
+func gs(ee *BIG) []*BIG {
 	var u []*BIG
 
-	q := NewBIGints(CURVE_Order, mem)
-	x := NewBIGints(CURVE_Bnx, mem)
+	q := NewBIGints(CURVE_Order)
+	x := NewBIGints(CURVE_Bnx)
 	bd := uint(q.nbits() - x.nbits())
-	w := NewBIGcopy(ee, mem)
+	w := NewBIGcopy(ee)
 	for i := 0; i < 15; i++ {
-		u = append(u, NewBIGcopy(w, mem))
-		u[i].ctmod(x, bd, mem)
-		w.ctdiv(x, bd, mem)
+		u = append(u, NewBIGcopy(w))
+		u[i].ctmod(x, bd)
+		w.ctdiv(x, bd)
 	}
-	u = append(u, NewBIGcopy(w, mem))
-	u[1].copy(Modneg(u[1], q, mem))
-	u[3].copy(Modneg(u[3], q, mem))
-	u[5].copy(Modneg(u[5], q, mem))
-	u[7].copy(Modneg(u[7], q, mem))
-	u[9].copy(Modneg(u[9], q, mem))
-	u[11].copy(Modneg(u[11], q, mem))
-	u[13].copy(Modneg(u[13], q, mem))
-	u[15].copy(Modneg(u[15], q, mem))
+	u = append(u, NewBIGcopy(w))
+	if SIGN_OF_X == NEGATIVEX {
+		u[1].copy(Modneg(u[1], q))
+		u[3].copy(Modneg(u[3], q))
+		u[5].copy(Modneg(u[5], q))
+		u[7].copy(Modneg(u[7], q))
+		u[9].copy(Modneg(u[9], q))
+		u[11].copy(Modneg(u[11], q))
+		u[13].copy(Modneg(u[13], q))
+		u[15].copy(Modneg(u[15], q))
+	}
 
 	return u
 }
 
 /* Multiply P by e in group G1 */
-func G1mul(P *ECP, e *BIG, mem *arena.Arena) *ECP {
+func G1mul(P *ECP, e *BIG) *ECP {
 	var R *ECP
-	q := NewBIGints(CURVE_Order, mem)
-	ee := NewBIGcopy(e, mem)
-	ee.Mod(q, mem)
-	R = NewECP(mem)
-	R.Copy(P)
-	Q := NewECP(mem)
-	Q.Copy(P)
-	Q.Affine(mem)
+	q := NewBIGints(CURVE_Order)
+	ee := NewBIGcopy(e)
+	ee.Mod(q)
+	if USE_GLV {
+		R = NewECP()
+		R.Copy(P)
+		Q := NewECP()
+		Q.Copy(P)
+		Q.Affine()
 
-	cru := NewFPbig(NewBIGints(CRu, mem), mem)
-	t := NewBIGint(0, mem)
-	u := glv(ee, mem)
-	Q.getx().Mul(cru, mem)
+		cru := NewFPbig(NewBIGints(CRu))
+		t := NewBIGint(0)
+		u := glv(ee)
+		Q.getx().Mul(cru)
 
-	np := u[0].nbits()
-	t.copy(Modneg(u[0], q, mem))
-	nn := t.nbits()
-	if nn < np {
-		u[0].copy(t)
-		R.Neg(mem)
+		np := u[0].nbits()
+		t.copy(Modneg(u[0], q))
+		nn := t.nbits()
+		if nn < np {
+			u[0].copy(t)
+			R.Neg()
+		}
+
+		np = u[1].nbits()
+		t.copy(Modneg(u[1], q))
+		nn = t.nbits()
+		if nn < np {
+			u[1].copy(t)
+			Q.Neg()
+		}
+		u[0].norm()
+		u[1].norm()
+		R = R.Mul2(u[0], Q, u[1])
+
+	} else {
+		R = P.clmul(e, q)
 	}
-
-	np = u[1].nbits()
-	t.copy(Modneg(u[1], q, mem))
-	nn = t.nbits()
-	if nn < np {
-		u[1].copy(t)
-		Q.Neg(mem)
-	}
-	u[0].norm()
-	u[1].norm()
-	R = R.Mul2(u[0], Q, u[1], mem)
-
 	return R
 }
 
 /* Multiply P by e in group G2 */
-func G2mul(P *ECP8, e *BIG, mem *arena.Arena) *ECP8 {
+func G2mul(P *ECP8, e *BIG) *ECP8 {
 	var R *ECP8
-	q := NewBIGints(CURVE_Order, mem)
-	ee := NewBIGcopy(e, mem)
-	ee.Mod(q, mem)
-	var Q []*ECP8
+	q := NewBIGints(CURVE_Order)
+	ee := NewBIGcopy(e)
+	ee.Mod(q)
+	if USE_GS_G2 {
+		var Q []*ECP8
 
-	F := ECP8_frob_constants()
-	u := gs(ee, mem)
+		F := ECP8_frob_constants()
+		u := gs(ee)
 
-	t := NewBIGint(0, mem)
+		t := NewBIGint(0)
 
-	Q = append(Q, NewECP8(mem))
-	Q[0].Copy(P)
-	for i := 1; i < 16; i++ {
-		Q = append(Q, NewECP8(mem))
-		Q[i].Copy(Q[i-1])
-		Q[i].frob(F, 1)
-	}
-	for i := 0; i < 16; i++ {
-		np := u[i].nbits()
-		t.copy(Modneg(u[i], q, mem))
-		nn := t.nbits()
-		if nn < np {
-			u[i].copy(t)
-			Q[i].Neg(mem)
+		Q = append(Q, NewECP8())
+		Q[0].Copy(P)
+		for i := 1; i < 16; i++ {
+			Q = append(Q, NewECP8())
+			Q[i].Copy(Q[i-1])
+			Q[i].frob(F, 1)
 		}
-		u[i].norm()
-	}
+		for i := 0; i < 16; i++ {
+			np := u[i].nbits()
+			t.copy(Modneg(u[i], q))
+			nn := t.nbits()
+			if nn < np {
+				u[i].copy(t)
+				Q[i].Neg()
+			}
+			u[i].norm()
+		}
 
-	R = Mul16(Q, u, mem)
+		R = Mul16(Q, u)
+
+	} else {
+		R = P.Mul(e)
+	}
 	return R
 }
 
 /* f=f^e */
 /* Note that this method requires a lot of RAM!  */
-// func GTpow(d *FP48, e *BIG) *FP48 {
-// 	var r *FP48
-// 	q := NewBIGints(CURVE_Order)
-// 	ee := NewBIGcopy(e)
-// 	ee.Mod(q)
-// 	if USE_GS_GT {
-// 		var g []*FP48
-// 		f := NewFP2bigs(NewBIGints(Fra), NewBIGints(Frb))
-// 		t := NewBIGint(0)
+func GTpow(d *FP48, e *BIG) *FP48 {
+	var r *FP48
+	q := NewBIGints(CURVE_Order)
+	ee := NewBIGcopy(e)
+	ee.Mod(q)
+	if USE_GS_GT {
+		var g []*FP48
+		f := NewFP2bigs(NewBIGints(Fra), NewBIGints(Frb))
+		t := NewBIGint(0)
 
-// 		u := gs(ee)
+		u := gs(ee)
 
-// 		g = append(g, NewFP48copy(d))
-// 		for i := 1; i < 16; i++ {
-// 			g = append(g, NewFP48())
-// 			g[i].Copy(g[i-1])
-// 			g[i].frob(f, 1)
-// 		}
-// 		for i := 0; i < 16; i++ {
-// 			np := u[i].nbits()
-// 			t.copy(Modneg(u[i], q))
-// 			nn := t.nbits()
-// 			if nn < np {
-// 				u[i].copy(t)
-// 				g[i].conj()
-// 			}
-// 			u[i].norm()
-// 		}
-// 		r = pow16(g, u)
-// 	} else {
-// 		r = d.Pow(ee)
-// 	}
-// 	return r
-// }
+		g = append(g, NewFP48copy(d))
+		for i := 1; i < 16; i++ {
+			g = append(g, NewFP48())
+			g[i].Copy(g[i-1])
+			g[i].frob(f, 1)
+		}
+		for i := 0; i < 16; i++ {
+			np := u[i].nbits()
+			t.copy(Modneg(u[i], q))
+			nn := t.nbits()
+			if nn < np {
+				u[i].copy(t)
+				g[i].conj()
+			}
+			u[i].norm()
+		}
+		r = pow16(g, u)
+	} else {
+		r = d.Pow(ee)
+	}
+	return r
+}
 
 /* test G1 group membership */
-func G1member(P *ECP, mem *arena.Arena) bool {
-	if P.Is_infinity(mem) {
+func G1member(P *ECP) bool {
+	if P.Is_infinity() {
 		return false
 	}
-	x := NewBIGints(CURVE_Bnx, mem)
-	cru := NewFPbig(NewBIGints(CRu, mem), mem)
-	W := NewECP(mem)
+	x := NewBIGints(CURVE_Bnx)
+	cru := NewFPbig(NewBIGints(CRu))
+	W := NewECP()
 	W.Copy(P)
-	W.getx().Mul(cru, mem)
-	T := P.lmul(x, mem, mem)
+	W.getx().Mul(cru)
+	T := P.lmul(x)
 	if P.Equals(T) {
 		return false
 	} // P is of low order
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T = T.Mul(x, mem, mem)
-	T.Neg(mem)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T = T.Mul(x)
+	T.Neg()
 	if !W.Equals(T) {
 		return false
 	}
@@ -694,17 +889,19 @@ func G1member(P *ECP, mem *arena.Arena) bool {
 }
 
 /* test G2 group membership */
-func G2member(P *ECP8, mem *arena.Arena) bool {
-	if P.Is_infinity(mem) {
+func G2member(P *ECP8) bool {
+	if P.Is_infinity() {
 		return false
 	}
 	F := ECP8_frob_constants()
-	x := NewBIGints(CURVE_Bnx, mem)
-	W := NewECP8(mem)
+	x := NewBIGints(CURVE_Bnx)
+	W := NewECP8()
 	W.Copy(P)
 	W.frob(F, 1)
-	T := P.Mul(x, mem)
-	T.Neg(mem)
+	T := P.Mul(x)
+	if SIGN_OF_X == NEGATIVEX {
+		T.Neg()
+	}
 	/*
 	   	R:=NewECP8(); R.Copy(W)
 	       R.frob(F,1)
@@ -731,20 +928,20 @@ func GTcyclotomic(m *FP48) bool {
 	if m.Isunity() {
 		return false
 	}
-	r := NewFP48copy(m, nil)
-	r.conj(nil)
-	r.Mul(m, nil)
+	r := NewFP48copy(m)
+	r.conj()
+	r.Mul(m)
 	if !r.Isunity() {
 		return false
 	}
 
-	f := NewFP2bigs(NewBIGints(Fra, nil), NewBIGints(Frb, nil), nil)
+	f := NewFP2bigs(NewBIGints(Fra), NewBIGints(Frb))
 
 	r.Copy(m)
-	r.frob(f, 8, nil)
-	w := NewFP48copy(r, nil)
-	w.frob(f, 8, nil)
-	w.Mul(m, nil)
+	r.frob(f, 8)
+	w := NewFP48copy(r)
+	w.frob(f, 8)
+	w.Mul(m)
 	if !w.Equals(r) {
 		return false
 	}
@@ -756,14 +953,16 @@ func GTmember(m *FP48) bool {
 	if !GTcyclotomic(m) {
 		return false
 	}
-	f := NewFP2bigs(NewBIGints(Fra, nil), NewBIGints(Frb, nil), nil)
-	x := NewBIGints(CURVE_Bnx, nil)
+	f := NewFP2bigs(NewBIGints(Fra), NewBIGints(Frb))
+	x := NewBIGints(CURVE_Bnx)
 
-	r := NewFP48copy(m, nil)
-	r.frob(f, 1, nil)
-	t := m.Pow(x, nil)
+	r := NewFP48copy(m)
+	r.frob(f, 1)
+	t := m.Pow(x)
 
-	t.conj(nil)
+	if SIGN_OF_X == NEGATIVEX {
+		t.conj()
+	}
 	if !r.Equals(t) {
 		return false
 	}

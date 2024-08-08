@@ -160,7 +160,7 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 	}
 
 	if sub.ch == nil {
-		sub.ch = make(chan *Message, 128)
+		sub.ch = make(chan *Message, 32)
 	}
 
 	out := make(chan *Subscription, 1)
@@ -220,7 +220,7 @@ type PublishOptions struct {
 type PubOpt func(pub *PublishOptions) error
 
 // Publish publishes data to bitmask.
-func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) error {
+func (t *Bitmask) Publish(ctx context.Context, bitmask []byte, data []byte, opts ...PubOpt) error {
 	t.mux.RLock()
 	defer t.mux.RUnlock()
 	if t.closed {
@@ -250,7 +250,7 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 
 	m := &pb.Message{
 		Data:    data,
-		Bitmask: t.bitmask,
+		Bitmask: bitmask,
 		From:    nil,
 		Seqno:   nil,
 	}
@@ -307,7 +307,7 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 		}
 	}
 
-	return t.p.val.PushLocal(&Message{m, "", t.p.host.ID(), nil, pub.local})
+	return t.p.val.PushLocal(&Message{m, nil, t.p.host.ID(), nil, pub.local})
 }
 
 // WithReadiness returns a publishing option for only publishing when the router is ready.

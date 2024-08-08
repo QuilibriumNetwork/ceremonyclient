@@ -25,7 +25,12 @@ func getBitmasks(psubs []*PubSub, bitmask []byte, opts ...BitmaskOpt) []*Bitmask
 		if err != nil {
 			panic(err)
 		}
-		bitmasks[i] = t
+
+		if len(t) != 1 {
+			panic("multi bit bitmasks not supported for tests using getBitmasks")
+		}
+
+		bitmasks[i] = t[0]
 	}
 
 	return bitmasks
@@ -98,9 +103,9 @@ func testBitmaskCloseWithOpenResource(t *testing.T, openResource func(bitmask *B
 	defer cancel()
 
 	const numHosts = 1
-	bitmaskID := []byte{0xf0, 0x0b, 0xa1, 0x20}
-	hosts := getNetHosts(t, ctx, numHosts)
-	ps := getPubsub(ctx, hosts[0])
+	bitmaskID := []byte{0x00, 0x01}
+	hosts := getDefaultHosts(t, numHosts)
+	ps := getBlossomSub(ctx, hosts[0])
 
 	// Try create and cancel bitmask
 	bitmask, err := ps.Join(bitmaskID)
@@ -108,7 +113,7 @@ func testBitmaskCloseWithOpenResource(t *testing.T, openResource func(bitmask *B
 		t.Fatal(err)
 	}
 
-	if err := bitmask.Close(); err != nil {
+	if err := bitmask[0].Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,9 +123,9 @@ func testBitmaskCloseWithOpenResource(t *testing.T, openResource func(bitmask *B
 		t.Fatal(err)
 	}
 
-	openResource(bitmask)
+	openResource(bitmask[0])
 
-	if err := bitmask.Close(); err == nil {
+	if err := bitmask[0].Close(); err == nil {
 		t.Fatal("expected an error closing a bitmask with an open resource")
 	}
 
@@ -128,7 +133,7 @@ func testBitmaskCloseWithOpenResource(t *testing.T, openResource func(bitmask *B
 	closeResource()
 	time.Sleep(time.Millisecond * 100)
 
-	if err := bitmask.Close(); err != nil {
+	if err := bitmask[0].Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -138,11 +143,11 @@ func TestBitmaskReuse(t *testing.T) {
 	defer cancel()
 
 	const numHosts = 2
-	bitmaskID := []byte{0xf0, 0x0b, 0xa1, 0x20}
-	hosts := getNetHosts(t, ctx, numHosts)
+	bitmaskID := []byte{0x00, 0x01}
+	hosts := getDefaultHosts(t, numHosts)
 
-	sender := getPubsub(ctx, hosts[0], WithDiscovery(&dummyDiscovery{}))
-	receiver := getPubsub(ctx, hosts[1])
+	sender := getBlossomSub(ctx, hosts[0])
+	receiver := getBlossomSub(ctx, hosts[1])
 
 	connectAll(t, hosts)
 
@@ -158,13 +163,18 @@ func TestBitmaskReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sub, err := receiveBitmask.Subscribe()
+	_, err = sendBitmask[0].Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := receiveBitmask[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	firstMsg := []byte("1")
-	if err := sendBitmask.Publish(ctx, firstMsg, WithReadiness(MinBitmaskSize(1))); err != nil {
+	if err := sendBitmask[0].Publish(ctx, bitmaskID, firstMsg, WithReadiness(MinBitmaskSize(1))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,54 +186,10 @@ func TestBitmaskReuse(t *testing.T) {
 		t.Fatal("received incorrect message")
 	}
 
-	if err := sendBitmask.Close(); err != nil {
-		t.Fatal(err)
-	}
-
 	// Recreate the same bitmask
-	newSendBitmask, err := sender.Join(bitmaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Try sending data with original bitmask
-	illegalSend := []byte("illegal")
-	if err := sendBitmask.Publish(ctx, illegalSend); err != ErrBitmaskClosed {
-		t.Fatal(err)
-	}
-
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, time.Second*2)
-	defer timeoutCancel()
-	msg, err = sub.Next(timeoutCtx)
-	if err != context.DeadlineExceeded {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(msg.GetData(), illegalSend) {
-			t.Fatal("received incorrect message from illegal bitmask")
-		}
-		t.Fatal("received message sent by illegal bitmask")
-	}
-	timeoutCancel()
-
-	// Try cancelling the new bitmask by using the original bitmask
-	if err := sendBitmask.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	secondMsg := []byte("2")
-	if err := newSendBitmask.Publish(ctx, secondMsg); err != nil {
-		t.Fatal(err)
-	}
-
-	timeoutCtx, timeoutCancel = context.WithTimeout(ctx, time.Second*2)
-	defer timeoutCancel()
-	msg, err = sub.Next(timeoutCtx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(msg.GetData(), secondMsg) {
-		t.Fatal("received incorrect message")
+	_, err = sender.Join(bitmaskID)
+	if err == nil {
+		t.Fatal("did not error on reuse of bitmask")
 	}
 }
 
@@ -232,9 +198,9 @@ func TestBitmaskEventHandlerCancel(t *testing.T) {
 	defer cancel()
 
 	const numHosts = 5
-	bitmaskID := []byte{0xf0, 0x0b, 0xa1, 0x20}
-	hosts := getNetHosts(t, ctx, numHosts)
-	ps := getPubsub(ctx, hosts[0])
+	bitmaskID := []byte{0x00, 0x01}
+	hosts := getDefaultHosts(t, numHosts)
+	ps := getBlossomSub(ctx, hosts[0])
 
 	// Try create and cancel bitmask
 	bitmask, err := ps.Join(bitmaskID)
@@ -242,7 +208,7 @@ func TestBitmaskEventHandlerCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	evts, err := bitmask.EventHandler()
+	evts, err := bitmask[0].EventHandler()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,8 +231,8 @@ func TestSubscriptionJoinNotification(t *testing.T) {
 
 	const numLateSubscribers = 10
 	const numHosts = 20
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), []byte{0xf0, 0x0b, 0xa1, 0x20})
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), []byte{0x00, 0x01})
 	evts := getBitmaskEvts(bitmasks)
 
 	subs := make([]*Subscription, numHosts)
@@ -331,9 +297,9 @@ func TestSubscriptionLeaveNotification(t *testing.T) {
 	defer cancel()
 
 	const numHosts = 20
-	hosts := getNetHosts(t, ctx, numHosts)
-	psubs := getPubsubs(ctx, hosts)
-	bitmasks := getBitmasks(psubs, []byte{0xf0, 0x0b, 0xa1, 0x20})
+	hosts := getDefaultHosts(t, numHosts)
+	psubs := getBlossomSubs(ctx, hosts)
+	bitmasks := getBitmasks(psubs, []byte{0x00, 0x01})
 	evts := getBitmaskEvts(bitmasks)
 
 	subs := make([]*Subscription, numHosts)
@@ -411,11 +377,11 @@ func TestSubscriptionManyNotifications(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 
 	const numHosts = 33
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 	evts := getBitmaskEvts(bitmasks)
 
 	subs := make([]*Subscription, numHosts)
@@ -516,11 +482,11 @@ func TestSubscriptionNotificationSubUnSub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 
 	const numHosts = 35
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 
 	for i := 1; i < numHosts; i++ {
 		connect(t, hosts[0], hosts[i])
@@ -534,11 +500,11 @@ func TestBitmaskRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 	const numHosts = 5
 
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 
 	// [0.Rel] - [1.Rel] - [2.Sub]
 	//             |
@@ -552,6 +518,7 @@ func TestBitmaskRelay(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 
 	var subs []*Subscription
+	var subscribedBitmasks []*Bitmask
 
 	for i, bitmask := range bitmasks {
 		if i == 2 || i == 4 {
@@ -561,6 +528,7 @@ func TestBitmaskRelay(t *testing.T) {
 			}
 
 			subs = append(subs, sub)
+			subscribedBitmasks = append(subscribedBitmasks, bitmask)
 		} else {
 			_, err := bitmask.Relay()
 			if err != nil {
@@ -569,14 +537,15 @@ func TestBitmaskRelay(t *testing.T) {
 		}
 	}
 
-	time.Sleep(time.Millisecond * 100)
+	// Give enough time to build the relay
+	time.Sleep(time.Second * 2)
 
 	for i := 0; i < 100; i++ {
-		msg := []byte("message")
+		msg := []byte(fmt.Sprintf("message %d", i))
 
-		owner := rand.Intn(len(bitmasks))
+		owner := rand.Intn(len(subscribedBitmasks))
 
-		err := bitmasks[owner].Publish(ctx, msg)
+		err := subscribedBitmasks[owner].Publish(ctx, subscribedBitmasks[owner].bitmask, msg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -598,11 +567,11 @@ func TestBitmaskRelayReuse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 	const numHosts = 1
 
-	hosts := getNetHosts(t, ctx, numHosts)
-	pubsubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, numHosts)
+	pubsubs := getBlossomSubs(ctx, hosts)
 	bitmasks := getBitmasks(pubsubs, bitmask)
 
 	relay1Cancel, err := bitmasks[0].Relay()
@@ -665,11 +634,11 @@ func TestBitmaskRelayOnClosedBitmask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 	const numHosts = 1
 
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 
 	err := bitmasks[0].Close()
 	if err != nil {
@@ -687,9 +656,9 @@ func TestProducePanic(t *testing.T) {
 	defer cancel()
 
 	const numHosts = 5
-	bitmaskID := []byte{0xf0, 0x0b, 0xa1, 0x20}
-	hosts := getNetHosts(t, ctx, numHosts)
-	ps := getPubsub(ctx, hosts[0])
+	bitmaskID := []byte{0x00, 0x01}
+	hosts := getDefaultHosts(t, numHosts)
+	ps := getBlossomSub(ctx, hosts[0])
 
 	// Create bitmask
 	bitmask, err := ps.Join(bitmaskID)
@@ -698,13 +667,13 @@ func TestProducePanic(t *testing.T) {
 	}
 
 	// Create subscription we're going to cancel
-	s, err := bitmask.Subscribe()
+	s, err := bitmask[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Create second subscription to keep us alive on the subscription map
 	// after the first one is canceled
-	s2, err := bitmask.Subscribe()
+	s2, err := bitmask[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,17 +758,22 @@ func TestMinBitmaskSizeNoDiscovery(t *testing.T) {
 	defer cancel()
 
 	const numHosts = 3
-	bitmaskID := []byte{0xf0, 0x0b, 0xa1, 0x20}
-	hosts := getNetHosts(t, ctx, numHosts)
+	bitmaskID := []byte{0x00, 0x01}
+	hosts := getDefaultHosts(t, numHosts)
 
-	sender := getPubsub(ctx, hosts[0])
-	receiver1 := getPubsub(ctx, hosts[1])
-	receiver2 := getPubsub(ctx, hosts[2])
+	sender := getBlossomSub(ctx, hosts[0])
+	receiver1 := getBlossomSub(ctx, hosts[1])
+	receiver2 := getBlossomSub(ctx, hosts[2])
 
 	connectAll(t, hosts)
 
 	// Sender creates bitmask
 	sendBitmask, err := sender.Join(bitmaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = sendBitmask[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,13 +784,13 @@ func TestMinBitmaskSizeNoDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sub1, err := receiveBitmask1.Subscribe()
+	sub1, err := receiveBitmask1[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	oneMsg := []byte("minimum one")
-	if err := sendBitmask.Publish(ctx, oneMsg, WithReadiness(MinBitmaskSize(1))); err != nil {
+	if err := sendBitmask[0].Publish(ctx, sendBitmask[0].bitmask, oneMsg, WithReadiness(MinBitmaskSize(1))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -832,7 +806,7 @@ func TestMinBitmaskSizeNoDiscovery(t *testing.T) {
 	{
 		ctx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		if err := sendBitmask.Publish(ctx, twoMsg, WithReadiness(MinBitmaskSize(2))); !errors.Is(err, context.DeadlineExceeded) {
+		if err := sendBitmask[0].Publish(ctx, sendBitmask[0].bitmask, twoMsg, WithReadiness(MinBitmaskSize(2))); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatal(err)
 		}
 	}
@@ -843,15 +817,17 @@ func TestMinBitmaskSizeNoDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sub2, err := receiveBitmask2.Subscribe()
+	sub2, err := receiveBitmask2[0].Subscribe()
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	twoMsg = []byte("minimum two, 2")
+
 	{
 		ctx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		if err := sendBitmask.Publish(ctx, twoMsg, WithReadiness(MinBitmaskSize(2))); err != nil {
+		if err := sendBitmask[0].Publish(ctx, sendBitmask[0].bitmask, twoMsg, WithReadiness(MinBitmaskSize(2))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -867,20 +843,20 @@ func TestWithBitmaskMsgIdFunction(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmaskA, bitmaskB := []byte{0xf0, 0x0b, 0xa1, 0x2a}, []byte{0xf0, 0x0b, 0xa1, 0x2b}
+	bitmaskA, bitmaskB := []byte{0x20, 0x00, 0x00, 0x00}, []byte{0x00, 0x00, 0x80, 0x00}
 	const numHosts = 2
 
-	hosts := getNetHosts(t, ctx, numHosts)
-	pubsubs := getPubsubs(ctx, hosts, WithMessageIdFn(func(pmsg *pb.Message) string {
+	hosts := getDefaultHosts(t, numHosts)
+	pubsubs := getBlossomSubs(ctx, hosts, WithMessageIdFn(func(pmsg *pb.Message) []byte {
 		hash := sha256.Sum256(pmsg.Data)
-		return string(hash[:])
+		return hash[:]
 	}))
 	connectAll(t, hosts)
 
 	bitmasksA := getBitmasks(pubsubs, bitmaskA)                                                        // uses global msgIdFn
-	bitmasksB := getBitmasks(pubsubs, bitmaskB, WithBitmaskMessageIdFn(func(pmsg *pb.Message) string { // uses custom
+	bitmasksB := getBitmasks(pubsubs, bitmaskB, WithBitmaskMessageIdFn(func(pmsg *pb.Message) []byte { // uses custom
 		hash := sha1.Sum(pmsg.Data)
-		return string(hash[:])
+		return hash[:]
 	}))
 
 	payload := []byte("pubsub rocks")
@@ -890,7 +866,12 @@ func TestWithBitmaskMsgIdFunction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = bitmasksA[1].Publish(ctx, payload, WithReadiness(MinBitmaskSize(1)))
+	_, err = bitmasksA[1].Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = bitmasksA[1].Publish(ctx, bitmasksA[1].bitmask, payload, WithReadiness(MinBitmaskSize(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -905,7 +886,14 @@ func TestWithBitmaskMsgIdFunction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = bitmasksB[1].Publish(ctx, payload, WithReadiness(MinBitmaskSize(1)))
+	_, err = bitmasksB[1].Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload = []byte("but blossomsub has more sensible scale strategies")
+
+	err = bitmasksB[1].Publish(ctx, bitmasksB[1].bitmask, payload, WithReadiness(MinBitmaskSize(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -915,7 +903,7 @@ func TestWithBitmaskMsgIdFunction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if msgA.ID == msgB.ID {
+	if bytes.Equal(msgA.ID, msgB.ID) {
 		t.Fatal("msg ids are equal")
 	}
 }
@@ -926,23 +914,23 @@ func TestBitmaskPublishWithKeyInvalidParameters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 	const numHosts = 5
 
 	virtualPeer := tnet.RandPeerNetParamsOrFatal(t)
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 
 	t.Run("nil sign private key should error", func(t *testing.T) {
 		withVirtualKey := WithSecretKeyAndPeerId(nil, virtualPeer.ID)
-		err := bitmasks[0].Publish(ctx, []byte("buff"), withVirtualKey)
+		err := bitmasks[0].Publish(ctx, bitmask, []byte("buff"), withVirtualKey)
 		if err != ErrNilSignKey {
 			t.Fatal("error should have been of type errNilSignKey")
 		}
 	})
 	t.Run("empty peer ID should error", func(t *testing.T) {
 		withVirtualKey := WithSecretKeyAndPeerId(virtualPeer.PrivKey, "")
-		err := bitmasks[0].Publish(ctx, []byte("buff"), withVirtualKey)
+		err := bitmasks[0].Publish(ctx, bitmask, []byte("buff2"), withVirtualKey)
 		if err != ErrEmptyPeerID {
 			t.Fatal("error should have been of type errEmptyPeerID")
 		}
@@ -953,12 +941,12 @@ func TestBitmaskRelayPublishWithKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 	const numHosts = 5
 
 	virtualPeer := tnet.RandPeerNetParamsOrFatal(t)
-	hosts := getNetHosts(t, ctx, numHosts)
-	bitmasks := getBitmasks(getPubsubs(ctx, hosts), bitmask)
+	hosts := getDefaultHosts(t, numHosts)
+	bitmasks := getBitmasks(getBlossomSubs(ctx, hosts), bitmask)
 
 	// [0.Rel] - [1.Rel] - [2.Sub]
 	//             |
@@ -972,6 +960,7 @@ func TestBitmaskRelayPublishWithKey(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 
 	var subs []*Subscription
+	var senders []*Bitmask
 
 	for i, bitmaskValue := range bitmasks {
 		if i == 2 || i == 4 {
@@ -981,6 +970,7 @@ func TestBitmaskRelayPublishWithKey(t *testing.T) {
 			}
 
 			subs = append(subs, sub)
+			senders = append(senders, bitmaskValue)
 		} else {
 			_, err := bitmaskValue.Relay()
 			if err != nil {
@@ -989,15 +979,15 @@ func TestBitmaskRelayPublishWithKey(t *testing.T) {
 		}
 	}
 
-	time.Sleep(time.Millisecond * 100)
+	time.Sleep(time.Second * 2)
 
 	for i := 0; i < 100; i++ {
-		msg := []byte("message")
+		msg := []byte(fmt.Sprintf("message %d", i))
 
-		owner := rand.Intn(len(bitmasks))
+		owner := rand.Intn(len(senders))
 
 		withVirtualKey := WithSecretKeyAndPeerId(virtualPeer.PrivKey, virtualPeer.ID)
-		err := bitmasks[owner].Publish(ctx, msg, withVirtualKey)
+		err := senders[owner].Publish(ctx, senders[owner].bitmask, msg, withVirtualKey)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1022,10 +1012,10 @@ func TestWithLocalPublication(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bitmask := []byte{0x7e, 57}
+	bitmask := []byte{0x01, 0x00}
 
-	hosts := getNetHosts(t, ctx, 2)
-	pubsubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 2)
+	pubsubs := getBlossomSubs(ctx, hosts)
 	bitmasks := getBitmasks(pubsubs, bitmask)
 	connectAll(t, hosts)
 
@@ -1041,7 +1031,7 @@ func TestWithLocalPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = bitmasks[0].Publish(ctx, payload, WithLocalPublication(true))
+	err = bitmasks[0].Publish(ctx, bitmasks[0].bitmask, payload, WithLocalPublication(true))
 	if err != nil {
 		t.Fatal(err)
 	}

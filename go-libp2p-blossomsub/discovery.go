@@ -321,11 +321,11 @@ type pubSubDiscovery struct {
 }
 
 func (d *pubSubDiscovery) Advertise(ctx context.Context, ns string, opts ...discovery.Option) (time.Duration, error) {
-	return d.Discovery.Advertise(ctx, "floodsub:"+ns, append(opts, d.opts...)...)
+	return d.Discovery.Advertise(ctx, "blossomsub:"+ns, append(opts, d.opts...)...)
 }
 
 func (d *pubSubDiscovery) FindPeers(ctx context.Context, ns string, opts ...discovery.Option) (<-chan peer.AddrInfo, error) {
-	return d.Discovery.FindPeers(ctx, "floodsub:"+ns, append(opts, d.opts...)...)
+	return d.Discovery.FindPeers(ctx, "blossomsub:"+ns, append(opts, d.opts...)...)
 }
 
 // WithDiscoveryOpts passes libp2p Discovery options into the PubSub discovery subsystem

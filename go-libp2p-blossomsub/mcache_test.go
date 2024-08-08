@@ -1,6 +1,7 @@
 package blossomsub
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
@@ -33,14 +34,14 @@ func TestMessageCache(t *testing.T) {
 		}
 	}
 
-	gids := mcache.GetGossipIDs([]byte{0x7e, 0x57})
+	gids := mcache.GetGossipIDs([]byte{0x01, 0x00})
 	if len(gids) != 10 {
 		t.Fatalf("Expected 10 gossip IDs; got %d", len(gids))
 	}
 
 	for i := 0; i < 10; i++ {
 		mid := msgID(msgs[i])
-		if mid != gids[i] {
+		if !bytes.Equal(mid, gids[i]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
@@ -62,21 +63,21 @@ func TestMessageCache(t *testing.T) {
 		}
 	}
 
-	gids = mcache.GetGossipIDs([]byte{0x7e, 0x57})
+	gids = mcache.GetGossipIDs([]byte{0x01, 0x00})
 	if len(gids) != 20 {
 		t.Fatalf("Expected 20 gossip IDs; got %d", len(gids))
 	}
 
 	for i := 0; i < 10; i++ {
 		mid := msgID(msgs[i])
-		if mid != gids[10+i] {
+		if !bytes.Equal(mid, gids[10+i]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
 
 	for i := 10; i < 20; i++ {
 		mid := msgID(msgs[i])
-		if mid != gids[i-10] {
+		if !bytes.Equal(mid, gids[i-10]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
@@ -125,28 +126,28 @@ func TestMessageCache(t *testing.T) {
 		}
 	}
 
-	gids = mcache.GetGossipIDs([]byte{0x7e, 0x57})
+	gids = mcache.GetGossipIDs([]byte{0x01, 0x00})
 	if len(gids) != 30 {
 		t.Fatalf("Expected 30 gossip IDs; got %d", len(gids))
 	}
 
 	for i := 0; i < 10; i++ {
 		mid := msgID(msgs[50+i])
-		if mid != gids[i] {
+		if !bytes.Equal(mid, gids[i]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
 
 	for i := 10; i < 20; i++ {
 		mid := msgID(msgs[30+i])
-		if mid != gids[i] {
+		if !bytes.Equal(mid, gids[i]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
 
 	for i := 20; i < 30; i++ {
 		mid := msgID(msgs[10+i])
-		if mid != gids[i] {
+		if !bytes.Equal(mid, gids[i]) {
 			t.Fatalf("GossipID mismatch for message %d", i)
 		}
 	}
@@ -157,11 +158,11 @@ func makeTestMessage(n int) *pb.Message {
 	seqno := make([]byte, 8)
 	binary.BigEndian.PutUint64(seqno, uint64(n))
 	data := []byte(fmt.Sprintf("%d", n))
-	bitmask := []byte{0x7e, 0x57}
+	bitmask := []byte{0x01, 0x00}
 	return &pb.Message{
 		Data:    data,
 		Bitmask: bitmask,
-		From:    []byte([]byte{0x7e, 0x57}),
+		From:    []byte([]byte{0x01, 0x00}),
 		Seqno:   seqno,
 	}
 }

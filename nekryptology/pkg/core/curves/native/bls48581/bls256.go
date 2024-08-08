@@ -42,7 +42,7 @@ func ceil(a int, b int) int {
 
 /* output u \in F_p */
 func Hash_to_field(hash int, hlen int, DST []byte, M []byte, ctr int) []*FP {
-	q := NewBIGints(Modulus, nil)
+	q := NewBIGints(Modulus)
 	nbq := q.nbits()
 	L := ceil(nbq+AESKEY*8, 8)
 	var u []*FP
@@ -53,7 +53,7 @@ func Hash_to_field(hash int, hlen int, DST []byte, M []byte, ctr int) []*FP {
 		for j := 0; j < L; j++ {
 			fd[j] = OKM[i*L+j]
 		}
-		u = append(u, NewFPbig(DBIG_fromBytes(fd).ctmod(q, uint(8*L-nbq), nil), nil))
+		u = append(u, NewFPbig(DBIG_fromBytes(fd).ctmod(q, uint(8*L-nbq))))
 	}
 	return u
 }
@@ -65,15 +65,15 @@ func Bls256_hash_to_point(M []byte) *ECP {
 
 	P := ECP_map2point(u[0])
 	P1 := ECP_map2point(u[1])
-	P.Add(P1, nil)
+	P.Add(P1)
 	P.Cfp()
-	P.Affine(nil)
+	P.Affine()
 	return P
 }
 
 func Init() int {
 	G := ECP8_generator()
-	if G.Is_infinity(nil) {
+	if G.Is_infinity() {
 		return BLS_FAIL
 	}
 	G2_TAB = precomp(G)
@@ -82,7 +82,7 @@ func Init() int {
 
 /* generate key pair, private key S, public key W */
 func KeyPairGenerate(IKM []byte, S []byte, W []byte) int {
-	r := NewBIGints(CURVE_Order, nil)
+	r := NewBIGints(CURVE_Order)
 	nbr := r.nbits()
 	L := ceil(3*ceil(nbr, 8), 2)
 	LEN := ext.InttoBytes(L, 2)
@@ -93,7 +93,7 @@ func KeyPairGenerate(IKM []byte, S []byte, W []byte) int {
 	AIKM[len(IKM)] = 0
 
 	G := ECP8_generator()
-	if G.Is_infinity(nil) {
+	if G.Is_infinity() {
 		return BLS_FAIL
 	}
 	SALT := []byte("BLS-SIG-KEYGEN-SALT-")
@@ -101,10 +101,10 @@ func KeyPairGenerate(IKM []byte, S []byte, W []byte) int {
 	OKM := ext.HKDF_Expand(ext.MC_SHA2, HASH_TYPE, L, PRK, LEN)
 
 	dx := DBIG_fromBytes(OKM[:])
-	s := dx.ctmod(r, uint(8*L-nbr), nil)
+	s := dx.ctmod(r, uint(8*L-nbr))
 	s.ToBytes(S)
 	// SkToPk
-	G = G2mul(G, s, nil)
+	G = G2mul(G, s)
 	G.ToBytes(W, true)
 	return BLS_OK
 }
@@ -113,7 +113,7 @@ func KeyPairGenerate(IKM []byte, S []byte, W []byte) int {
 func Core_Sign(SIG []byte, M []byte, S []byte) int {
 	D := Bls256_hash_to_point(M)
 	s := FromBytes(S)
-	D = G1mul(D, s, nil)
+	D = G1mul(D, s)
 	D.ToBytes(SIG, true)
 	return BLS_OK
 }
@@ -124,21 +124,21 @@ func Core_Verify(SIG []byte, M []byte, W []byte) int {
 	HM := Bls256_hash_to_point(M)
 
 	D := ECP_fromBytes(SIG)
-	if !G1member(D, nil) {
+	if !G1member(D) {
 		return BLS_FAIL
 	}
-	D.Neg(nil)
+	D.Neg()
 
 	PK := ECP8_fromBytes(W)
-	if !G2member(PK, nil) {
+	if !G2member(PK) {
 		return BLS_FAIL
 	}
 
 	// Use new multi-pairing mechanism
-	r := Initmp(nil)
+	r := Initmp()
 	Another_pc(r, G2_TAB, D)
-	Another(r, PK, HM, nil)
-	v := Miller(r, nil)
+	Another(r, PK, HM)
+	v := Miller(r)
 
 	//.. or alternatively
 	//	G := ECP8_generator()

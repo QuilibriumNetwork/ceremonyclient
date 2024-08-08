@@ -11,23 +11,20 @@ BINARIES_DIR="$ROOT_DIR/target/release"
 
 pushd "$NODE_DIR" > /dev/null
 
-export CGO_ENABLED=1
-export GOEXPERIMENT=arenas 
-
 os_type="$(uname)"
 case "$os_type" in
     "Darwin")
         # Check if the architecture is ARM
         if [[ "$(uname -m)" == "arm64" ]]; then
             # MacOS ld doesn't support -Bstatic and -Bdynamic, so it's important that there is only a static version of the library
-            go build -ldflags "-linkmode 'external' -extldflags '-L$BINARIES_DIR -lvdf -lbls48581 -ldl -lm'" "$@"
+            go build "$@"
         else
             echo "Unsupported platform"
             exit 1
         fi
         ;;
     "Linux")
-        go build -ldflags "-linkmode 'external' -extldflags '-L$BINARIES_DIR -Wl,-Bstatic -lvdf -lbls48581 -Wl,-Bdynamic -ldl -lm'" "$@"
+        go build "$@"
         ;;
     *)
         echo "Unsupported platform"

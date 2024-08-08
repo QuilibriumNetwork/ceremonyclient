@@ -45,7 +45,7 @@ func (gt *gossipTracer) Start(bs *BlossomSubRouter) {
 }
 
 // track a promise to deliver a message from a list of msgIDs we are requesting
-func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
+func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs [][]byte) {
 	if gt == nil {
 		return
 	}
@@ -56,10 +56,10 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 	gt.Lock()
 	defer gt.Unlock()
 
-	promises, ok := gt.promises[mid]
+	promises, ok := gt.promises[string(mid)]
 	if !ok {
 		promises = make(map[peer.ID]time.Time)
-		gt.promises[mid] = promises
+		gt.promises[string(mid)] = promises
 	}
 
 	_, ok = promises[p]
@@ -70,7 +70,7 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 			peerPromises = make(map[string]struct{})
 			gt.peerPromises[p] = peerPromises
 		}
-		peerPromises[mid] = struct{}{}
+		peerPromises[string(mid)] = struct{}{}
 	}
 }
 
@@ -122,17 +122,17 @@ func (gt *gossipTracer) fulfillPromise(msg *Message) {
 	gt.Lock()
 	defer gt.Unlock()
 
-	promises, ok := gt.promises[mid]
+	promises, ok := gt.promises[string(mid)]
 	if !ok {
 		return
 	}
-	delete(gt.promises, mid)
+	delete(gt.promises, string(mid))
 
 	// delete the promise for all peers that promised it, as they have no way to fulfill it.
 	for p := range promises {
 		peerPromises, ok := gt.peerPromises[p]
 		if ok {
-			delete(peerPromises, mid)
+			delete(peerPromises, string(mid))
 			if len(peerPromises) == 0 {
 				delete(gt.peerPromises, p)
 			}

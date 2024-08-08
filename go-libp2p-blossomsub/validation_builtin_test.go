@@ -20,6 +20,18 @@ import (
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 )
 
+func getBlossomSubsWithOptionC(ctx context.Context, hs []host.Host, cons ...func(int) Option) []*PubSub {
+	var psubs []*PubSub
+	for _, h := range hs {
+		var opts []Option
+		for i, c := range cons {
+			opts = append(opts, c(i))
+		}
+		psubs = append(psubs, getBlossomSub(ctx, h, opts...))
+	}
+	return psubs
+}
+
 var rng *rand.Rand
 
 func init() {
@@ -38,8 +50,8 @@ func testBasicSeqnoValidator(t *testing.T, ttl time.Duration) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
-	psubs := getPubsubsWithOptionC(ctx, hosts,
+	hosts := getDefaultHosts(t, 20)
+	psubs := getBlossomSubsWithOptionC(ctx, hosts,
 		func(i int) Option {
 			return WithDefaultValidator(NewBasicSeqnoValidator(newMockPeerMetadataStore()))
 		},
@@ -49,13 +61,19 @@ func testBasicSeqnoValidator(t *testing.T, ttl time.Duration) {
 	)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		msgs = append(msgs, subch...)
 	}
 
 	// connectAll(t, hosts)
@@ -68,7 +86,7 @@ func testBasicSeqnoValidator(t *testing.T, ttl time.Duration) {
 
 		owner := rng.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, bitmasks[owner].bitmask, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -86,8 +104,8 @@ func TestBasicSeqnoValidatorReplay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
-	psubs := getPubsubsWithOptionC(ctx, hosts[:19],
+	hosts := getDefaultHosts(t, 20)
+	psubs := getBlossomSubsWithOptionC(ctx, hosts[:19],
 		func(i int) Option {
 			return WithDefaultValidator(NewBasicSeqnoValidator(newMockPeerMetadataStore()))
 		},
@@ -98,13 +116,19 @@ func TestBasicSeqnoValidatorReplay(t *testing.T) {
 	_ = newReplayActor(t, ctx, hosts[19])
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		msgs = append(msgs, subch...)
 	}
 
 	sparseConnect(t, hosts)
@@ -116,7 +140,7 @@ func TestBasicSeqnoValidatorReplay(t *testing.T) {
 
 		owner := rng.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, bitmasks[owner].bitmask, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -169,7 +193,7 @@ type replayActor struct {
 
 func newReplayActor(t *testing.T, ctx context.Context, h host.Host) *replayActor {
 	replay := &replayActor{t: t, ctx: ctx, h: h, out: make(map[peer.ID]network.Stream)}
-	h.SetStreamHandler(FloodSubID, replay.handleStream)
+	h.SetStreamHandler(BlossomSubID_v2, replay.handleStream)
 	h.Network().Notify(&network.NotifyBundle{ConnectedF: replay.connected})
 	return replay
 }
@@ -246,7 +270,7 @@ func (r *replayActor) replay(msg *pb.Message) {
 
 		var peers []peer.ID
 		r.mx.Lock()
-		for p, _ := range r.out {
+		for p := range r.out {
 			if rng.Intn(2) > 0 {
 				peers = append(peers, p)
 			}
@@ -262,7 +286,7 @@ func (r *replayActor) replay(msg *pb.Message) {
 }
 
 func (r *replayActor) handleConnected(p peer.ID) {
-	s, err := r.h.NewStream(r.ctx, p, FloodSubID)
+	s, err := r.h.NewStream(r.ctx, p, BlossomSubID_v2)
 	if err != nil {
 		r.t.Logf("replay: error opening stream: %s", err)
 		return

@@ -1,11 +1,14 @@
 package blossomsub
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,8 +26,8 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultMaximumMessageSize is 16.7 MB.
-const DefaultMaxMessageSize = 1 << 24
+// DefaultMaximumMessageSize is 1 MB.
+const DefaultMaxMessageSize = 1 << 20
 
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
@@ -231,7 +234,7 @@ const (
 
 type Message struct {
 	*pb.Message
-	ID            string
+	ID            []byte
 	ReceivedFrom  peer.ID
 	ValidatorData interface{}
 	Local         bool
@@ -330,20 +333,19 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 			h.SetStreamHandler(id, ps.handleNewStream)
 		}
 	}
-	h.Network().Notify((*PubSubNotif)(ps))
+
+	go ps.watchForNewPeers(ctx)
 
 	ps.val.Start(ps)
 
 	go ps.processLoop(ctx)
-
-	(*PubSubNotif)(ps).Initialize()
 
 	return ps, nil
 }
 
 // MsgIdFunction returns a unique ID for the passed Message, and PubSub can be customized to use any
 // implementation of this function by configuring it with the Option from WithMessageIdFn.
-type MsgIdFunction func(pmsg *pb.Message) string
+type MsgIdFunction func(pmsg *pb.Message) []byte
 
 // WithMessageIdFn is an option to customize the way a message ID is computed for a pubsub message.
 // The default ID function is DefaultMsgIdFn (concatenate source and seq nr.),
@@ -495,14 +497,14 @@ func WithRawTracer(tracer RawTracer) Option {
 }
 
 // WithMaxMessageSize sets the global maximum message size for pubsub wire
-// messages. The default value is 16.7MiB (DefaultMaxMessageSize).
+// messages. The default value is 1MiB (DefaultMaxMessageSize).
 //
 // Observe the following warnings when setting this option.
 //
-// WARNING #1: Make sure to change the default protocol prefixes for floodsub
-// (FloodSubID) and BlossomSub (BlossomSubID). This avoids accidentally joining
-// the public default network, which uses the default max message size, and
-// therefore will cause messages to be dropped.
+// WARNING #1: Make sure to change the default protocol prefixes for BlossomSub
+// (BlossomSubID). This avoids accidentally joining the public default network,
+// which uses the default max message size, and therefore will cause messages to
+// be dropped.
 //
 // WARNING #2: Reducing the default max message limit is fine, if you are
 // certain that your application messages will not exceed the new limit.
@@ -622,22 +624,13 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case bitmask := <-p.rmRelay:
 			p.handleRemoveRelay([]byte(bitmask))
 		case preq := <-p.getPeers:
-			tmap, ok := p.bitmasks[string(preq.bitmask)]
-			if preq.bitmask != nil && !ok {
+			peers := p.getPeersInBitmask(preq.bitmask)
+
+			if len(peers) == 0 {
 				preq.resp <- nil
-				continue
+			} else {
+				preq.resp <- peers
 			}
-			var peers []peer.ID
-			for p := range p.peers {
-				if preq.bitmask != nil {
-					_, ok := tmap[p]
-					if !ok {
-						continue
-					}
-				}
-				peers = append(peers, p)
-			}
-			preq.resp <- peers
 		case rpc := <-p.incoming:
 			p.handleIncomingRPC(rpc)
 
@@ -675,6 +668,47 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (p *PubSub) getPeersInBitmask(bitmask []byte) []peer.ID {
+	bitmaskSlices := SliceBitmask(bitmask)
+	var peers []peer.ID
+peerloop:
+	for _, slice := range bitmaskSlices {
+		tmap, ok := p.bitmasks[string(slice)]
+		if !ok {
+			peers = []peer.ID{}
+			break peerloop
+		}
+
+		var peerset []peer.ID
+		for p := range p.peers {
+			_, ok := tmap[p]
+			if !ok {
+				continue
+			}
+			peerset = append(peerset, p)
+		}
+
+		if len(peers) == 0 {
+			peers = peerset
+		} else {
+			var update []peer.ID
+			for _, p := range peers {
+				if slices.Contains(peerset, p) {
+					update = append(update, p)
+				}
+			}
+
+			peers = update
+
+			if len(update) == 0 {
+				break peerloop
+			}
+		}
+	}
+
+	return peers
 }
 
 func (p *PubSub) handlePendingPeers() {
@@ -975,14 +1009,13 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
 // Only called from processLoop.
 func (p *PubSub) notifySubs(msg *Message) {
 	bitmask := msg.GetBitmask()
-	subs := p.mySubs[string(bitmask)]
+	slices := SliceBitmask(bitmask)
+	// o := rand.Intn(len(slices))
+	subs := p.mySubs[string(slices[0])]
 	for f := range subs {
 		select {
 		case f.ch <- msg:
-		case <-time.After(5 * time.Millisecond):
-			// it's unreasonable to immediately fall over because a subscriber didn't
-			// answer, message delivery sometimes lands next nanosecond and dropping
-			// it when there's room is absurd.
+		default:
 			p.tracer.UndeliverableMessage(msg)
 			log.Infof("Can't deliver message to subscription for bitmask %x; subscriber too slow", bitmask)
 		}
@@ -990,14 +1023,14 @@ func (p *PubSub) notifySubs(msg *Message) {
 }
 
 // seenMessage returns whether we already saw this message before
-func (p *PubSub) seenMessage(id string) bool {
-	return p.seenMessages.Has(id)
+func (p *PubSub) seenMessage(id []byte) bool {
+	return p.seenMessages.Has(string(id))
 }
 
 // markSeen marks a message as seen such that seenMessage returns `true' for the given id
 // returns true if the message was freshly marked
-func (p *PubSub) markSeen(id string) bool {
-	return p.seenMessages.Add(id)
+func (p *PubSub) markSeen(id []byte) bool {
+	return p.seenMessages.Add(string(id))
 }
 
 // subscribedToMessage returns whether we are subscribed to one of the bitmasks
@@ -1008,9 +1041,15 @@ func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
 	}
 
 	bitmask := msg.GetBitmask()
-	_, ok := p.mySubs[string(bitmask)]
+	slices := SliceBitmask(bitmask)
+	for _, slice := range slices {
+		_, ok := p.mySubs[string(slice)]
+		if !ok {
+			return false
+		}
+	}
 
-	return ok
+	return true
 }
 
 // canRelayMsg returns whether we are able to relay for one of the bitmasks
@@ -1021,9 +1060,15 @@ func (p *PubSub) canRelayMsg(msg *pb.Message) bool {
 	}
 
 	bitmask := msg.GetBitmask()
-	relays := p.myRelays[string(bitmask)]
+	slices := SliceBitmask(bitmask)
+	for _, slice := range slices {
+		relays := p.myRelays[string(slice)]
+		if relays > 0 {
+			return true
+		}
+	}
 
-	return relays > 0
+	return false
 }
 
 func (p *PubSub) notifyLeave(bitmask []byte, pid peer.ID) {
@@ -1049,7 +1094,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		var err error
 		subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
 		if err != nil {
-			log.Debugf("subscription filter error: %s; ignoring RPC", err)
+			log.Debugf("subscription filter error: %s; ignoring RPC\n", err)
 			return
 		}
 	}
@@ -1103,7 +1148,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				continue
 			}
 
-			p.pushMsg(&Message{pmsg, "", rpc.from, nil, false})
+			p.pushMsg(&Message{pmsg, []byte{}, rpc.from, nil, false})
 		}
 	}
 
@@ -1111,8 +1156,10 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 }
 
 // DefaultMsgIdFn returns a unique ID of the passed Message
-func DefaultMsgIdFn(pmsg *pb.Message) string {
-	return string(pmsg.GetFrom()) + string(pmsg.GetSeqno())
+func DefaultMsgIdFn(pmsg *pb.Message) []byte {
+	h := sha256.New()
+	h.Write(pmsg.Data)
+	return h.Sum([]byte{0x01})
 }
 
 // DefaultPeerFilter accepts all peers on all bitmasks
@@ -1233,59 +1280,75 @@ func (p *PubSub) PeerScore(pr peer.ID) float64 {
 	return p.rt.PeerScore(pr)
 }
 
-// Join joins the bitmask and returns a Bitmask handle. Only one Bitmask handle should exist per bitmask, and Join will error if
-// the Bitmask handle already exists.
-func (p *PubSub) Join(bitmask []byte, opts ...BitmaskOpt) (*Bitmask, error) {
-	t, ok, err := p.tryJoin(bitmask, opts...)
-	if err != nil {
-		return nil, err
+// Join joins the bitmasks and returns a set of Bitmask handles. Only one Bitmask
+// handle should exist per bit, and Join will error if all the Bitmask handles already exist.
+func (p *PubSub) Join(bitmask []byte, opts ...BitmaskOpt) ([]*Bitmask, error) {
+	ts, news, errs := p.tryJoin(bitmask, opts...)
+	if len(errs) != 0 {
+		return nil, errors.Join(errs...)
 	}
 
-	if !ok {
+	if !slices.Contains(news, true) {
 		return nil, fmt.Errorf("bitmask already exists")
 	}
 
-	return t, nil
+	return ts, nil
 }
 
 // tryJoin is an internal function that tries to join a bitmask
 // Returns the bitmask if it can be created or found
 // Returns true if the bitmask was newly created, false otherwise
 // Can be removed once pubsub.Publish() and pubsub.Subscribe() are removed
-func (p *PubSub) tryJoin(bitmask []byte, opts ...BitmaskOpt) (*Bitmask, bool, error) {
+func (p *PubSub) tryJoin(bitmask []byte, opts ...BitmaskOpt) ([]*Bitmask, []bool, []error) {
 	if p.subFilter != nil && !p.subFilter.CanSubscribe(bitmask) {
-		return nil, false, fmt.Errorf("bitmask is not allowed by the subscription filter")
+		return nil, nil, []error{fmt.Errorf("bitmask is not allowed by the subscription filter")}
 	}
 
-	t := &Bitmask{
-		p:           p,
-		bitmask:     bitmask,
-		evtHandlers: make(map[*BitmaskEventHandler]struct{}),
-	}
+	sliced := SliceBitmask(bitmask)
+	var bitmasks []*Bitmask
+	var newBitmasks []bool
+	var errors []error
 
-	for _, opt := range opts {
-		err := opt(t)
-		if err != nil {
-			return nil, false, err
+loop:
+	for _, slice := range sliced {
+		slice := slice
+
+		t := &Bitmask{
+			p:           p,
+			bitmask:     slice,
+			evtHandlers: make(map[*BitmaskEventHandler]struct{}),
+		}
+
+		for _, opt := range opts {
+			err := opt(t)
+			if err != nil {
+				errors = append(errors, err)
+				continue loop
+			}
+		}
+
+		resp := make(chan *Bitmask, 1)
+		select {
+		case t.p.addBitmask <- &addBitmaskReq{
+			bitmask: t,
+			resp:    resp,
+		}:
+		case <-t.p.ctx.Done():
+			errors = append(errors, t.p.ctx.Err())
+			continue loop
+		}
+		returnedBitmask := <-resp
+
+		if returnedBitmask != t {
+			bitmasks = append(bitmasks, returnedBitmask)
+			newBitmasks = append(newBitmasks, false)
+		} else {
+			bitmasks = append(bitmasks, t)
+			newBitmasks = append(newBitmasks, true)
 		}
 	}
 
-	resp := make(chan *Bitmask, 1)
-	select {
-	case t.p.addBitmask <- &addBitmaskReq{
-		bitmask: t,
-		resp:    resp,
-	}:
-	case <-t.p.ctx.Done():
-		return nil, false, t.p.ctx.Err()
-	}
-	returnedBitmask := <-resp
-
-	if returnedBitmask != t {
-		return returnedBitmask, false, nil
-	}
-
-	return t, true, nil
+	return bitmasks, newBitmasks, errors
 }
 
 type addSubReq struct {
@@ -1300,14 +1363,24 @@ type SubOpt func(sub *Subscription) error
 // before the subscription is processed by the pubsub main loop and propagated to our peers.
 //
 // Deprecated: use pubsub.Join() and bitmask.Subscribe() instead
-func (p *PubSub) Subscribe(bitmask []byte, opts ...SubOpt) (*Subscription, error) {
+func (p *PubSub) Subscribe(bitmask []byte, opts ...SubOpt) ([]*Subscription, error) {
 	// ignore whether the bitmask was newly created or not, since either way we have a valid bitmask to work with
-	bitmaskHandle, _, err := p.tryJoin(bitmask)
-	if err != nil {
-		return nil, err
+	bitmaskHandles, _, errs := p.tryJoin(bitmask)
+	if len(errs) != 0 {
+		return nil, errors.Join(errs...)
 	}
 
-	return bitmaskHandle.Subscribe(opts...)
+	var subs []*Subscription
+	for _, handle := range bitmaskHandles {
+		sub, err := handle.Subscribe(opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		subs = append(subs, sub)
+	}
+
+	return subs, nil
 }
 
 // WithBufferSize is a Subscribe option to customize the size of the subscribe output buffer.
@@ -1335,17 +1408,20 @@ func (p *PubSub) GetBitmasks() []string {
 	return <-out
 }
 
-// Publish publishes data to the given bitmask.
-//
-// Deprecated: use pubsub.Join() and bitmask.Publish() instead
-func (p *PubSub) Publish(bitmask []byte, data []byte, opts ...PubOpt) error {
-	// ignore whether the bitmask was newly created or not, since either way we have a valid bitmask to work with
-	t, _, err := p.tryJoin(bitmask)
-	if err != nil {
-		return err
+func (p *PubSub) Publish(ctx context.Context, bitmask []byte, data []byte, opts ...PubOpt) error {
+	peers := p.ListPeers(bitmask)
+	if len(peers) == 0 {
+		return ErrBitmaskClosed
 	}
 
-	return t.Publish(context.TODO(), data, opts...)
+	slices := SliceBitmask(bitmask)
+	o := rand.Intn(len(slices))
+	b, _, errs := p.tryJoin(slices[o])
+	if len(errs) != 0 {
+		return errors.Join(errs...)
+	}
+
+	return b[0].Publish(ctx, bitmask, data, opts...)
 }
 
 func (p *PubSub) nextSeqno() []byte {
@@ -1429,4 +1505,35 @@ type RelayCancelFunc func()
 type addRelayReq struct {
 	bitmask []byte
 	resp    chan RelayCancelFunc
+}
+
+func SliceBitmask(bitmask []byte) [][]byte {
+	sliced := [][]byte{}
+	if bytes.Equal(bitmask, make([]byte, len(bitmask))) {
+		sliced = append(sliced, bitmask)
+	} else {
+		for i, b := range bitmask {
+			if b == 0 {
+				continue
+			}
+
+			// fast: one bit in byte
+			if b&(b-1) == 0 {
+				slice := make([]byte, len(bitmask))
+				slice[i] = b
+				sliced = append(sliced, slice)
+				continue
+			}
+
+			for j := 7; j >= 0; j-- {
+				if (b>>j)&1 == 1 {
+					slice := make([]byte, len(bitmask))
+					slice[i] = 1 << j
+					sliced = append(sliced, slice)
+				}
+			}
+		}
+	}
+
+	return sliced
 }

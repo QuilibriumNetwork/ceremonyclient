@@ -11,24 +11,22 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
-
-	bhost "github.com/libp2p/go-libp2p/p2p/host/blank"
-	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
-
-	"github.com/libp2p/go-msgio/protoio"
+	"github.com/libp2p/go-msgio"
 )
 
 func testWithTracer(t *testing.T, tracer EventTracer) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts,
+		WithMessageIdFn(func(pmsg *pb.Message) []byte { return pmsg.Data }),
 		WithEventTracer(tracer),
 		// to bootstrap from star topology
 		WithPeerExchange(true),
@@ -49,7 +47,7 @@ func testWithTracer(t *testing.T, tracer EventTracer) {
 
 	// add a validator that rejects some messages to exercise those code paths in the tracer
 	for _, ps := range psubs {
-		ps.RegisterBitmaskValidator([]byte{0x7e, 57}, func(ctx context.Context, p peer.ID, msg *Message) bool {
+		ps.RegisterBitmaskValidator([]byte{0x01, 0x00}, func(ctx context.Context, p peer.ID, msg *Message) bool {
 			if string(msg.Data) == "invalid!" {
 				return false
 			} else {
@@ -79,8 +77,14 @@ func testWithTracer(t *testing.T, tracer EventTracer) {
 
 	// build the mesh
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0x7e, 0x57})
+		b, err := ps.Join([]byte{0x01, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x01, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,8 +95,8 @@ func testWithTracer(t *testing.T, tracer EventTracer) {
 					return
 				}
 			}
-		}(sub)
-		subs = append(subs, sub)
+		}(sub[0])
+		subs = append(subs, sub...)
 	}
 
 	// wait for the mesh to build
@@ -101,10 +105,14 @@ func testWithTracer(t *testing.T, tracer EventTracer) {
 	// publish some messages
 	for i := 0; i < 20; i++ {
 		if i%7 == 0 {
-			psubs[i].Publish([]byte{0x7e, 0x57}, []byte("invalid!"))
+			bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("invalid!"))
 		} else {
-			msg := []byte(fmt.Sprintf("message %d", i))
-			psubs[i].Publish([]byte{0x7e, 0x57}, msg)
+			if i%9 == 0 {
+				bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("dupe"))
+			} else {
+				msg := []byte(fmt.Sprintf("message %d", i))
+				bitmasks[i].Publish(ctx, bitmasks[i].bitmask, msg)
+			}
 		}
 	}
 
@@ -125,7 +133,6 @@ type traceStats struct {
 }
 
 func (t *traceStats) process(evt *pb.TraceEvent) {
-	// fmt.Printf("process event %s\n", evt.GetType())
 	switch evt.GetType() {
 	case pb.TraceEvent_PUBLISH_MESSAGE:
 		t.publish++
@@ -244,10 +251,16 @@ func TestPBTracer(t *testing.T) {
 	}
 	defer f.Close()
 
-	r := protoio.NewDelimitedReader(f, 1<<20)
+	r := msgio.NewVarintReaderSize(f, DefaultMaxMessageSize)
+
 	for {
 		evt.Reset()
-		err := r.ReadMsg(&evt)
+		v, err := r.ReadMsg()
+		if err != nil {
+			break
+		}
+
+		err = proto.Unmarshal(v, &evt)
 		if err != nil {
 			break
 		}
@@ -271,17 +284,23 @@ func (mrt *mockRemoteTracer) handleStream(s network.Stream) {
 		panic(err)
 	}
 
-	r := protoio.NewDelimitedReader(gzr, 1<<24)
+	r := msgio.NewVarintReader(gzr)
 
 	var batch pb.TraceEventBatch
 	for {
 		batch.Reset()
-		err := r.ReadMsg(&batch)
+
+		v, err := r.ReadMsg()
 		if err != nil {
 			if err != io.EOF {
 				s.Reset()
 			}
 			return
+		}
+
+		err = proto.Unmarshal(v, &batch)
+		if err != nil {
+			break
 		}
 
 		mrt.mx.Lock()
@@ -302,10 +321,9 @@ func TestRemoteTracer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h1 := bhost.NewBlankHost(swarmt.GenSwarm(t))
-	h2 := bhost.NewBlankHost(swarmt.GenSwarm(t))
-	defer h1.Close()
-	defer h2.Close()
+	hosts := getDefaultHosts(t, 2)
+	h1 := hosts[0]
+	h2 := hosts[1]
 
 	mrt := &mockRemoteTracer{}
 	h1.SetStreamHandler(RemoteTracerProtoID, mrt.handleStream)

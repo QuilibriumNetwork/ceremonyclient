@@ -109,7 +109,7 @@ func (t *tagTracer) addDeliveryTag(bitmask []byte) {
 		return
 	}
 
-	name := fmt.Sprintf("pubsub-deliveries:%s", bitmask)
+	name := "pubsub-deliveries:" + string(bitmask)
 	t.Lock()
 	defer t.Unlock()
 	tag, err := t.decayer.RegisterDecayingTag(
@@ -162,7 +162,7 @@ func (t *tagTracer) bumpTagsForMessage(p peer.ID, msg *Message) {
 func (t *tagTracer) nearFirstPeers(msg *Message) []peer.ID {
 	t.Lock()
 	defer t.Unlock()
-	peersMap, ok := t.nearFirst[t.idGen.ID(msg)]
+	peersMap, ok := t.nearFirst[string(t.idGen.ID(msg))]
 	if !ok {
 		return nil
 	}
@@ -194,7 +194,7 @@ func (t *tagTracer) DeliverMessage(msg *Message) {
 
 	// delete the delivery state for this message
 	t.Lock()
-	delete(t.nearFirst, t.idGen.ID(msg))
+	delete(t.nearFirst, string(t.idGen.ID(msg)))
 	t.Unlock()
 }
 
@@ -216,10 +216,10 @@ func (t *tagTracer) ValidateMessage(msg *Message) {
 
 	// create map to start tracking the peers who deliver while we're validating
 	id := t.idGen.ID(msg)
-	if _, exists := t.nearFirst[id]; exists {
+	if _, exists := t.nearFirst[string(id)]; exists {
 		return
 	}
-	t.nearFirst[id] = make(map[peer.ID]struct{})
+	t.nearFirst[string(id)] = make(map[peer.ID]struct{})
 }
 
 func (t *tagTracer) DuplicateMessage(msg *Message) {
@@ -227,7 +227,7 @@ func (t *tagTracer) DuplicateMessage(msg *Message) {
 	defer t.Unlock()
 
 	id := t.idGen.ID(msg)
-	peers, ok := t.nearFirst[id]
+	peers, ok := t.nearFirst[string(id)]
 	if !ok {
 		return
 	}
@@ -247,7 +247,7 @@ func (t *tagTracer) RejectMessage(msg *Message, reason string) {
 	case RejectValidationIgnored:
 		fallthrough
 	case RejectValidationFailed:
-		delete(t.nearFirst, t.idGen.ID(msg))
+		delete(t.nearFirst, string(t.idGen.ID(msg)))
 	}
 }
 

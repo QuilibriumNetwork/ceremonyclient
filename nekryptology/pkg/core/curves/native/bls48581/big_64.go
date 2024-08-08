@@ -24,7 +24,6 @@
 package bls48581
 
 import (
-	"arena"
 	"math/bits"
 	"strconv"
 
@@ -47,8 +46,8 @@ type DBIG struct {
 /* Note that because of the lack of a 128-bit integer, 32 and 64-bit code needs to be done differently */
 
 /* return a*b as DBIG */
-func mul(a *BIG, b *BIG, mem *arena.Arena) *DBIG {
-	c := NewDBIG(mem)
+func mul(a *BIG, b *BIG) *DBIG {
+	c := NewDBIG()
 	carry := Chunk(0)
 
 	for i := 0; i < NLEN; i++ {
@@ -63,8 +62,8 @@ func mul(a *BIG, b *BIG, mem *arena.Arena) *DBIG {
 }
 
 /* return a^2 as DBIG */
-func sqr(a *BIG, mem *arena.Arena) *DBIG {
-	c := NewDBIG(mem)
+func sqr(a *BIG) *DBIG {
+	c := NewDBIG()
 	carry := Chunk(0)
 
 	for i := 0; i < NLEN; i++ {
@@ -88,7 +87,7 @@ func sqr(a *BIG, mem *arena.Arena) *DBIG {
 	return c
 }
 
-func monty(md *BIG, mc Chunk, d *DBIG, mem *arena.Arena) *BIG {
+func monty(md *BIG, mc Chunk, d *DBIG) *BIG {
 	carry := Chunk(0)
 	m := Chunk(0)
 	for i := 0; i < NLEN; i++ {
@@ -111,7 +110,7 @@ func monty(md *BIG, mc Chunk, d *DBIG, mem *arena.Arena) *BIG {
 		d.w[NLEN+i] += carry
 	}
 
-	b := NewBIG(mem)
+	b := NewBIG()
 	for i := 0; i < NLEN; i++ {
 		b.w[i] = d.w[NLEN+i]
 	}
@@ -180,39 +179,27 @@ func (r *BIG) fshl(k uint) int {
 	return int(r.w[NLEN-1] >> ((8 * MODBYTES) % BASEBITS)) /* return excess - only used in ff.c */
 }
 
-func NewBIG(mem *arena.Arena) *BIG {
+func NewBIG() *BIG {
 	var b *BIG
-	if mem != nil {
-		b = arena.New[BIG](mem)
-	} else {
-		b = new(BIG)
-	}
+	b = new(BIG)
 	for i := 0; i < NLEN; i++ {
 		b.w[i] = 0
 	}
 	return b
 }
 
-func NewBIGints(x [NLEN]Chunk, mem *arena.Arena) *BIG {
+func NewBIGints(x [NLEN]Chunk) *BIG {
 	var b *BIG
-	if mem != nil {
-		b = arena.New[BIG](mem)
-	} else {
-		b = new(BIG)
-	}
+	b = new(BIG)
 	for i := 0; i < NLEN; i++ {
 		b.w[i] = x[i]
 	}
 	return b
 }
 
-func NewBIGint(x int, mem *arena.Arena) *BIG {
+func NewBIGint(x int) *BIG {
 	var b *BIG
-	if mem != nil {
-		b = arena.New[BIG](mem)
-	} else {
-		b = new(BIG)
-	}
+	b = new(BIG)
 	b.w[0] = Chunk(x)
 	for i := 1; i < NLEN; i++ {
 		b.w[i] = 0
@@ -220,26 +207,18 @@ func NewBIGint(x int, mem *arena.Arena) *BIG {
 	return b
 }
 
-func NewBIGcopy(x *BIG, mem *arena.Arena) *BIG {
+func NewBIGcopy(x *BIG) *BIG {
 	var b *BIG
-	if mem != nil {
-		b = arena.New[BIG](mem)
-	} else {
-		b = new(BIG)
-	}
+	b = new(BIG)
 	for i := 0; i < NLEN; i++ {
 		b.w[i] = x.w[i]
 	}
 	return b
 }
 
-func NewBIGdcopy(x *DBIG, mem *arena.Arena) *BIG {
+func NewBIGdcopy(x *DBIG) *BIG {
 	var b *BIG
-	if mem != nil {
-		b = arena.New[BIG](mem)
-	} else {
-		b = new(BIG)
-	}
+	b = new(BIG)
 	for i := 0; i < NLEN; i++ {
 		b.w[i] = x.w[i]
 	}
@@ -362,7 +341,7 @@ func (r *BIG) shl(k uint) {
 
 /* return number of bits */
 func (r *BIG) nbits() int {
-	t := NewBIGcopy(r, nil)
+	t := NewBIGcopy(r)
 	k := NLEN - 1
 	t.norm()
 	for k >= 0 && t.w[k] == 0 {
@@ -402,7 +381,7 @@ func (r *BIG) ToString() string {
 	}
 
 	for i := len - 1; i >= 0; i-- {
-		b := NewBIGcopy(r, nil)
+		b := NewBIGcopy(r)
 
 		b.shr(uint(i * 4))
 		s += strconv.FormatInt(int64(b.w[0]&15), 16)
@@ -439,8 +418,8 @@ func (r *BIG) inc(x int) {
 }
 
 /* this*=c and catch overflow in DBIG */
-func (r *BIG) pxmul(c int, mem *arena.Arena) *DBIG {
-	m := NewDBIG(mem)
+func (r *BIG) pxmul(c int) *DBIG {
+	m := NewDBIG()
 	carry := Chunk(0)
 	for j := 0; j < NLEN; j++ {
 		carry, m.w[j] = mulAdd(r.w[j], Chunk(c), carry, m.w[j])
@@ -504,7 +483,7 @@ func (r *BIG) pmul(c int) Chunk {
 /* convert this BIG to byte array */
 func (r *BIG) tobytearray(b []byte, n int) {
 	//r.norm();
-	c := NewBIGcopy(r, nil)
+	c := NewBIGcopy(r)
 	c.norm()
 
 	for i := int(MODBYTES) - 1; i >= 0; i-- {
@@ -515,7 +494,7 @@ func (r *BIG) tobytearray(b []byte, n int) {
 
 /* convert from byte array to BIG */
 func frombytearray(b []byte, n int) *BIG {
-	m := NewBIG(nil)
+	m := NewBIG()
 	l := len(b)
 	for i := 0; i < int(MODBYTES); i++ {
 		m.fshl(8)
@@ -552,7 +531,7 @@ func (r *BIG) div3() int {
 /* return a*b where result fits in a BIG */
 func smul(a *BIG, b *BIG) *BIG {
 	carry := Chunk(0)
-	c := NewBIG(nil)
+	c := NewBIG()
 	for i := 0; i < NLEN; i++ {
 		carry = 0
 		for j := 0; j < NLEN; j++ {
@@ -609,9 +588,9 @@ func (r *BIG) mod2m(m uint) {
 
 /* a=1/a mod 2^256. This is very fast! */
 func (r *BIG) invmod2m() {
-	U := NewBIG(nil)
-	b := NewBIG(nil)
-	c := NewBIG(nil)
+	U := NewBIG()
+	b := NewBIG()
+	c := NewBIG()
 
 	U.inc(invmod256(r.lastbits(8)))
 
@@ -646,10 +625,10 @@ func (r *BIG) invmod2m() {
 	r.norm()
 }
 
-func (r *BIG) ctmod(m *BIG, bd uint, mem *arena.Arena) {
+func (r *BIG) ctmod(m *BIG, bd uint) {
 	k := bd
-	sr := NewBIG(mem)
-	c := NewBIGcopy(m, mem)
+	sr := NewBIG()
+	c := NewBIGcopy(m)
 	r.norm()
 
 	c.shl(k)
@@ -668,20 +647,20 @@ func (r *BIG) ctmod(m *BIG, bd uint, mem *arena.Arena) {
 }
 
 /* reduce this mod m */
-func (r *BIG) Mod(m *BIG, mem *arena.Arena) {
+func (r *BIG) Mod(m *BIG) {
 	k := r.nbits() - m.nbits()
 	if k < 0 {
 		k = 0
 	}
-	r.ctmod(m, uint(k), mem)
+	r.ctmod(m, uint(k))
 }
 
-func (r *BIG) ctdiv(m *BIG, bd uint, mem *arena.Arena) {
+func (r *BIG) ctdiv(m *BIG, bd uint) {
 	k := bd
-	e := NewBIGint(1, mem)
-	sr := NewBIG(mem)
-	a := NewBIGcopy(r, mem)
-	c := NewBIGcopy(m, mem)
+	e := NewBIGint(1)
+	sr := NewBIG()
+	a := NewBIGcopy(r)
+	c := NewBIGcopy(m)
 	r.norm()
 	r.zero()
 
@@ -708,17 +687,17 @@ func (r *BIG) ctdiv(m *BIG, bd uint, mem *arena.Arena) {
 }
 
 /* divide this by m */
-func (r *BIG) div(m *BIG, mem *arena.Arena) {
+func (r *BIG) div(m *BIG) {
 	k := r.nbits() - m.nbits()
 	if k < 0 {
 		k = 0
 	}
-	r.ctdiv(m, uint(k), mem)
+	r.ctdiv(m, uint(k))
 }
 
 /* get 8*MODBYTES size random number */
 func Random(rng *ext.RAND) *BIG {
-	m := NewBIG(nil)
+	m := NewBIG()
 	var j int = 0
 	var r byte = 0
 	/* generate random BIG */
@@ -740,7 +719,7 @@ func Random(rng *ext.RAND) *BIG {
 
 /* Create random BIG in portable way, one bit at a time */
 func Randomnum(q *BIG, rng *ext.RAND) *BIG {
-	d := NewDBIG(nil)
+	d := NewDBIG()
 	var j int = 0
 	var r byte = 0
 	for i := 0; i < 2*q.nbits(); i++ {
@@ -756,7 +735,7 @@ func Randomnum(q *BIG, rng *ext.RAND) *BIG {
 		j++
 		j &= 7
 	}
-	m := d.Mod(q, nil)
+	m := d.Mod(q)
 	return m
 }
 
@@ -769,61 +748,59 @@ func Randtrunc(q *BIG, trunc int, rng *ext.RAND) *BIG {
 }
 
 /* return a*b mod m */
-func Modmul(a1, b1, m *BIG, mem *arena.Arena) *BIG {
-	a := NewBIGcopy(a1, mem)
-	b := NewBIGcopy(b1, mem)
-	a.Mod(m, mem)
-	b.Mod(m, mem)
-	d := mul(a, b, mem)
-	return d.ctmod(m, uint(m.nbits()), mem)
+func Modmul(a1, b1, m *BIG) *BIG {
+	a := NewBIGcopy(a1)
+	b := NewBIGcopy(b1)
+	a.Mod(m)
+	b.Mod(m)
+	d := mul(a, b)
+	return d.ctmod(m, uint(m.nbits()))
 }
 
 /* return a^2 mod m */
-func Modsqr(a1, m *BIG, mem *arena.Arena) *BIG {
-	a := NewBIGcopy(a1, mem)
-	a.Mod(m, mem)
-	d := sqr(a, mem)
-	return d.ctmod(m, uint(m.nbits()), mem)
+func Modsqr(a1, m *BIG) *BIG {
+	a := NewBIGcopy(a1)
+	a.Mod(m)
+	d := sqr(a)
+	return d.ctmod(m, uint(m.nbits()))
 }
 
 /* return -a mod m */
-func Modneg(a1, m *BIG, mem *arena.Arena) *BIG {
-	a := NewBIGcopy(a1, mem)
-	a.Mod(m, mem)
+func Modneg(a1, m *BIG) *BIG {
+	a := NewBIGcopy(a1)
+	a.Mod(m)
 	a.rsub(m)
 	a.norm()
 	return a
 }
 
 /* return a+b mod m */
-func ModAdd(a1, b1, m *BIG, mem *arena.Arena) *BIG {
-	a := NewBIGcopy(a1, mem)
-	b := NewBIGcopy(b1, mem)
-	a.Mod(m, mem)
-	b.Mod(m, mem)
+func ModAdd(a1, b1, m *BIG) *BIG {
+	a := NewBIGcopy(a1)
+	b := NewBIGcopy(b1)
+	a.Mod(m)
+	b.Mod(m)
 	a.Add(b)
 	a.norm()
-	a.ctmod(m, 1, mem)
+	a.ctmod(m, 1)
 	return a
 }
 
 /* Jacobi Symbol (this/p). Returns 0, 1 or -1 */
 func (r *BIG) Jacobi(p *BIG) int {
-	mem := arena.NewArena()
-	defer mem.Free()
 	m := 0
-	t := NewBIGint(0, mem)
-	x := NewBIGint(0, mem)
-	n := NewBIGint(0, mem)
-	zilch := NewBIGint(0, mem)
-	one := NewBIGint(1, mem)
+	t := NewBIGint(0)
+	x := NewBIGint(0)
+	n := NewBIGint(0)
+	zilch := NewBIGint(0)
+	one := NewBIGint(1)
 	if p.parity() == 0 || Comp(r, zilch) == 0 || Comp(p, one) <= 0 {
 		return 0
 	}
 	r.norm()
 	x.copy(r)
 	n.copy(p)
-	x.Mod(p, mem)
+	x.Mod(p)
 
 	for Comp(n, one) > 0 {
 		if Comp(x, zilch) == 0 {
@@ -840,7 +817,7 @@ func (r *BIG) Jacobi(p *BIG) int {
 		}
 		m += (n8 - 1) * (x.lastbits(2) - 1) / 4
 		t.copy(n)
-		t.Mod(x, mem)
+		t.Mod(x)
 		n.copy(x)
 		x.copy(t)
 		m %= 2
@@ -854,18 +831,16 @@ func (r *BIG) Jacobi(p *BIG) int {
 
 /* this=1/this mod p. Binary method */
 func (r *BIG) Invmodp(p *BIG) {
-	mem := arena.NewArena()
-	defer mem.Free()
-	r.Mod(p, mem)
+	r.Mod(p)
 	if r.IsZero() {
 		return
 	}
-	u := NewBIGcopy(r, mem)
-	v := NewBIGcopy(p, mem)
-	x1 := NewBIGint(1, mem)
-	x2 := NewBIGint(0, mem)
-	t := NewBIGint(0, mem)
-	one := NewBIGint(1, mem)
+	u := NewBIGcopy(r)
+	v := NewBIGcopy(p)
+	x1 := NewBIGint(1)
+	x2 := NewBIGint(0)
+	t := NewBIGint(0)
+	one := NewBIGint(1)
 	for Comp(u, one) != 0 && Comp(v, one) != 0 {
 		for u.parity() == 0 {
 			u.fshr(1)
@@ -906,23 +881,23 @@ func (r *BIG) Invmodp(p *BIG) {
 }
 
 /* return this^e mod m */
-func (r *BIG) Powmod(e1 *BIG, m *BIG, mem *arena.Arena) *BIG {
-	e := NewBIGcopy(e1, mem)
+func (r *BIG) Powmod(e1 *BIG, m *BIG) *BIG {
+	e := NewBIGcopy(e1)
 	r.norm()
 	e.norm()
-	a := NewBIGint(1, mem)
-	z := NewBIGcopy(e, mem)
-	s := NewBIGcopy(r, mem)
+	a := NewBIGint(1)
+	z := NewBIGcopy(e)
+	s := NewBIGcopy(r)
 	for true {
 		bt := z.parity()
 		z.fshr(1)
 		if bt == 1 {
-			a = Modmul(a, s, m, mem)
+			a = Modmul(a, s, m)
 		}
 		if z.IsZero() {
 			break
 		}
-		s = Modsqr(s, m, mem)
+		s = Modsqr(s, m)
 	}
 	return a
 }
