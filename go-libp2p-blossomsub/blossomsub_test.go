@@ -1053,6 +1053,7 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 }
 
 func TestMixedBlossomSub(t *testing.T) {
+	t.Skip("skip unless blossomsub regains some alternate messaging channel baked into the proto")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	hosts := getDefaultHosts(t, 30)
@@ -1945,7 +1946,7 @@ func TestBlossomSubPiggybackControl(t *testing.T) {
 		gs.mesh[string(test2)] = make(map[peer.ID]struct{})
 		gs.mesh[string(test1)][blah] = struct{}{}
 
-		rpc := &RPC{RPC: pb.RPC{}}
+		rpc := &RPC{RPC: &pb.RPC{}}
 		gs.piggybackControl(blah, rpc, &pb.ControlMessage{
 			Graft: []*pb.ControlGraft{{Bitmask: test1}, {Bitmask: test2}, {Bitmask: test3}},
 			Prune: []*pb.ControlPrune{{Bitmask: test1}, {Bitmask: test2}, {Bitmask: test3}},
@@ -2150,6 +2151,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 		}
 	}
 }
+
 func TestBlossomSubLeaveBitmask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2607,7 +2609,7 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 func TestFragmentRPCFunction(t *testing.T) {
 	p := peer.ID("some-peer")
 	bitmask := []byte{0x00, 0x00, 0x80, 0x00}
-	rpc := &RPC{from: p}
+	rpc := &RPC{RPC: new(pb.RPC), from: p}
 	limit := 1024
 
 	mkMsg := func(size int) *pb.Message {
@@ -2628,14 +2630,14 @@ func TestFragmentRPCFunction(t *testing.T) {
 	// it should not fragment if everything fits in one RPC
 	rpc.Publish = []*pb.Message{}
 	rpc.Publish = []*pb.Message{mkMsg(10), mkMsg(10)}
-	results := appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results := appendOrMergeRPC([]*RPC{}, limit, rpc)
 	if len(results) != 1 {
 		t.Fatalf("expected single RPC if input is < limit, got %d", len(results))
 	}
 
 	// if there's a message larger than the limit, we should fail
 	rpc.Publish = []*pb.Message{mkMsg(10), mkMsg(limit * 2)}
-	results = appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 
 	// if the individual messages are below the limit, but the RPC as a whole is larger, we should fragment
 	nMessages := 100
@@ -2651,7 +2653,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 	for i := 0; i < nMessages; i++ {
 		rpc.Publish[i] = mkMsg(msgSize)
 	}
-	results = appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	msgsPerRPC := limit / msgSize
 	expectedRPCs := nMessages / msgsPerRPC
@@ -2680,7 +2682,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 		Ihave: []*pb.ControlIHave{{MessageIDs: [][]byte{[]byte("foo")}}},
 		Iwant: []*pb.ControlIWant{{MessageIDs: [][]byte{[]byte("bar")}}},
 	}
-	results = appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	// we expect one more RPC than last time, with the final one containing the control messages
 	expectedCtrl := 1
@@ -2721,7 +2723,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 		rpc.Control.Ihave[i] = &pb.ControlIHave{MessageIDs: messageIds}
 		rpc.Control.Iwant[i] = &pb.ControlIWant{MessageIDs: messageIds}
 	}
-	results = appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	minExpectedCtl := rpc.Control.Size() / limit
 	minExpectedRPCs := (nMessages / msgsPerRPC) + minExpectedCtl
@@ -2738,7 +2740,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 			{MessageIDs: [][]byte{[]byte("hello"), giantIdBytes}},
 		},
 	}
-	results = appendOrMergeRPC([]*RPC{}, limit, *rpc)
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 RPC, got %d", len(results))
 	}

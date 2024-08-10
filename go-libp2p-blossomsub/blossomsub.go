@@ -1263,8 +1263,9 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 		return
 	}
 
+	outCopy := copyRPC(out)
 	// Potentially split the RPC into multiple RPCs that are below the max message size
-	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, *out)
+	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, outCopy)
 	for _, rpc := range outRPCs {
 		if rpc.Size() > bs.p.maxMessageSize {
 			// This should only happen if a single message/control is above the maxMessageSize.
@@ -1299,19 +1300,19 @@ func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
 // If an RPC is too large and can't be split further (e.g. Message data is
 // bigger than the RPC limit), then it will be returned as an oversized RPC.
 // The caller should filter out oversized RPCs.
-func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
+func appendOrMergeRPC(slice []*RPC, limit int, elems ...*RPC) []*RPC {
 	if len(elems) == 0 {
 		return slice
 	}
 
 	if len(slice) == 0 && len(elems) == 1 && elems[0].Size() < limit {
 		// Fast path: no merging needed and only one element
-		return append(slice, &elems[0])
+		return append(slice, elems[0])
 	}
 
 	out := slice
 	if len(out) == 0 {
-		out = append(out, &RPC{RPC: pb.RPC{}})
+		out = append(out, &RPC{RPC: &pb.RPC{}})
 		out[0].from = elems[0].from
 	}
 
@@ -1325,7 +1326,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 		for _, msg := range elem.GetPublish() {
 			if lastRPC.Publish = append(lastRPC.Publish, msg); lastRPC.Size() > limit {
 				lastRPC.Publish = lastRPC.Publish[:len(lastRPC.Publish)-1]
-				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC = &RPC{RPC: &pb.RPC{}, from: elem.from}
 				lastRPC.Publish = append(lastRPC.Publish, msg)
 				out = append(out, lastRPC)
 			}
@@ -1335,7 +1336,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 		for _, sub := range elem.GetSubscriptions() {
 			if lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub); lastRPC.Size() > limit {
 				lastRPC.Subscriptions = lastRPC.Subscriptions[:len(lastRPC.Subscriptions)-1]
-				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC = &RPC{RPC: &pb.RPC{}, from: elem.from}
 				lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub)
 				out = append(out, lastRPC)
 			}
@@ -1347,7 +1348,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 				lastRPC.Control = &pb.ControlMessage{}
 				if lastRPC.Size() > limit {
 					lastRPC.Control = nil
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					out = append(out, lastRPC)
 				}
 			}
@@ -1355,7 +1356,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 			for _, graft := range ctl.GetGraft() {
 				if lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft); lastRPC.Size() > limit {
 					lastRPC.Control.Graft = lastRPC.Control.Graft[:len(lastRPC.Control.Graft)-1]
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft)
 					out = append(out, lastRPC)
 				}
@@ -1364,7 +1365,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 			for _, prune := range ctl.GetPrune() {
 				if lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune); lastRPC.Size() > limit {
 					lastRPC.Control.Prune = lastRPC.Control.Prune[:len(lastRPC.Control.Prune)-1]
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune)
 					out = append(out, lastRPC)
 				}
@@ -1378,7 +1379,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					newIWant := &pb.ControlIWant{}
 					if lastRPC.Control.Iwant = append(lastRPC.Control.Iwant, newIWant); lastRPC.Size() > limit {
 						lastRPC.Control.Iwant = lastRPC.Control.Iwant[:len(lastRPC.Control.Iwant)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Iwant: []*pb.ControlIWant{newIWant},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
@@ -1387,7 +1388,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 				for _, msgID := range iwant.GetMessageIDs() {
 					if lastRPC.Control.Iwant[0].MessageIDs = append(lastRPC.Control.Iwant[0].MessageIDs, msgID); lastRPC.Size() > limit {
 						lastRPC.Control.Iwant[0].MessageIDs = lastRPC.Control.Iwant[0].MessageIDs[:len(lastRPC.Control.Iwant[0].MessageIDs)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Iwant: []*pb.ControlIWant{{MessageIDs: [][]byte{msgID}}},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
@@ -1402,7 +1403,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					newIhave := &pb.ControlIHave{Bitmask: ihave.Bitmask}
 					if lastRPC.Control.Ihave = append(lastRPC.Control.Ihave, newIhave); lastRPC.Size() > limit {
 						lastRPC.Control.Ihave = lastRPC.Control.Ihave[:len(lastRPC.Control.Ihave)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Ihave: []*pb.ControlIHave{newIhave},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
@@ -1412,7 +1413,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					lastIHave := lastRPC.Control.Ihave[len(lastRPC.Control.Ihave)-1]
 					if lastIHave.MessageIDs = append(lastIHave.MessageIDs, msgID); lastRPC.Size() > limit {
 						lastIHave.MessageIDs = lastIHave.MessageIDs[:len(lastIHave.MessageIDs)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Ihave: []*pb.ControlIHave{{Bitmask: ihave.Bitmask, MessageIDs: [][]byte{msgID}}},
 						}}, from: elem.from}
 						out = append(out, lastRPC)

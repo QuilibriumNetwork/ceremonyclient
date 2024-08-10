@@ -8,6 +8,7 @@ import (
 
 	pool "github.com/libp2p/go-buffer-pool"
 	"github.com/multiformats/go-varint"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -18,7 +19,9 @@ import (
 
 // get the initial RPC containing all of our subscriptions to send to new peers
 func (p *PubSub) getHelloPacket() *RPC {
-	var rpc RPC
+	var rpc = &RPC{
+		RPC: new(pb.RPC),
+	}
 
 	subscriptions := make(map[string]bool)
 
@@ -37,7 +40,7 @@ func (p *PubSub) getHelloPacket() *RPC {
 		}
 		rpc.Subscriptions = append(rpc.Subscriptions, as)
 	}
-	return &rpc
+	return rpc
 }
 
 func (p *PubSub) handleNewStream(s network.Stream) {
@@ -80,7 +83,9 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			continue
 		}
 
-		rpc := new(RPC)
+		rpc := &RPC{
+			RPC: new(pb.RPC),
+		}
 		err = rpc.Unmarshal(msgbytes)
 		r.ReleaseMsg(msgbytes)
 		if err != nil {
@@ -194,14 +199,14 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 
 func rpcWithSubs(subs ...*pb.RPC_SubOpts) *RPC {
 	return &RPC{
-		RPC: pb.RPC{
+		RPC: &pb.RPC{
 			Subscriptions: subs,
 		},
 	}
 }
 
 func rpcWithMessages(msgs ...*pb.Message) *RPC {
-	return &RPC{RPC: pb.RPC{Publish: msgs}}
+	return &RPC{RPC: &pb.RPC{Publish: msgs}}
 }
 
 func rpcWithControl(msgs []*pb.Message,
@@ -210,7 +215,7 @@ func rpcWithControl(msgs []*pb.Message,
 	graft []*pb.ControlGraft,
 	prune []*pb.ControlPrune) *RPC {
 	return &RPC{
-		RPC: pb.RPC{
+		RPC: &pb.RPC{
 			Publish: msgs,
 			Control: &pb.ControlMessage{
 				Ihave: ihave,
@@ -224,10 +229,7 @@ func rpcWithControl(msgs []*pb.Message,
 
 func copyRPC(rpc *RPC) *RPC {
 	res := new(RPC)
-	*res = *rpc
-	if rpc.Control != nil {
-		res.Control = new(pb.ControlMessage)
-		*res.Control = *rpc.Control
-	}
+	copiedRPC := (proto.Clone(rpc.RPC)).(*pb.RPC)
+	res.RPC = copiedRPC
 	return res
 }

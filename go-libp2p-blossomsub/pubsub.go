@@ -245,7 +245,7 @@ func (m *Message) GetFrom() peer.ID {
 }
 
 type RPC struct {
-	pb.RPC
+	*pb.RPC
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
