@@ -175,6 +175,9 @@ func NewBlossomSub(
 
 	blossomOpts := []blossomsub.Option{}
 
+	if isBootstrapPeer {
+		blossomOpts = append(blossomOpts, blossomsub.WithValidateQueueSize(1024))
+	}
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
