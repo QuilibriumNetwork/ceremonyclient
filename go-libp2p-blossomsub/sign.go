@@ -27,10 +27,8 @@ const (
 	// StrictNoSign does not produce signatures and drops and penalises incoming messages that carry one
 	StrictNoSign = msgVerification
 	// LaxSign produces signatures and validates incoming signatures iff one is present
-	// Deprecated: it is recommend to either strictly enable, or strictly disable, signatures.
 	LaxSign = msgSigning
 	// LaxNoSign does not produce signatures and validates incoming signatures iff one is present
-	// Deprecated: it is recommend to either strictly enable, or strictly disable, signatures.
 	LaxNoSign = 0
 )
 

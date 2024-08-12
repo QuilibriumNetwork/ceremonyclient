@@ -297,7 +297,7 @@ func (v *validation) validateWorker() {
 func (v *validation) validate(vals []*validatorImpl, src peer.ID, msg *Message, synchronous bool) error {
 	// If signature verification is enabled, but signing is disabled,
 	// the Signature is required to be nil upon receiving the message in PubSub.pushMsg.
-	if msg.Signature != nil {
+	if msg.Signature != nil && v.p.signPolicy&msgVerification != 0 {
 		if !v.validateSignature(msg) {
 			log.Debugf("message signature validation failed; dropping message from %s", src)
 			v.tracer.RejectMessage(msg, RejectInvalidSignature)

@@ -266,7 +266,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		peerOutboundQueueSize: 32,
 		signID:                h.ID(),
 		signKey:               nil,
-		signPolicy:            StrictSign,
+		signPolicy:            LaxSign,
 		incoming:              make(chan *RPC, 32),
 		newPeers:              make(chan struct{}, 1),
 		newPeersPend:          make(map[peer.ID]struct{}),
