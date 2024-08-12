@@ -20,7 +20,6 @@ func (ps *PubSub) watchForNewPeers(ctx context.Context) {
 		log.Errorf("failed to subscribe to peer identification events: %v", err)
 		return
 	}
-	defer sub.Close()
 
 	ps.newPeersPrioLk.RLock()
 	ps.newPeersMx.Lock()
@@ -68,6 +67,7 @@ func (ps *PubSub) watchForNewPeers(ctx context.Context) {
 		var ev any
 		select {
 		case <-ctx.Done():
+			sub.Close()
 			return
 		case ev = <-sub.Out():
 		}
@@ -95,7 +95,7 @@ func (ps *PubSub) watchForNewPeers(ctx context.Context) {
 			}
 		}
 	}
-
+	sub.Close()
 }
 
 func (ps *PubSub) notifyNewPeer(peer peer.ID) {

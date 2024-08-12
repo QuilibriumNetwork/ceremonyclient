@@ -554,7 +554,6 @@ func (bs *BlossomSubRouter) manageAddrBook() {
 		log.Errorf("failed to subscribe to peer identification events: %v", err)
 		return
 	}
-	defer sub.Close()
 
 	for {
 		select {
@@ -566,6 +565,7 @@ func (bs *BlossomSubRouter) manageAddrBook() {
 					log.Warnf("failed to close addr book: %v", errClose)
 				}
 			}
+			sub.Close()
 			return
 		case ev := <-sub.Out():
 			switch ev := ev.(type) {
@@ -1435,7 +1435,6 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 	}
 
 	ticker := time.NewTicker(bs.params.HeartbeatInterval)
-	defer ticker.Stop()
 
 	for {
 		select {
@@ -1443,9 +1442,11 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 			select {
 			case bs.p.eval <- bs.heartbeat:
 			case <-bs.p.ctx.Done():
+				ticker.Stop()
 				return
 			}
 		case <-bs.p.ctx.Done():
+			ticker.Stop()
 			return
 		}
 	}
@@ -1453,14 +1454,6 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 
 func (bs *BlossomSubRouter) heartbeat() {
 	start := time.Now()
-	defer func() {
-		if bs.params.SlowHeartbeatWarning > 0 {
-			slowWarning := time.Duration(bs.params.SlowHeartbeatWarning * float64(bs.params.HeartbeatInterval))
-			if dt := time.Since(start); dt > slowWarning {
-				log.Warnw("slow heartbeat", "took", dt)
-			}
-		}
-	}()
 
 	bs.heartbeatTicks++
 
@@ -1666,6 +1659,13 @@ func (bs *BlossomSubRouter) heartbeat() {
 		// 2nd arg are mesh peers excluded from gossip. We already push
 		// messages to them, so its redundant to gossip IHAVEs.
 		bs.emitGossip(bitmask, peers)
+
+		if bs.params.SlowHeartbeatWarning > 0 {
+			slowWarning := time.Duration(bs.params.SlowHeartbeatWarning * float64(bs.params.HeartbeatInterval))
+			if dt := time.Since(start); dt > slowWarning {
+				log.Warnw("slow heartbeat", "took", dt)
+			}
+		}
 	}
 
 	// expire fanout for bitmasks we haven't published to in a while

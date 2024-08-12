@@ -72,11 +72,11 @@ func (v *BasicSeqnoValidator) validate(ctx context.Context, _ peer.ID, m *Messag
 
 	// get the nonce and compare again with an exclusive lock before commiting (cf concurrent validation)
 	v.mx.Lock()
-	defer v.mx.Unlock()
 
 	nonceBytes, err = v.meta.Get(ctx, p)
 	if err != nil {
 		log.Warn("error retrieving peer nonce: %s", err)
+		v.mx.Unlock()
 		return ValidationIgnore
 	}
 
@@ -85,6 +85,7 @@ func (v *BasicSeqnoValidator) validate(ctx context.Context, _ peer.ID, m *Messag
 	}
 
 	if seqno <= nonce {
+		v.mx.Unlock()
 		return ValidationIgnore
 	}
 
@@ -96,6 +97,6 @@ func (v *BasicSeqnoValidator) validate(ctx context.Context, _ peer.ID, m *Messag
 	if err != nil {
 		log.Warn("error storing peer nonce: %s", err)
 	}
-
+	v.mx.Unlock()
 	return ValidationAccept
 }

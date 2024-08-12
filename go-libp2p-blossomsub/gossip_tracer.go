@@ -54,7 +54,6 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs [][]byte) {
 	mid := msgIDs[idx]
 
 	gt.Lock()
-	defer gt.Unlock()
 
 	promises, ok := gt.promises[string(mid)]
 	if !ok {
@@ -72,6 +71,8 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs [][]byte) {
 		}
 		peerPromises[string(mid)] = struct{}{}
 	}
+
+	gt.Unlock()
 }
 
 // returns the number of broken promises for each peer who didn't follow up
@@ -82,7 +83,6 @@ func (gt *gossipTracer) GetBrokenPromises() map[peer.ID]int {
 	}
 
 	gt.Lock()
-	defer gt.Unlock()
 
 	var res map[peer.ID]int
 	now := time.Now()
@@ -111,6 +111,7 @@ func (gt *gossipTracer) GetBrokenPromises() map[peer.ID]int {
 		}
 	}
 
+	gt.Unlock()
 	return res
 }
 
@@ -120,10 +121,10 @@ func (gt *gossipTracer) fulfillPromise(msg *Message) {
 	mid := gt.idGen.ID(msg)
 
 	gt.Lock()
-	defer gt.Unlock()
 
 	promises, ok := gt.promises[string(mid)]
 	if !ok {
+		gt.Unlock()
 		return
 	}
 	delete(gt.promises, string(mid))
@@ -138,6 +139,8 @@ func (gt *gossipTracer) fulfillPromise(msg *Message) {
 			}
 		}
 	}
+
+	gt.Unlock()
 }
 
 func (gt *gossipTracer) DeliverMessage(msg *Message) {
@@ -181,10 +184,10 @@ func (gt *gossipTracer) UndeliverableMessage(msg *Message)    {}
 
 func (gt *gossipTracer) ThrottlePeer(p peer.ID) {
 	gt.Lock()
-	defer gt.Unlock()
 
 	peerPromises, ok := gt.peerPromises[p]
 	if !ok {
+		gt.Unlock()
 		return
 	}
 
@@ -197,4 +200,5 @@ func (gt *gossipTracer) ThrottlePeer(p peer.ID) {
 	}
 
 	delete(gt.peerPromises, p)
+	gt.Unlock()
 }

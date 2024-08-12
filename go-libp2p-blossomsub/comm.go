@@ -55,14 +55,6 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 	p.inboundStreams[peer] = s
 	p.inboundStreamsMx.Unlock()
 
-	defer func() {
-		p.inboundStreamsMx.Lock()
-		if p.inboundStreams[peer] == s {
-			delete(p.inboundStreams, peer)
-		}
-		p.inboundStreamsMx.Unlock()
-	}()
-
 	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
 	for {
 		msgbytes, err := r.ReadMsg()
@@ -77,6 +69,11 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 				s.Close()
 			}
 
+			p.inboundStreamsMx.Lock()
+			if p.inboundStreams[peer] == s {
+				delete(p.inboundStreams, peer)
+			}
+			p.inboundStreamsMx.Unlock()
 			return
 		}
 		if len(msgbytes) == 0 {
@@ -91,6 +88,11 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 		if err != nil {
 			s.Reset()
 			log.Warnf("bogus rpc from %s: %s", s.Conn().RemotePeer(), err)
+			p.inboundStreamsMx.Lock()
+			if p.inboundStreams[peer] == s {
+				delete(p.inboundStreams, peer)
+			}
+			p.inboundStreamsMx.Unlock()
 			return
 		}
 
@@ -100,6 +102,11 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 		case <-p.ctx.Done():
 			// Close is useless because the other side isn't reading.
 			s.Reset()
+			p.inboundStreamsMx.Lock()
+			if p.inboundStreams[peer] == s {
+				delete(p.inboundStreams, peer)
+			}
+			p.inboundStreamsMx.Unlock()
 			return
 		}
 	}
@@ -161,37 +168,38 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 }
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing <-chan *RPC) {
-	writeRpc := func(rpc *RPC) error {
-		size := uint64(rpc.Size())
-
-		buf := pool.Get(varint.UvarintSize(size) + int(size))
-		defer pool.Put(buf)
-
-		n := binary.PutUvarint(buf, size)
-		_, err := rpc.MarshalTo(buf[n:])
-		if err != nil {
-			return err
-		}
-
-		_, err = s.Write(buf)
-		return err
-	}
-
-	defer s.Close()
 	for {
 		select {
 		case rpc, ok := <-outgoing:
 			if !ok {
+				s.Close()
 				return
 			}
 
-			err := writeRpc(rpc)
+			size := uint64(rpc.Size())
+
+			buf := pool.Get(varint.UvarintSize(size) + int(size))
+
+			n := binary.PutUvarint(buf, size)
+			_, err := rpc.MarshalTo(buf[n:])
 			if err != nil {
 				s.Reset()
 				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
+				s.Close()
 				return
 			}
+
+			_, err = s.Write(buf)
+			if err != nil {
+				s.Reset()
+				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
+				s.Close()
+				return
+			}
+
+			pool.Put(buf)
 		case <-ctx.Done():
+			s.Close()
 			return
 		}
 	}
