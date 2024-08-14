@@ -330,7 +330,7 @@ loop:
 			if res.Kind == tpt.UpdateKindHandshakeProgressed {
 				// Only wait for public addresses to complete dialing since private dials
 				// are quick any way
-				if manet.IsPublicAddr(res.Addr) {
+				if is, err := manet.IsPublicAddr(res.Addr); is && err == nil {
 					ad.expectedTCPUpgradeTime = w.cl.Now().Add(PublicTCPDelay)
 				}
 				scheduleNextDial()

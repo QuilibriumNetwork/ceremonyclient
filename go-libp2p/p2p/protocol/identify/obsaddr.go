@@ -40,7 +40,7 @@ type thinWaistWithCount struct {
 
 func thinWaistForm(a ma.Multiaddr) (thinWaist, error) {
 	i := 0
-	tw, rest := ma.SplitFunc(a, func(c ma.Component) bool {
+	tw, rest, err := ma.SplitFunc(a, func(c ma.Component) bool {
 		if i > 1 {
 			return true
 		}
@@ -60,6 +60,9 @@ func thinWaistForm(a ma.Multiaddr) (thinWaist, error) {
 		}
 		return false
 	})
+	if err != nil {
+		return thinWaist{}, err
+	}
 	if i <= 1 {
 		return thinWaist{}, fmt.Errorf("not a thinwaist address: %s", a)
 	}

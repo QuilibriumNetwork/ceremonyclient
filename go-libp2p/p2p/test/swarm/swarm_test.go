@@ -19,6 +19,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestDialPeerTransientConnection(t *testing.T) {
 	h1, err := libp2p.New(
 		libp2p.NoListenAddrs,
@@ -51,7 +56,7 @@ func TestDialPeerTransientConnection(t *testing.T) {
 	_, err = client.Reserve(context.Background(), h2, relay1info)
 	require.NoError(t, err)
 
-	relayaddr := ma.StringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
+	relayaddr := tStringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
 
 	h1.Peerstore().AddAddr(h2.ID(), relayaddr, peerstore.TempAddrTTL)
 
@@ -106,7 +111,7 @@ func TestNewStreamTransientConnection(t *testing.T) {
 	_, err = client.Reserve(context.Background(), h2, relay1info)
 	require.NoError(t, err)
 
-	relayaddr := ma.StringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
+	relayaddr := tStringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
 
 	h1.Peerstore().AddAddr(h2.ID(), relayaddr, peerstore.TempAddrTTL)
 

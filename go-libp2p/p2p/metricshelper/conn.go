@@ -13,9 +13,14 @@ func GetTransport(a ma.Multiaddr) string {
 	return "other"
 }
 
-func GetIPVersion(addr ma.Multiaddr) string {
+func GetIPVersion(addr ma.Multiaddr) (string, error) {
 	version := "unknown"
-	ma.ForEach(addr, func(c ma.Component) bool {
+	var err error
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			err = e
+			return false
+		}
 		if c.Protocol().Code == ma.P_IP4 {
 			version = "ip4"
 			return false
@@ -25,5 +30,5 @@ func GetIPVersion(addr ma.Multiaddr) string {
 		}
 		return true
 	})
-	return version
+	return version, err
 }

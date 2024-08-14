@@ -11,6 +11,11 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestConnectionGater(t *testing.T) {
 	ds := datastore.NewMapDatastore()
 
@@ -76,32 +81,32 @@ func TestConnectionGater(t *testing.T) {
 	}
 
 	// test addr and subnet blocking
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.4/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.4/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.4/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
@@ -111,32 +116,32 @@ func TestConnectionGater(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.4/tcp/1234"))
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.4/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.4/tcp/1234")})
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
@@ -146,22 +151,22 @@ func TestConnectionGater(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
@@ -208,32 +213,32 @@ func TestConnectionGater(t *testing.T) {
 		t.Fatal("expected gater to allow peerB")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.4/tcp/1234"))
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.4/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.4/tcp/1234")})
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if allow {
 		t.Fatal("expected gater to deny peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
@@ -274,32 +279,32 @@ func TestConnectionGater(t *testing.T) {
 		t.Fatal("expected gater to allow peerB")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.4/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.4/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.4/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
@@ -330,32 +335,32 @@ func TestConnectionGater(t *testing.T) {
 		t.Fatal("expected gater to allow peerB")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.4/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.4/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.4/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.4")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/1.2.3.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/1.2.3.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/1.2.3.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/1.2.3.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 1.2.3.5")
 	}
 
-	allow = cg.InterceptAddrDial(peerB, ma.StringCast("/ip4/2.3.4.5/tcp/1234"))
+	allow = cg.InterceptAddrDial(peerB, tStringCast("/ip4/2.3.4.5/tcp/1234"))
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}
 
-	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: ma.StringCast("/ip4/2.3.4.5/tcp/1234")})
+	allow = cg.InterceptAccept(&mockConnMultiaddrs{local: nil, remote: tStringCast("/ip4/2.3.4.5/tcp/1234")})
 	if !allow {
 		t.Fatal("expected gater to allow peerB in 2.3.4.5")
 	}

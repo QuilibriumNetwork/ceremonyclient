@@ -24,6 +24,11 @@ import (
 
 var muxers = []tptu.StreamMuxer{{ID: "/yamux", Muxer: yamux.DefaultTransport}}
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestTcpTransport(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		peerA, ia := makeInsecureMuxer(t)
@@ -74,7 +79,7 @@ func TestResourceManager(t *testing.T) {
 	require.NoError(t, err)
 	ta, err := NewTCPTransport(ua, nil)
 	require.NoError(t, err)
-	ln, err := ta.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+	ln, err := ta.Listen(tStringCast("/ip4/127.0.0.1/tcp/0"))
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -156,7 +161,7 @@ func TestDialWithUpdates(t *testing.T) {
 	require.NoError(t, err)
 	ta, err := NewTCPTransport(ua, nil)
 	require.NoError(t, err)
-	ln, err := ta.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+	ln, err := ta.Listen(tStringCast("/ip4/127.0.0.1/tcp/0"))
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -173,7 +178,7 @@ func TestDialWithUpdates(t *testing.T) {
 	require.NoError(t, err)
 
 	acceptAndClose := func() manet.Listener {
-		li, err := manet.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+		li, err := manet.Listen(tStringCast("/ip4/127.0.0.1/tcp/0"))
 		if err != nil {
 			t.Fatal(err)
 		}

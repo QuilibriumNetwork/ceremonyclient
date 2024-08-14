@@ -14,7 +14,7 @@ import (
 )
 
 var circuitProtocol = ma.ProtocolWithCode(ma.P_CIRCUIT)
-var circuitAddr = ma.Cast(circuitProtocol.VCode)
+var circuitAddr, _ = ma.Cast(circuitProtocol.VCode)
 
 // AddTransport constructs a new p2p-circuit/v2 client and adds it as a transport to the
 // host network

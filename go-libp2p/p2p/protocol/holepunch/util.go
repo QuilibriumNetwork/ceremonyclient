@@ -13,7 +13,7 @@ import (
 
 func containsPublicAddr(addrs []ma.Multiaddr) bool {
 	for _, addr := range addrs {
-		if isRelayAddress(addr) || !manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); err != nil || !is || isRelayAddress(addr) {
 			continue
 		}
 		return true

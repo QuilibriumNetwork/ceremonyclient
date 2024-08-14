@@ -63,11 +63,17 @@ func newListener(a ma.Multiaddr, tlsConf *tls.Config) (*listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	first, _ := ma.SplitFirst(a)
+	first, _, err := ma.SplitFirst(a)
+	if err != nil {
+		return nil, err
+	}
 	// Don't resolve dns addresses.
 	// We want to be able to announce domain names, so the peer can validate the TLS certificate.
 	if c := first.Protocol().Code; c == ma.P_DNS || c == ma.P_DNS4 || c == ma.P_DNS6 || c == ma.P_DNSADDR {
-		_, last := ma.SplitFirst(laddr)
+		_, last, err := ma.SplitFirst(laddr)
+		if err != nil {
+			return nil, err
+		}
 		laddr = first.Encapsulate(last)
 	}
 	parsed.restMultiaddr = laddr

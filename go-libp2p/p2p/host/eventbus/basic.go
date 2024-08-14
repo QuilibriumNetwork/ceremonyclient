@@ -85,8 +85,8 @@ func (b *basicBus) withNode(typ reflect.Type, cb func(*node), async func(*node))
 		n.lk.Unlock()
 	} else {
 		go func() {
-			defer n.lk.Unlock()
 			async(n)
+			n.lk.Unlock()
 		}()
 	}
 }
@@ -305,12 +305,12 @@ func (b *basicBus) Emitter(evtType interface{}, opts ...event.EmitterOpt) (e eve
 // or subscribers for.
 func (b *basicBus) GetAllEventTypes() []reflect.Type {
 	b.lk.RLock()
-	defer b.lk.RUnlock()
 
 	types := make([]reflect.Type, 0, len(b.nodes))
 	for t := range b.nodes {
 		types = append(types, t)
 	}
+	b.lk.RUnlock()
 	return types
 }
 

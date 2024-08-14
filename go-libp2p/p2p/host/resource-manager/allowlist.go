@@ -52,8 +52,13 @@ func toIPNet(ma multiaddr.Multiaddr) (*net.IPNet, peer.ID, error) {
 	var allowedPeerStr string
 	var allowedPeer peer.ID
 	var isIPV4 bool
+	var err error
 
-	multiaddr.ForEach(ma, func(c multiaddr.Component) bool {
+	multiaddr.ForEach(ma, func(c multiaddr.Component, e error) bool {
+		if e != nil {
+			err = e
+			return false
+		}
 		if c.Protocol().Code == multiaddr.P_IP4 || c.Protocol().Code == multiaddr.P_IP6 {
 			isIPV4 = c.Protocol().Code == multiaddr.P_IP4
 			ipString = c.Value()
@@ -66,6 +71,10 @@ func toIPNet(ma multiaddr.Multiaddr) (*net.IPNet, peer.ID, error) {
 		}
 		return ipString == "" || mask == "" || allowedPeerStr == ""
 	})
+
+	if err != nil {
+		return nil, allowedPeer, err
+	}
 
 	if ipString == "" {
 		return nil, allowedPeer, errors.New("missing ip address")
@@ -170,10 +179,10 @@ func (al *Allowlist) Allowed(ma multiaddr.Multiaddr) bool {
 		return false
 	}
 	al.mu.RLock()
-	defer al.mu.RUnlock()
 
 	for _, network := range al.allowedNetworks {
 		if network.Contains(ip) {
+			al.mu.RUnlock()
 			return true
 		}
 	}
@@ -181,11 +190,12 @@ func (al *Allowlist) Allowed(ma multiaddr.Multiaddr) bool {
 	for _, allowedNetworks := range al.allowedPeerByNetwork {
 		for _, network := range allowedNetworks {
 			if network.Contains(ip) {
+				al.mu.RUnlock()
 				return true
 			}
 		}
 	}
-
+	al.mu.RUnlock()
 	return false
 }
 
@@ -195,11 +205,11 @@ func (al *Allowlist) AllowedPeerAndMultiaddr(peerID peer.ID, ma multiaddr.Multia
 		return false
 	}
 	al.mu.RLock()
-	defer al.mu.RUnlock()
 
 	for _, network := range al.allowedNetworks {
 		if network.Contains(ip) {
 			// We found a match that isn't constrained by a peerID
+			al.mu.RUnlock()
 			return true
 		}
 	}
@@ -207,10 +217,11 @@ func (al *Allowlist) AllowedPeerAndMultiaddr(peerID peer.ID, ma multiaddr.Multia
 	if expectedNetworks, ok := al.allowedPeerByNetwork[peerID]; ok {
 		for _, expectedNetwork := range expectedNetworks {
 			if expectedNetwork.Contains(ip) {
+				al.mu.RUnlock()
 				return true
 			}
 		}
 	}
-
+	al.mu.RUnlock()
 	return false
 }

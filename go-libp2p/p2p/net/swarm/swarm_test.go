@@ -390,7 +390,7 @@ func TestTypedNilConn(t *testing.T) {
 
 func TestPreventDialListenAddr(t *testing.T) {
 	s := GenSwarm(t, OptDialOnly)
-	if err := s.Listen(ma.StringCast("/ip4/0.0.0.0/udp/0/quic-v1")); err != nil {
+	if err := s.Listen(tStringCast("/ip4/0.0.0.0/udp/0/quic-v1")); err != nil {
 		t.Fatal(err)
 	}
 	addrs, err := s.InterfaceListenAddresses()
@@ -544,8 +544,8 @@ func TestResourceManagerAcceptStream(t *testing.T) {
 func TestListenCloseCount(t *testing.T) {
 	s := GenSwarm(t, OptDialOnly)
 	addrsToListen := []ma.Multiaddr{
-		ma.StringCast("/ip4/0.0.0.0/tcp/0"),
-		ma.StringCast("/ip4/0.0.0.0/udp/0/quic-v1"),
+		tStringCast("/ip4/0.0.0.0/tcp/0"),
+		tStringCast("/ip4/0.0.0.0/udp/0/quic-v1"),
 	}
 
 	if err := s.Listen(addrsToListen...); err != nil {
@@ -557,7 +557,7 @@ func TestListenCloseCount(t *testing.T) {
 	for _, addr := range listenedAddrs {
 		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 			// make a copy of the address to make sure the multiaddr comparison actually works
-			addrToClose = ma.StringCast(addr.String())
+			addrToClose = tStringCast(addr.String())
 		}
 	}
 

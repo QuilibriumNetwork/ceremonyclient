@@ -36,17 +36,17 @@ func (c *mockConn) IsClosed() bool {
 }
 
 func TestShouldRecordObservationWithWebTransport(t *testing.T) {
-	listenAddr := ma.StringCast("/ip4/0.0.0.0/udp/0/quic-v1/webtransport/certhash/uEgNmb28")
-	ifaceAddr := ma.StringCast("/ip4/10.0.0.2/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")
+	listenAddr := tStringCast("/ip4/0.0.0.0/udp/0/quic-v1/webtransport/certhash/uEgNmb28")
+	ifaceAddr := tStringCast("/ip4/10.0.0.2/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")
 	listenAddrs := func() []ma.Multiaddr { return []ma.Multiaddr{listenAddr} }
 	ifaceListenAddrs := func() ([]ma.Multiaddr, error) { return []ma.Multiaddr{ifaceAddr}, nil }
 	addrs := func() []ma.Multiaddr { return []ma.Multiaddr{listenAddr} }
 
 	c := &mockConn{
 		local:  listenAddr,
-		remote: ma.StringCast("/ip4/1.2.3.6/udp/1236/quic-v1/webtransport"),
+		remote: tStringCast("/ip4/1.2.3.6/udp/1236/quic-v1/webtransport"),
 	}
-	observedAddr := ma.StringCast("/ip4/1.2.3.4/udp/1231/quic-v1/webtransport")
+	observedAddr := tStringCast("/ip4/1.2.3.4/udp/1231/quic-v1/webtransport")
 	o, err := NewObservedAddrManager(listenAddrs, addrs, ifaceListenAddrs, normalize)
 	require.NoError(t, err)
 	shouldRecord, _, _ := o.shouldRecordObservation(c, observedAddr)
@@ -54,10 +54,10 @@ func TestShouldRecordObservationWithWebTransport(t *testing.T) {
 }
 
 func TestShouldRecordObservationWithNAT64Addr(t *testing.T) {
-	listenAddr1 := ma.StringCast("/ip4/0.0.0.0/tcp/1234")
-	ifaceAddr1 := ma.StringCast("/ip4/10.0.0.2/tcp/4321")
-	listenAddr2 := ma.StringCast("/ip6/::/tcp/1234")
-	ifaceAddr2 := ma.StringCast("/ip6/1::1/tcp/4321")
+	listenAddr1 := tStringCast("/ip4/0.0.0.0/tcp/1234")
+	ifaceAddr1 := tStringCast("/ip4/10.0.0.2/tcp/4321")
+	listenAddr2 := tStringCast("/ip6/::/tcp/1234")
+	ifaceAddr2 := tStringCast("/ip6/1::1/tcp/4321")
 
 	var (
 		listenAddrs      = func() []ma.Multiaddr { return []ma.Multiaddr{listenAddr1, listenAddr2} }
@@ -66,7 +66,7 @@ func TestShouldRecordObservationWithNAT64Addr(t *testing.T) {
 	)
 	c := &mockConn{
 		local:  listenAddr1,
-		remote: ma.StringCast("/ip4/1.2.3.6/tcp/4321"),
+		remote: tStringCast("/ip4/1.2.3.6/tcp/4321"),
 	}
 
 	cases := []struct {
@@ -75,17 +75,17 @@ func TestShouldRecordObservationWithNAT64Addr(t *testing.T) {
 		failureReason string
 	}{
 		{
-			addr:          ma.StringCast("/ip4/1.2.3.4/tcp/1234"),
+			addr:          tStringCast("/ip4/1.2.3.4/tcp/1234"),
 			want:          true,
 			failureReason: "IPv4 should be observed",
 		},
 		{
-			addr:          ma.StringCast("/ip6/1::4/tcp/1234"),
+			addr:          tStringCast("/ip6/1::4/tcp/1234"),
 			want:          true,
 			failureReason: "public IPv6 address should be observed",
 		},
 		{
-			addr:          ma.StringCast("/ip6/64:ff9b::192.0.1.2/tcp/1234"),
+			addr:          tStringCast("/ip6/64:ff9b::192.0.1.2/tcp/1234"),
 			want:          false,
 			failureReason: "NAT64 IPv6 address shouldn't be observed",
 		},
@@ -138,17 +138,17 @@ func TestThinWaistForm(t *testing.T) {
 	}}
 	for i, tt := range tc {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			inputAddr := ma.StringCast(tt.input)
+			inputAddr := tStringCast(tt.input)
 			tw, err := thinWaistForm(inputAddr)
 			if tt.err {
 				require.Equal(t, tw, thinWaist{})
 				require.Error(t, err)
 				return
 			}
-			wantTW := ma.StringCast(tt.tw)
+			wantTW := tStringCast(tt.tw)
 			var restTW ma.Multiaddr
 			if tt.rest != "" {
-				restTW = ma.StringCast(tt.rest)
+				restTW = tStringCast(tt.rest)
 			}
 			require.Equal(t, tw.Addr, inputAddr, "%s %s", tw.Addr, inputAddr)
 			require.Equal(t, wantTW, tw.TW, "%s %s", tw.TW, wantTW)

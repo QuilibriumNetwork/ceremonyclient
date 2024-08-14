@@ -249,13 +249,19 @@ func (h *Host) setupListeners(listenerErrCh chan error) error {
 
 		var listenAddr ma.Multiaddr
 		if parsedAddr.useHTTPS && parsedAddr.sni != "" && parsedAddr.sni != host {
-			listenAddr = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/tls/sni/%s/http", host, port, parsedAddr.sni))
+			listenAddr, err = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/tls/sni/%s/http", host, port, parsedAddr.sni))
+			if err != nil {
+				return err
+			}
 		} else {
 			scheme := "http"
 			if parsedAddr.useHTTPS {
 				scheme = "https"
 			}
-			listenAddr = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/%s", host, port, scheme))
+			listenAddr, err = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/%s", host, port, scheme))
+			if err != nil {
+				return err
+			}
 		}
 
 		if parsedAddr.useHTTPS {
@@ -720,7 +726,10 @@ type httpMultiaddr struct {
 
 func parseMultiaddr(addr ma.Multiaddr) httpMultiaddr {
 	out := httpMultiaddr{}
-	ma.ForEach(addr, func(c ma.Component) bool {
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_IP4, ma.P_IP6, ma.P_DNS, ma.P_DNS4, ma.P_DNS6:
 			out.host = c.Value()
@@ -748,7 +757,7 @@ var tlsComponent, _ = ma.NewComponent("tls", "")
 // Returns a bool indicating if the input multiaddr has an http (or https) component.
 func normalizeHTTPMultiaddr(addr ma.Multiaddr) (ma.Multiaddr, bool) {
 	isHTTPMultiaddr := false
-	beforeHTTPS, afterIncludingHTTPS := ma.SplitFunc(addr, func(c ma.Component) bool {
+	beforeHTTPS, afterIncludingHTTPS, err := ma.SplitFunc(addr, func(c ma.Component) bool {
 		if c.Protocol().Code == ma.P_HTTP {
 			isHTTPMultiaddr = true
 		}
@@ -760,12 +769,20 @@ func normalizeHTTPMultiaddr(addr ma.Multiaddr) (ma.Multiaddr, bool) {
 		return false
 	})
 
+	if err != nil {
+		return addr, false
+	}
+
 	if afterIncludingHTTPS == nil {
 		// No HTTPS component, just return the original
 		return addr, isHTTPMultiaddr
 	}
 
-	_, afterHTTPS := ma.SplitFirst(afterIncludingHTTPS)
+	_, afterHTTPS, err := ma.SplitFirst(afterIncludingHTTPS)
+	if err != nil {
+		return addr, false
+	}
+
 	if afterHTTPS == nil {
 		return ma.Join(beforeHTTPS, tlsComponent, httpComponent), isHTTPMultiaddr
 	}

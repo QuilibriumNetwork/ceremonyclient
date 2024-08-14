@@ -20,15 +20,15 @@ func sortAddrDelays(addrDelays []network.AddrDelay) {
 }
 
 func TestNoDelayDialRanker(t *testing.T) {
-	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	wt1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
-	q2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q3 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
-	q3v1 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
-	q4 := ma.StringCast("/ip4/1.2.3.4/udp/4/quic-v1")
-	t1 := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
+	q1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	wt1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
+	q2, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q3, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q3v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q4, _ := ma.StringCast("/ip4/1.2.3.4/udp/4/quic-v1")
+	t1, _ := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
 
 	testCase := []struct {
 		name   string
@@ -70,14 +70,14 @@ func TestNoDelayDialRanker(t *testing.T) {
 }
 
 func TestDelayRankerQUICDelay(t *testing.T) {
-	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	wt1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
-	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q3v1 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	wt1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
+	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q3v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
 
-	q1v16 := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
-	q2v16 := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
-	q3v16 := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
+	q1v16, _ := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
+	q2v16, _ := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
+	q3v16, _ := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
 
 	testCase := []struct {
 		name   string
@@ -151,17 +151,15 @@ func TestDelayRankerQUICDelay(t *testing.T) {
 }
 
 func TestDelayRankerTCPDelay(t *testing.T) {
-	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-
-	q1v16 := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
-	q2v16 := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
-	q3v16 := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
-
-	t1 := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
-	t1v6 := ma.StringCast("/ip6/1::2/tcp/1")
-	t2 := ma.StringCast("/ip4/1.2.3.4/tcp/2")
-	t3 := ma.StringCast("/ip4/1.2.3.4/tcp/3")
+	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q1v16, _ := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
+	q2v16, _ := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
+	q3v16, _ := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
+	t1, _ := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
+	t1v6, _ := ma.StringCast("/ip6/1::2/tcp/1")
+	t2, _ := ma.StringCast("/ip4/1.2.3.4/tcp/2")
+	t3, _ := ma.StringCast("/ip4/1.2.3.4/tcp/3")
 
 	testCase := []struct {
 		name   string
@@ -247,12 +245,12 @@ func TestDelayRankerTCPDelay(t *testing.T) {
 }
 
 func TestDelayRankerRelay(t *testing.T) {
-	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q2, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
 
 	pid := test.RandPeerIDFatal(t)
-	r1 := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/1/p2p-circuit/p2p/%s", pid))
-	r2 := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/udp/1/quic/p2p-circuit/p2p/%s", pid))
+	r1, _ := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/1/p2p-circuit/p2p/%s", pid))
+	r2, _ := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/udp/1/quic/p2p-circuit/p2p/%s", pid))
 
 	testCase := []struct {
 		name   string

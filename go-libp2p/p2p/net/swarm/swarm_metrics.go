@@ -187,7 +187,8 @@ func (m *metricsTracer) OpenedConnection(dir network.Direction, p crypto.PubKey,
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connsOpened.WithLabelValues(*tags...).Inc()
 
 	*tags = (*tags)[:0]
@@ -202,7 +203,8 @@ func (m *metricsTracer) ClosedConnection(dir network.Direction, duration time.Du
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connsClosed.WithLabelValues(*tags...).Inc()
 	connDuration.WithLabelValues(*tags...).Observe(duration.Seconds())
 }
@@ -212,7 +214,8 @@ func (m *metricsTracer) CompletedHandshake(t time.Duration, cs network.Connectio
 	defer metricshelper.PutStringSlice(tags)
 
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connHandshakeLatency.WithLabelValues(*tags...).Observe(t.Seconds())
 }
 
@@ -246,7 +249,8 @@ func (m *metricsTracer) FailedDialing(addr ma.Multiaddr, dialErr error, cause er
 	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, transport, e)
-	*tags = append(*tags, metricshelper.GetIPVersion(addr))
+	ipv, _ := metricshelper.GetIPVersion(addr)
+	*tags = append(*tags, ipv)
 	dialError.WithLabelValues(*tags...).Inc()
 }
 

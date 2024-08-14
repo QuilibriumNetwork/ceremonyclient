@@ -95,7 +95,10 @@ func New(h host.Host, opts ...Option) (*Relay, error) {
 	}
 
 	r.constraints = newConstraints(&r.rc)
-	r.selfAddr = ma.StringCast(fmt.Sprintf("/p2p/%s", h.ID()))
+	r.selfAddr, err = ma.StringCast(fmt.Sprintf("/p2p/%s", h.ID()))
+	if err != nil {
+		return nil, err
+	}
 
 	h.SetStreamHandler(proto.ProtoIDv2Hop, r.handleStream)
 	r.notifiee = &network.NotifyBundle{DisconnectedF: r.disconnected}
@@ -574,7 +577,7 @@ func (r *Relay) makeReservationMsg(p peer.ID, expire time.Time) *pbv2.Reservatio
 
 	var addrBytes [][]byte
 	for _, addr := range r.host.Addrs() {
-		if !manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); !is && err == nil {
 			continue
 		}
 

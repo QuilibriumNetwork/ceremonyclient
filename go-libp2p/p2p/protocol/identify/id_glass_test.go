@@ -19,6 +19,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestFastDisconnect(t *testing.T) {
 	// This test checks to see if we correctly abort sending an identify
 	// response if the peer disconnects before we handle the request.
@@ -176,11 +181,11 @@ func TestInvalidSignedPeerRecord(t *testing.T) {
 }
 
 func TestIncomingAddrFilter(t *testing.T) {
-	lhAddr := ma.StringCast("/ip4/127.0.0.1/udp/123/quic-v1")
-	privAddr := ma.StringCast("/ip4/192.168.1.101/tcp/123")
-	pubAddr := ma.StringCast("/ip6/2001::1/udp/123/quic-v1")
-	pubDNSAddr := ma.StringCast("/dns/example.com/udp/123/quic-v1")
-	privDNSAddr := ma.StringCast("/dns4/localhost/udp/123/quic-v1")
+	lhAddr := tStringCast("/ip4/127.0.0.1/udp/123/quic-v1")
+	privAddr := tStringCast("/ip4/192.168.1.101/tcp/123")
+	pubAddr := tStringCast("/ip6/2001::1/udp/123/quic-v1")
+	pubDNSAddr := tStringCast("/dns/example.com/udp/123/quic-v1")
+	privDNSAddr := tStringCast("/dns4/localhost/udp/123/quic-v1")
 	tests := []struct {
 		output []ma.Multiaddr
 		remote ma.Multiaddr

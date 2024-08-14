@@ -130,7 +130,6 @@ func newConnLimiter() *connLimiter {
 
 func (cl *connLimiter) addNetworkPrefixLimit(isIP6 bool, npLimit NetworkPrefixLimit) {
 	cl.mu.Lock()
-	defer cl.mu.Unlock()
 	if isIP6 {
 		cl.networkPrefixLimitV6 = append(cl.networkPrefixLimitV6, npLimit)
 		cl.networkPrefixLimitV6 = sortNetworkPrefixes(cl.networkPrefixLimitV6)
@@ -138,12 +137,13 @@ func (cl *connLimiter) addNetworkPrefixLimit(isIP6 bool, npLimit NetworkPrefixLi
 		cl.networkPrefixLimitV4 = append(cl.networkPrefixLimitV4, npLimit)
 		cl.networkPrefixLimitV4 = sortNetworkPrefixes(cl.networkPrefixLimitV4)
 	}
+	cl.mu.Unlock()
 }
 
 // addConn adds a connection for the given IP address. It returns true if the connection is allowed.
 func (cl *connLimiter) addConn(ip netip.Addr) bool {
 	cl.mu.Lock()
-	defer cl.mu.Unlock()
+
 	networkPrefixLimits := cl.networkPrefixLimitV4
 	connsPerNetworkPrefix := cl.connsPerNetworkPrefixV4
 	limits := cl.connLimitPerSubnetV4
@@ -170,11 +170,13 @@ func (cl *connLimiter) addConn(ip netip.Addr) bool {
 	for i, limit := range networkPrefixLimits {
 		if limit.Network.Contains(ip) {
 			if connsPerNetworkPrefix[i]+1 > limit.ConnCount {
+				cl.mu.Unlock()
 				return false
 			}
 			connsPerNetworkPrefix[i]++
 			// Done. If we find a match in the network prefix limits, we use
 			// that and don't use the general subnet limits.
+			cl.mu.Unlock()
 			return true
 		}
 	}
@@ -191,6 +193,7 @@ func (cl *connLimiter) addConn(ip netip.Addr) bool {
 	for i, limit := range limits {
 		prefix, err := ip.Prefix(limit.PrefixLength)
 		if err != nil {
+			cl.mu.Unlock()
 			return false
 		}
 		masked := prefix.String()
@@ -202,6 +205,7 @@ func (cl *connLimiter) addConn(ip netip.Addr) bool {
 			connsPerLimit[i][masked] = 0
 		}
 		if counts+1 > limit.ConnCount {
+			cl.mu.Unlock()
 			return false
 		}
 	}
@@ -213,12 +217,12 @@ func (cl *connLimiter) addConn(ip netip.Addr) bool {
 		connsPerLimit[i][masked]++
 	}
 
+	cl.mu.Unlock()
 	return true
 }
 
 func (cl *connLimiter) rmConn(ip netip.Addr) {
 	cl.mu.Lock()
-	defer cl.mu.Unlock()
 	networkPrefixLimits := cl.networkPrefixLimitV4
 	connsPerNetworkPrefix := cl.connsPerNetworkPrefixV4
 	limits := cl.connLimitPerSubnetV4
@@ -247,10 +251,12 @@ func (cl *connLimiter) rmConn(ip netip.Addr) {
 			count := connsPerNetworkPrefix[i]
 			if count <= 0 {
 				log.Errorf("unexpected conn count for ip %s. Was this not added with addConn first?", ip)
+				cl.mu.Unlock()
 				return
 			}
 			connsPerNetworkPrefix[i]--
 			// Done. We updated the count in the defined network prefix limit.
+			cl.mu.Unlock()
 			return
 		}
 	}
@@ -285,4 +291,5 @@ func (cl *connLimiter) rmConn(ip netip.Addr) {
 			delete(connsPerLimit[i], masked)
 		}
 	}
+	cl.mu.Unlock()
 }

@@ -41,9 +41,13 @@ func isRelayError(err error) bool {
 // dialer
 func (c *Client) dial(ctx context.Context, a ma.Multiaddr, p peer.ID) (*Conn, error) {
 	// split /a/p2p-circuit/b into (/a, /p2p-circuit/b)
-	relayaddr, destaddr := ma.SplitFunc(a, func(c ma.Component) bool {
+	relayaddr, destaddr, err := ma.SplitFunc(a, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_CIRCUIT
 	})
+
+	if err != nil {
+		return nil, err
+	}
 
 	// If the address contained no /p2p-circuit part, the second part is nil.
 	if destaddr == nil {
@@ -58,7 +62,11 @@ func (c *Client) dial(ctx context.Context, a ma.Multiaddr, p peer.ID) (*Conn, er
 
 	// Strip the /p2p-circuit prefix from the destaddr so that we can pass the destination address
 	// (if present) for active relays
-	_, destaddr = ma.SplitFirst(destaddr)
+	_, destaddr, err = ma.SplitFirst(destaddr)
+	if err != nil {
+		return nil, err
+	}
+
 	if destaddr != nil {
 		dinfo.Addrs = append(dinfo.Addrs, destaddr)
 	}

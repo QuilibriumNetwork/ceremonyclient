@@ -119,14 +119,14 @@ func (rf *relayFinder) background(ctx context.Context) {
 	peerSourceRateLimiter := make(chan struct{}, 1)
 	rf.refCount.Add(1)
 	go func() {
-		defer rf.refCount.Done()
 		rf.findNodes(ctx, peerSourceRateLimiter)
+		rf.refCount.Done()
 	}()
 
 	rf.refCount.Add(1)
 	go func() {
-		defer rf.refCount.Done()
 		rf.handleNewCandidates(ctx)
+		rf.refCount.Done()
 	}()
 
 	subConnectedness, err := rf.host.EventBus().Subscribe(new(event.EvtPeerConnectednessChanged), eventbus.Name("autorelay (relay finder)"))
@@ -134,11 +134,9 @@ func (rf *relayFinder) background(ctx context.Context) {
 		log.Error("failed to subscribe to the EvtPeerConnectednessChanged")
 		return
 	}
-	defer subConnectedness.Close()
 
 	now := rf.conf.clock.Now()
 	bootDelayTimer := rf.conf.clock.InstantTimer(now.Add(rf.conf.bootDelay))
-	defer bootDelayTimer.Stop()
 
 	// This is the least frequent event. It's our fallback timer if we don't have any other work to do.
 	leastFrequentInterval := rf.conf.minInterval
@@ -162,12 +160,14 @@ func (rf *relayFinder) background(ctx context.Context) {
 	}
 
 	workTimer := rf.conf.clock.InstantTimer(rf.runScheduledWork(ctx, now, scheduledWork, peerSourceRateLimiter))
-	defer workTimer.Stop()
 
 	for {
 		select {
 		case ev, ok := <-subConnectedness.Out():
 			if !ok {
+				subConnectedness.Close()
+				bootDelayTimer.Stop()
+				workTimer.Stop()
 				return
 			}
 			evt := ev.(event.EvtPeerConnectednessChanged)
@@ -206,6 +206,9 @@ func (rf *relayFinder) background(ctx context.Context) {
 			// Ignore the next time because we aren't scheduling any future work here
 			_ = rf.runScheduledWork(ctx, rf.conf.clock.Now(), scheduledWork, peerSourceRateLimiter)
 		case <-ctx.Done():
+			subConnectedness.Close()
+			bootDelayTimer.Stop()
+			workTimer.Stop()
 			return
 		}
 	}
@@ -282,7 +285,6 @@ func (rf *relayFinder) clearOldCandidates(now time.Time) time.Time {
 
 	var deleted bool
 	rf.candidateMx.Lock()
-	defer rf.candidateMx.Unlock()
 	for id, cand := range rf.candidates {
 		expiry := cand.added.Add(rf.conf.maxCandidateAge)
 		if expiry.After(now) {
@@ -298,7 +300,7 @@ func (rf *relayFinder) clearOldCandidates(now time.Time) time.Time {
 	if deleted {
 		rf.notifyMaybeNeedNewCandidates()
 	}
-
+	rf.candidateMx.Unlock()
 	return nextTime
 }
 
@@ -308,7 +310,6 @@ func (rf *relayFinder) clearBackoff(now time.Time) time.Time {
 	nextTime := now.Add(rf.conf.backoff)
 
 	rf.candidateMx.Lock()
-	defer rf.candidateMx.Unlock()
 	for id, t := range rf.backoff {
 		expiry := t.Add(rf.conf.backoff)
 		if expiry.After(now) {
@@ -320,6 +321,7 @@ func (rf *relayFinder) clearBackoff(now time.Time) time.Time {
 			delete(rf.backoff, id)
 		}
 	}
+	rf.candidateMx.Unlock()
 
 	return nextTime
 }
@@ -383,11 +385,11 @@ func (rf *relayFinder) findNodes(ctx context.Context, peerSourceRateLimiter <-ch
 			rf.refCount.Add(1)
 			wg.Add(1)
 			go func() {
-				defer rf.refCount.Done()
-				defer wg.Done()
 				if added := rf.handleNewNode(ctx, pi); added {
 					rf.notifyNewCandidate()
 				}
+				rf.refCount.Done()
+				wg.Done()
 			}()
 		case <-ctx.Done():
 			rf.metricsTracer.CandidateLoopState(stopped)
@@ -430,13 +432,13 @@ func (rf *relayFinder) handleNewNode(ctx context.Context, pi peer.AddrInfo) (add
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
 	supportsV2, err := rf.tryNode(ctx, pi)
 	if err != nil {
 		log.Debugf("node %s not accepted as a candidate: %s", pi.ID, err)
 		if err == errProtocolNotSupported {
 			rf.metricsTracer.CandidateChecked(false)
 		}
+		cancel()
 		return false
 	}
 	rf.metricsTracer.CandidateChecked(true)
@@ -444,6 +446,7 @@ func (rf *relayFinder) handleNewNode(ctx context.Context, pi peer.AddrInfo) (add
 	rf.candidateMx.Lock()
 	if len(rf.candidates) > rf.conf.maxCandidates {
 		rf.candidateMx.Unlock()
+		cancel()
 		return false
 	}
 	log.Debugw("node supports relay protocol", "peer", pi.ID, "supports circuit v2", supportsV2)
@@ -453,6 +456,7 @@ func (rf *relayFinder) handleNewNode(ctx context.Context, pi peer.AddrInfo) (add
 		supportsRelayV2: supportsV2,
 	})
 	rf.candidateMx.Unlock()
+	cancel()
 	return true
 }
 
@@ -588,7 +592,6 @@ func (rf *relayFinder) connectToRelay(ctx context.Context, cand *candidate) (*ci
 	id := cand.ai.ID
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
 
 	var rsvp *circuitv2.Reservation
 
@@ -598,6 +601,7 @@ func (rf *relayFinder) connectToRelay(ctx context.Context, cand *candidate) (*ci
 			rf.candidateMx.Lock()
 			rf.removeCandidate(cand.ai.ID)
 			rf.candidateMx.Unlock()
+			cancel()
 			return nil, fmt.Errorf("failed to connect: %w", err)
 		}
 	}
@@ -615,6 +619,7 @@ func (rf *relayFinder) connectToRelay(ctx context.Context, cand *candidate) (*ci
 	rf.candidateMx.Lock()
 	rf.removeCandidate(id)
 	rf.candidateMx.Unlock()
+	cancel()
 	return rsvp, err
 }
 
@@ -716,9 +721,9 @@ func (rf *relayFinder) selectCandidates() []*candidate {
 //     through which we can be dialed.
 func (rf *relayFinder) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	rf.relayMx.Lock()
-	defer rf.relayMx.Unlock()
 
 	if rf.cachedAddrs != nil && rf.conf.clock.Now().Before(rf.cachedAddrsExpiry) {
+		rf.relayMx.Unlock()
 		return rf.cachedAddrs
 	}
 
@@ -726,7 +731,7 @@ func (rf *relayFinder) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 
 	// only keep private addrs from the original addr set
 	for _, addr := range addrs {
-		if manet.IsPrivateAddr(addr) {
+		if is, err := manet.IsPrivateAddr(addr); is && err == nil {
 			raddrs = append(raddrs, addr)
 		}
 	}
@@ -735,8 +740,11 @@ func (rf *relayFinder) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	relayAddrCnt := 0
 	for p := range rf.relays {
 		addrs := cleanupAddressSet(rf.host.Peerstore().Addrs(p))
+		circuit, err := ma.StringCast(fmt.Sprintf("/p2p/%s/p2p-circuit", p))
+		if err != nil {
+			continue
+		}
 		relayAddrCnt += len(addrs)
-		circuit := ma.StringCast(fmt.Sprintf("/p2p/%s/p2p-circuit", p))
 		for _, addr := range addrs {
 			pub := addr.Encapsulate(circuit)
 			raddrs = append(raddrs, pub)
@@ -747,13 +755,14 @@ func (rf *relayFinder) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	rf.cachedAddrsExpiry = rf.conf.clock.Now().Add(30 * time.Second)
 
 	rf.metricsTracer.RelayAddressCount(relayAddrCnt)
+	rf.relayMx.Unlock()
 	return raddrs
 }
 
 func (rf *relayFinder) Start() error {
 	rf.ctxCancelMx.Lock()
-	defer rf.ctxCancelMx.Unlock()
 	if rf.ctxCancel != nil {
+		rf.ctxCancelMx.Unlock()
 		return errAlreadyRunning
 	}
 	log.Debug("starting relay finder")
@@ -764,15 +773,15 @@ func (rf *relayFinder) Start() error {
 	rf.ctxCancel = cancel
 	rf.refCount.Add(1)
 	go func() {
-		defer rf.refCount.Done()
 		rf.background(ctx)
+		rf.refCount.Done()
 	}()
+	rf.ctxCancelMx.Unlock()
 	return nil
 }
 
 func (rf *relayFinder) Stop() error {
 	rf.ctxCancelMx.Lock()
-	defer rf.ctxCancelMx.Unlock()
 	log.Debug("stopping relay finder")
 	if rf.ctxCancel != nil {
 		rf.ctxCancel()
@@ -781,6 +790,7 @@ func (rf *relayFinder) Stop() error {
 	rf.ctxCancel = nil
 
 	rf.resetMetrics()
+	rf.ctxCancelMx.Unlock()
 	return nil
 }
 

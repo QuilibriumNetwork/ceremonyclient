@@ -1072,10 +1072,10 @@ func filterAddrs(addrs []ma.Multiaddr, remote ma.Multiaddr) []ma.Multiaddr {
 	if manet.IsIPLoopback(remote) {
 		return addrs
 	}
-	if manet.IsPrivateAddr(remote) {
+	if is, err := manet.IsPrivateAddr(remote); is && err == nil {
 		return ma.FilterAddrs(addrs, func(a ma.Multiaddr) bool { return !manet.IsIPLoopback(a) })
 	}
-	return ma.FilterAddrs(addrs, manet.IsPublicAddr)
+	return ma.FilterAddrs(addrs, func(a ma.Multiaddr) bool { is, err := manet.IsPublicAddr(a); return is && err == nil })
 }
 
 func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
@@ -1089,13 +1089,16 @@ func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
 
 	score := func(addr ma.Multiaddr) int {
 		var res int
-		if manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); is && err == nil {
 			res |= 1 << 12
 		} else if !manet.IsIPLoopback(addr) {
 			res |= 1 << 11
 		}
 		var protocolWeight int
-		ma.ForEach(addr, func(c ma.Component) bool {
+		ma.ForEach(addr, func(c ma.Component, e error) bool {
+			if e != nil {
+				return false
+			}
 			switch c.Protocol().Code {
 			case ma.P_QUIC_V1:
 				protocolWeight = 5

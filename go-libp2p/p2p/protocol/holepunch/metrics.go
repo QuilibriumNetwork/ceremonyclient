@@ -113,19 +113,19 @@ func (mt *metricsTracer) HolePunchFinished(side string, numAttempts int,
 	*tags = append(*tags, side, getNumAttemptString(numAttempts))
 	var dipv, dtransport string
 	if directConn != nil {
-		dipv = metricshelper.GetIPVersion(directConn.LocalMultiaddr())
+		dipv, _ = metricshelper.GetIPVersion(directConn.LocalMultiaddr())
 		dtransport = metricshelper.GetTransport(directConn.LocalMultiaddr())
 	}
 
 	matchingAddressCount := 0
 	// calculate holepunch outcome for all the addresses involved
 	for _, la := range localAddrs {
-		lipv := metricshelper.GetIPVersion(la)
+		lipv, _ := metricshelper.GetIPVersion(la)
 		ltransport := metricshelper.GetTransport(la)
 
 		matchingAddress := false
 		for _, ra := range remoteAddrs {
-			ripv := metricshelper.GetIPVersion(ra)
+			ripv, _ := metricshelper.GetIPVersion(ra)
 			rtransport := metricshelper.GetTransport(ra)
 			if ripv == lipv && rtransport == ltransport {
 				// the peer reported an address with the same transport

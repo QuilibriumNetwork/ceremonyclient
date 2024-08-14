@@ -446,6 +446,11 @@ func TestIdentifyPushWhileIdentifyingConn(t *testing.T) {
 	}
 }
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestIdentifyPushOnAddrChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -483,7 +488,7 @@ func TestIdentifyPushOnAddrChange(t *testing.T) {
 	testKnowsAddrs(t, h2, h1p, h1.Peerstore().Addrs(h1p))
 
 	// change addr on host 1 and ensure host2 gets a push
-	lad := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+	lad := tStringCast("/ip4/127.0.0.1/tcp/1234")
 	require.NoError(t, h1.Network().Listen(lad))
 	require.Contains(t, h1.Addrs(), lad)
 
@@ -497,7 +502,7 @@ func TestIdentifyPushOnAddrChange(t *testing.T) {
 	require.True(t, ma.Contains(h2.Peerstore().Addrs(h1p), lad))
 
 	// change addr on host2 and ensure host 1 gets a pus
-	lad = ma.StringCast("/ip4/127.0.0.1/tcp/1235")
+	lad = tStringCast("/ip4/127.0.0.1/tcp/1235")
 	require.NoError(t, h2.Network().Listen(lad))
 	require.Contains(t, h2.Addrs(), lad)
 	h1AddrStream := h1.Peerstore().AddrStream(ctx, h2p)
@@ -509,7 +514,7 @@ func TestIdentifyPushOnAddrChange(t *testing.T) {
 	require.True(t, ma.Contains(h1.Peerstore().Addrs(h2p), lad))
 
 	// change addr on host2 again
-	lad2 := ma.StringCast("/ip4/127.0.0.1/tcp/1236")
+	lad2 := tStringCast("/ip4/127.0.0.1/tcp/1236")
 	require.NoError(t, h2.Network().Listen(lad2))
 	require.Contains(t, h2.Addrs(), lad2)
 	emitAddrChangeEvt(t, h2)
@@ -776,7 +781,7 @@ func TestLargePushMessage(t *testing.T) {
 	testKnowsAddrs(t, h2, h1p, h1.Peerstore().Addrs(h1p))
 
 	// change addr on host 1 and ensure host2 gets a push
-	lad := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+	lad := tStringCast("/ip4/127.0.0.1/tcp/1234")
 	require.NoError(t, h1.Network().Listen(lad))
 	require.Contains(t, h1.Addrs(), lad)
 	emitAddrChangeEvt(t, h1)
@@ -786,7 +791,7 @@ func TestLargePushMessage(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	// change addr on host2 and ensure host 1 gets a pus
-	lad = ma.StringCast("/ip4/127.0.0.1/tcp/1235")
+	lad = tStringCast("/ip4/127.0.0.1/tcp/1235")
 	require.NoError(t, h2.Network().Listen(lad))
 	require.Contains(t, h2.Addrs(), lad)
 	emitAddrChangeEvt(t, h2)
@@ -796,7 +801,7 @@ func TestLargePushMessage(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	// change addr on host2 again
-	lad2 := ma.StringCast("/ip4/127.0.0.1/tcp/1236")
+	lad2 := tStringCast("/ip4/127.0.0.1/tcp/1236")
 	require.NoError(t, h2.Network().Listen(lad2))
 	require.Contains(t, h2.Addrs(), lad2)
 	emitAddrChangeEvt(t, h2)
@@ -903,7 +908,7 @@ func TestOutOfOrderConnectedNotifs(t *testing.T) {
 	h1, err := libp2p.New(libp2p.NoListenAddrs)
 	require.NoError(t, err)
 	defer h1.Close()
-	h2, err := libp2p.New(libp2p.ListenAddrs(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
+	h2, err := libp2p.New(libp2p.ListenAddrs(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
 	require.NoError(t, err)
 	defer h2.Close()
 

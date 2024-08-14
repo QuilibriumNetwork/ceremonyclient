@@ -29,6 +29,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestAddrsForDial(t *testing.T) {
 	mockResolver := madns.MockResolver{IP: make(map[string][]net.IPAddr)}
 	ipaddr, err := net.ResolveIPAddr("ip4", "1.2.3.4")
@@ -63,7 +68,7 @@ func TestAddrsForDial(t *testing.T) {
 
 	otherPeer := test.RandPeerIDFatal(t)
 
-	ps.AddAddr(otherPeer, ma.StringCast("/dns4/example.com/tcp/1234/wss"), time.Hour)
+	ps.AddAddr(otherPeer, tStringCast("/dns4/example.com/tcp/1234/wss"), time.Hour)
 
 	ctx := context.Background()
 	mas, _, err := s.addrsForDial(ctx, otherPeer)
@@ -107,8 +112,8 @@ func TestDedupAddrsForDial(t *testing.T) {
 
 	otherPeer := test.RandPeerIDFatal(t)
 
-	ps.AddAddr(otherPeer, ma.StringCast("/dns4/example.com/tcp/1234"), time.Hour)
-	ps.AddAddr(otherPeer, ma.StringCast("/ip4/1.2.3.4/tcp/1234"), time.Hour)
+	ps.AddAddr(otherPeer, tStringCast("/dns4/example.com/tcp/1234"), time.Hour)
+	ps.AddAddr(otherPeer, tStringCast("/ip4/1.2.3.4/tcp/1234"), time.Hour)
 
 	ctx := context.Background()
 	mas, _, err := s.addrsForDial(ctx, otherPeer)
@@ -164,11 +169,11 @@ func TestAddrResolution(t *testing.T) {
 
 	p1 := test.RandPeerIDFatal(t)
 	p2 := test.RandPeerIDFatal(t)
-	addr1 := ma.StringCast("/dnsaddr/example.com")
-	addr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123")
+	addr1 := tStringCast("/dnsaddr/example.com")
+	addr2 := tStringCast("/ip4/192.0.2.1/tcp/123")
 
-	p2paddr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
-	p2paddr3 := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p2.String())
+	p2paddr2 := tStringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
+	p2paddr3 := tStringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p2.String())
 
 	backend := &madns.MockResolver{
 		TXT: map[string][]string{"_dnsaddr.example.com": {
@@ -200,13 +205,13 @@ func TestAddrResolutionRecursive(t *testing.T) {
 	p1 := test.RandPeerIDFatal(t)
 	p2 := test.RandPeerIDFatal(t)
 
-	addr1 := ma.StringCast("/dnsaddr/example.com")
-	addr2 := ma.StringCast("/ip4/192.0.2.1/tcp/123")
-	p2paddr1 := ma.StringCast("/dnsaddr/example.com/p2p/" + p1.String())
-	p2paddr2 := ma.StringCast("/dnsaddr/example.com/p2p/" + p2.String())
-	p2paddr1i := ma.StringCast("/dnsaddr/foo.example.com/p2p/" + p1.String())
-	p2paddr2i := ma.StringCast("/dnsaddr/bar.example.com/p2p/" + p2.String())
-	p2paddr1f := ma.StringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
+	addr1 := tStringCast("/dnsaddr/example.com")
+	addr2 := tStringCast("/ip4/192.0.2.1/tcp/123")
+	p2paddr1 := tStringCast("/dnsaddr/example.com/p2p/" + p1.String())
+	p2paddr2 := tStringCast("/dnsaddr/example.com/p2p/" + p2.String())
+	p2paddr1i := tStringCast("/dnsaddr/foo.example.com/p2p/" + p1.String())
+	p2paddr2i := tStringCast("/dnsaddr/bar.example.com/p2p/" + p2.String())
+	p2paddr1f := tStringCast("/ip4/192.0.2.1/tcp/123/p2p/" + p1.String())
 
 	backend := &madns.MockResolver{
 		TXT: map[string][]string{
@@ -266,7 +271,7 @@ func TestAddrResolutionRecursiveTransportSpecific(t *testing.T) {
 	require.NoError(t, err)
 
 	s := newTestSwarmWithResolver(t, resolver)
-	pi1, err := peer.AddrInfoFromP2pAddr(ma.StringCast("/dnsaddr/example.com/p2p/" + p.String()))
+	pi1, err := peer.AddrInfoFromP2pAddr(tStringCast("/dnsaddr/example.com/p2p/" + p.String()))
 	require.NoError(t, err)
 
 	tctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
@@ -279,21 +284,21 @@ func TestAddrResolutionRecursiveTransportSpecific(t *testing.T) {
 }
 
 func TestAddrsForDialFiltering(t *testing.T) {
-	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	wt1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
+	q1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q1v1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	wt1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
 
-	q2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	wt2 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1/webtransport/")
+	q2 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q2v1 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	wt2 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1/webtransport/")
 
-	q3 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q3 := tStringCast("/ip4/1.2.3.4/udp/3/quic-v1")
 
-	t1 := ma.StringCast("/ip4/1.2.3.4/tcp/1")
-	ws1 := ma.StringCast("/ip4/1.2.3.4/tcp/1/ws")
+	t1 := tStringCast("/ip4/1.2.3.4/tcp/1")
+	ws1 := tStringCast("/ip4/1.2.3.4/tcp/1/ws")
 
-	unSpecQ := ma.StringCast("/ip4/0.0.0.0/udp/2/quic-v1")
-	unSpecT := ma.StringCast("/ip6/::/tcp/2/")
+	unSpecQ := tStringCast("/ip4/0.0.0.0/udp/2/quic-v1")
+	unSpecT := tStringCast("/ip6/::/tcp/2/")
 
 	resolver, err := madns.NewResolver(madns.WithDefaultResolver(&madns.MockResolver{}))
 	require.NoError(t, err)
@@ -368,7 +373,7 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 
 	// All dials to this addr will fail.
 	// manet.IsPublic is aggressive for IPv6 addresses. Use a NAT64 address.
-	addr := ma.StringCast("/ip6/64:ff9b::1.2.3.4/tcp/54321/")
+	addr := tStringCast("/ip6/64:ff9b::1.2.3.4/tcp/54321/")
 
 	p, err := test.RandPeerID()
 	if err != nil {

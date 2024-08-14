@@ -108,7 +108,7 @@ func (hp *holePuncher) directConnect(rp peer.ID) error {
 	// short-circuit hole punching if a direct dial works.
 	// attempt a direct connection ONLY if we have a public address for the remote peer
 	for _, a := range hp.host.Peerstore().Addrs(rp) {
-		if manet.IsPublicAddr(a) && !isRelayAddress(a) {
+		if is, err := manet.IsPublicAddr(a); err == nil && is && !isRelayAddress(a) {
 			forceDirectConnCtx := network.WithForceDirectDial(hp.ctx, "hole-punching")
 			dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, dialTimeout)
 

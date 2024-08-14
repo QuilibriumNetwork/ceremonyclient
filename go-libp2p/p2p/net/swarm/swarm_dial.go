@@ -434,7 +434,10 @@ func (s *Swarm) filterKnownUndialables(p peer.ID, addrs []ma.Multiaddr) (goodAdd
 	var ourAddrs []ma.Multiaddr
 	for _, addr := range lisAddrs {
 		// we're only sure about filtering out /ip4 and /ip6 addresses, so far
-		ma.ForEach(addr, func(c ma.Component) bool {
+		ma.ForEach(addr, func(c ma.Component, e error) bool {
+			if e != nil {
+				return true
+			}
 			if c.Protocol().Code == ma.P_IP4 || c.Protocol().Code == ma.P_IP6 {
 				ourAddrs = append(ourAddrs, addr)
 			}
@@ -504,9 +507,13 @@ func (s *Swarm) filterKnownUndialables(p peer.ID, addrs []ma.Multiaddr) (goodAdd
 // limitedDial will start a dial to the given peer when
 // it is able, respecting the various different types of rate
 // limiting that occur without using extra goroutines per addr
-func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp chan transport.DialUpdate) {
+func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp chan transport.DialUpdate) error {
 	timeout := s.dialTimeout
-	if manet.IsPrivateAddr(a) && s.dialTimeoutLocal < s.dialTimeout {
+	is, err := manet.IsPrivateAddr(a)
+	if err != nil {
+		return err
+	}
+	if is && s.dialTimeoutLocal < s.dialTimeout {
 		timeout = s.dialTimeoutLocal
 	}
 	s.limiter.AddDialJob(&dialJob{
@@ -516,6 +523,7 @@ func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp
 		ctx:     ctx,
 		timeout: timeout,
 	})
+	return nil
 }
 
 // dialAddr is the actual dial for an addr, indirectly invoked through the limiter
@@ -582,12 +590,12 @@ func (s *Swarm) dialAddr(ctx context.Context, p peer.ID, addr ma.Multiaddr, updC
 // For a circuit-relay address, we look at the address of the relay server/proxy
 // and use the same logic as above to decide.
 func isFdConsumingAddr(addr ma.Multiaddr) bool {
-	first, _ := ma.SplitFunc(addr, func(c ma.Component) bool {
+	first, _, err := ma.SplitFunc(addr, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_CIRCUIT
 	})
 
 	// for safety
-	if first == nil {
+	if err == nil && first == nil {
 		return true
 	}
 

@@ -42,23 +42,32 @@ func TestMapping(t *testing.T) {
 	externalAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 2, 3, 4}), 4321)
 	// pretend that we have a TCP mapping
 	mockNAT.EXPECT().GetMapping("tcp", 1234).Return(externalAddr, true)
-	require.Equal(t, ma.StringCast("/ip4/1.2.3.4/tcp/4321"), m.GetMapping(ma.StringCast("/ip4/0.0.0.0/tcp/1234")))
+	m1, _ := ma.StringCast("/ip4/1.2.3.4/tcp/4321")
+	m2, _ := ma.StringCast("/ip4/0.0.0.0/tcp/1234")
+	require.Equal(t, m1, m.GetMapping(m2))
 
 	// pretend that we have a QUIC mapping
 	mockNAT.EXPECT().GetMapping("udp", 1234).Return(externalAddr, true)
-	require.Equal(t, ma.StringCast("/ip4/1.2.3.4/udp/4321/quic-v1"), m.GetMapping(ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1")))
+	m3, _ := ma.StringCast("/ip4/1.2.3.4/udp/4321/quic-v1")
+	m4, _ := ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1")
+	require.Equal(t, m3, m.GetMapping(m4))
 
 	// pretend that there's no mapping
 	mockNAT.EXPECT().GetMapping("tcp", 1234).Return(netip.AddrPort{}, false)
-	require.Nil(t, m.GetMapping(ma.StringCast("/ip4/0.0.0.0/tcp/1234")))
+	m5, _ := ma.StringCast("/ip4/0.0.0.0/tcp/1234")
+	require.Nil(t, m.GetMapping(m5))
 
 	// make sure this works for WebSocket addresses as well
 	mockNAT.EXPECT().GetMapping("tcp", 1234).Return(externalAddr, true)
-	require.Equal(t, ma.StringCast("/ip4/1.2.3.4/tcp/4321/ws"), m.GetMapping(ma.StringCast("/ip4/0.0.0.0/tcp/1234/ws")))
+	m6, _ := ma.StringCast("/ip4/1.2.3.4/tcp/4321/ws")
+	m7, _ := ma.StringCast("/ip4/0.0.0.0/tcp/1234/ws")
+	require.Equal(t, m6, m.GetMapping(m7))
 
 	// make sure this works for WebTransport addresses as well
 	mockNAT.EXPECT().GetMapping("udp", 1234).Return(externalAddr, true)
-	require.Equal(t, ma.StringCast("/ip4/1.2.3.4/udp/4321/quic-v1/webtransport"), m.GetMapping(ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1/webtransport")))
+	m8, _ := ma.StringCast("/ip4/1.2.3.4/udp/4321/quic-v1/webtransport")
+	m9, _ := ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1/webtransport")
+	require.Equal(t, m8, m.GetMapping(m9))
 }
 
 func TestAddAndRemoveListeners(t *testing.T) {
@@ -77,7 +86,8 @@ func TestAddAndRemoveListeners(t *testing.T) {
 	added := make(chan struct{}, 1)
 	// add a TCP listener
 	mockNAT.EXPECT().AddMapping(gomock.Any(), "tcp", 1234).Do(func(context.Context, string, int) { added <- struct{}{} })
-	require.NoError(t, sw.Listen(ma.StringCast("/ip4/0.0.0.0/tcp/1234")))
+	m1, _ := ma.StringCast("/ip4/0.0.0.0/tcp/1234")
+	require.NoError(t, sw.Listen(m1))
 	select {
 	case <-added:
 	case <-time.After(time.Second):
@@ -86,7 +96,8 @@ func TestAddAndRemoveListeners(t *testing.T) {
 
 	// add a QUIC listener
 	mockNAT.EXPECT().AddMapping(gomock.Any(), "udp", 1234).Do(func(context.Context, string, int) { added <- struct{}{} })
-	require.NoError(t, sw.Listen(ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1")))
+	m2, _ := ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1")
+	require.NoError(t, sw.Listen(m2))
 	select {
 	case <-added:
 	case <-time.After(time.Second):
@@ -95,7 +106,8 @@ func TestAddAndRemoveListeners(t *testing.T) {
 
 	// remove the QUIC listener
 	mockNAT.EXPECT().RemoveMapping(gomock.Any(), "udp", 1234).Do(func(context.Context, string, int) { added <- struct{}{} })
-	sw.ListenClose(ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1"))
+	m3, _ := ma.StringCast("/ip4/0.0.0.0/udp/1234/quic-v1")
+	sw.ListenClose(m3)
 	select {
 	case <-added:
 	case <-time.After(time.Second):

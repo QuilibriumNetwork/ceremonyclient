@@ -34,12 +34,13 @@ func TestRoutedHostConnectToObsoleteAddresses(t *testing.T) {
 	require.NoError(t, err)
 	defer h2.Close()
 
+	m, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
 	// assemble the AddrInfo struct to use for the connection attempt
 	pi := peer.AddrInfo{
 		ID: h2.ID(),
 		// Use a wrong multi address for host 2, so that the initial connection attempt will fail
 		// (we have obsolete, old multi address information)
-		Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/1234")},
+		Addrs: []ma.Multiaddr{m},
 	}
 
 	// Build mock routing module and replace the FindPeer function.
@@ -70,12 +71,14 @@ func TestRoutedHostConnectFindPeerNoUsefulAddrs(t *testing.T) {
 	require.NoError(t, err)
 	defer h2.Close()
 
+	m1, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+
 	// assemble the AddrInfo struct to use for the connection attempt
 	pi := peer.AddrInfo{
 		ID: h2.ID(),
 		// Use a wrong multi address for host 2, so that the initial connection attempt will fail
 		// (we have obsolete, old multi address information)
-		Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/1234")},
+		Addrs: []ma.Multiaddr{m1},
 	}
 
 	// Build mock routing module and replace the FindPeer function.

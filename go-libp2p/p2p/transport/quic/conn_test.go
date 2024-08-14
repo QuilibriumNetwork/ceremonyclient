@@ -39,6 +39,11 @@ var connTestCases = []*connTestCase{
 	{"reuseport_off", []quicreuse.Option{quicreuse.DisableReuseport()}},
 }
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func createPeer(t *testing.T) (peer.ID, ic.PrivKey) {
 	var priv ic.PrivKey
 	var err error
@@ -62,7 +67,7 @@ func createPeer(t *testing.T) (peer.ID, ic.PrivKey) {
 func runServer(t *testing.T, tr tpt.Transport, addr string) tpt.Listener {
 	t.Helper()
 
-	ln, err := tr.Listen(ma.StringCast(addr))
+	ln, err := tr.Listen(tStringCast(addr))
 	require.NoError(t, err)
 	return ln
 }
@@ -143,7 +148,7 @@ func testResourceManagerSuccess(t *testing.T, tc *connTestCase) {
 	serverTransport, err := NewTransport(serverKey, newConnManager(t, tc.Options...), nil, nil, serverRcmgr)
 	require.NoError(t, err)
 	defer serverTransport.(io.Closer).Close()
-	ln, err := serverTransport.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
+	ln, err := serverTransport.Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -194,7 +199,7 @@ func testResourceManagerDialDenied(t *testing.T, tc *connTestCase) {
 	defer clientTransport.(io.Closer).Close()
 
 	connScope := mocknetwork.NewMockConnManagementScope(ctrl)
-	target := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
+	target := tStringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
 
 	rcmgr.EXPECT().OpenConnection(network.DirOutbound, false, target).Return(connScope, nil)
 	rerr := errors.New("nope")
@@ -237,7 +242,7 @@ func testResourceManagerAcceptDenied(t *testing.T, tc *connTestCase) {
 	serverTransport, err := NewTransport(serverKey, newConnManager(t, tc.Options...), nil, nil, serverRcmgr)
 	require.NoError(t, err)
 	defer serverTransport.(io.Closer).Close()
-	ln, err := serverTransport.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
+	ln, err := serverTransport.Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
 	require.NoError(t, err)
 	defer ln.Close()
 	connChan := make(chan tpt.CapableConn)
@@ -573,7 +578,7 @@ func testStatelessReset(t *testing.T, tc *connTestCase) {
 	proxy.Close()
 
 	// Start another listener (on a different port).
-	ln, err = serverTransport.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
+	ln, err = serverTransport.Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
 	require.NoError(t, err)
 	defer ln.Close()
 	// Now that the new server is up, re-enable packet forwarding.

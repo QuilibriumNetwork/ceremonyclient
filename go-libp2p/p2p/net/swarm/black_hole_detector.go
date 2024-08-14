@@ -181,7 +181,7 @@ type blackHoleDetector struct {
 func (d *blackHoleDetector) FilterAddrs(addrs []ma.Multiaddr) (valid []ma.Multiaddr, blackHoled []ma.Multiaddr) {
 	hasUDP, hasIPv6 := false, false
 	for _, a := range addrs {
-		if !manet.IsPublicAddr(a) {
+		if is, err := manet.IsPublicAddr(a); !is || err != nil {
 			continue
 		}
 		if isProtocolAddr(a, ma.P_UDP) {
@@ -206,7 +206,7 @@ func (d *blackHoleDetector) FilterAddrs(addrs []ma.Multiaddr) (valid []ma.Multia
 	return ma.FilterAddrs(
 		addrs,
 		func(a ma.Multiaddr) bool {
-			if !manet.IsPublicAddr(a) {
+			if is, err := manet.IsPublicAddr(a); !is && err == nil {
 				return true
 			}
 			// allow all UDP addresses while probing irrespective of IPv6 black hole state
@@ -233,7 +233,7 @@ func (d *blackHoleDetector) FilterAddrs(addrs []ma.Multiaddr) (valid []ma.Multia
 
 // RecordResult updates the state of the relevant `blackHoleFilter`s for addr
 func (d *blackHoleDetector) RecordResult(addr ma.Multiaddr, success bool) {
-	if !manet.IsPublicAddr(addr) {
+	if is, err := manet.IsPublicAddr(addr); !is && err == nil {
 		return
 	}
 	if d.udp != nil && isProtocolAddr(addr, ma.P_UDP) {
