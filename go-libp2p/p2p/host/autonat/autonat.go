@@ -198,10 +198,10 @@ func (as *AmbientAutoNAT) background() {
 		// probe finished.
 		case err, ok := <-as.dialResponses:
 			if !ok {
-				close(as.backgroundRunning)
-				as.subscriber.Close()
-				as.emitReachabilityChanged.Close()
 				timer.Stop()
+				as.emitReachabilityChanged.Close()
+				as.subscriber.Close()
+				close(as.backgroundRunning)
 				return
 			}
 			if IsDialRefused(err) {
@@ -215,10 +215,10 @@ func (as *AmbientAutoNAT) background() {
 			timerRunning = false
 			retryProbe = false
 		case <-as.ctx.Done():
-			close(as.backgroundRunning)
-			as.subscriber.Close()
-			as.emitReachabilityChanged.Close()
 			timer.Stop()
+			as.emitReachabilityChanged.Close()
+			as.subscriber.Close()
+			close(as.backgroundRunning)
 			return
 		}
 

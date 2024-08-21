@@ -133,7 +133,6 @@ func NewMetricsTracer(opts ...MetricsTracerOption) MetricsTracer {
 
 func (t *metricsTracer) TriggeredPushes(ev any) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	typ := "unknown"
 	switch ev.(type) {
@@ -144,19 +143,19 @@ func (t *metricsTracer) TriggeredPushes(ev any) {
 	}
 	*tags = append(*tags, typ)
 	pushesTriggered.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func (t *metricsTracer) IncrementPushSupport(s identifyPushSupport) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, getPushSupport(s))
 	connPushSupportTotal.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func (t *metricsTracer) IdentifySent(isPush bool, numProtocols int, numAddrs int) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	if isPush {
 		*tags = append(*tags, metricshelper.GetDirection(network.DirOutbound))
@@ -168,11 +167,11 @@ func (t *metricsTracer) IdentifySent(isPush bool, numProtocols int, numAddrs int
 
 	protocolsCount.Set(float64(numProtocols))
 	addrsCount.Set(float64(numAddrs))
+	metricshelper.PutStringSlice(tags)
 }
 
 func (t *metricsTracer) IdentifyReceived(isPush bool, numProtocols int, numAddrs int) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	if isPush {
 		*tags = append(*tags, metricshelper.GetDirection(network.DirInbound))
@@ -184,14 +183,15 @@ func (t *metricsTracer) IdentifyReceived(isPush bool, numProtocols int, numAddrs
 
 	numProtocolsReceived.Observe(float64(numProtocols))
 	numAddrsReceived.Observe(float64(numAddrs))
+	metricshelper.PutStringSlice(tags)
 }
 
 func (t *metricsTracer) ConnPushSupport(support identifyPushSupport) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, getPushSupport(support))
 	connPushSupportTotal.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func getPushSupport(s identifyPushSupport) string {

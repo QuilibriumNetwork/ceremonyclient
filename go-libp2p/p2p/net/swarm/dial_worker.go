@@ -109,8 +109,6 @@ func newDialWorker(s *Swarm, p peer.ID, reqch <-chan dialRequest, cl Clock) *dia
 // The loop exits when w.reqch is closed.
 func (w *dialWorker) loop() {
 	w.wg.Add(1)
-	defer w.wg.Done()
-	defer w.s.limiter.clearAllPeerDials(w.peer)
 
 	// dq is used to pace dials to different addresses of the peer
 	dq := newDialQueue()
@@ -120,7 +118,6 @@ func (w *dialWorker) loop() {
 	startTime := w.cl.Now()
 	// dialTimer is the dialTimer used to trigger dials
 	dialTimer := w.cl.InstantTimer(startTime.Add(math.MaxInt64))
-	defer dialTimer.Stop()
 
 	timerRunning := true
 	// scheduleNextDial updates timer for triggering the next dial
@@ -164,6 +161,9 @@ loop:
 				if w.s.metricsTracer != nil {
 					w.s.metricsTracer.DialCompleted(w.connected, totalDials)
 				}
+				w.wg.Done()
+				w.s.limiter.clearAllPeerDials(w.peer)
+				dialTimer.Stop()
 				return
 			}
 			// We have received a new request. If we do not have a suitable connection,

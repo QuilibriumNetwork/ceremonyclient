@@ -2257,7 +2257,9 @@ func TestBlossomSubJoinBitmask(t *testing.T) {
 
 	time.Sleep(time.Second)
 
+	router0.meshMx.RLock()
 	meshMap := router0.mesh[string([]byte{0x00, 0x00, 0x80, 0x00})]
+	router0.meshMx.RUnlock()
 	if len(meshMap) != 1 {
 		t.Fatalf("Unexpect peer included in the mesh")
 	}
@@ -2820,14 +2822,14 @@ func TestBloomRouting(t *testing.T) {
 			// Normally the expectation is that any subscription will do when using a bloom bitmask
 			// But we need to verify one gets it.
 			g := sync.WaitGroup{}
-			g.Add(len(sub))
+			g.Add(len(sub) + 1)
 			errch := make(chan error)
 			var errs []error
 			for _, s := range sub {
 				s := s
 				go func() {
 					defer g.Done()
-					nctx, _ := context.WithDeadline(ctx, time.Now().Add(10*time.Millisecond))
+					nctx, _ := context.WithDeadline(ctx, time.Now().Add(100*time.Millisecond))
 					got, err := s.Next(nctx)
 					if err != nil {
 						errch <- err
@@ -2842,7 +2844,7 @@ func TestBloomRouting(t *testing.T) {
 			}
 
 			go func() {
-				for i := 0; i < len(sub); i++ {
+				for _ = range sub {
 					select {
 					case err := <-errch:
 						if err != nil {
@@ -2850,6 +2852,7 @@ func TestBloomRouting(t *testing.T) {
 						}
 					}
 				}
+				g.Done()
 			}()
 			g.Wait()
 			if len(errs) == len(sub) {
@@ -2919,6 +2922,7 @@ func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
 		}
 
 		for _, subs := range chs {
+			subs := subs
 			g := sync.WaitGroup{}
 			g.Add(len(subs))
 			nctx, cancel := context.WithCancel(ctx)
@@ -3141,6 +3145,7 @@ func containsBitmask(bitmask []byte, slice []byte) bool {
 
 func assertReceivedBitmaskSubgroup(t *testing.T, ctx context.Context, subs [][]*Subscription, msg []byte) {
 	for i, subs := range subs {
+		subs := subs
 		g := sync.WaitGroup{}
 		g.Add(len(subs))
 		nctx, cancel := context.WithCancel(ctx)
@@ -3148,7 +3153,7 @@ func assertReceivedBitmaskSubgroup(t *testing.T, ctx context.Context, subs [][]*
 		for _, s := range subs {
 			s := s
 			go func() {
-				nctx, _ := context.WithDeadline(nctx, time.Now().Add(10*time.Millisecond))
+				nctx, _ := context.WithDeadline(nctx, time.Now().Add(100*time.Millisecond))
 				got, err := s.Next(nctx)
 				if err != nil {
 					g.Done()

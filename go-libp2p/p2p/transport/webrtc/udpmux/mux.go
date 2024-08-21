@@ -82,8 +82,8 @@ func NewUDPMux(socket net.PacketConn) *UDPMux {
 func (mux *UDPMux) Start() {
 	mux.wg.Add(1)
 	go func() {
-		defer mux.wg.Done()
 		mux.readLoop()
+		mux.wg.Done()
 	}()
 }
 
@@ -264,7 +264,6 @@ func (mux *UDPMux) RemoveConnByUfrag(ufrag string) {
 	}
 
 	mux.mx.Lock()
-	defer mux.mx.Unlock()
 
 	for _, isIPv6 := range [...]bool{true, false} {
 		key := ufragConnKey{ufrag: ufrag, isIPv6: isIPv6}
@@ -276,17 +275,18 @@ func (mux *UDPMux) RemoveConnByUfrag(ufrag string) {
 			delete(mux.ufragAddrMap, key)
 		}
 	}
+	mux.mx.Unlock()
 }
 
 func (mux *UDPMux) getOrCreateConn(ufrag string, isIPv6 bool, _ *UDPMux, addr net.Addr) (created bool, _ *muxedConnection) {
 	key := ufragConnKey{ufrag: ufrag, isIPv6: isIPv6}
 
 	mux.mx.Lock()
-	defer mux.mx.Unlock()
 
 	if conn, ok := mux.ufragMap[key]; ok {
 		mux.addrMap[addr.String()] = conn
 		mux.ufragAddrMap[key] = append(mux.ufragAddrMap[key], addr)
+		mux.mx.Unlock()
 		return false, conn
 	}
 
@@ -294,5 +294,6 @@ func (mux *UDPMux) getOrCreateConn(ufrag string, isIPv6 bool, _ *UDPMux, addr ne
 	mux.ufragMap[key] = conn
 	mux.addrMap[addr.String()] = conn
 	mux.ufragAddrMap[key] = append(mux.ufragAddrMap[key], addr)
+	mux.mx.Unlock()
 	return true, conn
 }

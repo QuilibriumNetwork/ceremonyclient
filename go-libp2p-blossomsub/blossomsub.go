@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -451,6 +452,7 @@ type BlossomSubRouter struct {
 	backoff  map[string]map[peer.ID]time.Time // prune backoff
 	connect  chan connectInfo                 // px connection requests
 	cab      peerstore.AddrBook
+	meshMx   sync.RWMutex
 
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
@@ -625,9 +627,11 @@ func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
 	bs.tracer.RemovePeer(p)
 	delete(bs.peers, p)
+	bs.meshMx.Lock()
 	for _, peers := range bs.mesh {
 		delete(peers, p)
 	}
+	bs.meshMx.Unlock()
 	for _, peers := range bs.fanout {
 		delete(peers, p)
 	}
@@ -651,8 +655,10 @@ func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 		}
 	}
 
+	bs.meshMx.RLock()
 	// BlossomSub peers
 	bsPeers = len(bs.mesh[string(bitmask)])
+	bs.meshMx.RUnlock()
 
 	if suggested == 0 {
 		suggested = bs.params.Dlo
@@ -724,7 +730,9 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 	iwant := make(map[string]struct{})
 	for _, ihave := range ctl.GetIhave() {
 		bitmask := ihave.GetBitmask()
+		bs.meshMx.RLock()
 		_, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -830,7 +838,9 @@ func (bs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 			continue
 		}
 
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			// don't do PX when there is an unknown bitmask to avoid leaking our peers
 			doPX = false
@@ -919,7 +929,9 @@ func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -1101,7 +1113,9 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 			}
 
 			// BlossomSub peers
+			bs.meshMx.RLock()
 			gmap, ok := bs.mesh[string(bitmask)]
+			bs.meshMx.RUnlock()
 			if !ok {
 				// we are not in the mesh for bitmask, use fanout peers
 				gmap, ok = bs.fanout[string(bitmask)]
@@ -1137,7 +1151,9 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 }
 
 func (bs *BlossomSubRouter) Join(bitmask []byte) {
+	bs.meshMx.RLock()
 	gmap, ok := bs.mesh[string(bitmask)]
+	bs.meshMx.RUnlock()
 	if ok {
 		return
 	}
@@ -1172,7 +1188,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 			}
 		}
 
+		bs.meshMx.Lock()
 		bs.mesh[string(bitmask)] = gmap
+		bs.meshMx.Unlock()
 		delete(bs.fanout, string(bitmask))
 		delete(bs.lastpub, string(bitmask))
 	} else {
@@ -1184,7 +1202,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 			return !direct && !doBackOff && bs.score.Score(p) >= 0
 		})
 		gmap = peerListToMap(peers)
+		bs.meshMx.Lock()
 		bs.mesh[string(bitmask)] = gmap
+		bs.meshMx.Unlock()
 	}
 
 	for p := range gmap {
@@ -1195,7 +1215,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 }
 
 func (bs *BlossomSubRouter) Leave(bitmask []byte) {
+	bs.meshMx.RLock()
 	gmap, ok := bs.mesh[string(bitmask)]
+	bs.meshMx.RUnlock()
 	if !ok {
 		return
 	}
@@ -1203,7 +1225,9 @@ func (bs *BlossomSubRouter) Leave(bitmask []byte) {
 	log.Debugf("LEAVE %s", bitmask)
 	bs.tracer.Leave(bitmask)
 
+	bs.meshMx.Lock()
 	delete(bs.mesh, string(bitmask))
+	bs.meshMx.Unlock()
 
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, bitmask)
@@ -1252,7 +1276,9 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 		delete(bs.gossip, p)
 	}
 
+	bs.p.peersMx.RLock()
 	mch, ok := bs.p.peers[p]
+	bs.p.peersMx.RUnlock()
 	if !ok {
 		return
 	}
@@ -1485,6 +1511,7 @@ func (bs *BlossomSubRouter) heartbeat() {
 	}
 
 	// maintain the mesh for bitmasks we have joined
+	bs.meshMx.Lock()
 	for bitmask, peers := range bs.mesh {
 		bitmask := []byte(bitmask)
 		prunePeer := func(p peer.ID) {
@@ -1667,6 +1694,7 @@ func (bs *BlossomSubRouter) heartbeat() {
 			}
 		}
 	}
+	bs.meshMx.Unlock()
 
 	// expire fanout for bitmasks we haven't published to in a while
 	now := time.Now().UnixNano()
@@ -1921,7 +1949,9 @@ func (bs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 
 	for _, graft := range ctl.GetGraft() {
 		bitmask := graft.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -1933,7 +1963,9 @@ func (bs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			toprune = append(toprune, prune)
 			continue

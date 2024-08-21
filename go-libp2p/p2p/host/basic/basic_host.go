@@ -563,8 +563,8 @@ func (h *BasicHost) background() {
 		case <-ticker.C:
 		case <-h.addrChangeChan:
 		case <-h.ctx.Done():
-			h.refCount.Done()
 			ticker.Stop()
+			h.refCount.Done()
 			return
 		}
 	}

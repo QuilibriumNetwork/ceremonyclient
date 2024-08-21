@@ -130,12 +130,15 @@ func (c *Client) dialPeer(ctx context.Context, relay, dest peer.AddrInfo) (*Conn
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, DialRelayTimeout)
-	defer cancel()
+
 	s, err := c.host.NewStream(dialCtx, relay.ID, proto.ProtoIDv2Hop)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("error opening hop stream to relay: %w", err)
 	}
-	return c.connect(s, dest)
+	conn, err := c.connect(s, dest)
+	cancel()
+	return conn, err
 }
 
 func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
@@ -143,11 +146,9 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 		s.Reset()
 		return nil, err
 	}
-	defer s.Scope().ReleaseMemory(maxMessageSize)
 
 	rd := util.NewDelimitedReader(s, maxMessageSize)
 	wr := util.NewDelimitedWriter(s)
-	defer rd.Close()
 
 	var msg pbv2.HopMessage
 
@@ -159,6 +160,8 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 	err := wr.WriteMsg(&msg)
 	if err != nil {
 		s.Reset()
+		s.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return nil, err
 	}
 
@@ -167,6 +170,8 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 	err = rd.ReadMsg(&msg)
 	if err != nil {
 		s.Reset()
+		s.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return nil, err
 	}
 
@@ -174,12 +179,16 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 
 	if msg.GetType() != pbv2.HopMessage_STATUS {
 		s.Reset()
+		s.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return nil, newRelayError("unexpected relay response; not a status message (%d)", msg.GetType())
 	}
 
 	status := msg.GetStatus()
 	if status != pbv2.Status_OK {
 		s.Reset()
+		s.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return nil, newRelayError("error opening relay circuit: %s (%d)", pbv2.Status_name[int32(status)], status)
 	}
 
@@ -193,5 +202,7 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 		stat.Extra[StatLimitData] = limit.GetData()
 	}
 
+	s.Scope().ReleaseMemory(maxMessageSize)
+	rd.Close()
 	return &Conn{stream: s, remote: dest, stat: stat, client: c}, nil
 }

@@ -65,7 +65,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 		data := make([]byte, 16)
 		rand.Read(data)
 
-		if err = bitmasks[0].Publish(ctx, bitmasks[0].bitmask, data); err != nil {
+		if err := bitmasks[0].Publish(ctx, bitmasks[0].bitmask, data); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -676,6 +676,7 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	ps, err := NewBlossomSub(ctx, legit,
 		WithEventTracer(tracer),
 		WithPeerScore(params, thresholds),
+		WithMessageSignaturePolicy(StrictSign),
 	)
 	if err != nil {
 		t.Fatal(err)

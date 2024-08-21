@@ -93,12 +93,12 @@ func newListener(a ma.Multiaddr, tlsConf *tls.Config) (*listener, error) {
 }
 
 func (l *listener) serve() {
-	defer close(l.closed)
 	if !l.isWss {
 		l.server.Serve(l.nl)
 	} else {
 		l.server.ServeTLS(l.nl, "", "")
 	}
+	close(l.closed)
 }
 
 func (l *listener) ServeHTTP(w http.ResponseWriter, r *http.Request) {

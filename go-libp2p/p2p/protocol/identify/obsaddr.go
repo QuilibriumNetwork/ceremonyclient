@@ -116,10 +116,10 @@ func (s *observerSet) cacheMultiaddr(addr ma.Multiaddr) ma.Multiaddr {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Check if some other go routine added this while we were waiting
 	res, ok = s.cachedMultiaddrs[addrStr]
 	if ok {
+		s.mu.Unlock()
 		return res
 	}
 	if s.cachedMultiaddrs == nil {
@@ -133,7 +133,9 @@ func (s *observerSet) cacheMultiaddr(addr ma.Multiaddr) ma.Multiaddr {
 		}
 	}
 	s.cachedMultiaddrs[addrStr] = ma.Join(s.ObservedTWAddr, addr)
-	return s.cachedMultiaddrs[addrStr]
+	mas := s.cachedMultiaddrs[addrStr]
+	s.mu.Unlock()
+	return mas
 }
 
 type observation struct {
@@ -202,9 +204,9 @@ func (o *ObservedAddrManager) AddrsFor(addr ma.Multiaddr) (addrs []ma.Multiaddr)
 		return nil
 	}
 	o.mu.RLock()
-	defer o.mu.RUnlock()
 	tw, err := thinWaistForm(o.normalize(addr))
 	if err != nil {
+		o.mu.RUnlock()
 		return nil
 	}
 
@@ -213,13 +215,13 @@ func (o *ObservedAddrManager) AddrsFor(addr ma.Multiaddr) (addrs []ma.Multiaddr)
 	for _, s := range observerSets {
 		res = append(res, s.cacheMultiaddr(tw.Rest))
 	}
+	o.mu.RUnlock()
 	return res
 }
 
 // Addrs return all activated observed addresses
 func (o *ObservedAddrManager) Addrs() []ma.Multiaddr {
 	o.mu.RLock()
-	defer o.mu.RUnlock()
 
 	m := make(map[string][]*observerSet)
 	for localTWStr := range o.externalAddrs {
@@ -231,6 +233,7 @@ func (o *ObservedAddrManager) Addrs() []ma.Multiaddr {
 			addrs = append(addrs, s.cacheMultiaddr(t.Rest))
 		}
 	}
+	o.mu.RUnlock()
 	return addrs
 }
 
@@ -282,13 +285,12 @@ func (o *ObservedAddrManager) Record(conn connMultiaddrs, observed ma.Multiaddr)
 }
 
 func (o *ObservedAddrManager) worker() {
-	defer o.wg.Done()
-
 	for {
 		select {
 		case obs := <-o.wch:
 			o.maybeRecordObservation(obs.conn, obs.observed)
 		case <-o.ctx.Done():
+			o.wg.Done()
 			return
 		}
 	}
@@ -372,12 +374,12 @@ func (o *ObservedAddrManager) maybeRecordObservation(conn connMultiaddrs, observ
 	log.Debugw("added own observed listen addr", "observed", observed)
 
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.recordObservationUnlocked(conn, localTW, observedTW)
 	select {
 	case o.addrRecordedNotif <- struct{}{}:
 	default:
 	}
+	o.mu.Unlock()
 }
 
 func (o *ObservedAddrManager) recordObservationUnlocked(conn connMultiaddrs, localTW, observedTW thinWaist) {
@@ -453,16 +455,17 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 		return
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
 
 	// normalize before obtaining the thinWaist so that we are always dealing
 	// with the normalized form of the address
 	localTW, err := thinWaistForm(o.normalize(conn.LocalMultiaddr()))
 	if err != nil {
+		o.mu.Unlock()
 		return
 	}
 	t, ok := o.localAddrs[string(localTW.Addr.Bytes())]
 	if !ok {
+		o.mu.Unlock()
 		return
 	}
 	t.Count--
@@ -472,11 +475,13 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 
 	observedTWAddr, ok := o.connObservedTWAddrs[conn]
 	if !ok {
+		o.mu.Unlock()
 		return
 	}
 	delete(o.connObservedTWAddrs, conn)
 	observer, err := getObserver(conn.RemoteMultiaddr())
 	if err != nil {
+		o.mu.Unlock()
 		return
 	}
 
@@ -485,11 +490,11 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 	case o.addrRecordedNotif <- struct{}{}:
 	default:
 	}
+	o.mu.Unlock()
 }
 
 func (o *ObservedAddrManager) getNATType() (tcpNATType, udpNATType network.NATDeviceType) {
 	o.mu.RLock()
-	defer o.mu.RUnlock()
 
 	var tcpCounts, udpCounts []int
 	var tcpTotal, udpTotal int
@@ -539,6 +544,7 @@ func (o *ObservedAddrManager) getNATType() (tcpNATType, udpNATType network.NATDe
 			udpNATType = network.NATDeviceTypeSymmetric
 		}
 	}
+	o.mu.RUnlock()
 	return
 }
 

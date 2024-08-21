@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math/bits"
 	"sync"
 	"time"
 
@@ -17,8 +18,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	ma "github.com/multiformats/go-multiaddr"
+	madns "github.com/multiformats/go-multiaddr-dns"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -111,6 +116,23 @@ func NewBlossomSub(
 		}
 	}
 
+	defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
+
+	if p2pConfig.Network == 0 {
+		defaultBootstrapPeers = config.BootstrapPeers
+	}
+
+	bootstrappers := []peer.AddrInfo{}
+
+	for _, peerAddr := range defaultBootstrapPeers {
+		peerinfo, err := peer.AddrInfoFromString(peerAddr)
+		if err != nil {
+			panic(err)
+		}
+
+		bootstrappers = append(bootstrappers, *peerinfo)
+	}
+
 	var privKey crypto.PrivKey
 	if p2pConfig.PeerPrivKey != "" {
 		peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -136,7 +158,17 @@ func NewBlossomSub(
 		if err != nil {
 			panic(err)
 		}
+
+		rm, err := resourceManager(
+			p2pConfig.HighWatermarkConnections,
+			bootstrappers,
+		)
+		if err != nil {
+			panic(err)
+		}
+
 		opts = append(opts, libp2p.ConnectionManager(cm))
+		opts = append(opts, libp2p.ResourceManager(rm))
 	}
 
 	bs := &BlossomSub{
@@ -156,7 +188,14 @@ func NewBlossomSub(
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
 
-	kademliaDHT := initDHT(ctx, p2pConfig, logger, h, isBootstrapPeer)
+	kademliaDHT := initDHT(
+		ctx,
+		p2pConfig,
+		logger,
+		h,
+		isBootstrapPeer,
+		bootstrappers,
+	)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
 
@@ -221,6 +260,96 @@ func NewBlossomSub(
 	bs.signKey = privKey
 
 	return bs
+}
+
+// adjusted from Lotus' reference implementation, addressing
+// https://github.com/libp2p/go-libp2p/issues/1640
+func resourceManager(highWatermark uint, bootstrappers []peer.AddrInfo) (
+	network.ResourceManager,
+	error,
+) {
+	defaultLimits := rcmgr.DefaultLimits
+
+	libp2p.SetDefaultServiceLimits(&defaultLimits)
+
+	defaultLimits.SystemBaseLimit.Memory = 1 << 28
+	defaultLimits.SystemLimitIncrease.Memory = 1 << 28
+	defaultLimitConfig := defaultLimits.AutoScale()
+
+	changes := rcmgr.PartialLimitConfig{}
+
+	if defaultLimitConfig.ToPartialLimitConfig().System.Memory > 2<<30 {
+		changes.System.Memory = 2 << 30
+	}
+
+	maxconns := uint(highWatermark)
+	if rcmgr.LimitVal(3*maxconns) > defaultLimitConfig.
+		ToPartialLimitConfig().System.ConnsInbound {
+		changes.System.ConnsInbound = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		changes.System.ConnsOutbound = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		changes.System.Conns = rcmgr.LimitVal(1 << bits.Len(6*maxconns))
+		changes.System.StreamsInbound = rcmgr.LimitVal(1 << bits.Len(36*maxconns))
+		changes.System.StreamsOutbound = rcmgr.LimitVal(1 << bits.Len(216*maxconns))
+		changes.System.Streams = rcmgr.LimitVal(1 << bits.Len(216*maxconns))
+
+		if rcmgr.LimitVal(3*maxconns) > defaultLimitConfig.
+			ToPartialLimitConfig().System.FD {
+			changes.System.FD = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		}
+
+		changes.ServiceDefault.StreamsInbound = rcmgr.LimitVal(
+			1 << bits.Len(12*maxconns),
+		)
+		changes.ServiceDefault.StreamsOutbound = rcmgr.LimitVal(
+			1 << bits.Len(48*maxconns),
+		)
+		changes.ServiceDefault.Streams = rcmgr.LimitVal(1 << bits.Len(48*maxconns))
+		changes.ProtocolDefault.StreamsInbound = rcmgr.LimitVal(
+			1 << bits.Len(12*maxconns),
+		)
+		changes.ProtocolDefault.StreamsOutbound = rcmgr.LimitVal(
+			1 << bits.Len(48*maxconns),
+		)
+		changes.ProtocolDefault.Streams = rcmgr.LimitVal(1 << bits.Len(48*maxconns))
+	}
+
+	changedLimitConfig := changes.Build(defaultLimitConfig)
+
+	limiter := rcmgr.NewFixedLimiter(changedLimitConfig)
+
+	str, err := rcmgr.NewStatsTraceReporter()
+	if err != nil {
+		return nil, errors.Wrap(err, "resource manager")
+	}
+
+	rcmgr.MustRegisterWith(prometheus.DefaultRegisterer)
+
+	// Metrics
+	opts := append(
+		[]rcmgr.Option{},
+		rcmgr.WithTraceReporter(str),
+	)
+
+	resolver := madns.DefaultResolver
+	var bootstrapperMaddrs []ma.Multiaddr
+	for _, pi := range bootstrappers {
+		for _, addr := range pi.Addrs {
+			resolved, err := resolver.Resolve(context.Background(), addr)
+			if err != nil {
+				continue
+			}
+			bootstrapperMaddrs = append(bootstrapperMaddrs, resolved...)
+		}
+	}
+
+	opts = append(opts, rcmgr.WithAllowlistedMultiaddrs(bootstrapperMaddrs))
+
+	mgr, err := rcmgr.NewResourceManager(limiter, opts...)
+	if err != nil {
+		return nil, errors.Wrap(err, "resource manager")
+	}
+
+	return mgr, nil
 }
 
 func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
@@ -303,26 +432,11 @@ func initDHT(
 	logger *zap.Logger,
 	h host.Host,
 	isBootstrapPeer bool,
+	bootstrappers []peer.AddrInfo,
 ) *dht.IpfsDHT {
 	logger.Info("establishing dht")
 	var kademliaDHT *dht.IpfsDHT
 	var err error
-	defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
-
-	if p2pConfig.Network == 0 {
-		defaultBootstrapPeers = config.BootstrapPeers
-	}
-
-	bootstrappers := []peer.AddrInfo{}
-
-	for _, peerAddr := range defaultBootstrapPeers {
-		peerinfo, err := peer.AddrInfoFromString(peerAddr)
-		if err != nil {
-			panic(err)
-		}
-
-		bootstrappers = append(bootstrappers, *peerinfo)
-	}
 
 	if isBootstrapPeer {
 		kademliaDHT, err = dht.New(

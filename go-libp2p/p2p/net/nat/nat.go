@@ -63,8 +63,8 @@ func DiscoverNAT(ctx context.Context) (*NAT, error) {
 	}
 	nat.refCount.Add(1)
 	go func() {
-		defer nat.refCount.Done()
 		nat.background()
+		nat.refCount.Done()
 	}()
 	return nat, nil
 }
@@ -101,15 +101,17 @@ func (nat *NAT) Close() error {
 
 func (nat *NAT) GetMapping(protocol string, port int) (addr netip.AddrPort, found bool) {
 	nat.mappingmu.Lock()
-	defer nat.mappingmu.Unlock()
 
 	if !nat.extAddr.IsValid() {
+		nat.mappingmu.Unlock()
 		return netip.AddrPort{}, false
 	}
 	extPort, found := nat.mappings[entry{protocol: protocol, port: port}]
 	if !found {
+		nat.mappingmu.Unlock()
 		return netip.AddrPort{}, false
 	}
+	nat.mappingmu.Unlock()
 	return netip.AddrPortFrom(nat.extAddr, uint16(extPort)), true
 }
 
@@ -126,9 +128,9 @@ func (nat *NAT) AddMapping(ctx context.Context, protocol string, port int) error
 	}
 
 	nat.mappingmu.Lock()
-	defer nat.mappingmu.Unlock()
 
 	if nat.closed {
+		nat.mappingmu.Unlock()
 		return errors.New("closed")
 	}
 
@@ -136,6 +138,7 @@ func (nat *NAT) AddMapping(ctx context.Context, protocol string, port int) error
 	// allowing users -- in the optimistic case -- to use results right after.
 	extPort := nat.establishMapping(ctx, protocol, port)
 	nat.mappings[entry{protocol: protocol, port: port}] = extPort
+	nat.mappingmu.Unlock()
 	return nil
 }
 
@@ -143,17 +146,19 @@ func (nat *NAT) AddMapping(ctx context.Context, protocol string, port int) error
 // It blocks until the NAT has removed the mapping.
 func (nat *NAT) RemoveMapping(ctx context.Context, protocol string, port int) error {
 	nat.mappingmu.Lock()
-	defer nat.mappingmu.Unlock()
 
 	switch protocol {
 	case "tcp", "udp":
 		e := entry{protocol: protocol, port: port}
 		if _, ok := nat.mappings[e]; ok {
 			delete(nat.mappings, e)
+			nat.mappingmu.Unlock()
 			return nat.nat.DeletePortMapping(ctx, protocol, port)
 		}
+		nat.mappingmu.Unlock()
 		return errors.New("unknown mapping")
 	default:
+		nat.mappingmu.Unlock()
 		return fmt.Errorf("invalid protocol: %s", protocol)
 	}
 }
@@ -166,7 +171,6 @@ func (nat *NAT) background() {
 	nextAddrUpdate := now.Add(CacheTime)
 
 	t := time.NewTimer(minTime(nextMappingUpdate, nextAddrUpdate).Sub(now)) // don't use a ticker here. We don't know how long establishing the mappings takes.
-	defer t.Stop()
 
 	var in []entry
 	var out []int // port numbers
@@ -209,12 +213,13 @@ func (nat *NAT) background() {
 		case <-nat.ctx.Done():
 			nat.mappingmu.Lock()
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
 			for e := range nat.mappings {
 				delete(nat.mappings, e)
 				nat.nat.DeletePortMapping(ctx, e.protocol, e.port)
 			}
 			nat.mappingmu.Unlock()
+			t.Stop()
+			cancel()
 			return
 		}
 	}

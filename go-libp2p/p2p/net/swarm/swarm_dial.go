@@ -122,10 +122,10 @@ func (db *DialBackoff) init(ctx context.Context) {
 
 func (db *DialBackoff) background(ctx context.Context) {
 	ticker := time.NewTicker(BackoffMax)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			ticker.Stop()
 			return
 		case <-ticker.C:
 			db.cleanup()
@@ -137,9 +137,9 @@ func (db *DialBackoff) background(ctx context.Context) {
 // peer p at address addr
 func (db *DialBackoff) Backoff(p peer.ID, addr ma.Multiaddr) (backoff bool) {
 	db.lock.RLock()
-	defer db.lock.RUnlock()
 
 	ap, found := db.entries[p][string(addr.Bytes())]
+	db.lock.RUnlock()
 	return found && time.Now().Before(ap.until)
 }
 
@@ -163,7 +163,6 @@ var BackoffMax = time.Minute * 5
 func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 	saddr := string(addr.Bytes())
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	bp, ok := db.entries[p]
 	if !ok {
 		bp = make(map[string]*backoffAddr, 1)
@@ -175,6 +174,7 @@ func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 			tries: 1,
 			until: time.Now().Add(BackoffBase),
 		}
+		db.lock.Unlock()
 		return
 	}
 
@@ -184,19 +184,19 @@ func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 	}
 	ba.until = time.Now().Add(backoffTime)
 	ba.tries++
+	db.lock.Unlock()
 }
 
 // Clear removes a backoff record. Clients should call this after a
 // successful Dial.
 func (db *DialBackoff) Clear(p peer.ID) {
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	delete(db.entries, p)
+	db.lock.Unlock()
 }
 
 func (db *DialBackoff) cleanup() {
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	now := time.Now()
 	for p, e := range db.entries {
 		good := false
@@ -214,6 +214,7 @@ func (db *DialBackoff) cleanup() {
 			delete(db.entries, p)
 		}
 	}
+	db.lock.Unlock()
 }
 
 // DialPeer connects to a peer. Use network.WithForceDirectDial to force a
@@ -260,7 +261,6 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 
 	// apply the DialPeer timeout
 	ctx, cancel := context.WithTimeout(ctx, network.GetDialPeerTimeout(ctx))
-	defer cancel()
 
 	conn, err = s.dsync.Dial(ctx, p)
 	if err == nil {
@@ -269,8 +269,10 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 		if conn.RemotePeer() != p {
 			conn.Close()
 			log.Errorw("Handshake failed to properly authenticate peer", "authenticated", conn.RemotePeer(), "expected", p)
+			cancel()
 			return nil, fmt.Errorf("unexpected peer")
 		}
+		cancel()
 		return conn, nil
 	}
 
@@ -278,14 +280,17 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 
 	if ctx.Err() != nil {
 		// Context error trumps any dial errors as it was likely the ultimate cause.
+		cancel()
 		return nil, ctx.Err()
 	}
 
 	if s.ctx.Err() != nil {
 		// Ok, so the swarm is shutting down.
+		cancel()
 		return nil, ErrSwarmClosed
 	}
 
+	cancel()
 	return nil, err
 }
 

@@ -77,13 +77,13 @@ type blackHoleFilter struct {
 // fraction over the last n outcomes is less than the minSuccessFraction of the filter.
 func (b *blackHoleFilter) RecordResult(success bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.state == blackHoleStateBlocked && success {
 		// If the call succeeds in a blocked state we reset to allowed.
 		// This is better than slowly accumulating values till we cross the minSuccessFraction
 		// threshold since a blackhole is a binary property.
 		b.reset()
+		b.mu.Unlock()
 		return
 	}
 
@@ -101,22 +101,25 @@ func (b *blackHoleFilter) RecordResult(success bool) {
 
 	b.updateState()
 	b.trackMetrics()
+	b.mu.Unlock()
 }
 
 // HandleRequest returns the result of applying the black hole filter for the request.
 func (b *blackHoleFilter) HandleRequest() blackHoleResult {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	b.requests++
 
 	b.trackMetrics()
 
 	if b.state == blackHoleStateAllowed {
+		b.mu.Unlock()
 		return blackHoleResultAllowed
 	} else if b.state == blackHoleStateProbing || b.requests%b.n == 0 {
+		b.mu.Unlock()
 		return blackHoleResultProbing
 	} else {
+		b.mu.Unlock()
 		return blackHoleResultBlocked
 	}
 }

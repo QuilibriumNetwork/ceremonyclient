@@ -108,7 +108,6 @@ func NewMetricsTracer(opts ...MetricsTracerOption) MetricsTracer {
 func (mt *metricsTracer) HolePunchFinished(side string, numAttempts int,
 	remoteAddrs []ma.Multiaddr, localAddrs []ma.Multiaddr, directConn network.ConnMultiaddrs) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, side, getNumAttemptString(numAttempts))
 	var dipv, dtransport string
@@ -165,6 +164,7 @@ func (mt *metricsTracer) HolePunchFinished(side string, numAttempts int,
 
 	*tags = append(*tags, outcome)
 	hpOutcomesTotal.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func getNumAttemptString(numAttempt int) string {
@@ -177,11 +177,11 @@ func getNumAttemptString(numAttempt int) string {
 
 func (mt *metricsTracer) DirectDialFinished(success bool) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 	if success {
 		*tags = append(*tags, "success")
 	} else {
 		*tags = append(*tags, "failed")
 	}
 	directDialsTotal.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }

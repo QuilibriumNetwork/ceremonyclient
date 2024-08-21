@@ -328,10 +328,10 @@ func (s *Swarm) close() {
 		if closer, ok := t.(io.Closer); ok {
 			wg.Add(1)
 			go func(c io.Closer) {
-				defer wg.Done()
 				if err := closer.Close(); err != nil {
 					log.Errorf("error when closing down transport %T: %s", c, err)
 				}
+				wg.Done()
 			}(closer)
 		}
 	}
@@ -526,14 +526,12 @@ func (s *Swarm) waitForDirectConn(ctx context.Context, p peer.ID) (*Conn, error)
 
 	// apply the DialPeer timeout
 	ctx, cancel := context.WithTimeout(ctx, network.GetDialPeerTimeout(ctx))
-	defer cancel()
 
 	// Wait for notification.
 	select {
 	case <-ctx.Done():
 		// Remove ourselves from the notification list
 		s.directConnNotifs.Lock()
-		defer s.directConnNotifs.Unlock()
 
 		s.directConnNotifs.m[p] = slices.DeleteFunc(
 			s.directConnNotifs.m[p],
@@ -542,17 +540,22 @@ func (s *Swarm) waitForDirectConn(ctx context.Context, p peer.ID) (*Conn, error)
 		if len(s.directConnNotifs.m[p]) == 0 {
 			delete(s.directConnNotifs.m, p)
 		}
+		s.directConnNotifs.Unlock()
+		cancel()
 		return nil, ctx.Err()
 	case <-ch:
 		// We do not need to remove ourselves from the list here as the notifier
 		// clears the map entry
 		c := s.bestConnToPeer(p)
 		if c == nil {
+			cancel()
 			return nil, network.ErrNoConn
 		}
 		if c.Stat().Limited {
+			cancel()
 			return nil, network.ErrLimitedConn
 		}
+		cancel()
 		return c, nil
 	}
 }
@@ -562,12 +565,12 @@ func (s *Swarm) ConnsToPeer(p peer.ID) []network.Conn {
 	// TODO: Consider sorting the connection list best to worst. Currently,
 	// it's sorted oldest to newest.
 	s.conns.RLock()
-	defer s.conns.RUnlock()
 	conns := s.conns.m[p]
 	output := make([]network.Conn, len(conns))
 	for i, c := range conns {
 		output[i] = c
 	}
+	s.conns.RUnlock()
 	return output
 }
 
@@ -610,7 +613,6 @@ func (s *Swarm) bestConnToPeer(p peer.ID) *Conn {
 	// For now, prefers direct connections over Relayed connections.
 	// For tie-breaking, select the newest non-closed connection with the most streams.
 	s.conns.RLock()
-	defer s.conns.RUnlock()
 
 	var best *Conn
 	for _, c := range s.conns.m[p] {
@@ -622,6 +624,7 @@ func (s *Swarm) bestConnToPeer(p peer.ID) *Conn {
 			best = c
 		}
 	}
+	s.conns.RUnlock()
 	return best
 }
 
@@ -648,9 +651,9 @@ func isDirectConn(c *Conn) bool {
 // network.Connected`.
 func (s *Swarm) Connectedness(p peer.ID) network.Connectedness {
 	s.conns.RLock()
-	defer s.conns.RUnlock()
-
-	return s.connectednessUnlocked(p)
+	connectedness := s.connectednessUnlocked(p)
+	s.conns.RUnlock()
+	return connectedness
 }
 
 // connectednessUnlocked returns the connectedness of a peer.
@@ -676,7 +679,6 @@ func (s *Swarm) connectednessUnlocked(p peer.ID) network.Connectedness {
 // Conns returns a slice of all connections.
 func (s *Swarm) Conns() []network.Conn {
 	s.conns.RLock()
-	defer s.conns.RUnlock()
 
 	conns := make([]network.Conn, 0, len(s.conns.m))
 	for _, cs := range s.conns.m {
@@ -684,6 +686,7 @@ func (s *Swarm) Conns() []network.Conn {
 			conns = append(conns, c)
 		}
 	}
+	s.conns.RUnlock()
 	return conns
 }
 
@@ -720,12 +723,13 @@ func (s *Swarm) ClosePeer(p peer.ID) error {
 // Peers returns a copy of the set of peers swarm is connected to.
 func (s *Swarm) Peers() []peer.ID {
 	s.conns.RLock()
-	defer s.conns.RUnlock()
+
 	peers := make([]peer.ID, 0, len(s.conns.m))
 	for p := range s.conns.m {
 		peers = append(peers, p)
 	}
 
+	s.conns.RUnlock()
 	return peers
 }
 
