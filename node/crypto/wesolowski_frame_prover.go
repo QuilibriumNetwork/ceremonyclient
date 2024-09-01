@@ -582,11 +582,13 @@ func (w *WesolowskiFrameProver) VerifyWeakRecursiveProof(
 func (w *WesolowskiFrameProver) CalculateChallengeProofDifficulty(
 	increment uint32,
 ) uint32 {
-	if increment >= 700000 {
-		return 25000
+	difficulty := 200000 - (increment / 4)
+
+	if difficulty < 25000 {
+		difficulty = 25000
 	}
 
-	return 200000 - (increment / 4)
+	return difficulty
 }
 
 func (w *WesolowskiFrameProver) CalculateChallengeProof(
