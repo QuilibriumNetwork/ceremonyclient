@@ -18,8 +18,22 @@ type EngineConfig struct {
 	DataWorkerMemoryLimit    int64  `yaml:"dataWorkerMemoryLimit"`
 	// Alternative configuration path to manually specify data workers by multiaddr
 	DataWorkerMultiaddrs []string `yaml:"dataWorkerMultiaddrs"`
+	Cluster              Cluster  `yaml:"cluster"`
 
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
 	Difficulty uint32 `yaml:"difficulty"`
+}
+
+type Cluster struct {
+	Enabled        bool             `yaml:"enabled"`
+	MachineConfigs []ClusterMachine `yaml:"machineConfigs"`
+}
+
+type ClusterMachine struct {
+	IpAddress                string `yaml:"ipAddress"`
+	Priority                 uint8  `yaml:"priority"`
+	DataWorkerProcessesCount uint16 `yaml:"dataWorkerProcessesCount"`
+	DataWorkerBaseListenPort uint16 `yaml:"dataWorkerBaseListenPort"`
+	DataWorkerMemoryLimit    int64  `yaml:"dataWorkerMemoryLimit"`
 }

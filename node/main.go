@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -108,6 +109,21 @@ var (
 		"core",
 		0,
 		"specifies the core of the process (defaults to zero, the initial launcher)",
+	)
+	coreRpcIpAddress = flag.String(
+		"core-rpc-ip-address",
+		"",
+		"specifies the multiaddr for the core process's rpc port (if defined, skips checking the config file)",
+	)
+	coreMaxMemory = flag.Int64(
+		"core-max-memory",
+		0,
+		"specifies the maximum memory in bytes for the core process (defaults to 0, no limit)",
+	)
+	coreBaseListenPort = flag.Int(
+		"core-base-listen-port",
+		0,
+		"specifies the base listen port for the core process (defaults to 0, no limit)",
 	)
 	parentProcess = flag.Int(
 		"parent-process",
@@ -297,6 +313,71 @@ func main() {
 		printLogo()
 		printVersion()
 		fmt.Println(" ")
+	}
+
+	if *core == 0 && *coreRpcIpAddress != "" {
+		fmt.Println(
+			"Core RPC IP Address param is only supported for running individual core " +
+				"processes. Remove --core-rpc-multiaddr or define a --core " +
+				"param to run the node. Exiting.",
+		)
+		os.Exit(1)
+
+		return
+	}
+
+	if *core != 0 && *coreRpcIpAddress != "" {
+		fmt.Println("Running core process...")
+
+		// Validate if coreRpcIpAddress is a valid IP address
+		if net.ParseIP(*coreRpcIpAddress) == nil {
+			fmt.Printf("Invalid IP address: %s\n", *coreRpcIpAddress)
+			os.Exit(1)
+		}
+
+		runtime.GOMAXPROCS(1)
+		rdebug.SetGCPercent(9999)
+
+		// skip config loading
+		var dataWorkerMemoryLimit int64 = 1792 * 1024 * 1024 // 1.75GiB
+		if *coreMaxMemory != 0 {
+			dataWorkerMemoryLimit = *coreMaxMemory
+		}
+
+		rdebug.SetMemoryLimit(dataWorkerMemoryLimit)
+
+		baseListenPort := 40000
+		if *coreBaseListenPort != 0 {
+			baseListenPort = *coreBaseListenPort
+		}
+
+		rpcMultiaddr := fmt.Sprintf(
+			"/ip4/%s/tcp/%d",
+			*coreRpcIpAddress,
+			baseListenPort+*core-1,
+		)
+
+		l, err := zap.NewProduction()
+		if err != nil {
+			panic(err)
+		}
+
+		srv, err := rpc.NewDataWorkerIPCServer(
+			rpcMultiaddr,
+			l,
+			uint32(*core)-1,
+			qcrypto.NewWesolowskiFrameProver(l),
+			*parentProcess,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		err = srv.Start()
+		if err != nil {
+			panic(err)
+		}
+		return
 	}
 
 	nodeConfig, err := config.LoadConfig(*configDirectory, "")
@@ -636,8 +717,19 @@ func RunSelfTestIfNeeded(
 	logger, _ := zap.NewProduction()
 
 	cores := runtime.GOMAXPROCS(0)
-	if len(nodeConfig.Engine.DataWorkerMultiaddrs) != 0 {
+	if len(nodeConfig.Engine.DataWorkerMultiaddrs) != 0 && !nodeConfig.Engine.Cluster.Enabled {
 		cores = len(nodeConfig.Engine.DataWorkerMultiaddrs) + 1
+	}
+
+	if nodeConfig.Engine.Cluster.Enabled {
+		cores = 1 // control process = 1
+		if len(nodeConfig.Engine.Cluster.MachineConfigs) != 0 {
+			for _, machineConfig := range nodeConfig.Engine.Cluster.MachineConfigs {
+				cores += int(machineConfig.DataWorkerProcessesCount)
+			}
+		} else {
+			panic("Cluster is enabled, but no machine configs found")
+		}
 	}
 
 	memory := memory.TotalMemory()
