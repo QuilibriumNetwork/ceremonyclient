@@ -32,8 +32,6 @@ type Cluster struct {
 
 type ClusterMachine struct {
 	IpAddress                string `yaml:"ipAddress"`
-	Priority                 uint8  `yaml:"priority"`
 	DataWorkerProcessesCount uint16 `yaml:"dataWorkerProcessesCount"`
 	DataWorkerBaseListenPort uint16 `yaml:"dataWorkerBaseListenPort"`
-	DataWorkerMemoryLimit    int64  `yaml:"dataWorkerMemoryLimit"`
 }

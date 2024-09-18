@@ -618,6 +618,12 @@ func (
 ) {
 	parallelism := 0
 	for _, machineConfig := range e.engineConfig.Cluster.MachineConfigs {
+		// There needs to be at least one data worker process per machine, if defined at all
+		if machineConfig.DataWorkerProcessesCount == 0 {
+			panic("DataWorkerProcessesCount for " + machineConfig.IpAddress + " is not set or is zero." +
+				" This must be set to a non-zero value.")
+		}
+
 		parallelism += int(machineConfig.DataWorkerProcessesCount)
 	}
 
@@ -631,8 +637,9 @@ func (
 	for _, machineConfig := range e.engineConfig.Cluster.MachineConfigs {
 		ipAddress := machineConfig.IpAddress
 		if net.ParseIP(ipAddress) == nil {
-			panic("invalid ip address: " + ipAddress)
+			panic("Invalid IP address: " + ipAddress)
 		}
+
 		for i := 0; i < int(machineConfig.DataWorkerProcessesCount); i++ {
 			port := int(machineConfig.DataWorkerBaseListenPort) + i
 			ma, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", ipAddress, port))
