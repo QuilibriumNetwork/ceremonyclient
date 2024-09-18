@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
@@ -248,7 +249,16 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 		}
 
 		var clients []protobufs.DataIPCServiceClient
-		if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+		if e.engineConfig.Cluster.Enabled {
+			if len(e.engineConfig.Cluster.MachineConfigs) == 0 {
+				panic("Invalid user configuration in config, the cluster machine config must have at least one entry")
+			}
+
+			clients, err = e.createParallelDataClientsFromClusterList()
+			if err != nil {
+				panic(err)
+			}
+		} else if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
 			clients, err = e.createParallelDataClientsFromList()
 			if err != nil {
 				panic(err)
@@ -598,6 +608,74 @@ func (e *MasterClockConsensusEngine) createParallelDataClientsFromListAndIndex(
 		zap.Uint32("client", index),
 	)
 	return client, nil
+}
+
+func (
+	e *MasterClockConsensusEngine,
+) createParallelDataClientsFromClusterList() (
+	[]protobufs.DataIPCServiceClient,
+	error,
+) {
+	parallelism := 0
+	for _, machineConfig := range e.engineConfig.Cluster.MachineConfigs {
+		// There needs to be at least one data worker process per machine, if defined at all
+		if machineConfig.DataWorkerProcessesCount == 0 {
+			panic("DataWorkerProcessesCount for " + machineConfig.IpAddress + " is not set or is zero." +
+				" This must be set to a non-zero value.")
+		}
+
+		parallelism += int(machineConfig.DataWorkerProcessesCount)
+	}
+
+	e.logger.Info(
+		"connecting to data worker processes",
+		zap.Int("parallelism", parallelism),
+	)
+
+	clients := make([]protobufs.DataIPCServiceClient, parallelism)
+
+	for _, machineConfig := range e.engineConfig.Cluster.MachineConfigs {
+		ipAddress := machineConfig.IpAddress
+		if net.ParseIP(ipAddress) == nil {
+			panic("Invalid IP address: " + ipAddress)
+		}
+
+		for i := 0; i < int(machineConfig.DataWorkerProcessesCount); i++ {
+			port := int(machineConfig.DataWorkerBaseListenPort) + i
+			ma, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", ipAddress, port))
+			if err != nil {
+				panic(err)
+			}
+
+			_, addr, err := mn.DialArgs(ma)
+			if err != nil {
+				panic(err)
+			}
+
+			conn, err := grpc.Dial(
+				addr,
+				grpc.WithTransportCredentials(
+					insecure.NewCredentials(),
+				),
+				grpc.WithDefaultCallOptions(
+					grpc.MaxCallSendMsgSize(10*1024*1024),
+					grpc.MaxCallRecvMsgSize(10*1024*1024),
+				),
+			)
+			if err != nil {
+				panic(err)
+			}
+
+			clients[i] = protobufs.NewDataIPCServiceClient(conn)
+		}
+
+	}
+
+	e.logger.Info(
+		"connected to data worker processes",
+		zap.Int("parallelism", parallelism),
+	)
+	return clients, nil
 }
 
 func (
