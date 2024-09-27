@@ -23,7 +23,7 @@ RUN go build -o qclient ./main.go
 
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.1
 
-FROM alpine:3.19
+FROM frolvlad/alpine-glibc:glibc-2.31
 
 ARG NODE_VERSION
 ARG GIT_REPO
