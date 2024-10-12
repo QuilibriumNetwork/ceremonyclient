@@ -9,10 +9,10 @@ import (
 )
 
 func TestAddressSorting(t *testing.T) {
-	u1 := ma.StringCast("/ip4/152.12.23.53/udp/1234/utp")
-	u2l := ma.StringCast("/ip4/127.0.0.1/udp/1234/utp")
-	local := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
-	norm := ma.StringCast("/ip4/6.5.4.3/tcp/1234")
+	u1, _ := ma.StringCast("/ip4/152.12.23.53/udp/1234/utp")
+	u2l, _ := ma.StringCast("/ip4/127.0.0.1/udp/1234/utp")
+	local, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+	norm, _ := ma.StringCast("/ip4/6.5.4.3/tcp/1234")
 
 	l := addrList{local, u1, u2l, norm}
 	sort.Sort(l)

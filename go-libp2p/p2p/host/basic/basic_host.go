@@ -327,7 +327,6 @@ func NewHost(n network.Network, opts *HostOpts) (*BasicHost, error) {
 
 func (h *BasicHost) updateLocalIpAddr() {
 	h.addrMu.Lock()
-	defer h.addrMu.Unlock()
 
 	h.filteredInterfaceAddrs = nil
 	h.allInterfaceAddrs = nil
@@ -367,6 +366,7 @@ func (h *BasicHost) updateLocalIpAddr() {
 		// Then bail. There's nothing else we can do here.
 		h.filteredInterfaceAddrs = append(h.filteredInterfaceAddrs, manet.IP4Loopback, manet.IP6Loopback)
 		h.allInterfaceAddrs = h.filteredInterfaceAddrs
+		h.addrMu.Unlock()
 		return
 	}
 
@@ -391,6 +391,7 @@ func (h *BasicHost) updateLocalIpAddr() {
 			}
 		}
 	}
+	h.addrMu.Unlock()
 }
 
 // Start starts background tasks in the host
@@ -508,7 +509,6 @@ func (h *BasicHost) makeSignedPeerRecord(addrs []ma.Multiaddr) (*record.Envelope
 }
 
 func (h *BasicHost) background() {
-	defer h.refCount.Done()
 	var lastAddrs []ma.Multiaddr
 
 	emitAddrChange := func(currentAddrs []ma.Multiaddr, lastAddrs []ma.Multiaddr) {
@@ -548,7 +548,6 @@ func (h *BasicHost) background() {
 	// periodically schedules an IdentifyPush to update our peers for changes
 	// in our address set (if needed)
 	ticker := time.NewTicker(addrChangeTickrInterval)
-	defer ticker.Stop()
 
 	for {
 		if len(h.network.ListenAddresses()) > 0 {
@@ -564,6 +563,8 @@ func (h *BasicHost) background() {
 		case <-ticker.C:
 		case <-h.addrChangeChan:
 		case <-h.ctx.Done():
+			ticker.Stop()
+			h.refCount.Done()
 			return
 		}
 	}
@@ -831,7 +832,7 @@ func (h *BasicHost) NormalizeMultiaddr(addr ma.Multiaddr) ma.Multiaddr {
 	if ok && n > 0 {
 		out := addr
 		for i := 0; i < n; i++ {
-			out, _ = ma.SplitLast(out)
+			out, _, _ = ma.SplitLast(out)
 		}
 		return out
 	}
@@ -885,7 +886,7 @@ func (h *BasicHost) AllAddrs() []ma.Multiaddr {
 			}
 
 			// Did the router give us a routable public addr?
-			if manet.IsPublicAddr(extMaddr) {
+			if is, err := manet.IsPublicAddr(extMaddr); is && err == nil {
 				// well done
 				continue
 			}
@@ -911,12 +912,12 @@ func (h *BasicHost) AllAddrs() []ma.Multiaddr {
 				}
 
 				// Drop the IP from the external maddr
-				_, extMaddrNoIP := ma.SplitFirst(extMaddr)
+				_, extMaddrNoIP, _ := ma.SplitFirst(extMaddr)
 
 				for _, obsMaddr := range observed {
 					// Extract a public observed addr.
-					ip, _ := ma.SplitFirst(obsMaddr)
-					if ip == nil || !manet.IsPublicAddr(ip) {
+					ip, _, _ := ma.SplitFirst(obsMaddr)
+					if is, err := manet.IsPublicAddr(ip); err != nil || !is || ip == nil {
 						continue
 					}
 
@@ -937,7 +938,7 @@ func (h *BasicHost) AllAddrs() []ma.Multiaddr {
 	return finalAddrs
 }
 
-var wtComponent = ma.StringCast("/webtransport")
+var wtComponent, _ = ma.StringCast("/webtransport")
 
 // inferWebtransportAddrsFromQuic infers more webtransport addresses from QUIC addresses.
 // This is useful when we discover our public QUIC address, but haven't discovered our public WebTransport addrs.
@@ -952,7 +953,7 @@ func inferWebtransportAddrsFromQuic(in []ma.Multiaddr) []ma.Multiaddr {
 	// Count the number of QUIC addrs, this will let us allocate just once at the beginning.
 	quicAddrCount := 0
 	for _, addr := range in {
-		if _, lastComponent := ma.SplitLast(addr); lastComponent.Protocol().Code == ma.P_QUIC_V1 {
+		if _, lastComponent, err := ma.SplitLast(addr); err == nil && lastComponent.Protocol().Code == ma.P_QUIC_V1 {
 			quicAddrCount++
 		}
 	}
@@ -964,14 +965,14 @@ func inferWebtransportAddrsFromQuic(in []ma.Multiaddr) []ma.Multiaddr {
 		if isWebtransport {
 			for i := 0; i < numCertHashes; i++ {
 				// Remove certhashes
-				addr, _ = ma.SplitLast(addr)
+				addr, _, _ = ma.SplitLast(addr)
 			}
 			webtransportAddrs[string(addr.Bytes())] = struct{}{}
 			// Remove webtransport component, now it's a multiaddr that ends in /quic-v1
-			addr, _ = ma.SplitLast(addr)
+			addr, _, _ = ma.SplitLast(addr)
 		}
 
-		if _, lastComponent := ma.SplitLast(addr); lastComponent.Protocol().Code == ma.P_QUIC_V1 {
+		if _, lastComponent, err := ma.SplitLast(addr); err == nil && lastComponent.Protocol().Code == ma.P_QUIC_V1 {
 			bytes := addr.Bytes()
 			if _, ok := quicOrWebtransportAddrs[string(bytes)]; ok {
 				foundSameListeningAddr = true
@@ -995,7 +996,7 @@ func inferWebtransportAddrsFromQuic(in []ma.Multiaddr) []ma.Multiaddr {
 	for _, addr := range in {
 		// Add all the original addresses
 		out = append(out, addr)
-		if _, lastComponent := ma.SplitLast(addr); lastComponent.Protocol().Code == ma.P_QUIC_V1 {
+		if _, lastComponent, err := ma.SplitLast(addr); err == nil && lastComponent.Protocol().Code == ma.P_QUIC_V1 {
 			// Convert quic to webtransport
 			addr = addr.Encapsulate(wtComponent)
 			if _, ok := webtransportAddrs[string(addr.Bytes())]; ok {
@@ -1021,13 +1022,16 @@ func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
 
 	score := func(addr ma.Multiaddr) int {
 		var res int
-		if manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); is && err == nil {
 			res |= 1 << 12
 		} else if !manet.IsIPLoopback(addr) {
 			res |= 1 << 11
 		}
 		var protocolWeight int
-		ma.ForEach(addr, func(c ma.Component) bool {
+		ma.ForEach(addr, func(c ma.Component, e error) bool {
+			if e != nil {
+				return false
+			}
 			switch c.Protocol().Code {
 			case ma.P_QUIC_V1:
 				protocolWeight = 5
@@ -1065,17 +1069,19 @@ func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
 // SetAutoNat sets the autonat service for the host.
 func (h *BasicHost) SetAutoNat(a autonat.AutoNAT) {
 	h.addrMu.Lock()
-	defer h.addrMu.Unlock()
+
 	if h.autoNat == nil {
 		h.autoNat = a
 	}
+	h.addrMu.Unlock()
 }
 
 // GetAutoNat returns the host's AutoNAT service, if AutoNAT is enabled.
 func (h *BasicHost) GetAutoNat() autonat.AutoNAT {
 	h.addrMu.Lock()
-	defer h.addrMu.Unlock()
-	return h.autoNat
+	n := h.autoNat
+	h.addrMu.Unlock()
+	return n
 }
 
 // Close shuts down the Host's services (network, etc).

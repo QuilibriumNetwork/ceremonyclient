@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	quicV1MA = ma.StringCast("/quic-v1")
+	quicV1MA, _ = ma.StringCast("/quic-v1")
 )
 
 func ToQuicMultiaddr(na net.Addr, version quic.VersionNumber) (ma.Multiaddr, error) {
@@ -29,7 +29,12 @@ func ToQuicMultiaddr(na net.Addr, version quic.VersionNumber) (ma.Multiaddr, err
 func FromQuicMultiaddr(addr ma.Multiaddr) (*net.UDPAddr, quic.VersionNumber, error) {
 	var version quic.VersionNumber
 	var partsBeforeQUIC []ma.Multiaddr
-	ma.ForEach(addr, func(c ma.Component) bool {
+	var err error
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			err = e
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_QUIC_V1:
 			version = quic.Version1
@@ -39,6 +44,9 @@ func FromQuicMultiaddr(addr ma.Multiaddr) (*net.UDPAddr, quic.VersionNumber, err
 			return true
 		}
 	})
+	if err != nil {
+		return nil, version, err
+	}
 	if len(partsBeforeQUIC) == 0 {
 		return nil, version, errors.New("no addr before QUIC component")
 	}

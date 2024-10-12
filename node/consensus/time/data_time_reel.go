@@ -55,7 +55,7 @@ type DataTimeReel struct {
 	totalDistance         *big.Int
 	headDistance          *big.Int
 	lruFrames             *lru.Cache[string, string]
-	proverTrie            *tries.RollingFrecencyCritbitTrie
+	proverTries           []*tries.RollingFrecencyCritbitTrie
 	pending               map[uint64][]*pendingFrame
 	incompleteForks       map[uint64][]*pendingFrame
 	frames                chan *pendingFrame
@@ -120,14 +120,13 @@ func NewDataTimeReel(
 }
 
 func (d *DataTimeReel) Start() error {
-	trie := &tries.RollingFrecencyCritbitTrie{}
-	frame, err := d.clockStore.GetLatestDataClockFrame(d.filter, trie)
+	frame, tries, err := d.clockStore.GetLatestDataClockFrame(d.filter)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		panic(err)
 	}
 
 	if frame == nil {
-		d.head, d.proverTrie = d.createGenesisFrame()
+		d.head, d.proverTries = d.createGenesisFrame()
 		d.totalDistance = big.NewInt(0)
 		d.headDistance = big.NewInt(0)
 	} else {
@@ -136,7 +135,7 @@ func (d *DataTimeReel) Start() error {
 			panic(err)
 		}
 		d.totalDistance = big.NewInt(0)
-		d.proverTrie = trie
+		d.proverTries = tries
 		d.headDistance, err = d.GetDistance(frame)
 	}
 
@@ -192,8 +191,10 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
 	return nil
 }
 
-func (d *DataTimeReel) GetFrameProverTrie() *tries.RollingFrecencyCritbitTrie {
-	return d.proverTrie
+func (
+	d *DataTimeReel,
+) GetFrameProverTries() []*tries.RollingFrecencyCritbitTrie {
+	return d.proverTries
 }
 
 func (d *DataTimeReel) NewFrameCh() <-chan *protobufs.ClockFrame {
@@ -210,7 +211,7 @@ func (d *DataTimeReel) Stop() {
 
 func (d *DataTimeReel) createGenesisFrame() (
 	*protobufs.ClockFrame,
-	*tries.RollingFrecencyCritbitTrie,
+	[]*tries.RollingFrecencyCritbitTrie,
 ) {
 	if d.origin == nil {
 		panic("origin is nil")
@@ -229,13 +230,12 @@ func (d *DataTimeReel) createGenesisFrame() (
 		difficulty = 100000
 	}
 
-	frame, trie, err := d.frameProver.CreateDataGenesisFrame(
+	frame, tries, err := d.frameProver.CreateDataGenesisFrame(
 		d.filter,
 		d.origin,
 		difficulty,
 		d.initialInclusionProof,
 		d.initialProverKeys,
-		true,
 	)
 	if err != nil {
 		panic(err)
@@ -265,7 +265,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 		d.filter,
 		0,
 		selector.FillBytes(make([]byte, 32)),
-		trie,
+		tries,
 		txn,
 		false,
 	); err != nil {
@@ -276,7 +276,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 		panic(err)
 	}
 
-	return frame, trie
+	return frame, tries
 }
 
 // Main data consensus loop
@@ -549,7 +549,7 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 		d.filter,
 		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
-		d.proverTrie,
+		d.proverTries,
 		txn,
 		false,
 	); err != nil {
@@ -568,7 +568,6 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 	}()
 }
 
-// tag: dusk – store the distance with the frame
 func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
 	selector, err := frame.GetSelector()
 	if err != nil {
@@ -632,7 +631,7 @@ func (d *DataTimeReel) GetDistance(frame *protobufs.ClockFrame) (
 	}
 
 	discriminatorNode :=
-		d.proverTrie.FindNearest(masterSelector.FillBytes(make([]byte, 32)))
+		d.proverTries[0].FindNearest(masterSelector.FillBytes(make([]byte, 32)))
 	discriminator := discriminatorNode.External.Key
 	addr, err := frame.GetAddress()
 	if err != nil {
@@ -809,7 +808,7 @@ func (d *DataTimeReel) forkChoice(
 			d.filter,
 			frameNumber,
 			next,
-			d.proverTrie,
+			d.proverTries,
 			txn,
 			rightIndex.FrameNumber < d.head.FrameNumber,
 		); err != nil {
@@ -832,7 +831,7 @@ func (d *DataTimeReel) forkChoice(
 		d.filter,
 		frame.FrameNumber,
 		selector.FillBytes(make([]byte, 32)),
-		d.proverTrie,
+		d.proverTries,
 		txn,
 		false,
 	); err != nil {

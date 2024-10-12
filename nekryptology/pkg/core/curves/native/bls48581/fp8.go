@@ -23,11 +23,7 @@
 
 package bls48581
 
-import (
-	"arena"
-
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581/ext"
-)
+import "source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves/native/bls48581/ext"
 
 //import "fmt"
 
@@ -36,115 +32,66 @@ type FP8 struct {
 	b *FP4
 }
 
-func NewFP8(mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4(mem)
-		F.b = NewFP4(mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4(nil)
-		F.b = NewFP4(nil)
-		return F
-	}
+func NewFP8() *FP8 {
+	F := new(FP8)
+	F.a = NewFP4()
+	F.b = NewFP4()
+	return F
 }
 
 /* Constructors */
-func NewFP8int(a int, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4int(a, mem)
-		F.b = NewFP4(mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4int(a, nil)
-		F.b = NewFP4(nil)
-		return F
-	}
+func NewFP8int(a int) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4int(a)
+	F.b = NewFP4()
+	return F
 }
 
 /* Constructors */
-func NewFP8ints(a int, b int, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4int(a, mem)
-		F.b = NewFP4int(b, mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4int(a, nil)
-		F.b = NewFP4int(b, nil)
-		return F
-	}
+func NewFP8ints(a int, b int) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4int(a)
+	F.b = NewFP4int(b)
+	return F
 }
 
-func NewFP8copy(x *FP8, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4copy(x.a, mem)
-		F.b = NewFP4copy(x.b, mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4copy(x.a, nil)
-		F.b = NewFP4copy(x.b, nil)
-		return F
-	}
+func NewFP8copy(x *FP8) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4copy(x.a)
+	F.b = NewFP4copy(x.b)
+	return F
 }
 
-func NewFP8fp4s(c *FP4, d *FP4, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4copy(c, mem)
-		F.b = NewFP4copy(d, mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4copy(c, nil)
-		F.b = NewFP4copy(d, nil)
-		return F
-	}
+func NewFP8fp4s(c *FP4, d *FP4) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4copy(c)
+	F.b = NewFP4copy(d)
+	return F
 }
 
-func NewFP8fp4(c *FP4, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4copy(c, mem)
-		F.b = NewFP4(mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4copy(c, nil)
-		F.b = NewFP4(nil)
-		return F
-	}
+func NewFP8fp4(c *FP4) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4copy(c)
+	F.b = NewFP4()
+	return F
 }
 
-func NewFP8fp(c *FP, mem *arena.Arena) *FP8 {
-	if mem != nil {
-		F := arena.New[FP8](mem)
-		F.a = NewFP4fp(c, mem)
-		F.b = NewFP4(mem)
-		return F
-	} else {
-		F := new(FP8)
-		F.a = NewFP4fp(c, nil)
-		F.b = NewFP4(nil)
-		return F
-	}
+func NewFP8fp(c *FP) *FP8 {
+	F := new(FP8)
+	F.a = NewFP4fp(c)
+	F.b = NewFP4()
+	return F
 }
 
 func NewFP8rand(rng *ext.RAND) *FP8 {
-	F := NewFP8fp4s(NewFP4rand(rng), NewFP4rand(rng), nil)
+	F := NewFP8fp4s(NewFP4rand(rng), NewFP4rand(rng))
 	return F
 }
 
 /* reduce all components of this mod Modulus */
-func (F *FP8) reduce(mem *arena.Arena) {
-	F.a.reduce(mem)
-	F.b.reduce(mem)
+func (F *FP8) reduce() {
+	F.a.reduce()
+	F.b.reduce()
 }
 
 /* normalise all components of this mod Modulus */
@@ -154,12 +101,12 @@ func (F *FP8) norm() {
 }
 
 /* test this==0 ? */
-func (F *FP8) IsZero(mem *arena.Arena) bool {
-	return F.a.IsZero(mem) && F.b.IsZero(mem)
+func (F *FP8) IsZero() bool {
+	return F.a.IsZero() && F.b.IsZero()
 }
 
 func (F *FP8) islarger() int {
-	if F.IsZero(nil) {
+	if F.IsZero() {
 		return 0
 	}
 	cmp := F.b.islarger()
@@ -193,7 +140,7 @@ func FP8_fromBytes(bf []byte) *FP8 {
 		t[i] = bf[i+MB]
 	}
 	ta := FP4_fromBytes(t[:])
-	return NewFP8fp4s(ta, tb, nil)
+	return NewFP8fp4s(ta, tb)
 }
 
 /* Conditional move */
@@ -204,15 +151,13 @@ func (F *FP8) cmove(g *FP8, d int) {
 
 /* test this==1 ? */
 func (F *FP8) isunity() bool {
-	mem := arena.NewArena()
-	defer mem.Free()
-	one := NewFP4int(1, mem)
-	return F.a.Equals(one) && F.b.IsZero(mem)
+	one := NewFP4int(1)
+	return F.a.Equals(one) && F.b.IsZero()
 }
 
 /* test is w real? That is in a+ib test b is zero */
 func (F *FP8) isreal() bool {
-	return F.b.IsZero(nil)
+	return F.b.IsZero()
 }
 
 /* extract real part a */
@@ -253,12 +198,12 @@ func (F *FP8) one() {
 }
 
 /* Return sign */
-func (F *FP8) sign(mem *arena.Arena) int {
-	p1 := F.a.sign(mem)
-	p2 := F.b.sign(mem)
+func (F *FP8) sign() int {
+	p1 := F.a.sign()
+	p2 := F.b.sign()
 	var u int
 	if BIG_ENDIAN_SIGN {
-		if F.b.IsZero(mem) {
+		if F.b.IsZero() {
 			u = 1
 		} else {
 			u = 0
@@ -266,7 +211,7 @@ func (F *FP8) sign(mem *arena.Arena) int {
 		p2 ^= (p1 ^ p2) & u
 		return p2
 	} else {
-		if F.a.IsZero(mem) {
+		if F.a.IsZero() {
 			u = 1
 		} else {
 			u = 0
@@ -277,137 +222,137 @@ func (F *FP8) sign(mem *arena.Arena) int {
 }
 
 /* set this=-this */
-func (F *FP8) Neg(mem *arena.Arena) {
+func (F *FP8) Neg() {
 	F.norm()
-	m := NewFP4copy(F.a, mem)
-	t := NewFP4(mem)
-	m.Add(F.b, mem)
-	m.Neg(mem)
+	m := NewFP4copy(F.a)
+	t := NewFP4()
+	m.Add(F.b)
+	m.Neg()
 	t.copy(m)
-	t.Add(F.b, mem)
+	t.Add(F.b)
 	F.b.copy(m)
-	F.b.Add(F.a, mem)
+	F.b.Add(F.a)
 	F.a.copy(t)
 	F.norm()
 }
 
 /* this=conjugate(this) */
-func (F *FP8) conj(mem *arena.Arena) {
-	F.b.Neg(mem)
+func (F *FP8) conj() {
+	F.b.Neg()
 	F.norm()
 }
 
 /* this=-conjugate(this) */
-func (F *FP8) nconj(mem *arena.Arena) {
-	F.a.Neg(mem)
+func (F *FP8) nconj() {
+	F.a.Neg()
 	F.norm()
 }
 
 /* this+=x */
-func (F *FP8) Add(x *FP8, mem *arena.Arena) {
-	F.a.Add(x.a, mem)
-	F.b.Add(x.b, mem)
+func (F *FP8) Add(x *FP8) {
+	F.a.Add(x.a)
+	F.b.Add(x.b)
 }
 
 /* this-=x */
-func (F *FP8) Sub(x *FP8, mem *arena.Arena) {
-	m := NewFP8copy(x, mem)
-	m.Neg(mem)
-	F.Add(m, mem)
+func (F *FP8) Sub(x *FP8) {
+	m := NewFP8copy(x)
+	m.Neg()
+	F.Add(m)
 }
 
 /* this-=x */
-func (F *FP8) rsub(x *FP8, mem *arena.Arena) {
-	F.Neg(mem)
-	F.Add(x, mem)
+func (F *FP8) rsub(x *FP8) {
+	F.Neg()
+	F.Add(x)
 }
 
 /* this*=s where s is FP4 */
-func (F *FP8) pmul(s *FP4, mem *arena.Arena) {
-	F.a.Mul(s, mem)
-	F.b.Mul(s, mem)
+func (F *FP8) pmul(s *FP4) {
+	F.a.Mul(s)
+	F.b.Mul(s)
 }
 
 /* this*=s where s is FP2 */
-func (F *FP8) qmul(s *FP2, mem *arena.Arena) {
-	F.a.pmul(s, mem)
-	F.b.pmul(s, mem)
+func (F *FP8) qmul(s *FP2) {
+	F.a.pmul(s)
+	F.b.pmul(s)
 }
 
 /* this*=s where s is FP */
-func (F *FP8) tmul(s *FP, mem *arena.Arena) {
-	F.a.qmul(s, mem)
-	F.b.qmul(s, mem)
+func (F *FP8) tmul(s *FP) {
+	F.a.qmul(s)
+	F.b.qmul(s)
 }
 
 /* this*=c where c is int */
-func (F *FP8) imul(c int, mem *arena.Arena) {
-	F.a.imul(c, mem)
-	F.b.imul(c, mem)
+func (F *FP8) imul(c int) {
+	F.a.imul(c)
+	F.b.imul(c)
 }
 
 /* this*=this */
-func (F *FP8) Sqr(mem *arena.Arena) {
-	t1 := NewFP4copy(F.a, mem)
-	t2 := NewFP4copy(F.b, mem)
-	t3 := NewFP4copy(F.a, mem)
+func (F *FP8) Sqr() {
+	t1 := NewFP4copy(F.a)
+	t2 := NewFP4copy(F.b)
+	t3 := NewFP4copy(F.a)
 
-	t3.Mul(F.b, mem)
-	t1.Add(F.b, mem)
-	t2.times_i(mem)
+	t3.Mul(F.b)
+	t1.Add(F.b)
+	t2.times_i()
 
-	t2.Add(F.a, mem)
+	t2.Add(F.a)
 
 	t1.norm()
 	t2.norm()
 
 	F.a.copy(t1)
-	F.a.Mul(t2, mem)
+	F.a.Mul(t2)
 
 	t2.copy(t3)
-	t2.times_i(mem)
-	t2.Add(t3, mem)
+	t2.times_i()
+	t2.Add(t3)
 	t2.norm()
-	t2.Neg(mem)
-	F.a.Add(t2, mem)
+	t2.Neg()
+	F.a.Add(t2)
 
 	F.b.copy(t3)
-	F.b.Add(t3, mem)
+	F.b.Add(t3)
 
 	F.norm()
 }
 
 /* this*=y */
-func (F *FP8) Mul(y *FP8, mem *arena.Arena) {
-	t1 := NewFP4copy(F.a, mem)
-	t2 := NewFP4copy(F.b, mem)
-	t3 := NewFP4(mem)
-	t4 := NewFP4copy(F.b, mem)
+func (F *FP8) Mul(y *FP8) {
+	t1 := NewFP4copy(F.a)
+	t2 := NewFP4copy(F.b)
+	t3 := NewFP4()
+	t4 := NewFP4copy(F.b)
 
-	t1.Mul(y.a, mem)
-	t2.Mul(y.b, mem)
+	t1.Mul(y.a)
+	t2.Mul(y.b)
 	t3.copy(y.b)
-	t3.Add(y.a, mem)
-	t4.Add(F.a, mem)
+	t3.Add(y.a)
+	t4.Add(F.a)
 
 	t3.norm()
 	t4.norm()
 
-	t4.Mul(t3, mem)
+	t4.Mul(t3)
 
 	t3.copy(t1)
-	t3.Neg(mem)
-	t4.Add(t3, mem)
+	t3.Neg()
+	t4.Add(t3)
 	t4.norm()
 
 	t3.copy(t2)
-	t3.Neg(mem)
+	t3.Neg()
 	F.b.copy(t4)
-	F.b.Add(t3, mem)
+	F.b.Add(t3)
 
-	t2.times_i(mem)
+	t2.times_i()
 	F.a.copy(t2)
-	F.a.Add(t1, mem)
+	F.a.Add(t1)
 
 	F.norm()
 }
@@ -418,55 +363,55 @@ func (F *FP8) toString() string {
 }
 
 /* this=1/this */
-func (F *FP8) Invert(h *FP, mem *arena.Arena) {
-	t1 := NewFP4copy(F.a, mem)
-	t2 := NewFP4copy(F.b, mem)
+func (F *FP8) Invert(h *FP) {
+	t1 := NewFP4copy(F.a)
+	t2 := NewFP4copy(F.b)
 
-	t1.Sqr(mem)
-	t2.Sqr(mem)
-	t2.times_i(mem)
+	t1.Sqr()
+	t2.Sqr()
+	t2.times_i()
 	t2.norm()
-	t1.Sub(t2, mem)
+	t1.Sub(t2)
 	t1.norm()
 
-	t1.Invert(h, mem)
+	t1.Invert(h)
 
-	F.a.Mul(t1, mem)
-	t1.Neg(mem)
+	F.a.Mul(t1)
+	t1.Neg()
 	t1.norm()
-	F.b.Mul(t1, mem)
+	F.b.Mul(t1)
 }
 
 /* this*=i where i = sqrt(sqrt(-1+sqrt(-1))) */
-func (F *FP8) times_i(mem *arena.Arena) {
-	s := NewFP4copy(F.b, mem)
-	t := NewFP4copy(F.a, mem)
-	s.times_i(mem)
+func (F *FP8) times_i() {
+	s := NewFP4copy(F.b)
+	t := NewFP4copy(F.a)
+	s.times_i()
 	F.a.copy(s)
 	F.b.copy(t)
 	F.norm()
 	if TOWER == POSITOWER {
-		F.Neg(mem)
+		F.Neg()
 		F.norm()
 	}
 }
 
-func (F *FP8) times_i2(mem *arena.Arena) {
-	F.a.times_i(mem)
-	F.b.times_i(mem)
+func (F *FP8) times_i2() {
+	F.a.times_i()
+	F.b.times_i()
 }
 
 /* this=this^p using Frobenius */
-func (F *FP8) frob(f *FP2, mem *arena.Arena) {
-	ff := NewFP2copy(f, mem)
-	ff.Sqr(mem)
-	ff.Mul_ip(mem)
+func (F *FP8) frob(f *FP2) {
+	ff := NewFP2copy(f)
+	ff.Sqr()
+	ff.Mul_ip()
 	ff.norm()
 
-	F.a.frob(ff, mem)
-	F.b.frob(ff, mem)
-	F.b.pmul(f, mem)
-	F.b.times_i(mem)
+	F.a.frob(ff)
+	F.b.frob(ff)
+	F.b.pmul(f)
+	F.b.times_i()
 }
 
 /* this=this^e
@@ -726,19 +671,19 @@ func (F *FP8) xtr_pow2(ck *FP8, ckml *FP8, ckm2l *FP8, a *BIG, b *BIG) *FP8 {
 }
 */
 /* this/=2 */
-func (F *FP8) div2(mem *arena.Arena) {
-	F.a.div2(mem)
-	F.b.div2(mem)
+func (F *FP8) div2() {
+	F.a.div2()
+	F.b.div2()
 }
 
-func (F *FP8) div_i(mem *arena.Arena) {
-	u := NewFP4copy(F.a, mem)
-	v := NewFP4copy(F.b, mem)
-	u.div_i(mem)
+func (F *FP8) div_i() {
+	u := NewFP4copy(F.a)
+	v := NewFP4copy(F.b)
+	u.div_i()
 	F.a.copy(v)
 	F.b.copy(u)
 	if TOWER == POSITOWER {
-		F.Neg(mem)
+		F.Neg()
 		F.norm()
 	}
 }
@@ -765,72 +710,70 @@ func (F *FP8) pow(b *BIG) {
 /* */
 // Test for Quadratic Residue
 func (F *FP8) qr(h *FP) int {
-	mem := arena.NewArena()
-	defer mem.Free()
-	c := NewFP8copy(F, mem)
-	c.conj(mem)
-	c.Mul(F, mem)
+	c := NewFP8copy(F)
+	c.conj()
+	c.Mul(F)
 	return c.a.qr(h)
 }
 
 // sqrt(a+ib) = sqrt(a+sqrt(a*a-n*b*b)/2)+ib/(2*sqrt(a+sqrt(a*a-n*b*b)/2))
-func (F *FP8) Sqrt(h *FP, mem *arena.Arena) {
-	if F.IsZero(mem) {
+func (F *FP8) Sqrt(h *FP) {
+	if F.IsZero() {
 		return
 	}
 
-	a := NewFP4copy(F.a, mem)
-	b := NewFP4(mem)
-	s := NewFP4copy(F.b, mem)
-	t := NewFP4copy(F.a, mem)
-	hint := NewFP(mem)
+	a := NewFP4copy(F.a)
+	b := NewFP4()
+	s := NewFP4copy(F.b)
+	t := NewFP4copy(F.a)
+	hint := NewFP()
 
-	s.Sqr(mem)
-	a.Sqr(mem)
-	s.times_i(mem)
+	s.Sqr()
+	a.Sqr()
+	s.times_i()
 	s.norm()
-	a.Sub(s, mem)
+	a.Sub(s)
 
 	s.copy(a)
 	s.norm()
 
-	s.Sqrt(h, mem)
+	s.Sqrt(h)
 	a.copy(t)
 	b.copy(t)
 
-	a.Add(s, mem)
+	a.Add(s)
 	a.norm()
-	a.div2(mem)
+	a.div2()
 
 	b.copy(F.b)
-	b.div2(mem)
+	b.div2()
 	qr := a.qr(hint)
 
 	// tweak hint - multiply old hint by Norm(1/Beta)^e where Beta is irreducible polynomial
 	s.copy(a)
-	twk := NewFPbig(NewBIGints(TWK, mem), mem)
-	twk.Mul(hint, mem)
-	s.div_i(mem)
+	twk := NewFPbig(NewBIGints(TWK))
+	twk.Mul(hint)
+	s.div_i()
 	s.norm()
 
 	a.cmove(s, 1-qr)
 	hint.cmove(twk, 1-qr)
 
 	F.a.copy(a)
-	F.a.Sqrt(hint, mem)
+	F.a.Sqrt(hint)
 	s.copy(a)
-	s.Invert(hint, mem)
-	s.Mul(F.a, mem)
+	s.Invert(hint)
+	s.Mul(F.a)
 	F.b.copy(s)
-	F.b.Mul(b, mem)
+	F.b.Mul(b)
 	t.copy(F.a)
 
 	F.a.cmove(F.b, 1-qr)
 	F.b.cmove(t, 1-qr)
 
-	sgn := F.sign(mem)
-	nr := NewFP8copy(F, mem)
-	nr.Neg(mem)
+	sgn := F.sign()
+	nr := NewFP8copy(F)
+	nr.Neg()
 	nr.norm()
 	F.cmove(nr, sgn)
 }

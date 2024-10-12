@@ -2,12 +2,14 @@ package rpc
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"runtime"
 	"syscall"
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
@@ -15,6 +17,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -24,6 +27,7 @@ type DataWorkerIPCServer struct {
 	logger          *zap.Logger
 	coreId          uint32
 	prover          crypto.FrameProver
+	indices         []int
 	parentProcessId int
 }
 
@@ -32,17 +36,116 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 	ctx context.Context,
 	req *protobufs.ChallengeProofRequest,
 ) (*protobufs.ChallengeProofResponse, error) {
-	if r.coreId != req.Core {
+	challenge := []byte{}
+	challenge = append(challenge, req.PeerId...)
+	challenge = binary.BigEndian.AppendUint64(
+		challenge,
+		req.ClockFrame.FrameNumber,
+	)
+	found := false
+	for _, proof := range req.ClockFrame.AggregateProofs {
+		for _, c := range proof.InclusionCommitments {
+			o := &protobufs.IntrinsicExecutionOutput{}
+			err := proto.Unmarshal(c.Data, o)
+			if err != nil {
+				return nil, err
+			}
+
+			outputs := &protobufs.TokenOutputs{}
+			err = proto.Unmarshal(o.Output, outputs)
+			if err != nil {
+				return nil, err
+			}
+
+		inRange:
+			for _, out := range outputs.Outputs {
+				switch e := out.Output.(type) {
+				case *protobufs.TokenOutput_Coin:
+					for _, idx := range p2p.GetOnesIndices(
+						p2p.GetBloomFilter(
+							e.Coin.Owner.GetImplicitAccount().Address,
+							1024,
+							64,
+						),
+					) {
+						for _, i := range r.indices {
+							if i == idx {
+								challenge = append(challenge, req.ClockFrame.Filter...)
+								challenge = append(challenge, req.ClockFrame.Input...)
+								challenge = append(challenge, c.Data...)
+								found = true
+								break inRange
+							}
+						}
+					}
+				case *protobufs.TokenOutput_DeletedCoin:
+					for _, idx := range p2p.GetOnesIndices(
+						p2p.GetBloomFilter(
+							e.DeletedCoin.Owner.GetImplicitAccount().Address,
+							1024,
+							64,
+						),
+					) {
+						for _, i := range r.indices {
+							if i == idx {
+								challenge = append(challenge, req.ClockFrame.Filter...)
+								challenge = append(challenge, req.ClockFrame.Input...)
+								challenge = append(challenge, c.Data...)
+								found = true
+								break inRange
+							}
+						}
+					}
+				case *protobufs.TokenOutput_DeletedProof:
+					for _, idx := range p2p.GetOnesIndices(
+						p2p.GetBloomFilter(
+							e.DeletedProof.Owner.GetImplicitAccount().Address,
+							1024,
+							64,
+						),
+					) {
+						for _, i := range r.indices {
+							if i == idx {
+								challenge = append(challenge, req.ClockFrame.Filter...)
+								challenge = append(challenge, req.ClockFrame.Input...)
+								challenge = append(challenge, c.Data...)
+								found = true
+								break inRange
+							}
+						}
+					}
+				case *protobufs.TokenOutput_Proof:
+					for _, idx := range p2p.GetOnesIndices(
+						p2p.GetBloomFilter(
+							e.Proof.Owner.GetImplicitAccount().Address,
+							1024,
+							64,
+						),
+					) {
+						for _, i := range r.indices {
+							if i == idx {
+								challenge = append(challenge, req.ClockFrame.Filter...)
+								challenge = append(challenge, req.ClockFrame.Input...)
+								challenge = append(challenge, c.Data...)
+								found = true
+								break inRange
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !found {
 		return nil, errors.Wrap(
-			errors.New("invalid core id"),
+			errors.New("no applicable challenge"),
 			"calculate challenge proof",
 		)
 	}
-
 	proof, err := r.prover.CalculateChallengeProof(
-		req.Challenge,
-		uint32(r.coreId),
-		req.Increment,
+		challenge,
+		req.ClockFrame.Difficulty,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "calculate challenge proof")

@@ -148,19 +148,19 @@ func (t *pubsubTracer) DuplicateMessage(msg *Message) {
 		return
 	}
 
-	now := time.Now().UnixNano()
-	evt := &pb.TraceEvent{
-		Type:      pb.TraceEvent_DUPLICATE_MESSAGE.Enum(),
-		PeerID:    []byte(t.pid),
-		Timestamp: &now,
-		DuplicateMessage: &pb.TraceEvent_DuplicateMessage{
-			MessageID:    []byte(t.idGen.ID(msg)),
-			ReceivedFrom: []byte(msg.ReceivedFrom),
-			Bitmask:      msg.Bitmask,
-		},
-	}
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_DUPLICATE_MESSAGE.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	DuplicateMessage: &pb.TraceEvent_DuplicateMessage{
+	// 		MessageID:    []byte(t.idGen.ID(msg)),
+	// 		ReceivedFrom: []byte(msg.ReceivedFrom),
+	// 		Bitmask:      msg.Bitmask,
+	// 	},
+	// }
 
-	t.tracer.Trace(evt)
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) DeliverMessage(msg *Message) {
@@ -178,19 +178,19 @@ func (t *pubsubTracer) DeliverMessage(msg *Message) {
 		return
 	}
 
-	now := time.Now().UnixNano()
-	evt := &pb.TraceEvent{
-		Type:      pb.TraceEvent_DELIVER_MESSAGE.Enum(),
-		PeerID:    []byte(t.pid),
-		Timestamp: &now,
-		DeliverMessage: &pb.TraceEvent_DeliverMessage{
-			MessageID:    []byte(t.idGen.ID(msg)),
-			Bitmask:      msg.Bitmask,
-			ReceivedFrom: []byte(msg.ReceivedFrom),
-		},
-	}
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_DELIVER_MESSAGE.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	DeliverMessage: &pb.TraceEvent_DeliverMessage{
+	// 		MessageID:    []byte(t.idGen.ID(msg)),
+	// 		Bitmask:      msg.Bitmask,
+	// 		ReceivedFrom: []byte(msg.ReceivedFrom),
+	// 	},
+	// }
 
-	t.tracer.Trace(evt)
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) AddPeer(p peer.ID, proto protocol.ID) {
@@ -260,18 +260,18 @@ func (t *pubsubTracer) RecvRPC(rpc *RPC) {
 		return
 	}
 
-	now := time.Now().UnixNano()
-	evt := &pb.TraceEvent{
-		Type:      pb.TraceEvent_RECV_RPC.Enum(),
-		PeerID:    []byte(t.pid),
-		Timestamp: &now,
-		RecvRPC: &pb.TraceEvent_RecvRPC{
-			ReceivedFrom: []byte(rpc.from),
-			Meta:         t.traceRPCMeta(rpc),
-		},
-	}
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_RECV_RPC.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	RecvRPC: &pb.TraceEvent_RecvRPC{
+	// 		ReceivedFrom: []byte(rpc.from),
+	// 		Meta:         t.traceRPCMeta(rpc),
+	// 	},
+	// }
 
-	t.tracer.Trace(evt)
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID) {
@@ -287,18 +287,18 @@ func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID) {
 		return
 	}
 
-	now := time.Now().UnixNano()
-	evt := &pb.TraceEvent{
-		Type:      pb.TraceEvent_SEND_RPC.Enum(),
-		PeerID:    []byte(t.pid),
-		Timestamp: &now,
-		SendRPC: &pb.TraceEvent_SendRPC{
-			SendTo: []byte(p),
-			Meta:   t.traceRPCMeta(rpc),
-		},
-	}
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_SEND_RPC.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	SendRPC: &pb.TraceEvent_SendRPC{
+	// 		SendTo: []byte(p),
+	// 		Meta:   t.traceRPCMeta(rpc),
+	// 	},
+	// }
 
-	t.tracer.Trace(evt)
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) DropRPC(rpc *RPC, p peer.ID) {
@@ -314,18 +314,18 @@ func (t *pubsubTracer) DropRPC(rpc *RPC, p peer.ID) {
 		return
 	}
 
-	now := time.Now().UnixNano()
-	evt := &pb.TraceEvent{
-		Type:      pb.TraceEvent_DROP_RPC.Enum(),
-		PeerID:    []byte(t.pid),
-		Timestamp: &now,
-		DropRPC: &pb.TraceEvent_DropRPC{
-			SendTo: []byte(p),
-			Meta:   t.traceRPCMeta(rpc),
-		},
-	}
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_DROP_RPC.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	DropRPC: &pb.TraceEvent_DropRPC{
+	// 		SendTo: []byte(p),
+	// 		Meta:   t.traceRPCMeta(rpc),
+	// 	},
+	// }
 
-	t.tracer.Trace(evt)
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) UndeliverableMessage(msg *Message) {
@@ -336,6 +336,24 @@ func (t *pubsubTracer) UndeliverableMessage(msg *Message) {
 	for _, tr := range t.raw {
 		tr.UndeliverableMessage(msg)
 	}
+
+	if t.tracer == nil {
+		return
+	}
+
+	// now := time.Now().UnixNano()
+	// evt := &pb.TraceEvent{
+	// 	Type:      pb.TraceEvent_UNDELIVERABLE_MESSAGE.Enum(),
+	// 	PeerID:    []byte(t.pid),
+	// 	Timestamp: &now,
+	// 	UndeliverableMessage: &pb.TraceEvent_UndeliverableMessage{
+	// 		MessageID:    []byte(t.idGen.ID(msg)),
+	// 		Bitmask:      msg.Bitmask,
+	// 		ReceivedFrom: []byte(msg.ReceivedFrom),
+	// 	},
+	// }
+
+	// t.tracer.Trace(evt)
 }
 
 func (t *pubsubTracer) traceRPCMeta(rpc *RPC) *pb.TraceEvent_RPCMeta {

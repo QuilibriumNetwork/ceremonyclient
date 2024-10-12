@@ -3,27 +3,135 @@ package blossomsub
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/record"
-
-	bhost "github.com/libp2p/go-libp2p/p2p/host/blank"
-	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
-
-	"github.com/libp2p/go-msgio/protoio"
+	"github.com/libp2p/go-msgio"
 )
+
+func assertPeerLists(t *testing.T, bitmask []byte, hosts []host.Host, ps *PubSub, has ...int) {
+	peers := ps.ListPeers(bitmask)
+	set := make(map[peer.ID]struct{})
+	for _, p := range peers {
+		set[p] = struct{}{}
+	}
+
+	for _, h := range has {
+		if _, ok := set[hosts[h].ID()]; !ok {
+			t.Fatal("expected to have connection to peer: ", h)
+		}
+	}
+}
+
+func checkMessageRouting(t *testing.T, ctx context.Context, bitmasks []*Bitmask, subs []*Subscription) {
+	for _, p := range bitmasks {
+		data := make([]byte, 16)
+		rand.Read(data)
+		err := p.Publish(ctx, p.bitmask, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, s := range subs {
+			assertReceive(t, s, data)
+		}
+	}
+}
+
+func getDefaultHosts(t *testing.T, n int) []host.Host {
+	var out []host.Host
+
+	for i := 0; i < n; i++ {
+		h, err := libp2p.New(libp2p.ResourceManager(&network.NullResourceManager{}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { h.Close() })
+		out = append(out, h)
+	}
+
+	return out
+}
+
+func connect(t *testing.T, a, b host.Host) {
+	pinfo := a.Peerstore().PeerInfo(a.ID())
+	err := b.Connect(context.Background(), pinfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sparseConnect(t *testing.T, hosts []host.Host) {
+	connectSome(t, hosts, 3)
+}
+
+func denseConnect(t *testing.T, hosts []host.Host) {
+	connectSome(t, hosts, 10)
+}
+
+func connectSome(t *testing.T, hosts []host.Host, d int) {
+	for i, a := range hosts {
+		for j := 0; j < d; j++ {
+			n := rand.Intn(len(hosts))
+			if n == i {
+				j--
+				continue
+			}
+
+			b := hosts[n]
+
+			connect(t, a, b)
+		}
+	}
+}
+
+func connectAll(t *testing.T, hosts []host.Host) {
+	for i, a := range hosts {
+		for j, b := range hosts {
+			if i == j {
+				continue
+			}
+
+			connect(t, a, b)
+		}
+	}
+}
+
+func assertReceive(t *testing.T, ch *Subscription, exp []byte) {
+	select {
+	case msg := <-ch.ch:
+		if !bytes.Equal(msg.GetData(), exp) {
+			t.Fatalf("got wrong message, expected %s but got %s", string(exp), string(msg.GetData()))
+		}
+	case <-time.After(time.Second * 5):
+		t.Logf("%#v\n", ch)
+		t.Fatal("timed out waiting for message of: ", string(exp))
+	}
+}
+
+func assertNeverReceives(t *testing.T, ch *Subscription, timeout time.Duration) {
+	select {
+	case msg := <-ch.ch:
+		t.Logf("%#v\n", ch)
+		t.Fatal("got unexpected message: ", string(msg.GetData()))
+	case <-time.After(timeout):
+	}
+}
 
 func getBlossomSub(ctx context.Context, h host.Host, opts ...Option) *PubSub {
 	ps, err := NewBlossomSub(ctx, h, opts...)
@@ -44,18 +152,26 @@ func getBlossomSubs(ctx context.Context, hs []host.Host, opts ...Option) []*PubS
 func TestSparseBlossomSub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	sparseConnect(t, hosts)
@@ -68,7 +184,7 @@ func TestSparseBlossomSub(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -85,18 +201,25 @@ func TestSparseBlossomSub(t *testing.T) {
 func TestDenseBlossomSub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -109,7 +232,7 @@ func TestDenseBlossomSub(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -126,18 +249,25 @@ func TestDenseBlossomSub(t *testing.T) {
 func TestBlossomSubFanout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs[1:] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -145,12 +275,15 @@ func TestBlossomSubFanout(t *testing.T) {
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
+	b, err := psubs[0].Join([]byte{0x00, 0x01})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for i := 0; i < 100; i++ {
-		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
+		msg := []byte(fmt.Sprintf("%d it's not a floooooood2 %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -164,11 +297,11 @@ func TestBlossomSubFanout(t *testing.T) {
 	}
 
 	// subscribe the owner
-	subch, err := psubs[0].Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+	subch, err := psubs[0].Subscribe([]byte{0x00, 0x01})
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs = append(msgs, subch)
+	msgs = append(msgs, subch...)
 
 	// wait for a heartbeat
 	time.Sleep(time.Second * 1)
@@ -176,9 +309,7 @@ func TestBlossomSubFanout(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -195,18 +326,25 @@ func TestBlossomSubFanout(t *testing.T) {
 func TestBlossomSubFanoutMaintenance(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs[1:] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -214,12 +352,15 @@ func TestBlossomSubFanoutMaintenance(t *testing.T) {
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
-	for i := 0; i < 100; i++ {
+	b, err := psubs[0].Join([]byte{0x00, 0x01})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -243,22 +384,20 @@ func TestBlossomSubFanoutMaintenance(t *testing.T) {
 
 	// resubscribe and repeat
 	for _, ps := range psubs[1:] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		msgs = append(msgs, subch...)
 	}
 
 	time.Sleep(time.Second * 2)
 
-	for i := 0; i < 100; i++ {
-		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
+	for i := 0; i < 20; i++ {
+		msg := []byte(fmt.Sprintf("%d it's not a floooooood2 %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -280,18 +419,25 @@ func TestBlossomSubFanoutExpiry(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 10)
+	hosts := getDefaultHosts(t, 10)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs[1:] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -299,12 +445,15 @@ func TestBlossomSubFanoutExpiry(t *testing.T) {
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
+	b, err := psubs[0].Join([]byte{0x00, 0x01})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for i := 0; i < 5; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -339,18 +488,25 @@ func TestBlossomSubFanoutExpiry(t *testing.T) {
 func TestBlossomSubGossip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -363,78 +519,9 @@ func TestBlossomSubGossip(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
-			got, err := sub.Next(ctx)
-			if err != nil {
-				t.Fatal(sub.err)
-			}
-			if !bytes.Equal(msg, got.Data) {
-				t.Fatal("got wrong message!")
-			}
-		}
-
-		// wait a bit to have some gossip interleaved
-		time.Sleep(time.Millisecond * 100)
-	}
-
-	// and wait for some gossip flushing
-	time.Sleep(time.Second * 2)
-}
-
-func TestBlossomSubGossipPiggyback(t *testing.T) {
-	t.Skip("test no longer relevant; gossip propagation has become eager")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
-
-	psubs := getBlossomSubs(ctx, hosts)
-
-	var msgs []*Subscription
-	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		msgs = append(msgs, subch)
-	}
-
-	var xmsgs []*Subscription
-	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xba, 0x2c, 0x12, 0x08})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		xmsgs = append(xmsgs, subch)
-	}
-
-	denseConnect(t, hosts)
-
-	// wait for heartbeats to build mesh
-	time.Sleep(time.Second * 2)
-
-	for i := 0; i < 100; i++ {
-		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
-
-		owner := rand.Intn(len(psubs))
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
-		psubs[owner].Publish([]byte{0xba, 0x2c, 0x12, 0x08}, msg)
-
-		for _, sub := range msgs {
-			got, err := sub.Next(ctx)
-			if err != nil {
-				t.Fatal(sub.err)
-			}
-			if !bytes.Equal(msg, got.Data) {
-				t.Fatal("got wrong message!")
-			}
-		}
-
-		for _, sub := range xmsgs {
 			got, err := sub.Next(ctx)
 			if err != nil {
 				t.Fatal(sub.err)
@@ -456,7 +543,7 @@ func TestBlossomSubGossipPropagation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 40)
 	psubs := getBlossomSubs(ctx, hosts)
 
 	hosts1 := hosts[:BlossomSubD+1]
@@ -466,13 +553,25 @@ func TestBlossomSubGossipPropagation(t *testing.T) {
 	denseConnect(t, hosts2)
 
 	var msgs1 []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs[1 : BlossomSubD+1] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs1 = append(msgs1, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs1 = append(msgs1, subch...)
+	}
+
+	b, err := psubs[0].Join([]byte{0x00, 0x01})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	time.Sleep(time.Second * 1)
@@ -480,9 +579,7 @@ func TestBlossomSubGossipPropagation(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
-		owner := 0
-
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs1 {
 			got, err := sub.Next(ctx)
@@ -499,12 +596,12 @@ func TestBlossomSubGossipPropagation(t *testing.T) {
 
 	var msgs2 []*Subscription
 	for _, ps := range psubs[BlossomSubD+1:] {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs2 = append(msgs2, subch)
+		msgs2 = append(msgs2, subch...)
 	}
 
 	var collect [][]byte
@@ -536,18 +633,25 @@ func TestBlossomSubGossipPropagation(t *testing.T) {
 func TestBlossomSubPrune(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -568,7 +672,7 @@ func TestBlossomSubPrune(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs[5:] {
 			got, err := sub.Next(ctx)
@@ -585,7 +689,7 @@ func TestBlossomSubPrune(t *testing.T) {
 func TestBlossomSubPruneBackoffTime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 10)
+	hosts := getDefaultHosts(t, 10)
 
 	// App specific score that we'll change later.
 	currentScoreForHost0 := int32(0)
@@ -614,13 +718,21 @@ func TestBlossomSubPruneBackoffTime(t *testing.T) {
 		}))
 
 	var msgs []*Subscription
+
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	connectAll(t, hosts)
@@ -644,7 +756,7 @@ func TestBlossomSubPruneBackoffTime(t *testing.T) {
 		// Run this check in the eval thunk so that we don't step over the heartbeat goroutine and trigger a race.
 		psubs[idx].rt.(*BlossomSubRouter).p.eval <- func() {
 			defer wg.Done()
-			backoff, ok := psubs[idx].rt.(*BlossomSubRouter).backoff[string([]byte{0xf0, 0x0b, 0xa1, 0x20})][hosts[0].ID()]
+			backoff, ok := psubs[idx].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x01})][hosts[0].ID()]
 			if !ok {
 				atomic.AddUint32(&missingBackoffs, 1)
 			}
@@ -666,7 +778,7 @@ func TestBlossomSubPruneBackoffTime(t *testing.T) {
 		// Don't publish from host 0, since everyone should have pruned it.
 		owner := rand.Intn(len(psubs)-1) + 1
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs[1:] {
 			got, err := sub.Next(ctx)
@@ -683,7 +795,7 @@ func TestBlossomSubPruneBackoffTime(t *testing.T) {
 func TestBlossomSubGraft(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
@@ -692,13 +804,20 @@ func TestBlossomSubGraft(t *testing.T) {
 	time.Sleep(time.Second * 1)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 
 		// wait for announce to propagate
 		time.Sleep(time.Millisecond * 100)
@@ -711,7 +830,7 @@ func TestBlossomSubGraft(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -728,18 +847,25 @@ func TestBlossomSubGraft(t *testing.T) {
 func TestBlossomSubRemovePeer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
 	var msgs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x20})
+		b, err := ps.Join([]byte{0x00, 0x01})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x01})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	denseConnect(t, hosts)
@@ -760,7 +886,7 @@ func TestBlossomSubRemovePeer(t *testing.T) {
 
 		owner := 5 + rand.Intn(len(psubs)-5)
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x20}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs[5:] {
 			got, err := sub.Next(ctx)
@@ -778,25 +904,31 @@ func TestBlossomSubGraftPruneRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 10)
+	hosts := getDefaultHosts(t, 10)
 	psubs := getBlossomSubs(ctx, hosts)
 	denseConnect(t, hosts)
 
-	var bitmasks [][]byte
 	var msgs [][]*Subscription
+	var bitmasks [][]*Bitmask
 	for i := 0; i < 35; i++ {
-		bitmask := []byte{byte(i)}
-		bitmasks = append(bitmasks, bitmask)
-
+		bitmask := bytes.Repeat([]byte{0x00}, i+1)
 		var subs []*Subscription
+		var masks []*Bitmask
 		for _, ps := range psubs {
+			b, err := ps.Join(bitmask)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			masks = append(masks, b...)
 			subch, err := ps.Subscribe(bitmask)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			subs = append(subs, subch)
+			subs = append(subs, subch...)
 		}
+		bitmasks = append(bitmasks, masks)
 		msgs = append(msgs, subs)
 	}
 
@@ -808,7 +940,7 @@ func TestBlossomSubGraftPruneRetry(t *testing.T) {
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish(bitmask, msg)
+		bitmask[owner].Publish(ctx, bitmask[owner].bitmask, msg)
 
 		for _, sub := range msgs[i] {
 			got, err := sub.Next(ctx)
@@ -828,12 +960,19 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 10)
+	hosts := getDefaultHosts(t, 10)
 	psubs := getBlossomSubs(ctx, hosts)
 	denseConnect(t, hosts)
 
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xff, 0xff, 0xff, 0xff})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x00, 0x08})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x00, 0x00, 0x08})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -844,7 +983,7 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 					break
 				}
 			}
-		}(subch)
+		}(subch[0])
 	}
 
 	time.Sleep(time.Second * 1)
@@ -855,7 +994,7 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 		owner := rand.Intn(len(psubs))
 		for i := 0; i < 10000; i++ {
 			msg := []byte("background flooooood")
-			psubs[owner].Publish([]byte{0xff, 0xff, 0xff, 0xff}, msg)
+			bitmasks[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 		}
 		done <- struct{}{}
 	}()
@@ -865,21 +1004,28 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 	// and subscribe to a bunch of bitmasks in the meantime -- this should
 	// result in some dropped control messages, with subsequent piggybacking
 	// in the background flood
-	var bitmasks [][]byte
+	var otherBitmasks [][]*Bitmask
 	var msgs [][]*Subscription
 	for i := 0; i < 5; i++ {
-		bitmask := []byte{byte(i)}
-		bitmasks = append(bitmasks, bitmask)
-
+		bitmask := make([]byte, i)
+		var masks []*Bitmask
 		var subs []*Subscription
 		for _, ps := range psubs {
+			b, err := ps.Join(bitmask)
+			if err != nil {
+				t.Fatal(err)
+			}
+			masks = append(masks, b...)
+
 			subch, err := ps.Subscribe(bitmask)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			subs = append(subs, subch)
+			subs = append(subs, subch...)
 		}
+
+		otherBitmasks = append(otherBitmasks, masks)
 		msgs = append(msgs, subs)
 	}
 
@@ -887,12 +1033,12 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 	<-done
 
 	// and test that we have functional overlays
-	for i, bitmask := range bitmasks {
+	for i, bitmask := range otherBitmasks {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish(bitmask, msg)
+		bitmask[owner].Publish(ctx, []byte{0x00, 0x01}, msg)
 
 		for _, sub := range msgs[i] {
 			got, err := sub.Next(ctx)
@@ -907,35 +1053,41 @@ func TestBlossomSubControlPiggyback(t *testing.T) {
 }
 
 func TestMixedBlossomSub(t *testing.T) {
+	t.Skip("skip unless blossomsub regains some alternate messaging channel baked into the proto")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 30)
+	hosts := getDefaultHosts(t, 30)
 
-	gsubs := getBlossomSubs(ctx, hosts[:20])
-	fsubs := getPubsubs(ctx, hosts[20:])
-	psubs := append(gsubs, fsubs...)
+	bsubs := getBlossomSubs(ctx, hosts[:20])
 
 	var msgs []*Subscription
-	for _, ps := range psubs {
-		subch, err := ps.Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x2b})
+	var bitmasks []*Bitmask
+	for _, ps := range bsubs {
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		msgs = append(msgs, subch)
+		bitmasks = append(bitmasks, b...)
+		subch, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch...)
 	}
 
 	sparseConnect(t, hosts)
 
 	// wait for heartbeats to build mesh
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second * 4)
 
 	for i := 0; i < 100; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
 
-		owner := rand.Intn(len(psubs))
+		owner := rand.Intn(len(bsubs))
 
-		psubs[owner].Publish([]byte{0xf0, 0x0b, 0xa1, 0x2b}, msg)
+		bitmasks[owner].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
@@ -953,7 +1105,7 @@ func TestBlossomSubMultihops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 6)
+	hosts := getDefaultHosts(t, 6)
 
 	psubs := getBlossomSubs(ctx, hosts)
 
@@ -964,19 +1116,26 @@ func TestBlossomSubMultihops(t *testing.T) {
 	connect(t, hosts[4], hosts[5])
 
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for i := 1; i < 6; i++ {
-		ch, err := psubs[i].Subscribe([]byte{0xf0, 0x0b, 0xa1, 0x2b})
+		b, err := psubs[i].Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, ch)
+
+		bitmasks = append(bitmasks, b...)
+		ch, err := psubs[i].Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, ch...)
 	}
 
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
 	msg := []byte("i like cats")
-	err := psubs[0].Publish([]byte{0xf0, 0x0b, 0xa1, 0x2b}, msg)
+	err := bitmasks[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -996,7 +1155,7 @@ func TestBlossomSubTreeTopology(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 10)
+	hosts := getDefaultHosts(t, 10)
 	psubs := getBlossomSubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
@@ -1020,23 +1179,30 @@ func TestBlossomSubTreeTopology(t *testing.T) {
 	*/
 
 	var chs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		ch, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		chs = append(chs, ch)
+		bitmasks = append(bitmasks, b...)
+		ch, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		chs = append(chs, ch...)
 	}
 
 	// wait for heartbeats to build mesh
 	time.Sleep(time.Second * 2)
 
-	assertPeerLists(t, hosts, psubs[0], 1, 5)
-	assertPeerLists(t, hosts, psubs[1], 0, 2, 4)
-	assertPeerLists(t, hosts, psubs[2], 1, 3)
+	assertPeerLists(t, []byte{0x00, 0x00, 0x80, 0x00}, hosts, psubs[0], 1, 5)
+	assertPeerLists(t, []byte{0x00, 0x00, 0x80, 0x00}, hosts, psubs[1], 0, 2, 4)
+	assertPeerLists(t, []byte{0x00, 0x00, 0x80, 0x00}, hosts, psubs[2], 1, 3)
 
-	checkMessageRouting(t, []byte{0xf1, 0x22, 0xb0, 0x22}, []*PubSub{psubs[9], psubs[3]}, chs)
+	checkMessageRouting(t, ctx, []*Bitmask{bitmasks[9], bitmasks[3]}, chs)
 }
 
 // this tests overlay bootstrapping through px in BlossomSub v1.2
@@ -1060,7 +1226,7 @@ func TestBlossomSubStarTopology(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts, WithPeerExchange(true), WithFloodPublish(true))
 
 	// configure the center of the star with a very low D
@@ -1093,16 +1259,23 @@ func TestBlossomSubStarTopology(t *testing.T) {
 
 	// build the mesh
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	// wait a bit for the mesh to build
-	time.Sleep(10 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	// check that all peers have > 1 connection
 	for i, h := range hosts {
@@ -1114,7 +1287,7 @@ func TestBlossomSubStarTopology(t *testing.T) {
 	// send a message from each peer and assert it was propagated
 	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1134,17 +1307,20 @@ func TestBlossomSubStarTopologyWithSignedPeerRecords(t *testing.T) {
 	BlossomSubDlo = BlossomSubD - 1
 	originalBlossomSubDscore := BlossomSubDscore
 	BlossomSubDscore = BlossomSubDlo
+	originalBlossomSubPruneBackoff := BlossomSubPruneBackoff
+	BlossomSubPruneBackoff = 2 * time.Second
 	defer func() {
 		BlossomSubD = originalBlossomSubD
 		BlossomSubDhi = originalBlossomSubDhi
 		BlossomSubDlo = originalBlossomSubDlo
 		BlossomSubDscore = originalBlossomSubDscore
+		BlossomSubPruneBackoff = originalBlossomSubPruneBackoff
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts, WithPeerExchange(true), WithFloodPublish(true))
 
 	// configure the center of the star with a very low D
@@ -1161,7 +1337,7 @@ func TestBlossomSubStarTopologyWithSignedPeerRecords(t *testing.T) {
 	for i := range hosts[1:] {
 		privKey := hosts[i].Peerstore().PrivKey(hosts[i].ID())
 		if privKey == nil {
-			t.Fatalf("unable to get private key for host %s", hosts[i].ID().Pretty())
+			t.Fatalf("unable to get private key for host %s", hosts[i].ID().String())
 		}
 		ai := host.InfoFromHost(hosts[i])
 		rec := peer.PeerRecordFromAddrInfo(*ai)
@@ -1189,12 +1365,19 @@ func TestBlossomSubStarTopologyWithSignedPeerRecords(t *testing.T) {
 
 	// build the mesh
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	// wait a bit for the mesh to build
@@ -1203,14 +1386,14 @@ func TestBlossomSubStarTopologyWithSignedPeerRecords(t *testing.T) {
 	// check that all peers have > 1 connection
 	for i, h := range hosts {
 		if len(h.Network().Conns()) == 1 {
-			t.Errorf("peer %d has ony a single connection", i)
+			t.Errorf("peer %d has only a single connection", i)
 		}
 	}
 
 	// send a message from each peer and assert it was propagated
 	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1222,7 +1405,7 @@ func TestBlossomSubDirectPeers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := getNetHosts(t, ctx, 3)
+	h := getDefaultHosts(t, 3)
 	psubs := []*PubSub{
 		getBlossomSub(ctx, h[0], WithDirectConnectTicks(2)),
 		getBlossomSub(ctx, h[1], WithDirectPeers([]peer.AddrInfo{{ID: h[2].ID(), Addrs: h[2].Addrs()}}), WithDirectConnectTicks(2)),
@@ -1240,12 +1423,19 @@ func TestBlossomSubDirectPeers(t *testing.T) {
 
 	// build the mesh
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
@@ -1253,7 +1443,7 @@ func TestBlossomSubDirectPeers(t *testing.T) {
 	// publish some messages
 	for i := 0; i < 3; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1273,8 +1463,8 @@ func TestBlossomSubDirectPeers(t *testing.T) {
 
 	// publish some messages
 	for i := 0; i < 3; i++ {
-		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		msg := []byte(fmt.Sprintf("message %d", i+3))
+		bitmasks[i].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1286,7 +1476,7 @@ func TestBlossomSubPeerFilter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := getNetHosts(t, ctx, 3)
+	h := getDefaultHosts(t, 3)
 	psubs := []*PubSub{
 		getBlossomSub(ctx, h[0], WithPeerFilter(func(pid peer.ID, bitmask []byte) bool {
 			return pid == h[1].ID()
@@ -1302,24 +1492,35 @@ func TestBlossomSubPeerFilter(t *testing.T) {
 
 	// Join all peers
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
 
 	msg := []byte("message")
 
-	psubs[0].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+	bitmasks[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
+	assertReceive(t, subs[0], msg)
 	assertReceive(t, subs[1], msg)
 	assertNeverReceives(t, subs[2], time.Second)
 
-	psubs[1].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+	msg = []byte("message2")
+
+	bitmasks[1].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 	assertReceive(t, subs[0], msg)
+	assertReceive(t, subs[1], msg)
 	assertNeverReceives(t, subs[2], time.Second)
 }
 
@@ -1328,7 +1529,7 @@ func TestBlossomSubDirectPeersFanout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := getNetHosts(t, ctx, 3)
+	h := getDefaultHosts(t, 3)
 	psubs := []*PubSub{
 		getBlossomSub(ctx, h[0]),
 		getBlossomSub(ctx, h[1], WithDirectPeers([]peer.AddrInfo{{ID: h[2].ID(), Addrs: h[2].Addrs()}})),
@@ -1340,20 +1541,32 @@ func TestBlossomSubDirectPeersFanout(t *testing.T) {
 
 	// Join all peers except h2
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs[:2] {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
 
+	b, err := psubs[2].Join([]byte{0x00, 0x00, 0x80, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// h2 publishes some messages to build a fanout
 	for i := 0; i < 3; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[2].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1364,7 +1577,7 @@ func TestBlossomSubDirectPeersFanout(t *testing.T) {
 	result := make(chan bool, 2)
 	psubs[2].eval <- func() {
 		rt := psubs[2].rt.(*BlossomSubRouter)
-		fanout := rt.fanout[string([]byte{0xf1, 0x22, 0xb0, 0x22})]
+		fanout := rt.fanout[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		_, ok := fanout[h[0].ID()]
 		result <- ok
 		_, ok = fanout[h[1].ID()]
@@ -1382,7 +1595,7 @@ func TestBlossomSubDirectPeersFanout(t *testing.T) {
 	}
 
 	// now subscribe h2 too and verify tht h0 is in the mesh but not h1
-	_, err := psubs[2].Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+	_, err = psubs[2].Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1391,7 +1604,7 @@ func TestBlossomSubDirectPeersFanout(t *testing.T) {
 
 	psubs[2].eval <- func() {
 		rt := psubs[2].rt.(*BlossomSubRouter)
-		mesh := rt.mesh[string([]byte{0xf1, 0x22, 0xb0, 0x22})]
+		mesh := rt.mesh[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		_, ok := mesh[h[0].ID()]
 		result <- ok
 		_, ok = mesh[h[1].ID()]
@@ -1415,7 +1628,7 @@ func TestBlossomSubFloodPublish(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts, WithFloodPublish(true))
 
 	// build the star
@@ -1425,12 +1638,19 @@ func TestBlossomSubFloodPublish(t *testing.T) {
 
 	// build the (partial, unstable) mesh
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
@@ -1438,7 +1658,7 @@ func TestBlossomSubFloodPublish(t *testing.T) {
 	// send a message from the star and assert it was received
 	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[0].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
@@ -1450,11 +1670,11 @@ func TestBlossomSubEnoughPeers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts)
 
 	for _, ps := range psubs {
-		_, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		_, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1463,7 +1683,7 @@ func TestBlossomSubEnoughPeers(t *testing.T) {
 	// at this point we have no connections and no mesh, so EnoughPeers should return false
 	res := make(chan bool, 1)
 	psubs[0].eval <- func() {
-		res <- psubs[0].rt.EnoughPeers([]byte{0xf1, 0x22, 0xb0, 0x22}, 0)
+		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x80, 0x00}, 0)
 	}
 	enough := <-res
 	if enough {
@@ -1476,7 +1696,7 @@ func TestBlossomSubEnoughPeers(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	psubs[0].eval <- func() {
-		res <- psubs[0].rt.EnoughPeers([]byte{0xf1, 0x22, 0xb0, 0x22}, 0)
+		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x80, 0x00}, 0)
 	}
 	enough = <-res
 	if !enough {
@@ -1494,12 +1714,9 @@ func TestBlossomSubCustomParams(t *testing.T) {
 	wantedFollowTime := 1 * time.Second
 	params.IWantFollowupTime = wantedFollowTime
 
-	customGossipFactor := 0.12
-	params.GossipFactor = customGossipFactor
-
 	wantedMaxPendingConns := 23
 	params.MaxPendingConnections = wantedMaxPendingConns
-	hosts := getNetHosts(t, ctx, 1)
+	hosts := getDefaultHosts(t, 1)
 	psubs := getBlossomSubs(ctx, hosts,
 		WithBlossomSubParams(params))
 
@@ -1515,9 +1732,6 @@ func TestBlossomSubCustomParams(t *testing.T) {
 	if rt.params.IWantFollowupTime != wantedFollowTime {
 		t.Errorf("Wanted %d of param BlossomSubIWantFollowupTime but got %d", wantedFollowTime, rt.params.IWantFollowupTime)
 	}
-	if rt.params.GossipFactor != customGossipFactor {
-		t.Errorf("Wanted %f of param BlossomSubGossipFactor but got %f", customGossipFactor, rt.params.GossipFactor)
-	}
 	if rt.params.MaxPendingConnections != wantedMaxPendingConns {
 		t.Errorf("Wanted %d of param BlossomSubMaxPendingConnections but got %d", wantedMaxPendingConns, rt.params.MaxPendingConnections)
 	}
@@ -1528,7 +1742,7 @@ func TestBlossomSubNegativeScore(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 20)
+	hosts := getDefaultHosts(t, 20)
 	psubs := getBlossomSubs(ctx, hosts,
 		WithPeerScore(
 			&PeerScoreParams{
@@ -1552,19 +1766,26 @@ func TestBlossomSubNegativeScore(t *testing.T) {
 	denseConnect(t, hosts)
 
 	var subs []*Subscription
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(3 * time.Second)
 
 	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i%20].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i%20].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -1612,7 +1833,7 @@ func TestBlossomSubScoreValidatorEx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 3)
+	hosts := getDefaultHosts(t, 3)
 	psubs := getBlossomSubs(ctx, hosts,
 		WithPeerScore(
 			&PeerScoreParams{
@@ -1620,7 +1841,7 @@ func TestBlossomSubScoreValidatorEx(t *testing.T) {
 				DecayInterval:    time.Second,
 				DecayToZero:      0.01,
 				Bitmasks: map[string]*BitmaskScoreParams{
-					string([]byte{0xf1, 0x22, 0xb0, 0x22}): {
+					string([]byte{0x00, 0x00, 0x80, 0x00}): {
 						BitmaskWeight:                  1,
 						TimeInMeshQuantum:              time.Second,
 						InvalidMessageDeliveriesWeight: -1,
@@ -1636,7 +1857,7 @@ func TestBlossomSubScoreValidatorEx(t *testing.T) {
 
 	connectAll(t, hosts)
 
-	err := psubs[0].RegisterBitmaskValidator([]byte{0xf1, 0x22, 0xb0, 0x22}, func(ctx context.Context, p peer.ID, msg *Message) ValidationResult {
+	err := psubs[0].RegisterBitmaskValidator([]byte{0x00, 0x00, 0x80, 0x00}, func(ctx context.Context, p peer.ID, msg *Message) ValidationResult {
 		// we ignore host1 and reject host2
 		if p == hosts[1].ID() {
 			return ValidationIgnore
@@ -1651,7 +1872,17 @@ func TestBlossomSubScoreValidatorEx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sub, err := psubs[0].Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+	sub, err := psubs[0].Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b1, err := psubs[1].Join([]byte{0x00, 0x00, 0x80, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := psubs[2].Join([]byte{0x00, 0x00, 0x80, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1668,11 +1899,11 @@ func TestBlossomSubScoreValidatorEx(t *testing.T) {
 		}
 	}
 
-	psubs[1].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, []byte("i am not a walrus"))
-	psubs[2].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, []byte("i am not a walrus either"))
+	b1[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, []byte("i am not a walrus"))
+	b2[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, []byte("i am not a walrus either"))
 
 	// assert no messages
-	expectNoMessage(sub)
+	expectNoMessage(sub[0])
 
 	// assert that peer1's score is still 0 (its message was ignored) while peer2 should have
 	// a negative score (its message got rejected)
@@ -1700,8 +1931,7 @@ func TestBlossomSubPiggybackControl(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := bhost.NewBlankHost(swarmt.GenSwarm(t))
-	defer h.Close()
+	h := getDefaultHosts(t, 1)[0]
 	ps := getBlossomSub(ctx, h)
 
 	blah := peer.ID("bogotr0n")
@@ -1709,14 +1939,14 @@ func TestBlossomSubPiggybackControl(t *testing.T) {
 	res := make(chan *RPC, 1)
 	ps.eval <- func() {
 		gs := ps.rt.(*BlossomSubRouter)
-		test1 := []byte{0xff, 0x00, 0x00, 0x00}
-		test2 := []byte{0x00, 0xff, 0x00, 0x00}
-		test3 := []byte{0x00, 0x00, 0xff, 0x00}
+		test1 := []byte{0x00, 0x80, 0x00, 0x00}
+		test2 := []byte{0x00, 0x20, 0x00, 0x00}
+		test3 := []byte{0x00, 0x00, 0x02, 0x00}
 		gs.mesh[string(test1)] = make(map[peer.ID]struct{})
 		gs.mesh[string(test2)] = make(map[peer.ID]struct{})
 		gs.mesh[string(test1)][blah] = struct{}{}
 
-		rpc := &RPC{RPC: pb.RPC{}}
+		rpc := &RPC{RPC: &pb.RPC{}}
 		gs.piggybackControl(blah, rpc, &pb.ControlMessage{
 			Graft: []*pb.ControlGraft{{Bitmask: test1}, {Bitmask: test2}, {Bitmask: test3}},
 			Prune: []*pb.ControlPrune{{Bitmask: test1}, {Bitmask: test2}, {Bitmask: test3}},
@@ -1731,16 +1961,16 @@ func TestBlossomSubPiggybackControl(t *testing.T) {
 	if len(rpc.Control.Graft) != 1 {
 		t.Fatal("expected 1 GRAFT")
 	}
-	if !bytes.Equal(rpc.Control.Graft[0].GetBitmask(), []byte{0xff, 0x00, 0x00, 0x00}) {
+	if !bytes.Equal(rpc.Control.Graft[0].GetBitmask(), []byte{0x00, 0x80, 0x00, 0x00}) {
 		t.Fatal("expected test1 as graft bitmask ID")
 	}
 	if len(rpc.Control.Prune) != 2 {
 		t.Fatal("expected 2 PRUNEs")
 	}
-	if !bytes.Equal(rpc.Control.Prune[0].GetBitmask(), []byte{0x00, 0xff, 0x00, 0x00}) {
+	if !bytes.Equal(rpc.Control.Prune[0].GetBitmask(), []byte{0x00, 0x20, 0x00, 0x00}) {
 		t.Fatal("expected test2 as prune bitmask ID")
 	}
-	if !bytes.Equal(rpc.Control.Prune[1].GetBitmask(), []byte{0x00, 0x00, 0xff, 0x00}) {
+	if !bytes.Equal(rpc.Control.Prune[1].GetBitmask(), []byte{0x00, 0x00, 0x02, 0x00}) {
 		t.Fatal("expected test3 as prune bitmask ID")
 	}
 }
@@ -1749,15 +1979,15 @@ func TestBlossomSubMultipleGraftBitmasks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	psubs := getBlossomSubs(ctx, hosts)
 	sparseConnect(t, hosts)
 
 	time.Sleep(time.Second * 1)
 
-	firstBitmask := []byte{0xff, 0x00, 0x00, 0x00}
-	secondBitmask := []byte{0x00, 0xff, 0x00, 0x00}
-	thirdBitmask := []byte{0x00, 0x00, 0xff, 0x00}
+	firstBitmask := []byte{0x00, 0x80, 0x00, 0x00}
+	secondBitmask := []byte{0x00, 0x20, 0x00, 0x00}
+	thirdBitmask := []byte{0x00, 0x00, 0x02, 0x00}
 
 	firstPeer := hosts[0].ID()
 	secondPeer := hosts[1].ID()
@@ -1817,7 +2047,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 50)
+	hosts := getDefaultHosts(t, 50)
 	// pubsubs for the first 10 hosts
 	psubs := getBlossomSubs(ctx, hosts[:10],
 		WithFloodPublish(true),
@@ -1828,7 +2058,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 				DecayInterval:     time.Second,
 				DecayToZero:       0.01,
 				Bitmasks: map[string]*BitmaskScoreParams{
-					string([]byte{0xf1, 0x22, 0xb0, 0x22}): {
+					string([]byte{0x00, 0x00, 0x80, 0x00}): {
 						BitmaskWeight:                 1,
 						TimeInMeshWeight:              0.0002777,
 						TimeInMeshQuantum:             time.Second,
@@ -1853,7 +2083,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 	// sybil squatters for the remaining 40 hosts
 	for _, h := range hosts[10:] {
 		squatter := &sybilSquatter{h: h}
-		h.SetStreamHandler(BlossomSubID_v12, squatter.handleStream)
+		h.SetStreamHandler(BlossomSubID_v2, squatter.handleStream)
 	}
 
 	// connect all squatters to every real host
@@ -1867,8 +2097,15 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// ask the real pubsus to join the bitmask
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bitmasks = append(bitmasks, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1880,13 +2117,13 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 					return
 				}
 			}
-		}(sub)
+		}(sub[0])
 	}
 
 	// publish a bunch of messages from the real hosts
 	for i := 0; i < 1000; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i%10].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i%10].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -1900,7 +2137,7 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 			gs := ps.rt.(*BlossomSubRouter)
 			count := 0
 			for _, h := range hosts[:10] {
-				_, ok := gs.mesh[string([]byte{0xf1, 0x22, 0xb0, 0x22})][h.ID()]
+				_, ok := gs.mesh[string([]byte{0x00, 0x00, 0x80, 0x00})][h.ID()]
 				if ok {
 					count++
 				}
@@ -1914,11 +2151,12 @@ func TestBlossomSubOpportunisticGrafting(t *testing.T) {
 		}
 	}
 }
+
 func TestBlossomSubLeaveBitmask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := getNetHosts(t, ctx, 2)
+	h := getDefaultHosts(t, 2)
 	psubs := []*PubSub{
 		getBlossomSub(ctx, h[0]),
 		getBlossomSub(ctx, h[1]),
@@ -1929,11 +2167,11 @@ func TestBlossomSubLeaveBitmask(t *testing.T) {
 	// Join all peers
 	var subs []*Subscription
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
@@ -1943,9 +2181,9 @@ func TestBlossomSubLeaveBitmask(t *testing.T) {
 
 	psubs[0].rt.(*BlossomSubRouter).p.eval <- func() {
 		defer close(done)
-		psubs[0].rt.Leave([]byte{0xf1, 0x22, 0xb0, 0x22})
+		psubs[0].rt.Leave([]byte{0x00, 0x00, 0x80, 0x00})
 		time.Sleep(time.Second)
-		peerMap := psubs[0].rt.(*BlossomSubRouter).backoff[string([]byte{0xf1, 0x22, 0xb0, 0x22})]
+		peerMap := psubs[0].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		if len(peerMap) != 1 {
 			t.Fatalf("No peer is populated in the backoff map for peer 0")
 		}
@@ -1967,7 +2205,7 @@ func TestBlossomSubLeaveBitmask(t *testing.T) {
 	// for peer 0.
 	psubs[1].rt.(*BlossomSubRouter).p.eval <- func() {
 		defer close(done)
-		peerMap2 := psubs[1].rt.(*BlossomSubRouter).backoff[string([]byte{0xf1, 0x22, 0xb0, 0x22})]
+		peerMap2 := psubs[1].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		if len(peerMap2) != 1 {
 			t.Fatalf("No peer is populated in the backoff map for peer 1")
 		}
@@ -1989,7 +2227,7 @@ func TestBlossomSubJoinBitmask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := getNetHosts(t, ctx, 3)
+	h := getDefaultHosts(t, 3)
 	psubs := []*PubSub{
 		getBlossomSub(ctx, h[0]),
 		getBlossomSub(ctx, h[1]),
@@ -2005,21 +2243,23 @@ func TestBlossomSubJoinBitmask(t *testing.T) {
 	peerMap := make(map[peer.ID]time.Time)
 	peerMap[h[1].ID()] = time.Now().Add(router0.params.UnsubscribeBackoff)
 
-	router0.backoff[string([]byte{0xf1, 0x22, 0xb0, 0x22})] = peerMap
+	router0.backoff[string([]byte{0x00, 0x00, 0x80, 0x00})] = peerMap
 
 	// Join all peers
 	var subs []*Subscription
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		sub, err := ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+		subs = append(subs, sub...)
 	}
 
 	time.Sleep(time.Second)
 
-	meshMap := router0.mesh[string([]byte{0xf1, 0x22, 0xb0, 0x22})]
+	router0.meshMx.RLock()
+	meshMap := router0.mesh[string([]byte{0x00, 0x00, 0x80, 0x00})]
+	router0.meshMx.RUnlock()
 	if len(meshMap) != 1 {
 		t.Fatalf("Unexpect peer included in the mesh")
 	}
@@ -2037,18 +2277,24 @@ type sybilSquatter struct {
 func (sq *sybilSquatter) handleStream(s network.Stream) {
 	defer s.Close()
 
-	os, err := sq.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v12)
+	os, err := sq.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v2)
 	if err != nil {
 		panic(err)
 	}
 
 	// send a subscription for test in the output stream to become candidate for GRAFT
 	// and then just read and ignore the incoming RPCs
-	r := protoio.NewDelimitedReader(s, 1<<20)
-	w := protoio.NewDelimitedWriter(os)
+	r := msgio.NewVarintReaderSize(s, DefaultMaxMessageSize)
+	w := msgio.NewVarintWriter(os)
 	truth := true
-	bitmask := []byte{0xf1, 0x22, 0xb0, 0x22}
-	err = w.WriteMsg(&pb.RPC{Subscriptions: []*pb.RPC_SubOpts{{Subscribe: truth, Bitmask: bitmask}}})
+	bitmask := []byte{0x00, 0x00, 0x80, 0x00}
+	msg := &pb.RPC{Subscriptions: []*pb.RPC_SubOpts{{Subscribe: truth, Bitmask: bitmask}}}
+	out, err := proto.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
+
+	err = w.WriteMsg(out)
 	if err != nil {
 		panic(err)
 	}
@@ -2056,12 +2302,14 @@ func (sq *sybilSquatter) handleStream(s network.Stream) {
 	var rpc pb.RPC
 	for {
 		rpc.Reset()
-		err = r.ReadMsg(&rpc)
+		v, err := r.ReadMsg()
 		if err != nil {
-			if err != io.EOF {
-				s.Reset()
-			}
-			return
+			break
+		}
+
+		err = proto.Unmarshal(v, &rpc)
+		if err != nil {
+			break
 		}
 	}
 }
@@ -2071,14 +2319,14 @@ func TestBlossomSubPeerScoreInspect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 
 	inspector := &mockPeerScoreInspector{}
 	psub1 := getBlossomSub(ctx, hosts[0],
 		WithPeerScore(
 			&PeerScoreParams{
 				Bitmasks: map[string]*BitmaskScoreParams{
-					string([]byte{0xf1, 0x22, 0xb0, 0x22}): {
+					string([]byte{0x00, 0x00, 0x80, 0x00}): {
 						BitmaskWeight:                  1,
 						TimeInMeshQuantum:              time.Second,
 						FirstMessageDeliveriesWeight:   1,
@@ -2102,9 +2350,15 @@ func TestBlossomSubPeerScoreInspect(t *testing.T) {
 	psubs := []*PubSub{psub1, psub2}
 
 	connect(t, hosts[0], hosts[1])
-
+	var bitmasks []*Bitmask
 	for _, ps := range psubs {
-		_, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+		b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bitmasks = append(bitmasks, b...)
+		_, err = ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2114,7 +2368,7 @@ func TestBlossomSubPeerScoreInspect(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		msg := []byte(fmt.Sprintf("message %d", i))
-		psubs[i%2].Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		bitmasks[i%2].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -2131,13 +2385,13 @@ func TestBlossomSubPeerScoreResetBitmaskParams(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 1)
+	hosts := getDefaultHosts(t, 1)
 
 	ps := getBlossomSub(ctx, hosts[0],
 		WithPeerScore(
 			&PeerScoreParams{
 				Bitmasks: map[string]*BitmaskScoreParams{
-					string([]byte{0xf1, 0x22, 0xb0, 0x22}): {
+					string([]byte{0x00, 0x00, 0x80, 0x00}): {
 						BitmaskWeight:                  1,
 						TimeInMeshQuantum:              time.Second,
 						FirstMessageDeliveriesWeight:   1,
@@ -2157,12 +2411,12 @@ func TestBlossomSubPeerScoreResetBitmaskParams(t *testing.T) {
 				GraylistThreshold: -1000,
 			}))
 
-	bitmask, err := ps.Join([]byte{0xf1, 0x22, 0xb0, 0x22})
+	bitmask, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = bitmask.SetScoreParams(
+	err = bitmask[0].SetScoreParams(
 		&BitmaskScoreParams{
 			BitmaskWeight:                  1,
 			TimeInMeshQuantum:              time.Second,
@@ -2198,17 +2452,21 @@ func TestBlossomSubRPCFragmentation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	ps := getBlossomSub(ctx, hosts[0])
 
 	// make a fake peer that requests everything through IWANT gossip
 	iwe := iwantEverything{h: hosts[1]}
-	iwe.h.SetStreamHandler(BlossomSubID_v12, iwe.handleStream)
+	iwe.h.SetStreamHandler(BlossomSubID_v2, iwe.handleStream)
 
 	connect(t, hosts[0], hosts[1])
 
 	// have the real pubsub join the test bitmask
-	_, err := ps.Subscribe([]byte{0xf1, 0x22, 0xb0, 0x22})
+	b, err := ps.Join([]byte{0x00, 0x00, 0x80, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ps.Subscribe([]byte{0x00, 0x00, 0x80, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2222,7 +2480,7 @@ func TestBlossomSubRPCFragmentation(t *testing.T) {
 	for i := 0; i < nMessages; i++ {
 		msg := make([]byte, msgSize)
 		rand.Read(msg)
-		ps.Publish([]byte{0xf1, 0x22, 0xb0, 0x22}, msg)
+		b[0].Publish(ctx, []byte{0x00, 0x00, 0x80, 0x00}, msg)
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -2265,7 +2523,7 @@ type iwantEverything struct {
 func (iwe *iwantEverything) handleStream(s network.Stream) {
 	defer s.Close()
 
-	os, err := iwe.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v12)
+	os, err := iwe.h.NewStream(context.Background(), s.Conn().RemotePeer(), BlossomSubID_v2)
 	if err != nil {
 		panic(err)
 	}
@@ -2274,11 +2532,18 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 	gossipMsgIdsReceived := make(map[string]struct{})
 
 	// send a subscription for test in the output stream to become candidate for gossip
-	r := protoio.NewDelimitedReader(s, 1<<20)
-	w := protoio.NewDelimitedWriter(os)
+	r := msgio.NewVarintReaderSize(s, DefaultMaxMessageSize)
+	w := msgio.NewVarintWriter(os)
 	truth := true
-	bitmask := []byte{0xf1, 0x22, 0xb0, 0x22}
-	err = w.WriteMsg(&pb.RPC{Subscriptions: []*pb.RPC_SubOpts{{Subscribe: truth, Bitmask: bitmask}}})
+	bitmask := []byte{0x00, 0x00, 0x80, 0x00}
+	msg := &pb.RPC{Subscriptions: []*pb.RPC_SubOpts{{Subscribe: truth, Bitmask: bitmask}}}
+	out, err := proto.Marshal(msg)
+
+	if err != nil {
+		panic(err)
+	}
+
+	err = w.WriteMsg(out)
 	if err != nil {
 		panic(err)
 	}
@@ -2286,12 +2551,14 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 	var rpc pb.RPC
 	for {
 		rpc.Reset()
-		err = r.ReadMsg(&rpc)
+		v, err := r.ReadMsg()
 		if err != nil {
-			if err != io.EOF {
-				s.Reset()
-			}
-			return
+			break
+		}
+
+		err = proto.Unmarshal(v, &rpc)
+		if err != nil {
+			break
 		}
 
 		iwe.lk.Lock()
@@ -2318,14 +2585,20 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 			for _, ihave := range rpc.Control.Ihave {
 				iwants = append(iwants, &pb.ControlIWant{MessageIDs: ihave.MessageIDs})
 				for _, msgId := range ihave.MessageIDs {
-					if _, seen := gossipMsgIdsReceived[msgId]; !seen {
+					if _, seen := gossipMsgIdsReceived[string(msgId)]; !seen {
 						iwe.ihavesReceived++
 					}
-					gossipMsgIdsReceived[msgId] = struct{}{}
+					gossipMsgIdsReceived[string(msgId)] = struct{}{}
 				}
 			}
 
-			out := rpcWithControl(nil, nil, iwants, nil, prunes)
+			msg := rpcWithControl(nil, nil, iwants, nil, prunes)
+			out, err := proto.Marshal(msg)
+
+			if err != nil {
+				panic(err)
+			}
+
 			err = w.WriteMsg(out)
 			if err != nil {
 				panic(err)
@@ -2337,8 +2610,8 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 
 func TestFragmentRPCFunction(t *testing.T) {
 	p := peer.ID("some-peer")
-	bitmask := []byte{0xf1, 0x22, 0xb0, 0x22}
-	rpc := &RPC{from: p}
+	bitmask := []byte{0x00, 0x00, 0x80, 0x00}
+	rpc := &RPC{RPC: new(pb.RPC), from: p}
 	limit := 1024
 
 	mkMsg := func(size int) *pb.Message {
@@ -2359,20 +2632,14 @@ func TestFragmentRPCFunction(t *testing.T) {
 	// it should not fragment if everything fits in one RPC
 	rpc.Publish = []*pb.Message{}
 	rpc.Publish = []*pb.Message{mkMsg(10), mkMsg(10)}
-	results, err := fragmentRPC(rpc, limit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	results := appendOrMergeRPC([]*RPC{}, limit, rpc)
 	if len(results) != 1 {
 		t.Fatalf("expected single RPC if input is < limit, got %d", len(results))
 	}
 
 	// if there's a message larger than the limit, we should fail
 	rpc.Publish = []*pb.Message{mkMsg(10), mkMsg(limit * 2)}
-	results, err = fragmentRPC(rpc, limit)
-	if err == nil {
-		t.Fatalf("expected an error if a message exceeds limit, got %d RPCs instead", len(results))
-	}
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 
 	// if the individual messages are below the limit, but the RPC as a whole is larger, we should fragment
 	nMessages := 100
@@ -2388,10 +2655,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 	for i := 0; i < nMessages; i++ {
 		rpc.Publish[i] = mkMsg(msgSize)
 	}
-	results, err = fragmentRPC(rpc, limit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	msgsPerRPC := limit / msgSize
 	expectedRPCs := nMessages / msgsPerRPC
@@ -2417,13 +2681,10 @@ func TestFragmentRPCFunction(t *testing.T) {
 	rpc.Control = &pb.ControlMessage{
 		Graft: []*pb.ControlGraft{{Bitmask: bitmask}},
 		Prune: []*pb.ControlPrune{{Bitmask: bitmask}},
-		Ihave: []*pb.ControlIHave{{MessageIDs: []string{"foo"}}},
-		Iwant: []*pb.ControlIWant{{MessageIDs: []string{"bar"}}},
+		Ihave: []*pb.ControlIHave{{MessageIDs: [][]byte{[]byte("foo")}}},
+		Iwant: []*pb.ControlIWant{{MessageIDs: [][]byte{[]byte("bar")}}},
 	}
-	results, err = fragmentRPC(rpc, limit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	// we expect one more RPC than last time, with the final one containing the control messages
 	expectedCtrl := 1
@@ -2455,19 +2716,16 @@ func TestFragmentRPCFunction(t *testing.T) {
 	rpc.Control.Ihave = make([]*pb.ControlIHave, nBitmasks)
 	rpc.Control.Iwant = make([]*pb.ControlIWant, nBitmasks)
 	for i := 0; i < nBitmasks; i++ {
-		messageIds := make([]string, msgsPerBitmask)
+		messageIds := make([][]byte, msgsPerBitmask)
 		for m := 0; m < msgsPerBitmask; m++ {
 			mid := make([]byte, messageIdSize)
 			rand.Read(mid)
-			messageIds[m] = string(mid)
+			messageIds[m] = mid
 		}
 		rpc.Control.Ihave[i] = &pb.ControlIHave{MessageIDs: messageIds}
 		rpc.Control.Iwant[i] = &pb.ControlIWant{MessageIDs: messageIds}
 	}
-	results, err = fragmentRPC(rpc, limit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
 	ensureBelowLimit(results)
 	minExpectedCtl := rpc.Control.Size() / limit
 	minExpectedRPCs := (nMessages / msgsPerRPC) + minExpectedCtl
@@ -2476,27 +2734,454 @@ func TestFragmentRPCFunction(t *testing.T) {
 	}
 
 	// Test the pathological case where a single gossip message ID exceeds the limit.
-	// It should not be present in the fragmented messages, but smaller IDs should be
 	rpc.Reset()
 	giantIdBytes := make([]byte, limit*2)
 	rand.Read(giantIdBytes)
 	rpc.Control = &pb.ControlMessage{
 		Iwant: []*pb.ControlIWant{
-			{MessageIDs: []string{"hello", string(giantIdBytes)}},
+			{MessageIDs: [][]byte{[]byte("hello"), giantIdBytes}},
 		},
 	}
-	results, err = fragmentRPC(rpc, limit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 RPC, got %d", len(results))
+	results = appendOrMergeRPC([]*RPC{}, limit, rpc)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 RPC, got %d", len(results))
 	}
 	if len(results[0].Control.Iwant) != 1 {
 		t.Fatalf("expected 1 IWANT, got %d", len(results[0].Control.Iwant))
 	}
-	if results[0].Control.Iwant[0].MessageIDs[0] != "hello" {
+	if len(results[1].Control.Iwant) != 1 {
+		t.Fatalf("expected 1 IWANT, got %d", len(results[1].Control.Iwant))
+	}
+	if !bytes.Equal(results[0].Control.Iwant[0].MessageIDs[0], []byte("hello")) {
 		t.Fatalf("expected small message ID to be included unaltered, got %s instead",
 			results[0].Control.Iwant[0].MessageIDs[0])
+	}
+	if !bytes.Equal(results[1].Control.Iwant[0].MessageIDs[0], giantIdBytes) {
+		t.Fatalf("expected giant message ID to be included unaltered, got %s instead",
+			results[1].Control.Iwant[0].MessageIDs[0])
+	}
+}
+
+func TestBloomRouting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 20)
+	psubs := getBlossomSubs(ctx, hosts)
+
+	var msgs [][]*Subscription
+	var bitmasks [][]*Bitmask
+	targetSets := [][]byte{
+		{0x00, 0x01},
+		{0x00, 0x10},
+		{0x01, 0x00},
+		{0x01, 0x01},
+		{0x01, 0x11},
+	}
+
+	expectedGroups := [][]int{
+		{0, 3, 4},
+		{1, 4},
+		{2, 3, 4},
+		{3, 4},
+		{4},
+	}
+
+	for i, ps := range psubs {
+		b, err := ps.Join(targetSets[i%5])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bitmasks = append(bitmasks, b)
+
+		subch, err := ps.Subscribe(targetSets[i%5])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs = append(msgs, subch)
+	}
+
+	connectAll(t, hosts)
+
+	// wait for heartbeats to build mesh
+	time.Sleep(time.Second * 2)
+
+	for i := 0; i < 100; i++ {
+		msg := []byte(fmt.Sprintf("%d it's not a floooooood %d", i, i))
+
+		owner := rand.Intn(len(psubs))
+
+		psubs[owner].Publish(ctx, targetSets[owner%5], msg)
+
+		for i, sub := range msgs {
+			if !slices.Contains(expectedGroups[owner%5], i%5) {
+				continue
+			}
+
+			// Normally the expectation is that any subscription will do when using a bloom bitmask
+			// But we need to verify one gets it.
+			g := sync.WaitGroup{}
+			g.Add(len(sub) + 1)
+			errch := make(chan error)
+			var errs []error
+			for _, s := range sub {
+				s := s
+				go func() {
+					defer g.Done()
+					nctx, _ := context.WithDeadline(ctx, time.Now().Add(100*time.Millisecond))
+					got, err := s.Next(nctx)
+					if err != nil {
+						errch <- err
+						return
+					}
+					if !bytes.Equal(msg, got.Data) {
+						errch <- errors.New("got wrong message!")
+						return
+					}
+					errch <- nil
+				}()
+			}
+
+			go func() {
+				for _ = range sub {
+					select {
+					case err := <-errch:
+						if err != nil {
+							errs = append(errs, err)
+						}
+					}
+				}
+				g.Done()
+			}()
+			g.Wait()
+			if len(errs) == len(sub) {
+				t.Fatal(errors.Join(errs...))
+			}
+		}
+	}
+}
+
+func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getDefaultHosts(t, 10)
+	psubs := getBlossomSubs(ctx, hosts)
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+	connect(t, hosts[1], hosts[4])
+	connect(t, hosts[2], hosts[3])
+	connect(t, hosts[0], hosts[5])
+	connect(t, hosts[5], hosts[6])
+	connect(t, hosts[5], hosts[8])
+	connect(t, hosts[6], hosts[7])
+	connect(t, hosts[8], hosts[9])
+
+	/*
+		[0] -> [1] -> [2] -> [3]
+		 |      L->[4]
+		 v
+		[5] -> [6] -> [7]
+		 |
+		 v
+		[8] -> [9]
+	*/
+
+	var chs [][]*Subscription
+	var bitmasks [][]*Bitmask
+	for _, ps := range psubs {
+		b, err := ps.Join([]byte{0x10, 0x10, 0x10, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bitmasks = append(bitmasks, b)
+		ch, err := ps.Subscribe([]byte{0x10, 0x10, 0x10, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		chs = append(chs, ch)
+	}
+
+	// wait for heartbeats to build mesh
+	time.Sleep(time.Second * 2)
+
+	assertPeerLists(t, []byte{0x10, 0x10, 0x10, 0x00}, hosts, psubs[0], 1, 5)
+	assertPeerLists(t, []byte{0x10, 0x10, 0x10, 0x00}, hosts, psubs[1], 0, 2, 4)
+	assertPeerLists(t, []byte{0x10, 0x10, 0x10, 0x00}, hosts, psubs[2], 1, 3)
+
+	for _, p := range bitmasks {
+		data := make([]byte, 32)
+		rand.Read(data)
+		err := p[0].Publish(ctx, []byte{0x10, 0x10, 0x10, 0x00}, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, subs := range chs {
+			subs := subs
+			g := sync.WaitGroup{}
+			g.Add(len(subs))
+			nctx, cancel := context.WithCancel(ctx)
+			msgch := make(chan struct{})
+			for _, s := range subs {
+				s := s
+				go func() {
+					nctx, _ := context.WithDeadline(nctx, time.Now().Add(10*time.Millisecond))
+					got, err := s.Next(nctx)
+					if err != nil {
+						g.Done()
+						return
+					}
+
+					if !bytes.Equal(data, got.Data) {
+						g.Done()
+						return
+					}
+					msgch <- struct{}{}
+					g.Done()
+				}()
+			}
+
+			var msg *struct{} = nil
+			go func() {
+				for i := 0; i < len(subs); i++ {
+					select {
+					case m := <-msgch:
+						msg = &m
+						cancel()
+					}
+				}
+			}()
+			g.Wait()
+			if msg == nil {
+				t.Fatal("didn't get message")
+			}
+		}
+	}
+}
+
+func TestBlossomSubBloomStarTopology(t *testing.T) {
+	originalBlossomSubD := BlossomSubD
+	BlossomSubD = 4
+	originalBlossomSubDhi := BlossomSubDhi
+	BlossomSubDhi = BlossomSubD + 1
+	originalBlossomSubDlo := BlossomSubDlo
+	BlossomSubDlo = BlossomSubD - 1
+	originalBlossomSubDscore := BlossomSubDscore
+	BlossomSubDscore = BlossomSubDlo
+	defer func() {
+		BlossomSubD = originalBlossomSubD
+		BlossomSubDhi = originalBlossomSubDhi
+		BlossomSubDlo = originalBlossomSubDlo
+		BlossomSubDscore = originalBlossomSubDscore
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getDefaultHosts(t, 200)
+	psubs := []*PubSub{}
+	// Core bootstrapper:
+	psubs = append(psubs, getBlossomSubs(ctx, hosts[:1], WithPeerExchange(true), WithFloodPublish(true))...)
+	// Everyone else:
+	psubs = append(psubs, getBlossomSubs(ctx, hosts[1:])...)
+
+	// configure the center of the star with a very low D
+	psubs[0].eval <- func() {
+		gs := psubs[0].rt.(*BlossomSubRouter)
+		gs.params.D = 0
+		gs.params.Dlo = 0
+		gs.params.Dhi = 0
+		gs.params.Dscore = 0
+	}
+
+	// add all peer addresses to the peerstores
+	// this is necessary because we can't have signed address records witout identify
+	// pushing them
+	for i := range hosts {
+		for j := range hosts {
+			if i == j {
+				continue
+			}
+			hosts[i].Peerstore().AddAddrs(hosts[j].ID(), hosts[j].Addrs(), peerstore.PermanentAddrTTL)
+		}
+	}
+
+	// build the star
+	for i := 1; i < 200; i++ {
+		connect(t, hosts[0], hosts[i])
+	}
+
+	fullBitmask := []byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	}
+	slices := [][]byte{}
+	for i := 0; i < 63; i++ {
+		if i%2 == 0 {
+			slices = append(
+				slices,
+				append(
+					append(
+						bytes.Repeat([]byte{0x00}, i/2),
+						0xff,
+					),
+					bytes.Repeat([]byte{0x00}, 31-i/2)...,
+				),
+			)
+		} else {
+			slices = append(
+				slices,
+				append(
+					append(
+						bytes.Repeat([]byte{0x00}, i/2),
+						0x0f,
+						0xf0,
+					),
+					bytes.Repeat([]byte{0x00}, 30-i/2)...,
+				),
+			)
+		}
+	}
+	time.Sleep(time.Second)
+
+	// build the mesh
+	var subs [][]*Subscription
+	var bitmasks [][]*Bitmask
+	for i, ps := range psubs {
+		if i == 0 {
+			b, err := ps.Join(fullBitmask)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			bitmasks = append(bitmasks, b)
+			sub, err := ps.Subscribe(fullBitmask)
+			if err != nil {
+				t.Fatal(err)
+			}
+			subs = append(subs, sub)
+		} else {
+			b, err := ps.Join(slices[i%len(slices)])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			bitmasks = append(bitmasks, b)
+			sub, err := ps.Subscribe(slices[i%len(slices)])
+			if err != nil {
+				t.Fatal(err)
+			}
+			subs = append(subs, sub)
+		}
+	}
+
+	// wait a bit for the mesh to build
+	time.Sleep(2 * time.Second)
+
+	// check that all peers have > 1 connection
+	for i, h := range hosts {
+		if len(h.Network().Conns()) == 1 {
+			t.Errorf("peer %d has ony a single connection", i)
+		}
+	}
+
+	// send a message from each peer and assert it was propagated
+	for i := 0; i < 600; i++ {
+		msg := []byte(fmt.Sprintf("message %d", i))
+		if i == 0 {
+			for j := 0; j < 256; j++ {
+				msg = []byte(fmt.Sprintf("message %d-sub-%d", i, j))
+				bitmasks[i%200][j].Publish(ctx, bitmasks[i%200][j].bitmask, msg)
+
+				subgroup := [][]*Subscription{}
+				for _, group := range subs {
+					group := group
+					for _, s := range group {
+						if containsBitmask(bitmasks[i%200][j].bitmask, s.bitmask) {
+							subgroup = append(subgroup, group)
+							break
+						}
+					}
+				}
+				assertReceivedBitmaskSubgroup(t, ctx, subgroup, msg)
+			}
+		} else {
+			psubs[i%200].Publish(ctx, slices[(i%200)%len(slices)], msg)
+
+			subgroup := [][]*Subscription{}
+			for _, group := range subs[1:] {
+				group := group
+				in := true
+				for _, s := range group {
+					if !containsBitmask(slices[(i%200)%len(slices)], s.bitmask) {
+						in = false
+						break
+					}
+				}
+				if in {
+					subgroup = append(subgroup, group)
+				}
+			}
+			assertReceivedBitmaskSubgroup(t, ctx, subgroup, msg)
+		}
+	}
+}
+
+func containsBitmask(bitmask []byte, slice []byte) bool {
+	out := make([]byte, len(slice))
+	for i, b := range bitmask {
+		out[i] = b & slice[i]
+	}
+
+	return bytes.Equal(out, slice)
+}
+
+func assertReceivedBitmaskSubgroup(t *testing.T, ctx context.Context, subs [][]*Subscription, msg []byte) {
+	for i, subs := range subs {
+		subs := subs
+		g := sync.WaitGroup{}
+		g.Add(len(subs))
+		nctx, cancel := context.WithCancel(ctx)
+		msgch := make(chan struct{})
+		for _, s := range subs {
+			s := s
+			go func() {
+				nctx, _ := context.WithDeadline(nctx, time.Now().Add(100*time.Millisecond))
+				got, err := s.Next(nctx)
+				if err != nil {
+					g.Done()
+					return
+				}
+
+				if !bytes.Equal(msg, got.Data) {
+					g.Done()
+					return
+				}
+				msgch <- struct{}{}
+				g.Done()
+			}()
+		}
+
+		var msg *struct{} = nil
+		go func() {
+			for i := 0; i < len(subs); i++ {
+				select {
+				case m := <-msgch:
+					msg = &m
+					cancel()
+				}
+			}
+		}()
+		g.Wait()
+		if msg == nil {
+			t.Fatalf("%d didn't get message", i)
+		}
 	}
 }

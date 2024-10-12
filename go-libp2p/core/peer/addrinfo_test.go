@@ -19,13 +19,13 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-	maddrPeer = ma.StringCast("/p2p/" + testID.String())
-	maddrTpt = ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+	maddrPeer, _ = ma.StringCast("/p2p/" + testID.String())
+	maddrTpt, _ = ma.StringCast("/ip4/127.0.0.1/tcp/1234")
 	maddrFull = maddrTpt.Encapsulate(maddrPeer)
 }
 
 func TestSplitAddr(t *testing.T) {
-	tpt, id := SplitAddr(maddrFull)
+	tpt, id, _ := SplitAddr(maddrFull)
 	if !tpt.Equal(maddrTpt) {
 		t.Fatal("expected transport")
 	}
@@ -33,7 +33,7 @@ func TestSplitAddr(t *testing.T) {
 		t.Fatalf("%s != %s", id, testID)
 	}
 
-	tpt, id = SplitAddr(maddrPeer)
+	tpt, id, _ = SplitAddr(maddrPeer)
 	if tpt != nil {
 		t.Fatal("expected no transport")
 	}
@@ -41,7 +41,7 @@ func TestSplitAddr(t *testing.T) {
 		t.Fatalf("%s != %s", id, testID)
 	}
 
-	tpt, id = SplitAddr(maddrTpt)
+	tpt, id, _ = SplitAddr(maddrTpt)
 	if !tpt.Equal(maddrTpt) {
 		t.Fatal("expected a transport")
 	}
@@ -91,22 +91,30 @@ func TestAddrInfosFromP2pAddrs(t *testing.T) {
 		t.Fatal("expected nil multiaddr to fail")
 	}
 
+	m1, _ := ma.StringCast("/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64")
+	m2, _ := ma.StringCast("/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64")
+	m3, _ := ma.StringCast("/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd")
+	m4, _ := ma.StringCast("/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd")
+	m5, _ := ma.StringCast("/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM")
 	addrs := []ma.Multiaddr{
-		ma.StringCast("/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64"),
-		ma.StringCast("/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64"),
+		m1,
+		m2,
 
-		ma.StringCast("/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd"),
-		ma.StringCast("/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd"),
+		m3,
+		m4,
 
-		ma.StringCast("/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM"),
+		m5,
 	}
+	p1, _ := ma.StringCast("/ip4/128.199.219.111/tcp/4001")
+	p2, _ := ma.StringCast("/ip4/104.236.76.40/tcp/4001")
+	p3, _ := ma.StringCast("/ip4/178.62.158.247/tcp/4001")
 	expected := map[string][]ma.Multiaddr{
 		"QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64": {
-			ma.StringCast("/ip4/128.199.219.111/tcp/4001"),
-			ma.StringCast("/ip4/104.236.76.40/tcp/4001"),
+			p1,
+			p2,
 		},
 		"QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd": {
-			ma.StringCast("/ip4/178.62.158.247/tcp/4001"),
+			p3,
 		},
 		"QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM": nil,
 	}

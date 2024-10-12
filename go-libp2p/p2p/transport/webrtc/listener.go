@@ -153,7 +153,10 @@ func (l *listener) handleCandidate(ctx context.Context, candidate udpmux.Candida
 		return nil, err
 	}
 	if l.transport.gater != nil {
-		localAddr, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+		localAddr, _, err := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+		if err != nil {
+			return nil, err
+		}
 		if !l.transport.gater.InterceptAccept(&connMultiaddrs{local: localAddr, remote: remoteMultiaddr}) {
 			// The connection attempt is rejected before we can send the client an error.
 			// This means that the connection attempt will time out.
@@ -264,7 +267,11 @@ func (l *listener) setupConnection(
 		return nil, err
 	}
 
-	localMultiaddrWithoutCerthash, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+	localMultiaddrWithoutCerthash, _, err := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := newConnection(
 		network.DirInbound,
 		w.PeerConnection,

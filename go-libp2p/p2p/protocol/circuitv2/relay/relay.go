@@ -95,7 +95,10 @@ func New(h host.Host, opts ...Option) (*Relay, error) {
 	}
 
 	r.constraints = newConstraints(&r.rc)
-	r.selfAddr = ma.StringCast(fmt.Sprintf("/p2p/%s", h.ID()))
+	r.selfAddr, err = ma.StringCast(fmt.Sprintf("/p2p/%s", h.ID()))
+	if err != nil {
+		return nil, err
+	}
 
 	h.SetStreamHandler(proto.ProtoIDv2Hop, r.handleStream)
 	r.notifiee = &network.NotifyBundle{DisconnectedF: r.disconnected}
@@ -143,10 +146,8 @@ func (r *Relay) handleStream(s network.Stream) {
 		s.Reset()
 		return
 	}
-	defer s.Scope().ReleaseMemory(maxMessageSize)
 
 	rd := util.NewDelimitedReader(s, maxMessageSize)
-	defer rd.Close()
 
 	s.SetReadDeadline(time.Now().Add(StreamTimeout))
 
@@ -155,6 +156,8 @@ func (r *Relay) handleStream(s network.Stream) {
 	err := rd.ReadMsg(&msg)
 	if err != nil {
 		r.handleError(s, pbv2.Status_MALFORMED_MESSAGE)
+		s.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return
 	}
 	// reset stream deadline as message has been read
@@ -173,22 +176,25 @@ func (r *Relay) handleStream(s network.Stream) {
 	default:
 		r.handleError(s, pbv2.Status_MALFORMED_MESSAGE)
 	}
+	s.Scope().ReleaseMemory(maxMessageSize)
+	rd.Close()
 }
 
 func (r *Relay) handleReserve(s network.Stream) pbv2.Status {
-	defer s.Close()
 	p := s.Conn().RemotePeer()
 	a := s.Conn().RemoteMultiaddr()
 
 	if isRelayAddr(a) {
 		log.Debugf("refusing relay reservation for %s; reservation attempt over relay connection")
 		r.handleError(s, pbv2.Status_PERMISSION_DENIED)
+		s.Close()
 		return pbv2.Status_PERMISSION_DENIED
 	}
 
 	if r.acl != nil && !r.acl.AllowReserve(p, a) {
 		log.Debugf("refusing relay reservation for %s; permission denied", p)
 		r.handleError(s, pbv2.Status_PERMISSION_DENIED)
+		s.Close()
 		return pbv2.Status_PERMISSION_DENIED
 	}
 
@@ -199,6 +205,7 @@ func (r *Relay) handleReserve(s network.Stream) pbv2.Status {
 		r.mx.Unlock()
 		log.Debugf("refusing relay reservation for %s; relay closed", p)
 		r.handleError(s, pbv2.Status_PERMISSION_DENIED)
+		s.Close()
 		return pbv2.Status_PERMISSION_DENIED
 	}
 	now := time.Now()
@@ -209,6 +216,7 @@ func (r *Relay) handleReserve(s network.Stream) pbv2.Status {
 			r.mx.Unlock()
 			log.Debugf("refusing relay reservation for %s; IP constraint violation: %s", p, err)
 			r.handleError(s, pbv2.Status_RESERVATION_REFUSED)
+			s.Close()
 			return pbv2.Status_RESERVATION_REFUSED
 		}
 	}
@@ -229,8 +237,10 @@ func (r *Relay) handleReserve(s network.Stream) pbv2.Status {
 	if err := r.writeResponse(s, pbv2.Status_OK, r.makeReservationMsg(p, expire), r.makeLimitMsg(p)); err != nil {
 		log.Debugf("error writing reservation response; retracting reservation for %s", p)
 		s.Reset()
+		s.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
+	s.Close()
 	return pbv2.Status_OK
 }
 
@@ -321,7 +331,6 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 	}
 
 	ctx, cancel := context.WithTimeout(r.ctx, ConnectTimeout)
-	defer cancel()
 
 	ctx = network.WithNoDial(ctx, "relay connect")
 
@@ -330,6 +339,7 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 		log.Debugf("error opening relay stream to %s: %s", dest.ID, err)
 		cleanup()
 		r.handleError(s, pbv2.Status_CONNECTION_FAILED)
+		cancel()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
@@ -342,6 +352,7 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 	if err := bs.Scope().SetService(ServiceName); err != nil {
 		log.Debugf("error attaching stream to relay service: %s", err)
 		fail(pbv2.Status_RESOURCE_LIMIT_EXCEEDED)
+		cancel()
 		return pbv2.Status_RESOURCE_LIMIT_EXCEEDED
 	}
 
@@ -349,13 +360,12 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 	if err := bs.Scope().ReserveMemory(maxMessageSize, network.ReservationPriorityAlways); err != nil {
 		log.Debugf("error reserving memory for stream: %s", err)
 		fail(pbv2.Status_RESOURCE_LIMIT_EXCEEDED)
+		cancel()
 		return pbv2.Status_RESOURCE_LIMIT_EXCEEDED
 	}
-	defer bs.Scope().ReleaseMemory(maxMessageSize)
 
 	rd := util.NewDelimitedReader(bs, maxMessageSize)
 	wr := util.NewDelimitedWriter(bs)
-	defer rd.Close()
 
 	var stopmsg pbv2.StopMessage
 	stopmsg.Type = pbv2.StopMessage_CONNECT.Enum()
@@ -368,6 +378,10 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 	if err != nil {
 		log.Debugf("error writing stop handshake")
 		fail(pbv2.Status_CONNECTION_FAILED)
+
+		cancel()
+		bs.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
@@ -377,18 +391,30 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 	if err != nil {
 		log.Debugf("error reading stop response: %s", err.Error())
 		fail(pbv2.Status_CONNECTION_FAILED)
+
+		cancel()
+		bs.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
 	if t := stopmsg.GetType(); t != pbv2.StopMessage_STATUS {
 		log.Debugf("unexpected stop response; not a status message (%d)", t)
 		fail(pbv2.Status_CONNECTION_FAILED)
+
+		cancel()
+		bs.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
 	if status := stopmsg.GetStatus(); status != pbv2.Status_OK {
 		log.Debugf("relay stop failure: %d", status)
 		fail(pbv2.Status_CONNECTION_FAILED)
+
+		cancel()
+		bs.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
@@ -404,6 +430,10 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 		bs.Reset()
 		s.Reset()
 		cleanup()
+
+		cancel()
+		bs.Scope().ReleaseMemory(maxMessageSize)
+		rd.Close()
 		return pbv2.Status_CONNECTION_FAILED
 	}
 
@@ -434,6 +464,9 @@ func (r *Relay) handleConnect(s network.Stream, msg *pbv2.HopMessage) pbv2.Statu
 		go r.relayUnlimited(bs, s, dest.ID, src, done)
 	}
 
+	cancel()
+	bs.Scope().ReleaseMemory(maxMessageSize)
+	rd.Close()
 	return pbv2.Status_OK
 }
 
@@ -458,10 +491,7 @@ func (r *Relay) rmConn(p peer.ID) {
 }
 
 func (r *Relay) relayLimited(src, dest network.Stream, srcID, destID peer.ID, limit int64, done func()) {
-	defer done()
-
 	buf := pool.Get(r.rc.BufferSize)
-	defer pool.Put(buf)
 
 	limitedSrc := io.LimitReader(src, limit)
 
@@ -481,13 +511,13 @@ func (r *Relay) relayLimited(src, dest network.Stream, srcID, destID peer.ID, li
 	}
 
 	log.Debugf("relayed %d bytes from %s to %s", count, srcID, destID)
+
+	done()
+	pool.Put(buf)
 }
 
 func (r *Relay) relayUnlimited(src, dest network.Stream, srcID, destID peer.ID, done func()) {
-	defer done()
-
 	buf := pool.Get(r.rc.BufferSize)
-	defer pool.Put(buf)
 
 	count, err := r.copyWithBuffer(dest, src, buf)
 	if err != nil {
@@ -501,6 +531,9 @@ func (r *Relay) relayUnlimited(src, dest network.Stream, srcID, destID peer.ID, 
 	}
 
 	log.Debugf("relayed %d bytes from %s to %s", count, srcID, destID)
+
+	done()
+	pool.Put(buf)
 }
 
 // errInvalidWrite means that a write returned an impossible count.
@@ -557,7 +590,6 @@ func (r *Relay) handleError(s network.Stream, status pbv2.Status) {
 
 func (r *Relay) writeResponse(s network.Stream, status pbv2.Status, rsvp *pbv2.Reservation, limit *pbv2.Limit) error {
 	s.SetWriteDeadline(time.Now().Add(StreamTimeout))
-	defer s.SetWriteDeadline(time.Time{})
 	wr := util.NewDelimitedWriter(s)
 
 	var msg pbv2.HopMessage
@@ -566,7 +598,9 @@ func (r *Relay) writeResponse(s network.Stream, status pbv2.Status, rsvp *pbv2.R
 	msg.Reservation = rsvp
 	msg.Limit = limit
 
-	return wr.WriteMsg(&msg)
+	err := wr.WriteMsg(&msg)
+	s.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (r *Relay) makeReservationMsg(p peer.ID, expire time.Time) *pbv2.Reservation {
@@ -574,7 +608,7 @@ func (r *Relay) makeReservationMsg(p peer.ID, expire time.Time) *pbv2.Reservatio
 
 	var addrBytes [][]byte
 	for _, addr := range r.host.Addrs() {
-		if !manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); !is && err == nil {
 			continue
 		}
 
@@ -626,13 +660,13 @@ func (r *Relay) makeLimitMsg(p peer.ID) *pbv2.Limit {
 
 func (r *Relay) background() {
 	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			r.gc()
 		case <-r.ctx.Done():
+			ticker.Stop()
 			return
 		}
 	}
@@ -640,7 +674,6 @@ func (r *Relay) background() {
 
 func (r *Relay) gc() {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	now := time.Now()
 	cnt := 0
@@ -660,6 +693,7 @@ func (r *Relay) gc() {
 			delete(r.conns, p)
 		}
 	}
+	r.mx.Unlock()
 }
 
 func (r *Relay) disconnected(n network.Network, c network.Conn) {

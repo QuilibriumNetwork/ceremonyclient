@@ -24,7 +24,11 @@ func newConn(local, remote ma.Multiaddr) *mockConn {
 
 func normalize(addr ma.Multiaddr) ma.Multiaddr {
 	for {
-		out, last := ma.SplitLast(addr)
+		out, last, err := ma.SplitLast(addr)
+		if err != nil {
+			return nil
+		}
+
 		if last == nil {
 			return addr
 		}
@@ -67,12 +71,12 @@ func addrsEqual(a, b []ma.Multiaddr) bool {
 }
 
 func TestObservedAddrManager(t *testing.T) {
-	tcp4ListenAddr := ma.StringCast("/ip4/192.168.1.100/tcp/1")
-	quic4ListenAddr := ma.StringCast("/ip4/0.0.0.0/udp/1/quic-v1")
-	webTransport4ListenAddr := ma.StringCast("/ip4/0.0.0.0/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
-	tcp6ListenAddr := ma.StringCast("/ip6/2004::1/tcp/1")
-	quic6ListenAddr := ma.StringCast("/ip6/::/udp/1/quic-v1")
-	webTransport6ListenAddr := ma.StringCast("/ip6/::/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
+	tcp4ListenAddr := tStringCast("/ip4/192.168.1.100/tcp/1")
+	quic4ListenAddr := tStringCast("/ip4/0.0.0.0/udp/1/quic-v1")
+	webTransport4ListenAddr := tStringCast("/ip4/0.0.0.0/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
+	tcp6ListenAddr := tStringCast("/ip6/2004::1/tcp/1")
+	quic6ListenAddr := tStringCast("/ip6/::/udp/1/quic-v1")
+	webTransport6ListenAddr := tStringCast("/ip6/::/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
 	newObservedAddrMgr := func() *ObservedAddrManager {
 		listenAddrs := []ma.Multiaddr{
 			tcp4ListenAddr, quic4ListenAddr, webTransport4ListenAddr, tcp6ListenAddr, quic6ListenAddr, webTransport6ListenAddr,
@@ -97,11 +101,11 @@ func TestObservedAddrManager(t *testing.T) {
 	t.Run("Single Observation", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
-		observed := ma.StringCast("/ip4/2.2.2.2/tcp/2")
-		c1 := newConn(tcp4ListenAddr, ma.StringCast("/ip4/1.2.3.1/tcp/1"))
-		c2 := newConn(tcp4ListenAddr, ma.StringCast("/ip4/1.2.3.2/tcp/1"))
-		c3 := newConn(tcp4ListenAddr, ma.StringCast("/ip4/1.2.3.3/tcp/1"))
-		c4 := newConn(tcp4ListenAddr, ma.StringCast("/ip4/1.2.3.4/tcp/1"))
+		observed := tStringCast("/ip4/2.2.2.2/tcp/2")
+		c1 := newConn(tcp4ListenAddr, tStringCast("/ip4/1.2.3.1/tcp/1"))
+		c2 := newConn(tcp4ListenAddr, tStringCast("/ip4/1.2.3.2/tcp/1"))
+		c3 := newConn(tcp4ListenAddr, tStringCast("/ip4/1.2.3.3/tcp/1"))
+		c4 := newConn(tcp4ListenAddr, tStringCast("/ip4/1.2.3.4/tcp/1"))
 		o.Record(c1, observed)
 		o.Record(c2, observed)
 		o.Record(c3, observed)
@@ -121,12 +125,12 @@ func TestObservedAddrManager(t *testing.T) {
 	t.Run("WebTransport inferred from QUIC", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
-		observedQuic := ma.StringCast("/ip4/2.2.2.2/udp/2/quic-v1")
-		observedWebTransport := ma.StringCast("/ip4/2.2.2.2/udp/2/quic-v1/webtransport")
-		c1 := newConn(quic4ListenAddr, ma.StringCast("/ip4/1.2.3.1/udp/1/quic-v1"))
-		c2 := newConn(quic4ListenAddr, ma.StringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
-		c3 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
-		c4 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
+		observedQuic := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
+		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1/webtransport")
+		c1 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.1/udp/1/quic-v1"))
+		c2 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
+		c3 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
+		c4 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
 		o.Record(c1, observedQuic)
 		o.Record(c2, observedQuic)
 		o.Record(c3, observedWebTransport)
@@ -147,13 +151,13 @@ func TestObservedAddrManager(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 
-		observedQuic := ma.StringCast("/ip4/2.2.2.2/udp/2/quic-v1")
+		observedQuic := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
 
 		const N = 4 // ActivationThresh
 		var ob1, ob2 [N]connMultiaddrs
 		for i := 0; i < N; i++ {
-			ob1[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			ob2[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob1[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
 		}
 		for i := 0; i < N-1; i++ {
 			o.Record(ob1[i], observedQuic)
@@ -190,14 +194,14 @@ func TestObservedAddrManager(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 
-		observedQuic1 := ma.StringCast("/ip4/2.2.2.2/udp/2/quic-v1")
-		observedQuic2 := ma.StringCast("/ip4/2.2.2.2/udp/3/quic-v1")
+		observedQuic1 := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
+		observedQuic2 := tStringCast("/ip4/2.2.2.2/udp/3/quic-v1")
 
 		const N = 4 // ActivationThresh
 		var ob1, ob2 [N]connMultiaddrs
 		for i := 0; i < N; i++ {
-			ob1[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			ob2[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob1[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
 		}
 		for i := 0; i < N-1; i++ {
 			o.Record(ob1[i], observedQuic1)
@@ -234,15 +238,15 @@ func TestObservedAddrManager(t *testing.T) {
 	t.Run("Old observations discarded", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
-		c1 := newConn(quic4ListenAddr, ma.StringCast("/ip4/1.2.3.1/udp/1/quic-v1"))
-		c2 := newConn(quic4ListenAddr, ma.StringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
-		c3 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
-		c4 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
+		c1 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.1/udp/1/quic-v1"))
+		c2 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
+		c3 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
+		c4 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
 		var observedQuic, observedWebTransport ma.Multiaddr
 		for i := 0; i < 10; i++ {
 			// Change the IP address in each observation
-			observedQuic = ma.StringCast(fmt.Sprintf("/ip4/2.2.2.%d/udp/2/quic-v1", i))
-			observedWebTransport = ma.StringCast(fmt.Sprintf("/ip4/2.2.2.%d/udp/2/quic-v1/webtransport", i))
+			observedQuic = tStringCast(fmt.Sprintf("/ip4/2.2.2.%d/udp/2/quic-v1", i))
+			observedWebTransport = tStringCast(fmt.Sprintf("/ip4/2.2.2.%d/udp/2/quic-v1/webtransport", i))
 			o.Record(c1, observedQuic)
 			o.Record(c2, observedQuic)
 			o.Record(c3, observedWebTransport)
@@ -276,17 +280,17 @@ func TestObservedAddrManager(t *testing.T) {
 		const N = 100
 		var tcpConns, quicConns, webTransportConns [N]*mockConn
 		for i := 0; i < N; i++ {
-			tcpConns[i] = newConn(tcp4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
-			quicConns[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			webTransportConns[i] = newConn(webTransport4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
+			tcpConns[i] = newConn(tcp4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
+			quicConns[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			webTransportConns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 		}
 		var observedQuic, observedWebTransport, observedTCP ma.Multiaddr
 		for i := 0; i < N; i++ {
 			for j := 0; j < 5; j++ {
 				// ip addr has the form 2.2.<conn-num>.<obs-num>
-				observedQuic = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1", i/10, j))
-				observedWebTransport = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1/webtransport", i/10, j))
-				observedTCP = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/tcp/2", i/10, j))
+				observedQuic = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1", i/10, j))
+				observedWebTransport = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1/webtransport", i/10, j))
+				observedTCP = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/tcp/2", i/10, j))
 				o.Record(tcpConns[i], observedTCP)
 				o.Record(quicConns[i], observedQuic)
 				o.Record(webTransportConns[i], observedWebTransport)
@@ -307,9 +311,9 @@ func TestObservedAddrManager(t *testing.T) {
 		// Now we bias a few address counts and check for sorting correctness
 		var resTCPAddrs, resQuicAddrs, resWebTransportAddrs [maxExternalThinWaistAddrsPerLocalAddr]ma.Multiaddr
 		for i := 0; i < maxExternalThinWaistAddrsPerLocalAddr; i++ {
-			resTCPAddrs[i] = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/tcp/2", 9-i))
-			resQuicAddrs[i] = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1", 9-i))
-			resWebTransportAddrs[i] = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1/webtransport", 9-i))
+			resTCPAddrs[i] = tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/tcp/2", 9-i))
+			resQuicAddrs[i] = tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1", 9-i))
+			resWebTransportAddrs[i] = tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1/webtransport", 9-i))
 			o.Record(tcpConns[i], resTCPAddrs[i])
 			o.Record(quicConns[i], resQuicAddrs[i])
 			o.Record(webTransportConns[i], resWebTransportAddrs[i])
@@ -335,11 +339,11 @@ func TestObservedAddrManager(t *testing.T) {
 
 	t.Run("WebTransport certhash", func(t *testing.T) {
 		o := newObservedAddrMgr()
-		observedWebTransport := ma.StringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
-		c1 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.1/udp/1/quic-v1/webtransport"))
-		c2 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.2/udp/1/quic-v1/webtransport"))
-		c3 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
-		c4 := newConn(webTransport4ListenAddr, ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
+		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		c1 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.1/udp/1/quic-v1/webtransport"))
+		c2 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1/webtransport"))
+		c3 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
+		c4 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
 		o.Record(c1, observedWebTransport)
 		o.Record(c2, observedWebTransport)
 		o.Record(c3, observedWebTransport)
@@ -360,10 +364,10 @@ func TestObservedAddrManager(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 
-		observedWebTransport := ma.StringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
 		var udpConns [5 * maxExternalThinWaistAddrsPerLocalAddr]connMultiaddrs
 		for i := 0; i < len(udpConns); i++ {
-			udpConns[i] = newConn(webTransport4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
+			udpConns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 			o.Record(udpConns[i], observedWebTransport)
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -381,14 +385,14 @@ func TestObservedAddrManager(t *testing.T) {
 		const N = 100
 		var tcpConns, quicConns [N]*mockConn
 		for i := 0; i < N; i++ {
-			tcpConns[i] = newConn(tcp4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
-			quicConns[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			tcpConns[i] = newConn(tcp4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
+			quicConns[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
 		}
 		var observedQuic, observedTCP ma.Multiaddr
 		for i := 0; i < N; i++ {
 			// ip addr has the form 2.2.<conn-num>.2
-			observedQuic = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.2/udp/2/quic-v1", i%20))
-			observedTCP = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.2/tcp/2", i%20))
+			observedQuic = tStringCast(fmt.Sprintf("/ip4/2.2.%d.2/udp/2/quic-v1", i%20))
+			observedTCP = tStringCast(fmt.Sprintf("/ip4/2.2.%d.2/tcp/2", i%20))
 			o.Record(tcpConns[i], observedTCP)
 			o.Record(quicConns[i], observedQuic)
 			time.Sleep(10 * time.Millisecond)
@@ -415,7 +419,7 @@ func TestObservedAddrManager(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 		o.maybeRecordObservation(nil, nil)
-		remoteAddr := ma.StringCast("/ip4/1.2.3.4/tcp/1")
+		remoteAddr := tStringCast("/ip4/1.2.3.4/tcp/1")
 		o.maybeRecordObservation(newConn(tcp4ListenAddr, remoteAddr), nil)
 		o.maybeRecordObservation(nil, remoteAddr)
 		o.AddrsFor(nil)
@@ -442,10 +446,10 @@ func TestObservedAddrManager(t *testing.T) {
 
 		sub, err := bus.Subscribe(new(event.EvtNATDeviceTypeChanged))
 		require.NoError(t, err)
-		observedWebTransport := ma.StringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
 		var udpConns [5 * maxExternalThinWaistAddrsPerLocalAddr]connMultiaddrs
 		for i := 0; i < len(udpConns); i++ {
-			udpConns[i] = newConn(webTransport4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
+			udpConns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 			o.Record(udpConns[i], observedWebTransport)
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -470,27 +474,27 @@ func TestObservedAddrManager(t *testing.T) {
 		var tcp4Conns, quic4Conns, webTransport4Conns [N]*mockConn
 		var tcp6Conns, quic6Conns, webTransport6Conns [N]*mockConn
 		for i := 0; i < N; i++ {
-			tcp4Conns[i] = newConn(tcp4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
-			quic4Conns[i] = newConn(quic4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			webTransport4Conns[i] = newConn(webTransport4ListenAddr, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
+			tcp4Conns[i] = newConn(tcp4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/tcp/1", i)))
+			quic4Conns[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			webTransport4Conns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 
-			tcp6Conns[i] = newConn(tcp6ListenAddr, ma.StringCast(fmt.Sprintf("/ip6/20%02x::/tcp/1", i)))
-			quic6Conns[i] = newConn(quic6ListenAddr, ma.StringCast(fmt.Sprintf("/ip6/20%02x::/udp/1/quic-v1", i)))
-			webTransport6Conns[i] = newConn(webTransport6ListenAddr, ma.StringCast(fmt.Sprintf("/ip6/20%02x::/udp/1/quic-v1/webtransport", i)))
+			tcp6Conns[i] = newConn(tcp6ListenAddr, tStringCast(fmt.Sprintf("/ip6/20%02x::/tcp/1", i)))
+			quic6Conns[i] = newConn(quic6ListenAddr, tStringCast(fmt.Sprintf("/ip6/20%02x::/udp/1/quic-v1", i)))
+			webTransport6Conns[i] = newConn(webTransport6ListenAddr, tStringCast(fmt.Sprintf("/ip6/20%02x::/udp/1/quic-v1/webtransport", i)))
 		}
 		var observedQUIC4, observedWebTransport4, observedTCP4 ma.Multiaddr
 		var observedQUIC6, observedWebTransport6, observedTCP6 ma.Multiaddr
 		for i := 0; i < N; i++ {
 			for j := 0; j < 5; j++ {
 				// ip addr has the form 2.2.<conn-num>.<obs-num>
-				observedQUIC4 = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1", i/10, j))
-				observedWebTransport4 = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1/webtransport", i/10, j))
-				observedTCP4 = ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.%d/tcp/2", i/10, j))
+				observedQUIC4 = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1", i/10, j))
+				observedWebTransport4 = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/udp/2/quic-v1/webtransport", i/10, j))
+				observedTCP4 = tStringCast(fmt.Sprintf("/ip4/2.2.%d.%d/tcp/2", i/10, j))
 
 				// ip addr has the form 20XX::YY
-				observedQUIC6 = ma.StringCast(fmt.Sprintf("/ip6/20%02x::%02x/udp/2/quic-v1", i/10, j))
-				observedWebTransport6 = ma.StringCast(fmt.Sprintf("/ip6/20%02x::%02x/udp/2/quic-v1/webtransport", i/10, j))
-				observedTCP6 = ma.StringCast(fmt.Sprintf("/ip6/20%02x::%02x/tcp/2", i/10, j))
+				observedQUIC6 = tStringCast(fmt.Sprintf("/ip6/20%02x::%02x/udp/2/quic-v1", i/10, j))
+				observedWebTransport6 = tStringCast(fmt.Sprintf("/ip6/20%02x::%02x/udp/2/quic-v1/webtransport", i/10, j))
+				observedTCP6 = tStringCast(fmt.Sprintf("/ip6/20%02x::%02x/tcp/2", i/10, j))
 
 				o.maybeRecordObservation(tcp4Conns[i], observedTCP4)
 				o.maybeRecordObservation(quic4Conns[i], observedQUIC4)
@@ -516,18 +520,18 @@ func TestObservedAddrManager(t *testing.T) {
 		var resTCPAddrs, resQuicAddrs, resWebTransportAddrs []ma.Multiaddr
 
 		for i, idx := 0, 0; i < maxExternalThinWaistAddrsPerLocalAddr; i++ {
-			resTCPAddrs = append(resTCPAddrs, ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/tcp/2", 9-i)))
-			resQuicAddrs = append(resQuicAddrs, ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1", 9-i)))
-			resWebTransportAddrs = append(resWebTransportAddrs, ma.StringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1/webtransport", 9-i)))
+			resTCPAddrs = append(resTCPAddrs, tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/tcp/2", 9-i)))
+			resQuicAddrs = append(resQuicAddrs, tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1", 9-i)))
+			resWebTransportAddrs = append(resWebTransportAddrs, tStringCast(fmt.Sprintf("/ip4/2.2.%d.4/udp/2/quic-v1/webtransport", 9-i)))
 
 			o.maybeRecordObservation(tcp4Conns[i], resTCPAddrs[idx])
 			o.maybeRecordObservation(quic4Conns[i], resQuicAddrs[idx])
 			o.maybeRecordObservation(webTransport4Conns[i], resWebTransportAddrs[idx])
 			idx++
 
-			resTCPAddrs = append(resTCPAddrs, ma.StringCast(fmt.Sprintf("/ip6/20%02x::04/tcp/2", 9-i)))
-			resQuicAddrs = append(resQuicAddrs, ma.StringCast(fmt.Sprintf("/ip6/20%02x::04/udp/2/quic-v1", 9-i)))
-			resWebTransportAddrs = append(resWebTransportAddrs, ma.StringCast(fmt.Sprintf("/ip6/20%02x::04/udp/2/quic-v1/webtransport", 9-i)))
+			resTCPAddrs = append(resTCPAddrs, tStringCast(fmt.Sprintf("/ip6/20%02x::04/tcp/2", 9-i)))
+			resQuicAddrs = append(resQuicAddrs, tStringCast(fmt.Sprintf("/ip6/20%02x::04/udp/2/quic-v1", 9-i)))
+			resWebTransportAddrs = append(resWebTransportAddrs, tStringCast(fmt.Sprintf("/ip6/20%02x::04/udp/2/quic-v1/webtransport", 9-i)))
 			o.maybeRecordObservation(tcp6Conns[i], resTCPAddrs[idx])
 			o.maybeRecordObservation(quic6Conns[i], resQuicAddrs[idx])
 			o.maybeRecordObservation(webTransport6Conns[i], resWebTransportAddrs[idx])
@@ -574,12 +578,12 @@ func FuzzObservedAddrManager(f *testing.F) {
 		"/quic-v1",
 		"/quic-v1/webtransport",
 	}
-	tcp4 := ma.StringCast("/ip4/192.168.1.100/tcp/1")
-	quic4 := ma.StringCast("/ip4/0.0.0.0/udp/1/quic-v1")
-	wt4 := ma.StringCast("/ip4/0.0.0.0/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
-	tcp6 := ma.StringCast("/ip6/1::1/tcp/1")
-	quic6 := ma.StringCast("/ip6/::/udp/1/quic-v1")
-	wt6 := ma.StringCast("/ip6/::/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
+	tcp4 := tStringCast("/ip4/192.168.1.100/tcp/1")
+	quic4 := tStringCast("/ip4/0.0.0.0/udp/1/quic-v1")
+	wt4 := tStringCast("/ip4/0.0.0.0/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
+	tcp6 := tStringCast("/ip6/1::1/tcp/1")
+	quic6 := tStringCast("/ip6/::/udp/1/quic-v1")
+	wt6 := tStringCast("/ip6/::/udp/1/quic-v1/webtransport/certhash/uEgNmb28")
 	newObservedAddrMgr := func() *ObservedAddrManager {
 		listenAddrs := []ma.Multiaddr{
 			tcp4, quic4, wt4, tcp6, quic6, wt6,
@@ -602,15 +606,15 @@ func FuzzObservedAddrManager(f *testing.F) {
 		addrs := []ma.Multiaddr{genIPMultiaddr(true), genIPMultiaddr(false)}
 		n := len(addrs)
 		for i := 0; i < n; i++ {
-			addrs = append(addrs, addrs[i].Encapsulate(ma.StringCast(fmt.Sprintf("/tcp/%d", port))))
-			addrs = append(addrs, addrs[i].Encapsulate(ma.StringCast(fmt.Sprintf("/udp/%d", port))))
-			addrs = append(addrs, ma.StringCast(fmt.Sprintf("/tcp/%d", port)))
-			addrs = append(addrs, ma.StringCast(fmt.Sprintf("/udp/%d", port)))
+			addrs = append(addrs, addrs[i].Encapsulate(tStringCast(fmt.Sprintf("/tcp/%d", port))))
+			addrs = append(addrs, addrs[i].Encapsulate(tStringCast(fmt.Sprintf("/udp/%d", port))))
+			addrs = append(addrs, tStringCast(fmt.Sprintf("/tcp/%d", port)))
+			addrs = append(addrs, tStringCast(fmt.Sprintf("/udp/%d", port)))
 		}
 		n = len(addrs)
 		for i := 0; i < n; i++ {
 			for j := 0; j < len(protos); j++ {
-				protoAddr := ma.StringCast(protos[j])
+				protoAddr := tStringCast(protos[j])
 				addrs = append(addrs, addrs[i].Encapsulate(protoAddr))
 				addrs = append(addrs, protoAddr)
 			}
@@ -635,19 +639,19 @@ func TestObserver(t *testing.T) {
 		want string
 	}{
 		{
-			addr: ma.StringCast("/ip4/1.2.3.4/tcp/1"),
+			addr: tStringCast("/ip4/1.2.3.4/tcp/1"),
 			want: "1.2.3.4",
 		},
 		{
-			addr: ma.StringCast("/ip4/192.168.0.1/tcp/1"),
+			addr: tStringCast("/ip4/192.168.0.1/tcp/1"),
 			want: "192.168.0.1",
 		},
 		{
-			addr: ma.StringCast("/ip6/200::1/udp/1/quic-v1"),
+			addr: tStringCast("/ip6/200::1/udp/1/quic-v1"),
 			want: "200::",
 		},
 		{
-			addr: ma.StringCast("/ip6/::1/udp/1/quic-v1"),
+			addr: tStringCast("/ip6/::1/udp/1/quic-v1"),
 			want: "::",
 		},
 	}

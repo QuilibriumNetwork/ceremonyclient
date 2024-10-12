@@ -204,13 +204,12 @@ func newPeerGater(ctx context.Context, host host.Host, params *PeerGaterParams) 
 func (pg *peerGater) background(ctx context.Context) {
 	tick := time.NewTicker(pg.params.DecayInterval)
 
-	defer tick.Stop()
-
 	for {
 		select {
 		case <-tick.C:
 			pg.decayStats()
 		case <-ctx.Done():
+			tick.Stop()
 			return
 		}
 	}
@@ -218,7 +217,6 @@ func (pg *peerGater) background(ctx context.Context) {
 
 func (pg *peerGater) decayStats() {
 	pg.Lock()
-	defer pg.Unlock()
 
 	pg.validate *= pg.params.GlobalDecay
 	if pg.validate < pg.params.DecayToZero {
@@ -256,6 +254,8 @@ func (pg *peerGater) decayStats() {
 			delete(pg.ipStats, ip)
 		}
 	}
+
+	pg.Unlock()
 }
 
 func (pg *peerGater) getPeerStats(p peer.ID) *peerGaterStats {
@@ -323,21 +323,23 @@ func (pg *peerGater) AcceptFrom(p peer.ID) AcceptStatus {
 	}
 
 	pg.Lock()
-	defer pg.Unlock()
 
 	// check the quiet period; if the validation queue has not throttled for more than the Quiet
 	// interval, we turn off the circuit breaker and accept.
 	if time.Since(pg.lastThrottle) > pg.params.Quiet {
+		pg.Unlock()
 		return AcceptAll
 	}
 
 	// no throttle events -- or they have decayed; accept.
 	if pg.throttle == 0 {
+		pg.Unlock()
 		return AcceptAll
 	}
 
 	// check the throttle/validate ration; if it is below threshold we accept.
 	if pg.validate != 0 && pg.throttle/pg.validate < pg.params.Threshold {
+		pg.Unlock()
 		return AcceptAll
 	}
 
@@ -346,6 +348,7 @@ func (pg *peerGater) AcceptFrom(p peer.ID) AcceptStatus {
 	// compute the goodput of the peer; the denominator is the weighted mix of message counters
 	total := st.deliver + pg.params.DuplicateWeight*st.duplicate + pg.params.IgnoreWeight*st.ignore + pg.params.RejectWeight*st.reject
 	if total == 0 {
+		pg.Unlock()
 		return AcceptAll
 	}
 
@@ -355,10 +358,12 @@ func (pg *peerGater) AcceptFrom(p peer.ID) AcceptStatus {
 	// accepted; this is not a sinkhole/blacklist.
 	threshold := (1 + st.deliver) / (1 + total)
 	if rand.Float64() < threshold {
+		pg.Unlock()
 		return AcceptAll
 	}
 
 	log.Debugf("throttling peer %s with threshold %f", p, threshold)
+	pg.Unlock()
 	return AcceptControl
 }
 
@@ -368,21 +373,21 @@ var _ RawTracer = (*peerGater)(nil)
 // tracer interface
 func (pg *peerGater) AddPeer(p peer.ID, proto protocol.ID) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	st := pg.getPeerStats(p)
 	st.connected++
+	pg.Unlock()
 }
 
 func (pg *peerGater) RemovePeer(p peer.ID) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	st := pg.getPeerStats(p)
 	st.connected--
 	st.expire = time.Now().Add(pg.params.RetainStats)
 
 	delete(pg.peerStats, p)
+	pg.Unlock()
 }
 
 func (pg *peerGater) Join(bitmask []byte)             {}
@@ -392,14 +397,13 @@ func (pg *peerGater) Prune(p peer.ID, bitmask []byte) {}
 
 func (pg *peerGater) ValidateMessage(msg *Message) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	pg.validate++
+	pg.Unlock()
 }
 
 func (pg *peerGater) DeliverMessage(msg *Message) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	st := pg.getPeerStats(msg.ReceivedFrom)
 
@@ -411,11 +415,11 @@ func (pg *peerGater) DeliverMessage(msg *Message) {
 	}
 
 	st.deliver += weight
+	pg.Unlock()
 }
 
 func (pg *peerGater) RejectMessage(msg *Message, reason string) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	switch reason {
 	case RejectValidationQueueFull:
@@ -432,14 +436,15 @@ func (pg *peerGater) RejectMessage(msg *Message, reason string) {
 		st := pg.getPeerStats(msg.ReceivedFrom)
 		st.reject++
 	}
+	pg.Unlock()
 }
 
 func (pg *peerGater) DuplicateMessage(msg *Message) {
 	pg.Lock()
-	defer pg.Unlock()
 
 	st := pg.getPeerStats(msg.ReceivedFrom)
 	st.duplicate++
+	pg.Unlock()
 }
 
 func (pg *peerGater) ThrottlePeer(p peer.ID) {}

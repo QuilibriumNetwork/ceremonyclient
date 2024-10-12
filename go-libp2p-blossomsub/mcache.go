@@ -30,7 +30,7 @@ func NewMessageCache(gossip, history int) *MessageCache {
 		peertx:  make(map[string]map[peer.ID]int),
 		history: make([][]CacheEntry, history),
 		gossip:  gossip,
-		msgID: func(msg *Message) string {
+		msgID: func(msg *Message) []byte {
 			return DefaultMsgIdFn(msg.Message)
 		},
 	}
@@ -41,47 +41,47 @@ type MessageCache struct {
 	peertx  map[string]map[peer.ID]int
 	history [][]CacheEntry
 	gossip  int
-	msgID   func(*Message) string
+	msgID   func(*Message) []byte
 }
 
-func (mc *MessageCache) SetMsgIdFn(msgID func(*Message) string) {
+func (mc *MessageCache) SetMsgIdFn(msgID func(*Message) []byte) {
 	mc.msgID = msgID
 }
 
 type CacheEntry struct {
-	mid     string
+	mid     []byte
 	bitmask []byte
 }
 
 func (mc *MessageCache) Put(msg *Message) {
 	mid := mc.msgID(msg)
-	mc.msgs[mid] = msg
+	mc.msgs[string(mid)] = msg
 	mc.history[0] = append(mc.history[0], CacheEntry{mid: mid, bitmask: msg.GetBitmask()})
 }
 
-func (mc *MessageCache) Get(mid string) (*Message, bool) {
-	m, ok := mc.msgs[mid]
+func (mc *MessageCache) Get(mid []byte) (*Message, bool) {
+	m, ok := mc.msgs[string(mid)]
 	return m, ok
 }
 
-func (mc *MessageCache) GetForPeer(mid string, p peer.ID) (*Message, int, bool) {
-	m, ok := mc.msgs[mid]
+func (mc *MessageCache) GetForPeer(mid []byte, p peer.ID) (*Message, int, bool) {
+	m, ok := mc.msgs[string(mid)]
 	if !ok {
 		return nil, 0, false
 	}
 
-	tx, ok := mc.peertx[mid]
+	tx, ok := mc.peertx[string(mid)]
 	if !ok {
 		tx = make(map[peer.ID]int)
-		mc.peertx[mid] = tx
+		mc.peertx[string(mid)] = tx
 	}
 	tx[p]++
 
 	return m, tx[p], true
 }
 
-func (mc *MessageCache) GetGossipIDs(bitmask []byte) []string {
-	var mids []string
+func (mc *MessageCache) GetGossipIDs(bitmask []byte) [][]byte {
+	var mids [][]byte
 	for _, entries := range mc.history[:mc.gossip] {
 		for _, entry := range entries {
 			if bytes.Equal(entry.bitmask, bitmask) {
@@ -95,8 +95,8 @@ func (mc *MessageCache) GetGossipIDs(bitmask []byte) []string {
 func (mc *MessageCache) Shift() {
 	last := mc.history[len(mc.history)-1]
 	for _, entry := range last {
-		delete(mc.msgs, entry.mid)
-		delete(mc.peertx, entry.mid)
+		delete(mc.msgs, string(entry.mid))
+		delete(mc.peertx, string(entry.mid))
 	}
 	for i := len(mc.history) - 2; i >= 0; i-- {
 		mc.history[i+1] = mc.history[i]

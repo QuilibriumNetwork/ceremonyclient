@@ -61,12 +61,13 @@ func TestBasicDialPeerWithResolver(t *testing.T) {
 	// that the resovler has to resolve this
 	var s2Addrs []ma.Multiaddr
 	for _, a := range s2.ListenAddresses() {
-		_, rest := ma.SplitFunc(a, func(c ma.Component) bool {
+		_, rest, _ := ma.SplitFunc(a, func(c ma.Component) bool {
 			return c.Protocol().Code == ma.P_TCP || c.Protocol().Code == ma.P_UDP
 		},
 		)
 		if rest != nil {
-			s2Addrs = append(s2Addrs, ma.StringCast("/dns4/example.com").Encapsulate(rest))
+			e, _ := ma.StringCast("/dns4/example.com")
+			s2Addrs = append(s2Addrs, e.Encapsulate(rest))
 		}
 	}
 
@@ -646,7 +647,8 @@ func TestDialSelf(t *testing.T) {
 func TestDialQUICDraft29(t *testing.T) {
 	s := makeDialOnlySwarm(t)
 	id := testutil.RandPeerIDFatal(t)
-	s.Peerstore().AddAddr(id, ma.StringCast("/ip4/127.0.0.1/udp/1234/quic"), time.Hour)
+	l, _ := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic")
+	s.Peerstore().AddAddr(id, l, time.Hour)
 	_, err := s.DialPeer(context.Background(), id)
 	require.ErrorIs(t, err, swarm.ErrQUICDraft29)
 	require.ErrorIs(t, err, swarm.ErrNoTransport)

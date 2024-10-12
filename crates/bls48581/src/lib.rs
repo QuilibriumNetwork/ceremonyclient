@@ -363,7 +363,7 @@ pub fn prove_raw(
       subz = big::BIG::modadd(&subz, &big::BIG::modneg(&z, &big::BIG::new_ints(&rom::CURVE_ORDER)), &big::BIG::new_ints(&rom::CURVE_ORDER));
       let mut subzinv = subz.clone();
       subzinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
-      let mut o = big::BIG::new_int(1);
+      let o = big::BIG::new_int(1);
       let mut oinv = o.clone();
       oinv.invmodp(&big::BIG::new_ints(&rom::CURVE_ORDER));
       let divisors: Vec<big::BIG> = vec![
@@ -436,7 +436,29 @@ pub fn verify_raw(
   let y = big::BIG::frombytes(data);
 
   let c = ecp::ECP::frombytes(commit);
+  if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
+    return false;
+  }
+
   let p = ecp::ECP::frombytes(proof);
+  if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+    return false;
+  }
+
+  if poly_size > 1024 {
+    let mut xc = c.clone();
+    xc.sub(&bls::singleton().FFTBLS48581[&poly_size][index as usize].clone().mul(&y));
+    let mut check = c.clone();
+    check.neg();
+    let yp = &bls::singleton().CeremonyBLS48581G2[1].clone().mul(&y);
+    let mut r = pair8::initmp();
+    pair8::another(&mut r, &bls::singleton().CeremonyBLS48581G2[1], &check);
+    pair8::another(&mut r, &yp, &bls::singleton().FFTBLS48581[&poly_size][index as usize]);
+    pair8::another(&mut r, &bls::singleton().CeremonyBLS48581G2[1], &xc);
+    let mut v = pair8::miller(&mut r);
+    v = pair8::fexp(&v);
+    return v.isunity();
+  }
 
   return verify(
     &c,

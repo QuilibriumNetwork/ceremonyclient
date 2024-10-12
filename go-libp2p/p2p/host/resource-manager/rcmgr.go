@@ -240,28 +240,30 @@ func (r *resourceManager) ViewTransient(f func(network.ResourceScope) error) err
 
 func (r *resourceManager) ViewService(srv string, f func(network.ServiceScope) error) error {
 	s := r.getServiceScope(srv)
-	defer s.DecRef()
+	e := f(s)
+	s.DecRef()
 
-	return f(s)
+	return e
 }
 
 func (r *resourceManager) ViewProtocol(proto protocol.ID, f func(network.ProtocolScope) error) error {
 	s := r.getProtocolScope(proto)
-	defer s.DecRef()
+	e := f(s)
+	s.DecRef()
 
-	return f(s)
+	return e
 }
 
 func (r *resourceManager) ViewPeer(p peer.ID, f func(network.PeerScope) error) error {
 	s := r.getPeerScope(p)
-	defer s.DecRef()
+	e := f(s)
+	s.DecRef()
 
-	return f(s)
+	return e
 }
 
 func (r *resourceManager) getServiceScope(svc string) *serviceScope {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	s, ok := r.svc[svc]
 	if !ok {
@@ -270,12 +272,12 @@ func (r *resourceManager) getServiceScope(svc string) *serviceScope {
 	}
 
 	s.IncRef()
+	r.mx.Unlock()
 	return s
 }
 
 func (r *resourceManager) getProtocolScope(proto protocol.ID) *protocolScope {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	s, ok := r.proto[proto]
 	if !ok {
@@ -284,22 +286,22 @@ func (r *resourceManager) getProtocolScope(proto protocol.ID) *protocolScope {
 	}
 
 	s.IncRef()
+	r.mx.Unlock()
 	return s
 }
 
 func (r *resourceManager) setStickyProtocol(proto protocol.ID) {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	if r.stickyProto == nil {
 		r.stickyProto = make(map[protocol.ID]struct{})
 	}
 	r.stickyProto[proto] = struct{}{}
+	r.mx.Unlock()
 }
 
 func (r *resourceManager) getPeerScope(p peer.ID) *peerScope {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	s, ok := r.peer[p]
 	if !ok {
@@ -308,33 +310,34 @@ func (r *resourceManager) getPeerScope(p peer.ID) *peerScope {
 	}
 
 	s.IncRef()
+	r.mx.Unlock()
 	return s
 }
 
 func (r *resourceManager) setStickyPeer(p peer.ID) {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	if r.stickyPeer == nil {
 		r.stickyPeer = make(map[peer.ID]struct{})
 	}
 
 	r.stickyPeer[p] = struct{}{}
+	r.mx.Unlock()
 }
 
 func (r *resourceManager) nextConnId() int64 {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	r.connId++
+	r.mx.Unlock()
 	return r.connId
 }
 
 func (r *resourceManager) nextStreamId() int64 {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	r.streamId++
+	r.mx.Unlock()
 	return r.streamId
 }
 
@@ -414,17 +417,16 @@ func (r *resourceManager) Close() error {
 }
 
 func (r *resourceManager) background() {
-	defer r.wg.Done()
-
 	// periodically garbage collects unused peer and protocol scopes
 	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			r.gc()
 		case <-r.cancelCtx.Done():
+			ticker.Stop()
+			r.wg.Done()
 			return
 		}
 	}
@@ -432,7 +434,6 @@ func (r *resourceManager) background() {
 
 func (r *resourceManager) gc() {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	for proto, s := range r.proto {
 		_, sticky := r.stickyProto[proto]
@@ -482,6 +483,7 @@ func (r *resourceManager) gc() {
 		}
 		s.Unlock()
 	}
+	r.mx.Unlock()
 }
 
 func newSystemScope(limit Limit, rcmgr *resourceManager, name string) *systemScope {
@@ -633,11 +635,11 @@ func (s *serviceScope) Name() string {
 
 func (s *serviceScope) getPeerScope(p peer.ID) *resourceScope {
 	s.Lock()
-	defer s.Unlock()
 
 	ps, ok := s.peers[p]
 	if ok {
 		ps.IncRef()
+		s.Unlock()
 		return ps
 	}
 
@@ -651,6 +653,7 @@ func (s *serviceScope) getPeerScope(p peer.ID) *resourceScope {
 	s.peers[p] = ps
 
 	ps.IncRef()
+	s.Unlock()
 	return ps
 }
 
@@ -660,11 +663,11 @@ func (s *protocolScope) Protocol() protocol.ID {
 
 func (s *protocolScope) getPeerScope(p peer.ID) *resourceScope {
 	s.Lock()
-	defer s.Unlock()
 
 	ps, ok := s.peers[p]
 	if ok {
 		ps.IncRef()
+		s.Unlock()
 		return ps
 	}
 
@@ -678,6 +681,7 @@ func (s *protocolScope) getPeerScope(p peer.ID) *resourceScope {
 	s.peers[p] = ps
 
 	ps.IncRef()
+	s.Unlock()
 	return ps
 }
 
@@ -687,26 +691,29 @@ func (s *peerScope) Peer() peer.ID {
 
 func (s *connectionScope) PeerScope() network.PeerScope {
 	s.Lock()
-	defer s.Unlock()
 
 	// avoid nil is not nil footgun; go....
 	if s.peer == nil {
+		s.Unlock()
 		return nil
 	}
 
+	s.Unlock()
 	return s.peer
 }
 
 func (s *connectionScope) Done() {
 	s.Lock()
-	defer s.Unlock()
+
 	if s.done {
+		s.Unlock()
 		return
 	}
 	if s.ip.IsValid() {
 		s.rcmgr.connLimiter.rmConn(s.ip)
 	}
 	s.resourceScope.doneUnlocked()
+	s.Unlock()
 }
 
 // transferAllowedToStandard transfers this connection scope from being part of
@@ -731,15 +738,9 @@ func (s *connectionScope) transferAllowedToStandard() (err error) {
 	}
 	systemScope.IncRef()
 
-	// Undo this if we fail later
-	defer func() {
-		if err != nil {
-			systemScope.ReleaseForChild(stat)
-			systemScope.DecRef()
-		}
-	}()
-
 	if err := transientScope.ReserveForChild(stat); err != nil {
+		systemScope.ReleaseForChild(stat)
+		systemScope.DecRef()
 		return err
 	}
 	transientScope.IncRef()
@@ -754,9 +755,9 @@ func (s *connectionScope) transferAllowedToStandard() (err error) {
 
 func (s *connectionScope) SetPeer(p peer.ID) error {
 	s.Lock()
-	defer s.Unlock()
 
 	if s.peer != nil {
+		s.Unlock()
 		return fmt.Errorf("connection scope already attached to a peer")
 	}
 
@@ -778,6 +779,7 @@ func (s *connectionScope) SetPeer(p peer.ID) error {
 			// was _almost_ an allowlisted connection.
 			if err := s.transferAllowedToStandard(); err != nil {
 				// Failed to transfer this connection to the standard scopes
+				s.Unlock()
 				return err
 			}
 
@@ -795,6 +797,7 @@ func (s *connectionScope) SetPeer(p peer.ID) error {
 		s.peer.DecRef()
 		s.peer = nil
 		s.rcmgr.metrics.BlockPeer(p)
+		s.Unlock()
 		return err
 	}
 
@@ -809,26 +812,29 @@ func (s *connectionScope) SetPeer(p peer.ID) error {
 	s.resourceScope.edges = edges
 
 	s.rcmgr.metrics.AllowPeer(p)
+	s.Unlock()
 	return nil
 }
 
 func (s *streamScope) ProtocolScope() network.ProtocolScope {
 	s.Lock()
-	defer s.Unlock()
 
 	// avoid nil is not nil footgun; go....
 	if s.proto == nil {
+		s.Unlock()
 		return nil
 	}
 
-	return s.proto
+	sc := s.proto
+	s.Unlock()
+	return sc
 }
 
 func (s *streamScope) SetProtocol(proto protocol.ID) error {
 	s.Lock()
-	defer s.Unlock()
 
 	if s.proto != nil {
+		s.Unlock()
 		return fmt.Errorf("stream scope already attached to a protocol")
 	}
 
@@ -840,6 +846,7 @@ func (s *streamScope) SetProtocol(proto protocol.ID) error {
 		s.proto.DecRef()
 		s.proto = nil
 		s.rcmgr.metrics.BlockProtocol(proto)
+		s.Unlock()
 		return err
 	}
 
@@ -851,6 +858,7 @@ func (s *streamScope) SetProtocol(proto protocol.ID) error {
 		s.peerProtoScope.DecRef()
 		s.peerProtoScope = nil
 		s.rcmgr.metrics.BlockProtocolPeer(proto, s.peer.peer)
+		s.Unlock()
 		return err
 	}
 
@@ -867,29 +875,33 @@ func (s *streamScope) SetProtocol(proto protocol.ID) error {
 	s.resourceScope.edges = edges
 
 	s.rcmgr.metrics.AllowProtocol(proto)
+	s.Unlock()
 	return nil
 }
 
 func (s *streamScope) ServiceScope() network.ServiceScope {
 	s.Lock()
-	defer s.Unlock()
 
 	// avoid nil is not nil footgun; go....
 	if s.svc == nil {
+		s.Unlock()
 		return nil
 	}
 
-	return s.svc
+	svc := s.svc
+	s.Unlock()
+	return svc
 }
 
 func (s *streamScope) SetService(svc string) error {
 	s.Lock()
-	defer s.Unlock()
 
 	if s.svc != nil {
+		s.Unlock()
 		return fmt.Errorf("stream scope already attached to a service")
 	}
 	if s.proto == nil {
+		s.Unlock()
 		return fmt.Errorf("stream scope not attached to a protocol")
 	}
 
@@ -901,6 +913,7 @@ func (s *streamScope) SetService(svc string) error {
 		s.svc.DecRef()
 		s.svc = nil
 		s.rcmgr.metrics.BlockService(svc)
+		s.Unlock()
 		return err
 	}
 
@@ -913,6 +926,7 @@ func (s *streamScope) SetService(svc string) error {
 		s.peerSvcScope.DecRef()
 		s.peerSvcScope = nil
 		s.rcmgr.metrics.BlockServicePeer(svc, s.peer.peer)
+		s.Unlock()
 		return err
 	}
 
@@ -928,17 +942,19 @@ func (s *streamScope) SetService(svc string) error {
 	s.resourceScope.edges = edges
 
 	s.rcmgr.metrics.AllowService(svc)
+	s.Unlock()
 	return nil
 }
 
 func (s *streamScope) PeerScope() network.PeerScope {
 	s.Lock()
-	defer s.Unlock()
 
 	// avoid nil is not nil footgun; go....
 	if s.peer == nil {
 		return nil
 	}
 
-	return s.peer
+	p := s.peer
+	s.Unlock()
+	return p
 }

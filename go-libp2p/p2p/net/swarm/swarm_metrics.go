@@ -183,37 +183,40 @@ func appendConnectionState(tags []string, cs network.ConnectionState) []string {
 
 func (m *metricsTracer) OpenedConnection(dir network.Direction, p crypto.PubKey, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connsOpened.WithLabelValues(*tags...).Inc()
 
 	*tags = (*tags)[:0]
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = append(*tags, p.Type().String())
 	keyTypes.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) ClosedConnection(dir network.Direction, duration time.Duration, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connsClosed.WithLabelValues(*tags...).Inc()
 	connDuration.WithLabelValues(*tags...).Observe(duration.Seconds())
+	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) CompletedHandshake(t time.Duration, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = appendConnectionState(*tags, cs)
-	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
+	ipv, _ := metricshelper.GetIPVersion(laddr)
+	*tags = append(*tags, ipv)
 	connHandshakeLatency.WithLabelValues(*tags...).Observe(t.Seconds())
+	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) FailedDialing(addr ma.Multiaddr, dialErr error, cause error) {
@@ -243,16 +246,16 @@ func (m *metricsTracer) FailedDialing(addr ma.Multiaddr, dialErr error, cause er
 	}
 
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, transport, e)
-	*tags = append(*tags, metricshelper.GetIPVersion(addr))
+	ipv, _ := metricshelper.GetIPVersion(addr)
+	*tags = append(*tags, ipv)
 	dialError.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) DialCompleted(success bool, totalDials int) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 	if success {
 		*tags = append(*tags, "success")
 	} else {
@@ -268,6 +271,7 @@ func (m *metricsTracer) DialCompleted(success bool, totalDials int) {
 	}
 	*tags = append(*tags, numDials)
 	dialsPerPeer.WithLabelValues(*tags...).Inc()
+	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) DialRankingDelay(d time.Duration) {
@@ -277,11 +281,11 @@ func (m *metricsTracer) DialRankingDelay(d time.Duration) {
 func (m *metricsTracer) UpdatedBlackHoleFilterState(name string, state blackHoleState,
 	nextProbeAfter int, successFraction float64) {
 	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, name)
 
 	blackHoleFilterState.WithLabelValues(*tags...).Set(float64(state))
 	blackHoleFilterSuccessFraction.WithLabelValues(*tags...).Set(successFraction)
 	blackHoleFilterNextRequestAllowedAfter.WithLabelValues(*tags...).Set(float64(nextProbeAfter))
+	metricshelper.PutStringSlice(tags)
 }

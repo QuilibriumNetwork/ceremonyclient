@@ -122,10 +122,10 @@ func (db *DialBackoff) init(ctx context.Context) {
 
 func (db *DialBackoff) background(ctx context.Context) {
 	ticker := time.NewTicker(BackoffMax)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			ticker.Stop()
 			return
 		case <-ticker.C:
 			db.cleanup()
@@ -137,9 +137,9 @@ func (db *DialBackoff) background(ctx context.Context) {
 // peer p at address addr
 func (db *DialBackoff) Backoff(p peer.ID, addr ma.Multiaddr) (backoff bool) {
 	db.lock.RLock()
-	defer db.lock.RUnlock()
 
 	ap, found := db.entries[p][string(addr.Bytes())]
+	db.lock.RUnlock()
 	return found && time.Now().Before(ap.until)
 }
 
@@ -163,7 +163,6 @@ var BackoffMax = time.Minute * 5
 func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 	saddr := string(addr.Bytes())
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	bp, ok := db.entries[p]
 	if !ok {
 		bp = make(map[string]*backoffAddr, 1)
@@ -175,6 +174,7 @@ func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 			tries: 1,
 			until: time.Now().Add(BackoffBase),
 		}
+		db.lock.Unlock()
 		return
 	}
 
@@ -184,19 +184,19 @@ func (db *DialBackoff) AddBackoff(p peer.ID, addr ma.Multiaddr) {
 	}
 	ba.until = time.Now().Add(backoffTime)
 	ba.tries++
+	db.lock.Unlock()
 }
 
 // Clear removes a backoff record. Clients should call this after a
 // successful Dial.
 func (db *DialBackoff) Clear(p peer.ID) {
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	delete(db.entries, p)
+	db.lock.Unlock()
 }
 
 func (db *DialBackoff) cleanup() {
 	db.lock.Lock()
-	defer db.lock.Unlock()
 	now := time.Now()
 	for p, e := range db.entries {
 		good := false
@@ -214,6 +214,7 @@ func (db *DialBackoff) cleanup() {
 			delete(db.entries, p)
 		}
 	}
+	db.lock.Unlock()
 }
 
 // DialPeer connects to a peer. Use network.WithForceDirectDial to force a
@@ -260,7 +261,6 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 
 	// apply the DialPeer timeout
 	ctx, cancel := context.WithTimeout(ctx, network.GetDialPeerTimeout(ctx))
-	defer cancel()
 
 	conn, err = s.dsync.Dial(ctx, p)
 	if err == nil {
@@ -269,8 +269,10 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 		if conn.RemotePeer() != p {
 			conn.Close()
 			log.Errorw("Handshake failed to properly authenticate peer", "authenticated", conn.RemotePeer(), "expected", p)
+			cancel()
 			return nil, fmt.Errorf("unexpected peer")
 		}
+		cancel()
 		return conn, nil
 	}
 
@@ -278,14 +280,17 @@ func (s *Swarm) dialPeer(ctx context.Context, p peer.ID) (*Conn, error) {
 
 	if ctx.Err() != nil {
 		// Context error trumps any dial errors as it was likely the ultimate cause.
+		cancel()
 		return nil, ctx.Err()
 	}
 
 	if s.ctx.Err() != nil {
 		// Ok, so the swarm is shutting down.
+		cancel()
 		return nil, ErrSwarmClosed
 	}
 
+	cancel()
 	return nil, err
 }
 
@@ -434,7 +439,10 @@ func (s *Swarm) filterKnownUndialables(p peer.ID, addrs []ma.Multiaddr) (goodAdd
 	var ourAddrs []ma.Multiaddr
 	for _, addr := range lisAddrs {
 		// we're only sure about filtering out /ip4 and /ip6 addresses, so far
-		ma.ForEach(addr, func(c ma.Component) bool {
+		ma.ForEach(addr, func(c ma.Component, e error) bool {
+			if e != nil {
+				return true
+			}
 			if c.Protocol().Code == ma.P_IP4 || c.Protocol().Code == ma.P_IP6 {
 				ourAddrs = append(ourAddrs, addr)
 			}
@@ -504,9 +512,13 @@ func (s *Swarm) filterKnownUndialables(p peer.ID, addrs []ma.Multiaddr) (goodAdd
 // limitedDial will start a dial to the given peer when
 // it is able, respecting the various different types of rate
 // limiting that occur without using extra goroutines per addr
-func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp chan transport.DialUpdate) {
+func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp chan transport.DialUpdate) error {
 	timeout := s.dialTimeout
-	if manet.IsPrivateAddr(a) && s.dialTimeoutLocal < s.dialTimeout {
+	is, err := manet.IsPrivateAddr(a)
+	if err != nil {
+		return err
+	}
+	if is && s.dialTimeoutLocal < s.dialTimeout {
 		timeout = s.dialTimeoutLocal
 	}
 	s.limiter.AddDialJob(&dialJob{
@@ -516,6 +528,7 @@ func (s *Swarm) limitedDial(ctx context.Context, p peer.ID, a ma.Multiaddr, resp
 		ctx:     ctx,
 		timeout: timeout,
 	})
+	return nil
 }
 
 // dialAddr is the actual dial for an addr, indirectly invoked through the limiter
@@ -582,12 +595,12 @@ func (s *Swarm) dialAddr(ctx context.Context, p peer.ID, addr ma.Multiaddr, updC
 // For a circuit-relay address, we look at the address of the relay server/proxy
 // and use the same logic as above to decide.
 func isFdConsumingAddr(addr ma.Multiaddr) bool {
-	first, _ := ma.SplitFunc(addr, func(c ma.Component) bool {
+	first, _, err := ma.SplitFunc(addr, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_CIRCUIT
 	})
 
 	// for safety
-	if first == nil {
+	if err == nil && first == nil {
 		return true
 	}
 

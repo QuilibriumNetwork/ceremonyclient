@@ -1,5 +1,7 @@
 package crypto
 
+import "source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+
 type InclusionCommitment struct {
 	TypeUrl    string
 	Data       []byte
@@ -13,16 +15,7 @@ type InclusionAggregateProof struct {
 }
 
 type InclusionProver interface {
-	// Commit(
-	// 	data []byte,
-	// 	typeUrl string,
-	// ) (*InclusionCommitment, error)
-	// ProveAggregate(commits []*InclusionCommitment) (
-	// 	*InclusionAggregateProof,
-	// 	error,
-	// )
-	// VerifyAggregate(proof *InclusionAggregateProof) (bool, error)
-	// VerifyFrame(frame *protobufs.ClockFrame) error
+	VerifyFrame(frame *protobufs.ClockFrame) error
 	CommitRaw(
 		data []byte,
 		polySize uint64,

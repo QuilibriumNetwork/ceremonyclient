@@ -51,7 +51,6 @@ func newBackoff(ctx context.Context, sizeThreshold int, cleanupInterval time.Dur
 
 func (b *backoff) updateAndGet(id peer.ID) (time.Duration, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	h, ok := b.info[id]
 	switch {
@@ -62,6 +61,7 @@ func (b *backoff) updateAndGet(id peer.ID) (time.Duration, error) {
 			attempts: 0,
 		}
 	case h.attempts >= b.maxAttempts:
+		b.mu.Unlock()
 		return 0, fmt.Errorf("peer %s has reached its maximum backoff attempts", id)
 
 	case h.duration < MinBackoffDelay:
@@ -78,27 +78,29 @@ func (b *backoff) updateAndGet(id peer.ID) (time.Duration, error) {
 	h.attempts += 1
 	h.lastTried = time.Now()
 	b.info[id] = h
+	b.mu.Unlock()
 	return h.duration, nil
 }
 
 func (b *backoff) cleanup() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	for id, h := range b.info {
 		if time.Since(h.lastTried) > TimeToLive {
 			delete(b.info, id)
 		}
 	}
+
+	b.mu.Unlock()
 }
 
 func (b *backoff) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(b.ci)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			ticker.Stop()
 			return // pubsub shutting down
 		case <-ticker.C:
 			b.cleanup()

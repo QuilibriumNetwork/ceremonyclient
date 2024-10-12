@@ -13,7 +13,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-var dummyMA = multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
+var dummyMA, _ = multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
 
 func TestResourceManager(t *testing.T) {
 	peerA := peer.ID("A")
@@ -1000,9 +1000,11 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 	baseLimit.Apply(limits.allowlistedTransient)
 	limits.allowlistedTransient = baseLimit
 
+	m1, _ := multiaddr.StringCast("/ip4/1.2.3.4")
+	m2, _ := multiaddr.StringCast("/ip4/4.3.2.1/p2p/" + peerA.String())
 	rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-		multiaddr.StringCast("/ip4/1.2.3.4"),
-		multiaddr.StringCast("/ip4/4.3.2.1/p2p/" + peerA.String()),
+		m1,
+		m2,
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -1014,14 +1016,17 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 		t.Fatal("Expected to be able to get the allowlist")
 	}
 
+	m3, _ := multiaddr.StringCast("/ip4/1.2.3.5")
+	m4, _ := multiaddr.StringCast("/ip4/1.2.3.4")
+
 	// A connection comes in from a non-allowlisted ip address
-	_, err = rcmgr.OpenConnection(network.DirInbound, true, multiaddr.StringCast("/ip4/1.2.3.5"))
+	_, err = rcmgr.OpenConnection(network.DirInbound, true, m3)
 	if err == nil {
 		t.Fatalf("Expected this to fail. err=%v", err)
 	}
 
 	// A connection comes in from an allowlisted ip address
-	connScope, err := rcmgr.OpenConnection(network.DirInbound, true, multiaddr.StringCast("/ip4/1.2.3.4"))
+	connScope, err := rcmgr.OpenConnection(network.DirInbound, true, m4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1031,8 +1036,11 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	m5, _ := multiaddr.StringCast("/ip4/4.3.2.1")
+	m6, _ := multiaddr.StringCast("/ip4/4.3.2.1")
+
 	// A connection comes in that looks like it should be allowlisted, but then has the wrong peer id.
-	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, multiaddr.StringCast("/ip4/4.3.2.1"))
+	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, m5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1051,7 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 	}
 
 	// A connection comes in that looks like it should be allowlisted, and it has the allowlisted peer id
-	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, multiaddr.StringCast("/ip4/4.3.2.1"))
+	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, m6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1060,9 +1068,12 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 	limits.allowlistedSystem.Conns = 8
 	limits.allowlistedSystem.ConnsInbound = 8
 	limits.allowlistedSystem.ConnsOutbound = 8
+	m1, _ := multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24")
+	m2, _ := multiaddr.StringCast("/ip6/1:2:3::/ipcidr/58")
+	m3, _ := multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24")
 	t.Run("IPv4", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24"),
+			m1,
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{}, []NetworkPrefixLimit{}))
 		if err != nil {
 			t.Fatal(err)
@@ -1077,7 +1088,7 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 	})
 	t.Run("IPv6", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			multiaddr.StringCast("/ip6/1:2:3::/ipcidr/58"),
+			m2,
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{}, []NetworkPrefixLimit{}))
 		if err != nil {
 			t.Fatal(err)
@@ -1093,7 +1104,7 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 
 	t.Run("Does not override if you set a limit directly", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24"),
+			m3,
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{
 			{Network: netip.MustParsePrefix("1.2.3.0/24"), ConnCount: 1},
 		}, []NetworkPrefixLimit{}))

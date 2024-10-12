@@ -50,15 +50,11 @@ func (p *PingService) PingHandler(s network.Stream) {
 		s.Reset()
 		return
 	}
-	defer s.Scope().ReleaseMemory(PingSize)
 
 	buf := pool.Get(PingSize)
-	defer pool.Put(buf)
 
 	errCh := make(chan error, 1)
-	defer close(errCh)
 	timer := time.NewTimer(pingTimeout)
-	defer timer.Stop()
 
 	go func() {
 		select {
@@ -78,12 +74,22 @@ func (p *PingService) PingHandler(s network.Stream) {
 		_, err := io.ReadFull(s, buf)
 		if err != nil {
 			errCh <- err
+
+			s.Scope().ReleaseMemory(PingSize)
+			pool.Put(buf)
+			close(errCh)
+			timer.Stop()
 			return
 		}
 
 		_, err = s.Write(buf)
 		if err != nil {
 			errCh <- err
+
+			s.Scope().ReleaseMemory(PingSize)
+			pool.Put(buf)
+			close(errCh)
+			timer.Stop()
 			return
 		}
 
@@ -134,15 +140,14 @@ func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
 
 	out := make(chan Result)
 	go func() {
-		defer close(out)
-		defer cancel()
-
 		for ctx.Err() == nil {
 			var res Result
 			res.RTT, res.Error = ping(s, ra)
 
 			// canceled, ignore everything.
 			if ctx.Err() != nil {
+				close(out)
+				cancel()
 				return
 			}
 
@@ -154,9 +159,13 @@ func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
 			select {
 			case out <- res:
 			case <-ctx.Done():
+				close(out)
+				cancel()
 				return
 			}
 		}
+		close(out)
+		cancel()
 	}()
 	context.AfterFunc(ctx, func() {
 		// forces the ping to abort.
@@ -172,30 +181,40 @@ func ping(s network.Stream, randReader io.Reader) (time.Duration, error) {
 		s.Reset()
 		return 0, err
 	}
-	defer s.Scope().ReleaseMemory(2 * PingSize)
 
 	buf := pool.Get(PingSize)
-	defer pool.Put(buf)
 
 	if _, err := io.ReadFull(randReader, buf); err != nil {
+		s.Scope().ReleaseMemory(2 * PingSize)
+		pool.Put(buf)
 		return 0, err
 	}
 
 	before := time.Now()
 	if _, err := s.Write(buf); err != nil {
+		s.Scope().ReleaseMemory(2 * PingSize)
+		pool.Put(buf)
 		return 0, err
 	}
 
 	rbuf := pool.Get(PingSize)
-	defer pool.Put(rbuf)
 
 	if _, err := io.ReadFull(s, rbuf); err != nil {
+		s.Scope().ReleaseMemory(2 * PingSize)
+		pool.Put(buf)
+		pool.Put(rbuf)
 		return 0, err
 	}
 
 	if !bytes.Equal(buf, rbuf) {
+		s.Scope().ReleaseMemory(2 * PingSize)
+		pool.Put(buf)
+		pool.Put(rbuf)
 		return 0, errors.New("ping packet was incorrect")
 	}
 
+	s.Scope().ReleaseMemory(2 * PingSize)
+	pool.Put(buf)
+	pool.Put(rbuf)
 	return time.Since(before), nil
 }

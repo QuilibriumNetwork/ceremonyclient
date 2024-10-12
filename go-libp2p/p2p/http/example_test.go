@@ -14,10 +14,15 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func ExampleHost_withAStockGoHTTPClient() {
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	// A server with a simple echo protocol
@@ -65,14 +70,14 @@ func ExampleHost_listenOnHTTPTransportAndStreams() {
 
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 		StreamHost:        serverStreamHost,
 	}
 	go server.Serve()
 	defer server.Close()
 
 	for _, a := range server.Addrs() {
-		_, transport := ma.SplitLast(a)
+		_, transport, _ := ma.SplitLast(a)
 		fmt.Printf("Server listening on transport: %s\n", transport)
 	}
 	// Output: Server listening on transport: /quic-v1
@@ -128,7 +133,7 @@ func ExampleHost_overLibp2pStreams() {
 func ExampleHost_Serve() {
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/50221/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/50221/http")},
 	}
 
 	go server.Serve()
@@ -142,7 +147,7 @@ func ExampleHost_Serve() {
 func ExampleHost_SetHTTPHandler() {
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	server.SetHTTPHandler("/hello/1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +181,7 @@ func ExampleHost_SetHTTPHandler() {
 func ExampleHost_SetHTTPHandlerAtPath() {
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	server.SetHTTPHandlerAtPath("/hello/1", "/other-place/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +218,7 @@ func ExampleHost_NamespacedClient() {
 	// Create the server
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	server.SetHTTPHandlerAtPath("/hello/1", "/other-place/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -251,7 +256,7 @@ func ExampleHost_NamespaceRoundTripper() {
 	// Create the server
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	server.SetHTTPHandler("/hello/1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +300,7 @@ func ExampleHost_NewConstrainedRoundTripper() {
 	// Create the server
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true, // For our example, we'll allow insecure HTTP
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	server.SetHTTPHandler("/hello/1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

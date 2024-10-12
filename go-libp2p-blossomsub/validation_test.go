@@ -15,8 +15,8 @@ func TestRegisterUnregisterValidator(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 1)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 1)
+	psubs := getBlossomSubs(ctx, hosts)
 
 	err := psubs[0].RegisterBitmaskValidator([]byte{0xf0, 0x00}, func(context.Context, peer.ID, *Message) bool {
 		return true
@@ -40,10 +40,10 @@ func TestRegisterValidatorEx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 3)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 3)
+	psubs := getBlossomSubs(ctx, hosts)
 
-	err := psubs[0].RegisterBitmaskValidator([]byte{0x7e, 0x57},
+	err := psubs[0].RegisterBitmaskValidator([]byte{0x01, 0x00},
 		Validator(func(context.Context, peer.ID, *Message) bool {
 			return true
 		}))
@@ -51,7 +51,7 @@ func TestRegisterValidatorEx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = psubs[1].RegisterBitmaskValidator([]byte{0x7e, 0x57},
+	err = psubs[1].RegisterBitmaskValidator([]byte{0x01, 0x00},
 		ValidatorEx(func(context.Context, peer.ID, *Message) ValidationResult {
 			return ValidationAccept
 		}))
@@ -59,7 +59,7 @@ func TestRegisterValidatorEx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = psubs[2].RegisterBitmaskValidator([]byte{0x7e, 0x57}, "bogus")
+	err = psubs[2].RegisterBitmaskValidator([]byte{0x01, 0x00}, "bogus")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -69,15 +69,20 @@ func TestValidate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 2)
+	psubs := getBlossomSubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 
 	err := psubs[1].RegisterBitmaskValidator(bitmask, func(ctx context.Context, from peer.ID, msg *Message) bool {
 		return !bytes.Contains(msg.Data, []byte("illegal"))
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := psubs[0].Join(bitmask)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,13 +105,13 @@ func TestValidate(t *testing.T) {
 	}
 
 	for _, tc := range msgs {
-		err := psubs[0].Publish(bitmask, tc.msg)
+		err := b[0].Publish(ctx, b[0].bitmask, tc.msg)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		select {
-		case msg := <-sub.ch:
+		case msg := <-sub[0].ch:
 			if !tc.validates {
 				t.Log(msg)
 				t.Error("expected message validation to filter out the message")
@@ -123,10 +128,10 @@ func TestValidate2(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 1)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 1)
+	psubs := getBlossomSubs(ctx, hosts)
 
-	bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+	bitmask := []byte{0x00, 0x01}
 
 	err := psubs[0].RegisterBitmaskValidator(bitmask, func(ctx context.Context, from peer.ID, msg *Message) bool {
 		return !bytes.Contains(msg.Data, []byte("illegal"))
@@ -145,8 +150,13 @@ func TestValidate2(t *testing.T) {
 		{msg: []byte("but subversive actors will use leetspeek to spread 1ll3g4l content"), validates: true},
 	}
 
+	b, err := psubs[0].Join(bitmask)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for _, tc := range msgs {
-		err := psubs[0].Publish(bitmask, tc.msg)
+		err := b[0].Publish(ctx, b[0].bitmask, tc.msg)
 		if tc.validates {
 			if err != nil {
 				t.Fatal(err)
@@ -183,7 +193,7 @@ func TestValidateOverload(t *testing.T) {
 				{msg: []byte("still, all good"), validates: true},
 				{msg: []byte("this is getting boring"), validates: true},
 				{msg: []byte([]byte{0xf0, 0x00}), validates: true},
-				{msg: []byte([]byte{0xf0, 0x0b, 0xa1, 0x20}), validates: true},
+				{msg: []byte([]byte{0x00, 0x01}), validates: true},
 				{msg: []byte("foofoo"), validates: true},
 				{msg: []byte("barfoo"), validates: true},
 				{msg: []byte("oh no!"), validates: false},
@@ -201,11 +211,11 @@ func TestValidateOverload(t *testing.T) {
 
 	for tci, tc := range tcs {
 		t.Run(fmt.Sprintf("%d", tci), func(t *testing.T) {
-			hosts := getNetHosts(t, ctx, 2)
-			psubs := getPubsubs(ctx, hosts)
+			hosts := getDefaultHosts(t, 2)
+			psubs := getBlossomSubs(ctx, hosts)
 
 			connect(t, hosts[0], hosts[1])
-			bitmask := []byte{0xf0, 0x0b, 0xa1, 0x20}
+			bitmask := []byte{0x00, 0x01}
 
 			block := make(chan struct{})
 
@@ -232,13 +242,17 @@ func TestValidateOverload(t *testing.T) {
 			}
 
 			p := psubs[0]
+			b, err := p.Join(bitmask)
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			var wg sync.WaitGroup
 			wg.Add(1)
 			go func() {
 				for _, tmsg := range tc.msgs {
 					select {
-					case msg := <-sub.ch:
+					case msg := <-sub[0].ch:
 						if !tmsg.validates {
 							t.Log(msg)
 							t.Error("expected message validation to drop the message because all validator goroutines are taken")
@@ -253,7 +267,7 @@ func TestValidateOverload(t *testing.T) {
 			}()
 
 			for _, tmsg := range tc.msgs {
-				err := p.Publish(bitmask, tmsg.msg)
+				err := b[0].Publish(ctx, b[0].bitmask, tmsg.msg)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -273,8 +287,8 @@ func TestValidateAssortedOptions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 10)
-	psubs := getPubsubs(ctx, hosts,
+	hosts := getDefaultHosts(t, 10)
+	psubs := getBlossomSubs(ctx, hosts,
 		WithValidateQueueSize(10),
 		WithValidateThrottle(10),
 		WithValidateWorkers(10))
@@ -282,7 +296,7 @@ func TestValidateAssortedOptions(t *testing.T) {
 	sparseConnect(t, hosts)
 
 	for _, psub := range psubs {
-		err := psub.RegisterBitmaskValidator([]byte{0xff, 0x00, 0x00, 0x00},
+		err := psub.RegisterBitmaskValidator([]byte{0x00, 0x80, 0x00, 0x00},
 			func(context.Context, peer.ID, *Message) bool {
 				return true
 			},
@@ -291,7 +305,7 @@ func TestValidateAssortedOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = psub.RegisterBitmaskValidator([]byte{0x00, 0xff, 0x00, 0x00},
+		err = psub.RegisterBitmaskValidator([]byte{0x00, 0x20, 0x00, 0x00},
 			func(context.Context, peer.ID, *Message) bool {
 				return true
 			},
@@ -302,31 +316,44 @@ func TestValidateAssortedOptions(t *testing.T) {
 	}
 
 	var subs1, subs2 []*Subscription
+	var bitmasks1, bitmasks2 []*Bitmask
 	for _, ps := range psubs {
-		sub, err := ps.Subscribe([]byte{0xff, 0x00, 0x00, 0x00})
+		b, err := ps.Join([]byte{0x00, 0x80, 0x00, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs1 = append(subs1, sub)
+		bitmasks1 = append(bitmasks1, b...)
 
-		sub, err = ps.Subscribe([]byte{0x00, 0xff, 0x00, 0x00})
+		b, err = ps.Join([]byte{0x00, 0x04, 0x00, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs2 = append(subs2, sub)
+		bitmasks2 = append(bitmasks2, b...)
+		sub, err := ps.Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs1 = append(subs1, sub...)
+
+		sub, err = ps.Subscribe([]byte{0x00, 0x04, 0x00, 0x00})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs2 = append(subs2, sub...)
 	}
 
 	time.Sleep(time.Second)
 
 	for i := 0; i < 10; i++ {
-		msg := []byte(fmt.Sprintf("message %d", i))
+		msg := []byte(fmt.Sprintf("message1 %d", i))
 
-		psubs[i].Publish([]byte{0xff, 0x00, 0x00, 0x00}, msg)
+		bitmasks1[i].Publish(ctx, bitmasks1[i].bitmask, msg)
 		for _, sub := range subs1 {
 			assertReceive(t, sub, msg)
 		}
+		msg = []byte(fmt.Sprintf("message2 %d", i))
 
-		psubs[i].Publish([]byte{0x00, 0xff, 0x00, 0x00}, msg)
+		bitmasks2[i].Publish(ctx, bitmasks2[i].bitmask, msg)
 		for _, sub := range subs2 {
 			assertReceive(t, sub, msg)
 		}

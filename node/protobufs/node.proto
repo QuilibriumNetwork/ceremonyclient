@@ -5,6 +5,7 @@ package quilibrium.node.node.pb;
 option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 
 import "clock.proto";
+import "keys.proto";
 
 message GetFramesRequest {
   bytes filter = 1;
@@ -117,50 +118,18 @@ message Capability {
 }
 
 message SelfTestReport {
-  // The difficulty the self test was conducted under
-  uint32 difficulty = 1;
-  // The resulting local time of computing the VDF test under the difficulty
-  int64 difficulty_metric = 2;
-  // The resulting local time of computing a KZG commitment for a 16 degree
-  // polynomial
-  int64 commit_16_metric = 3;
-  // The resulting local time of computing a KZG commitment for a 128 degree
-  // polynomial
-  int64 commit_128_metric = 4;
-  // The resulting local time of computing a KZG commitment for a 1024 degree
-  // polynomial
-  int64 commit_1024_metric = 5;
-  // The resulting local time of computing a KZG commitment for a 65536 degree
-  // polynomial
-  int64 commit_65536_metric = 6;
-  // The resulting local time of computing a KZG proof for a 16 degree
-  // polynomial
-  int64 proof_16_metric = 7;
-  // The resulting local time of computing a KZG proof for a 128 degree
-  // polynomial
-  int64 proof_128_metric = 8;
-  // The resulting local time of computing a KZG proof for a 1024 degree
-  // polynomial
-  int64 proof_1024_metric = 9;
-  // The resulting local time of computing a KZG proof for a 65536 degree
-  // polynomial
-  int64 proof_65536_metric = 10;
   // The number of reported accessible cores
-  uint32 cores = 11;
+  uint32 cores = 1;
   // The total available memory
-  bytes memory = 12;
+  bytes memory = 2;
   // The total available storage
-  bytes storage = 13;
+  bytes storage = 3;
   // The list of supported capabilities
-  repeated Capability capabilities = 14;
+  repeated Capability capabilities = 4;
   // The highest master frame the node has
-  uint64 master_head_frame = 15;
-  // A challenge proof
-  bytes proof = 16;
-  // The challenge, minus the peer id
-  bytes challenge = 17;
-  // The increment value
-  uint32 increment = 18;
+  uint64 master_head_frame = 5;
+  // The bit slice declaring prover range
+  bytes prover_range = 6; 
 }
 
 message ValidationMessage {
@@ -184,48 +153,25 @@ message GetPeerManifestsRequest {}
 
 message PeerManifest {
   bytes peer_id = 1;
-  // The difficulty the self test was conducted under
-  uint32 difficulty = 2;
-  // The resulting local time of computing the VDF test under the difficulty
-  int64 difficulty_metric = 3;
-  // The resulting local time of computing a KZG commitment for a 16 degree
-  // polynomial
-  int64 commit_16_metric = 4;
-  // The resulting local time of computing a KZG commitment for a 128 degree
-  // polynomial
-  int64 commit_128_metric = 5;
-  // The resulting local time of computing a KZG commitment for a 1024 degree
-  // polynomial
-  int64 commit_1024_metric = 6;
-  // The resulting local time of computing a KZG commitment for a 65536 degree
-  // polynomial
-  int64 commit_65536_metric = 7;
-  // The resulting local time of computing a KZG proof for a 16 degree
-  // polynomial
-  int64 proof_16_metric = 8;
-  // The resulting local time of computing a KZG proof for a 128 degree
-  // polynomial
-  int64 proof_128_metric = 9;
-  // The resulting local time of computing a KZG proof for a 1024 degree
-  // polynomial
-  int64 proof_1024_metric = 10;
-  // The resulting local time of computing a KZG proof for a 65536 degree
-  // polynomial
-  int64 proof_65536_metric = 11;
   // The number of reported accessible cores
-  uint32 cores = 12;
+  uint32 cores = 2;
   // The total available memory
-  bytes memory = 13;
+  bytes memory = 3;
   // The total available storage
-  bytes storage = 14;
+  bytes storage = 4;
   // The list of supported capabilities
-  repeated Capability capabilities = 15;
+  repeated Capability capabilities = 5;
   // The highest master frame the node has
-  uint64 master_head_frame = 16;
+  uint64 master_head_frame = 6;
   // The last time seen tick
-  int64 last_seen = 17;
+  int64 last_seen = 7;
   // The increment of the node
-  uint32 increment = 18;
+  uint32 increment = 8;
+}
+
+message AnnounceProverRequest {
+  repeated quilibrium.node.keys.pb.Ed448Signature public_key_signatures_ed448 = 1;
+  MintCoinRequest initial_proof = 2;
 }
 
 message OriginatedAccountRef {
@@ -251,6 +197,50 @@ message AccountAllowanceRef {
 
 message CoinAllowanceRef {
   bytes address = 1;
+}
+
+message Coin {
+  bytes amount = 1;
+  bytes intersection = 2;
+  AccountRef owner = 3;
+}
+
+message TokenRequest {
+  oneof request {
+    TransferCoinRequest transfer = 1;
+    SplitCoinRequest split = 2;
+    MergeCoinRequest merge = 3;
+    MintCoinRequest mint = 4;
+    AnnounceProverRequest announce = 5;
+  }
+}
+
+message TokenRequests {
+  repeated TokenRequest requests = 1;
+}
+
+message PreCoinProof {
+  bytes amount = 1;
+  uint32 index = 2;
+  bytes indexProof = 3;
+  bytes commitment = 4;
+  bytes proof = 5;
+  uint32 parallelism = 6;
+  uint32 difficulty = 7;
+  AccountRef owner = 8;
+}
+
+message TokenOutput {
+  oneof output {
+    Coin coin = 1;
+    PreCoinProof proof = 2;
+    Coin deleted_coin = 3;
+    PreCoinProof deleted_proof = 4;
+  }
+}
+
+message TokenOutputs {
+  repeated TokenOutput outputs = 1;
 }
 
 message CoinRef {
@@ -326,13 +316,13 @@ message MergeCoinRequest {
   repeated CoinRef coins = 1;
   AccountAllowanceRef account_allowance = 2;
   repeated CoinAllowanceRef coin_allowances = 3;
-  Signature signature = 4;
+  quilibrium.node.keys.pb.Ed448Signature signature = 4;
 }
 
 message MintCoinRequest {
   repeated bytes proofs = 1;
   AccountAllowanceRef allowance = 2;
-  Signature signature = 3;
+  quilibrium.node.keys.pb.Ed448Signature signature = 3;
 }
 
 message MutualReceiveCoinRequest {
@@ -369,7 +359,7 @@ message SplitCoinRequest {
   repeated bytes amounts = 2;
   AccountAllowanceRef account_allowance = 3;
   CoinAllowanceRef coin_allowance = 4;
-  Signature signature = 5;
+  quilibrium.node.keys.pb.Ed448Signature signature = 5;
 }
 
 message TransferCoinRequest {
@@ -379,7 +369,7 @@ message TransferCoinRequest {
   int64 expiry = 4;
   AccountAllowanceRef account_allowance = 5;
   CoinAllowanceRef coin_allowance = 6;
-  Signature signature = 7;
+  quilibrium.node.keys.pb.Ed448Signature signature = 7;
 }
 
 message ApprovePendingTransactionRequest {

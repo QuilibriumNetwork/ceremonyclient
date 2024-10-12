@@ -19,7 +19,8 @@ import (
 )
 
 func addrWithPort(p int) ma.Multiaddr {
-	return ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p))
+	m1, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p))
+	return m1
 }
 
 // in these tests I use addresses with tcp ports over a certain number to
@@ -155,7 +156,7 @@ func TestFDLimiting(t *testing.T) {
 	}
 
 	pid5 := peer.ID("testpeer5")
-	utpaddr := ma.StringCast("/ip4/127.0.0.1/udp/7777/utp")
+	utpaddr, _ := ma.StringCast("/ip4/127.0.0.1/udp/7777/utp")
 
 	// This should complete immediately since utp addresses arent blocked by fd rate limiting
 	l.AddDialJob(&dialJob{ctx: ctx, peer: pid5, addr: utpaddr, resp: resch})
@@ -172,7 +173,7 @@ func TestFDLimiting(t *testing.T) {
 	// A relay address with tcp transport will complete because we do not consume fds for dials
 	// with relay addresses as the fd will be consumed when we actually dial the relay server.
 	pid6 := test.RandPeerIDFatal(t)
-	relayAddr := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/20/p2p-circuit/p2p/%s", pid6))
+	relayAddr, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/20/p2p-circuit/p2p/%s", pid6))
 	l.AddDialJob(&dialJob{ctx: ctx, peer: pid6, addr: relayAddr, resp: resch})
 
 	select {
@@ -216,11 +217,13 @@ func TestTokenRedistribution(t *testing.T) {
 		tryDialAddrs(ctx, l, pid, bads, resch)
 	}
 
+	m1, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1001")
+
 	// add a good dial job for peer 1
 	l.AddDialJob(&dialJob{
 		ctx:  ctx,
 		peer: pids[1],
-		addr: ma.StringCast("/ip4/127.0.0.1/tcp/1001"),
+		addr: m1,
 		resp: resch,
 	})
 

@@ -67,18 +67,21 @@ func newHolePuncher(h host.Host, ids identify.IDService, tracer *tracer, filter 
 
 func (hp *holePuncher) beginDirectConnect(p peer.ID) error {
 	hp.closeMx.RLock()
-	defer hp.closeMx.RUnlock()
 	if hp.closed {
+		hp.closeMx.RUnlock()
 		return ErrClosed
 	}
 
 	hp.activeMx.Lock()
-	defer hp.activeMx.Unlock()
 	if _, ok := hp.active[p]; ok {
+		hp.activeMx.Unlock()
+		hp.closeMx.RUnlock()
 		return ErrHolePunchActive
 	}
 
 	hp.active[p] = struct{}{}
+	hp.activeMx.Unlock()
+	hp.closeMx.RUnlock()
 	return nil
 }
 
@@ -90,13 +93,11 @@ func (hp *holePuncher) DirectConnect(p peer.ID) error {
 		return err
 	}
 
-	defer func() {
-		hp.activeMx.Lock()
-		delete(hp.active, p)
-		hp.activeMx.Unlock()
-	}()
-
-	return hp.directConnect(p)
+	err := hp.directConnect(p)
+	hp.activeMx.Lock()
+	delete(hp.active, p)
+	hp.activeMx.Unlock()
+	return err
 }
 
 func (hp *holePuncher) directConnect(rp peer.ID) error {
@@ -108,7 +109,7 @@ func (hp *holePuncher) directConnect(rp peer.ID) error {
 	// short-circuit hole punching if a direct dial works.
 	// attempt a direct connection ONLY if we have a public address for the remote peer
 	for _, a := range hp.host.Peerstore().Addrs(rp) {
-		if manet.IsPublicAddr(a) && !isRelayAddress(a) {
+		if is, err := manet.IsPublicAddr(a); err == nil && is && !isRelayAddress(a) {
 			forceDirectConnCtx := network.WithForceDirectDial(hp.ctx, "hole-punching")
 			dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, dialTimeout)
 
@@ -181,14 +182,15 @@ func (hp *holePuncher) initiateHolePunch(rp peer.ID) ([]ma.Multiaddr, []ma.Multi
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("failed to open hole-punching stream: %w", err)
 	}
-	defer str.Close()
 
 	addr, obsAddr, rtt, err := hp.initiateHolePunchImpl(str)
 	if err != nil {
 		log.Debugf("%s", err)
 		str.Reset()
+		str.Close()
 		return addr, obsAddr, rtt, err
 	}
+	str.Close()
 	return addr, obsAddr, rtt, err
 }
 
@@ -200,7 +202,6 @@ func (hp *holePuncher) initiateHolePunchImpl(str network.Stream) ([]ma.Multiaddr
 	if err := str.Scope().ReserveMemory(maxMsgSize, network.ReservationPriorityAlways); err != nil {
 		return nil, nil, 0, fmt.Errorf("error reserving memory for stream: %s", err)
 	}
-	defer str.Scope().ReleaseMemory(maxMsgSize)
 
 	w := pbio.NewDelimitedWriter(str)
 	rd := pbio.NewDelimitedReader(str, maxMsgSize)
@@ -213,6 +214,7 @@ func (hp *holePuncher) initiateHolePunchImpl(str network.Stream) ([]ma.Multiaddr
 		obsAddrs = hp.filter.FilterLocal(str.Conn().RemotePeer(), obsAddrs)
 	}
 	if len(obsAddrs) == 0 {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, errors.New("aborting hole punch initiation as we have no public address")
 	}
 
@@ -222,16 +224,19 @@ func (hp *holePuncher) initiateHolePunchImpl(str network.Stream) ([]ma.Multiaddr
 		ObsAddrs: addrsToBytes(obsAddrs),
 	}); err != nil {
 		str.Reset()
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, err
 	}
 
 	// wait for a CONNECT message from the remote peer
 	var msg pb.HolePunch
 	if err := rd.ReadMsg(&msg); err != nil {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, fmt.Errorf("failed to read CONNECT message from remote peer: %w", err)
 	}
 	rtt := time.Since(start)
 	if t := msg.GetType(); t != pb.HolePunch_CONNECT {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, fmt.Errorf("expect CONNECT message, got %s", t)
 	}
 
@@ -241,12 +246,15 @@ func (hp *holePuncher) initiateHolePunchImpl(str network.Stream) ([]ma.Multiaddr
 	}
 
 	if len(addrs) == 0 {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, errors.New("didn't receive any public addresses in CONNECT")
 	}
 
 	if err := w.WriteMsg(&pb.HolePunch{Type: pb.HolePunch_SYNC.Enum()}); err != nil {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return nil, nil, 0, fmt.Errorf("failed to send SYNC message for hole punching: %w", err)
 	}
+	str.Scope().ReleaseMemory(maxMsgSize)
 	return addrs, obsAddrs, rtt, nil
 }
 
@@ -269,17 +277,17 @@ func (nn *netNotifiee) Connected(_ network.Network, conn network.Conn) {
 	if conn.Stat().Direction == network.DirInbound && isRelayAddress(conn.RemoteMultiaddr()) {
 		hs.refCount.Add(1)
 		go func() {
-			defer hs.refCount.Done()
-
 			select {
 			// waiting for Identify here will allow us to access the peer's public and observed addresses
 			// that we can dial to for a hole punch.
 			case <-hs.ids.IdentifyWait(conn):
 			case <-hs.ctx.Done():
+				hs.refCount.Done()
 				return
 			}
 
 			_ = hs.DirectConnect(conn.RemotePeer())
+			hs.refCount.Done()
 		}()
 	}
 }

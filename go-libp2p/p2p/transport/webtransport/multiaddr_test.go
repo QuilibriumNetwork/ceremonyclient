@@ -12,6 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestWebtransportMultiaddr(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		addr, err := toWebtransportMultiaddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337})
@@ -67,7 +72,7 @@ func TestExtractCertHashes(t *testing.T) {
 		{addr: fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/%s", fooHash), hashes: []string{"foo"}},
 		{addr: fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/%s/certhash/%s", fooHash, barHash), hashes: []string{"foo", "bar"}},
 	} {
-		ch, err := extractCertHashes(ma.StringCast(tc.addr))
+		ch, err := extractCertHashes(tStringCast(tc.addr))
 		require.NoError(t, err)
 		require.Len(t, ch, len(tc.hashes))
 		for i, h := range tc.hashes {
@@ -88,7 +93,7 @@ func TestWebtransportResolve(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc, func(t *testing.T) {
-			outMa, err := tpt.Resolve(ctx, ma.StringCast(tc))
+			outMa, err := tpt.Resolve(ctx, tStringCast(tc))
 			require.NoError(t, err)
 			sni, err := outMa[0].ValueForProtocol(ma.P_SNI)
 			require.NoError(t, err)
@@ -97,7 +102,7 @@ func TestWebtransportResolve(t *testing.T) {
 	}
 
 	t.Run("No sni", func(t *testing.T) {
-		outMa, err := tpt.Resolve(ctx, ma.StringCast("/ip4/127.0.0.1/udp/1337/quic-v1/webtransport"))
+		outMa, err := tpt.Resolve(ctx, tStringCast("/ip4/127.0.0.1/udp/1337/quic-v1/webtransport"))
 		require.NoError(t, err)
 		_, err = outMa[0].ValueForProtocol(ma.P_SNI)
 		require.Error(t, err)
@@ -123,7 +128,7 @@ func TestIsWebtransportMultiaddr(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.addr, func(t *testing.T) {
-			got, n := IsWebtransportMultiaddr(ma.StringCast(tc.addr))
+			got, n := IsWebtransportMultiaddr(tStringCast(tc.addr))
 			require.Equal(t, tc.want, got)
 			require.Equal(t, tc.certhashCount, n)
 		})

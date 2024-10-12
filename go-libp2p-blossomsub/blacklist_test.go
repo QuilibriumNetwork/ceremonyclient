@@ -38,11 +38,16 @@ func TestBlacklist(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 2)
+	psubs := getBlossomSubs(ctx, hosts)
 	connect(t, hosts[0], hosts[1])
 
-	sub, err := psubs[1].Subscribe([]byte{0xff, 0x00, 0x00, 0x00})
+	bitmasks, err := psubs[0].Join([]byte{0x00, 0x80, 0x00, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := psubs[1].Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,11 +56,11 @@ func TestBlacklist(t *testing.T) {
 	psubs[1].BlacklistPeer(hosts[0].ID())
 	time.Sleep(time.Millisecond * 100)
 
-	psubs[0].Publish([]byte{0xff, 0x00, 0x00, 0x00}, []byte("message"))
+	bitmasks[0].Publish(ctx, bitmasks[0].bitmask, []byte("message"))
 
 	wctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	_, err = sub.Next(wctx)
+	_, err = sub[0].Next(wctx)
 
 	if err == nil {
 		t.Fatal("got message from blacklisted peer")
@@ -66,16 +71,21 @@ func TestBlacklist2(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 2)
+	psubs := getBlossomSubs(ctx, hosts)
 	connect(t, hosts[0], hosts[1])
 
-	_, err := psubs[0].Subscribe([]byte{0xff, 0x00, 0x00, 0x00})
+	bitmasks, err := psubs[0].Join([]byte{0x00, 0x80, 0x00, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	sub1, err := psubs[1].Subscribe([]byte{0xff, 0x00, 0x00, 0x00})
+	_, err = psubs[0].Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub1, err := psubs[1].Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,11 +94,11 @@ func TestBlacklist2(t *testing.T) {
 	psubs[1].BlacklistPeer(hosts[0].ID())
 	time.Sleep(time.Millisecond * 100)
 
-	psubs[0].Publish([]byte{0xff, 0x00, 0x00, 0x00}, []byte("message"))
+	bitmasks[0].Publish(ctx, bitmasks[0].bitmask, []byte("message"))
 
 	wctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	_, err = sub1.Next(wctx)
+	_, err = sub1[0].Next(wctx)
 
 	if err == nil {
 		t.Fatal("got message from blacklisted peer")
@@ -99,25 +109,30 @@ func TestBlacklist3(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts := getDefaultHosts(t, 2)
+	psubs := getBlossomSubs(ctx, hosts)
 
 	psubs[1].BlacklistPeer(hosts[0].ID())
 	time.Sleep(time.Millisecond * 100)
 	connect(t, hosts[0], hosts[1])
 
-	sub, err := psubs[1].Subscribe([]byte{0xff, 0x00, 0x00, 0x00})
+	bitmasks, err := psubs[0].Join([]byte{0x00, 0x80, 0x00, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := psubs[1].Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 100)
 
-	psubs[0].Publish([]byte{0xff, 0x00, 0x00, 0x00}, []byte("message"))
+	bitmasks[0].Publish(ctx, bitmasks[0].bitmask, []byte("message"))
 
 	wctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	_, err = sub.Next(wctx)
+	_, err = sub[0].Next(wctx)
 
 	if err == nil {
 		t.Fatal("got message from blacklisted peer")

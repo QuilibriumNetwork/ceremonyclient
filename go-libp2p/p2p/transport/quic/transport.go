@@ -194,15 +194,15 @@ func (t *transport) holePunch(ctx context.Context, raddr ma.Multiaddr, p peer.ID
 	if err != nil {
 		return nil, err
 	}
-	defer tr.DecreaseCount()
 
 	ctx, cancel := context.WithTimeout(ctx, HolePunchTimeout)
-	defer cancel()
 
 	key := holePunchKey{addr: addr.String(), peer: p}
 	t.holePunchingMx.Lock()
 	if _, ok := t.holePunching[key]; ok {
 		t.holePunchingMx.Unlock()
+		tr.DecreaseCount()
+		cancel()
 		return nil, fmt.Errorf("already punching hole for %s", addr)
 	}
 	connCh := make(chan tpt.CapableConn, 1)
@@ -210,11 +210,6 @@ func (t *transport) holePunch(ctx context.Context, raddr ma.Multiaddr, p peer.ID
 	t.holePunchingMx.Unlock()
 
 	var timer *time.Timer
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
 
 	payload := make([]byte, 64)
 	var punchErr error
@@ -247,6 +242,11 @@ loop:
 			t.holePunchingMx.Lock()
 			delete(t.holePunching, key)
 			t.holePunchingMx.Unlock()
+			tr.DecreaseCount()
+			cancel()
+			if timer != nil {
+				timer.Stop()
+			}
 			return c, nil
 		case <-timer.C:
 		case <-ctx.Done():
@@ -256,14 +256,24 @@ loop:
 	}
 	// we only arrive here if punchErr != nil
 	t.holePunchingMx.Lock()
-	defer func() {
-		delete(t.holePunching, key)
-		t.holePunchingMx.Unlock()
-	}()
 	select {
 	case c := <-t.holePunching[key].connCh:
+		tr.DecreaseCount()
+		cancel()
+		if timer != nil {
+			timer.Stop()
+		}
+		delete(t.holePunching, key)
+		t.holePunchingMx.Unlock()
 		return c, nil
 	default:
+		tr.DecreaseCount()
+		cancel()
+		if timer != nil {
+			timer.Stop()
+		}
+		delete(t.holePunching, key)
+		t.holePunchingMx.Unlock()
 		return nil, punchErr
 	}
 }
@@ -294,7 +304,6 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	}
 
 	t.listenersMu.Lock()
-	defer t.listenersMu.Unlock()
 	listeners := t.listeners[udpAddr.String()]
 	var underlyingListener *listener
 	var acceptRunner *acceptLoopRunner
@@ -304,16 +313,19 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 		acceptRunner = listeners[0].acceptRunnner
 		// Make sure our underlying listener is listening on the specified QUIC version
 		if _, ok := underlyingListener.localMultiaddrs[version]; !ok {
+			t.listenersMu.Unlock()
 			return nil, fmt.Errorf("can't listen on quic version %v, underlying listener doesn't support it", version)
 		}
 	} else {
 		ln, err := t.connManager.ListenQUIC(addr, &tlsConf, t.allowWindowIncrease)
 		if err != nil {
+			t.listenersMu.Unlock()
 			return nil, err
 		}
 		l, err := newListener(ln, t, t.localPeer, t.privKey, t.rcmgr)
 		if err != nil {
 			_ = ln.Close()
+			t.listenersMu.Unlock()
 			return nil, err
 		}
 		underlyingListener = &l
@@ -335,7 +347,7 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 
 	listeners = append(listeners, l)
 	t.listeners[udpAddr.String()] = listeners
-
+	t.listenersMu.Unlock()
 	return l, nil
 }
 
@@ -373,7 +385,6 @@ func (t *transport) Close() error {
 
 func (t *transport) CloseVirtualListener(l *virtualListener) error {
 	t.listenersMu.Lock()
-	defer t.listenersMu.Unlock()
 
 	var err error
 	listeners := t.listeners[l.udpAddr]
@@ -381,6 +392,7 @@ func (t *transport) CloseVirtualListener(l *virtualListener) error {
 		// This is the last virtual listener here, so we can close the underlying listener
 		err = l.listener.Close()
 		delete(t.listeners, l.udpAddr)
+		t.listenersMu.Unlock()
 		return err
 	}
 
@@ -394,6 +406,6 @@ func (t *transport) CloseVirtualListener(l *virtualListener) error {
 		}
 	}
 
+	t.listenersMu.Unlock()
 	return nil
-
 }

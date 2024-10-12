@@ -1,6 +1,7 @@
 package master
 
 import (
+	"bytes"
 	"time"
 
 	"github.com/pkg/errors"
@@ -13,19 +14,28 @@ func (e *MasterClockConsensusEngine) prove(
 	previousFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
 	e.logger.Debug("proving new frame")
+	if bytes.Equal(e.pubSub.GetPeerID(), []byte(e.beacon)) {
+		e.collectedProverSlotsMx.Lock()
+		collectedProverSlots := e.collectedProverSlots
+		e.collectedProverSlots = []*protobufs.InclusionAggregateProof{}
+		e.collectedProverSlotsMx.Unlock()
 
-	frame, err := e.frameProver.ProveMasterClockFrame(
-		previousFrame,
-		time.Now().UnixMilli(),
-		e.difficulty,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "prove")
+		frame, err := e.frameProver.ProveMasterClockFrame(
+			previousFrame,
+			time.Now().UnixMilli(),
+			e.difficulty,
+			collectedProverSlots,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "prove")
+		}
+
+		e.state = consensus.EngineStatePublishing
+		e.logger.Debug("returning new proven frame")
+		return frame, nil
 	}
 
-	e.state = consensus.EngineStatePublishing
-	e.logger.Debug("returning new proven frame")
-	return frame, nil
+	return previousFrame, nil
 }
 
 func (e *MasterClockConsensusEngine) GetMostAheadPeers() (

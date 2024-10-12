@@ -76,15 +76,16 @@ func (pb *memoryProtoBook) internProtocol(proto protocol.ID) protocol.ID {
 
 	// intern with the write lock
 	pb.lk.Lock()
-	defer pb.lk.Unlock()
 
 	// check again in case it got interned in between locks
 	interned, ok = pb.interned[proto]
 	if ok {
+		pb.lk.Unlock()
 		return interned
 	}
 
 	pb.interned[proto] = proto
+	pb.lk.Unlock()
 	return proto
 }
 
@@ -109,7 +110,6 @@ func (pb *memoryProtoBook) SetProtocols(p peer.ID, protos ...protocol.ID) error 
 func (pb *memoryProtoBook) AddProtocols(p peer.ID, protos ...protocol.ID) error {
 	s := pb.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
 
 	protomap, ok := s.protocols[p]
 	if !ok {
@@ -117,49 +117,51 @@ func (pb *memoryProtoBook) AddProtocols(p peer.ID, protos ...protocol.ID) error 
 		s.protocols[p] = protomap
 	}
 	if len(protomap)+len(protos) > pb.maxProtos {
+		s.Unlock()
 		return errTooManyProtocols
 	}
 
 	for _, proto := range protos {
 		protomap[pb.internProtocol(proto)] = struct{}{}
 	}
+	s.Unlock()
 	return nil
 }
 
 func (pb *memoryProtoBook) GetProtocols(p peer.ID) ([]protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
 	out := make([]protocol.ID, 0, len(s.protocols[p]))
 	for k := range s.protocols[p] {
 		out = append(out, k)
 	}
 
+	s.RUnlock()
 	return out, nil
 }
 
 func (pb *memoryProtoBook) RemoveProtocols(p peer.ID, protos ...protocol.ID) error {
 	s := pb.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
 
 	protomap, ok := s.protocols[p]
 	if !ok {
 		// nothing to remove.
+		s.Unlock()
 		return nil
 	}
 
 	for _, proto := range protos {
 		delete(protomap, pb.internProtocol(proto))
 	}
+	s.Unlock()
 	return nil
 }
 
 func (pb *memoryProtoBook) SupportsProtocols(p peer.ID, protos ...protocol.ID) ([]protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
 	out := make([]protocol.ID, 0, len(protos))
 	for _, proto := range protos {
@@ -168,19 +170,21 @@ func (pb *memoryProtoBook) SupportsProtocols(p peer.ID, protos ...protocol.ID) (
 		}
 	}
 
+	s.RUnlock()
 	return out, nil
 }
 
 func (pb *memoryProtoBook) FirstSupportedProtocol(p peer.ID, protos ...protocol.ID) (protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
 	for _, proto := range protos {
 		if _, ok := s.protocols[p][proto]; ok {
+			s.RUnlock()
 			return proto, nil
 		}
 	}
+	s.RUnlock()
 	return "", nil
 }
 

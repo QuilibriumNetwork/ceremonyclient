@@ -48,27 +48,30 @@ func newConstraints(rc *Resources) *constraints {
 // If adding this reservation violates IP constraints, an error is returned.
 func (c *constraints) AddReservation(p peer.ID, a ma.Multiaddr) error {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
 
 	now := time.Now()
 	c.cleanup(now)
 
 	if len(c.total) >= c.rc.MaxReservations {
+		c.mutex.Unlock()
 		return errTooManyReservations
 	}
 
 	ip, err := manet.ToIP(a)
 	if err != nil {
+		c.mutex.Unlock()
 		return errors.New("no IP address associated with peer")
 	}
 
 	peerReservations := c.peers[p]
 	if len(peerReservations) >= c.rc.MaxReservationsPerPeer {
+		c.mutex.Unlock()
 		return errTooManyReservationsForPeer
 	}
 
 	ipReservations := c.ips[ip.String()]
 	if len(ipReservations) >= c.rc.MaxReservationsPerIP {
+		c.mutex.Unlock()
 		return errTooManyReservationsForIP
 	}
 
@@ -79,6 +82,7 @@ func (c *constraints) AddReservation(p peer.ID, a ma.Multiaddr) error {
 		if asn != 0 {
 			asnReservations = c.asns[asn]
 			if len(asnReservations) >= c.rc.MaxReservationsPerASN {
+				c.mutex.Unlock()
 				return errTooManyReservationsForASN
 			}
 		}
@@ -97,6 +101,7 @@ func (c *constraints) AddReservation(p peer.ID, a ma.Multiaddr) error {
 		asnReservations = append(asnReservations, expiry)
 		c.asns[asn] = asnReservations
 	}
+	c.mutex.Unlock()
 	return nil
 }
 

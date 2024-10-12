@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
+	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -21,8 +24,8 @@ import (
 )
 
 const (
-	// BlossomSubID_v12 is the protocol ID for version 1.2.1 of the BlossomSub protocol.
-	BlossomSubID_v12 = protocol.ID("/blossomsub/1.2.1")
+	// BlossomSubID_v2 is the protocol ID for version 2.0.0 of the BlossomSub protocol.
+	BlossomSubID_v2 = protocol.ID("/blossomsub/2.0.0")
 )
 
 // Defines the default BlossomSub parameters.
@@ -35,8 +38,8 @@ var (
 	BlossomSubHistoryLength                    = 5
 	BlossomSubHistoryGossip                    = 3
 	BlossomSubDlazy                            = 6
-	BlossomSubGossipFactor                     = 0.25
-	BlossomSubGossipRetransmission             = 1
+	BlossomSubGossipRetransmission             = 3
+	BlossomSubBitmaskWidth                     = 256
 	BlossomSubHeartbeatInitialDelay            = 100 * time.Millisecond
 	BlossomSubHeartbeatInterval                = 1 * time.Second
 	BlossomSubFanoutTTL                        = 60 * time.Second
@@ -87,6 +90,9 @@ type BlossomSubParams struct {
 	// Dout must be set below Dlo, and must not exceed D / 2.
 	Dout int
 
+	// BitmaskWidth sets the size of the bitmask for subscriptions.
+	BitmaskWidth int
+
 	// gossip parameters
 
 	// HistoryLength controls the size of the message cache used for gossip.
@@ -105,14 +111,8 @@ type BlossomSubParams struct {
 
 	// Dlazy affects how many peers we will emit gossip to at each heartbeat.
 	// We will send gossip to at least Dlazy peers outside our mesh. The actual
-	// number may be more, depending on GossipFactor and how many peers we're
-	// connected to.
+	// number may be less, depending on how many peers we're connected to.
 	Dlazy int
-
-	// GossipFactor affects how many peers we will emit gossip to at each heartbeat.
-	// We will send gossip to GossipFactor * (total number of non-mesh peers), or
-	// Dlazy, whichever is greater.
-	GossipFactor float64
 
 	// GossipRetransmission controls how many times we will allow a peer to request
 	// the same message id through IWANT gossip before we start ignoring them. This is designed
@@ -214,7 +214,7 @@ func NewBlossomSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, 
 }
 
 // NewBlossomSubRouter returns a new BlossomSubRouter with custom parameters.
-func NewBlossomSubRouter(h host.Host, params BlossomSubParams, addrBook peerstore.AddrBook) *BlossomSubRouter {
+func NewBlossomSubRouter(h host.Host, params BlossomSubParams) *BlossomSubRouter {
 	return &BlossomSubRouter{
 		peers:     make(map[peer.ID]protocol.ID),
 		mesh:      make(map[string]map[peer.ID]struct{}),
@@ -222,7 +222,7 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, addrBook peerstor
 		lastpub:   make(map[string]int64),
 		gossip:    make(map[peer.ID][]*pb.ControlIHave),
 		control:   make(map[peer.ID]*pb.ControlMessage),
-		cab:       addrBook,
+		cab:       pstoremem.NewAddrBook(),
 		backoff:   make(map[string]map[peer.ID]time.Time),
 		peerhave:  make(map[peer.ID]int),
 		iasked:    make(map[peer.ID]int),
@@ -272,7 +272,6 @@ func DefaultBlossomSubParams() BlossomSubParams {
 		HistoryLength:             BlossomSubHistoryLength,
 		HistoryGossip:             BlossomSubHistoryGossip,
 		Dlazy:                     BlossomSubDlazy,
-		GossipFactor:              BlossomSubGossipFactor,
 		GossipRetransmission:      BlossomSubGossipRetransmission,
 		HeartbeatInitialDelay:     BlossomSubHeartbeatInitialDelay,
 		HeartbeatInterval:         BlossomSubHeartbeatInterval,
@@ -453,6 +452,7 @@ type BlossomSubRouter struct {
 	backoff  map[string]map[peer.ID]time.Time // prune backoff
 	connect  chan connectInfo                 // px connection requests
 	cab      peerstore.AddrBook
+	meshMx   sync.RWMutex
 
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
@@ -556,11 +556,18 @@ func (bs *BlossomSubRouter) manageAddrBook() {
 		log.Errorf("failed to subscribe to peer identification events: %v", err)
 		return
 	}
-	defer sub.Close()
 
 	for {
 		select {
 		case <-bs.p.ctx.Done():
+			cabCloser, ok := bs.cab.(io.Closer)
+			if ok {
+				errClose := cabCloser.Close()
+				if errClose != nil {
+					log.Warnf("failed to close addr book: %v", errClose)
+				}
+			}
+			sub.Close()
 			return
 		case ev := <-sub.Out():
 			switch ev := ev.(type) {
@@ -620,9 +627,11 @@ func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
 	bs.tracer.RemovePeer(p)
 	delete(bs.peers, p)
+	bs.meshMx.Lock()
 	for _, peers := range bs.mesh {
 		delete(peers, p)
 	}
+	bs.meshMx.Unlock()
 	for _, peers := range bs.fanout {
 		delete(peers, p)
 	}
@@ -638,7 +647,7 @@ func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 		return false
 	}
 
-	fsPeers, gsPeers := 0, 0
+	fsPeers, bsPeers := 0, 0
 	// floodsub peers
 	for p := range tmap {
 		if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) {
@@ -646,14 +655,16 @@ func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
 		}
 	}
 
+	bs.meshMx.RLock()
 	// BlossomSub peers
-	gsPeers = len(bs.mesh[string(bitmask)])
+	bsPeers = len(bs.mesh[string(bitmask)])
+	bs.meshMx.RUnlock()
 
 	if suggested == 0 {
 		suggested = bs.params.Dlo
 	}
 
-	if fsPeers+gsPeers >= suggested || gsPeers >= bs.params.Dhi {
+	if fsPeers+bsPeers >= suggested || bsPeers >= bs.params.Dhi {
 		return true
 	}
 
@@ -719,7 +730,9 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 	iwant := make(map[string]struct{})
 	for _, ihave := range ctl.GetIhave() {
 		bitmask := ihave.GetBitmask()
+		bs.meshMx.RLock()
 		_, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -728,11 +741,18 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 			continue
 		}
 
-		for _, mid := range ihave.GetMessageIDs() {
+	checkIwantMsgsLoop:
+		for msgIdx, mid := range ihave.GetMessageIDs() {
+			// prevent remote peer from sending too many msg_ids on a single IHAVE message
+			if msgIdx >= bs.params.MaxIHaveLength {
+				log.Debugf("IHAVE: peer %s has sent IHAVE on bitmask %s with too many messages (%d); ignoring remaining msgs", p, bitmask, len(ihave.MessageIDs))
+				break checkIwantMsgsLoop
+			}
+
 			if bs.p.seenMessage(mid) {
 				continue
 			}
-			iwant[mid] = struct{}{}
+			iwant[string(mid)] = struct{}{}
 		}
 	}
 
@@ -747,9 +767,9 @@ func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb
 
 	log.Debugf("IHAVE: Asking for %d out of %d messages from %s", iask, len(iwant), p)
 
-	iwantlst := make([]string, 0, len(iwant))
+	iwantlst := make([][]byte, 0, len(iwant))
 	for mid := range iwant {
-		iwantlst = append(iwantlst, mid)
+		iwantlst = append(iwantlst, []byte(mid))
 	}
 
 	// truncate to the messages we are actually asking for and update the iasked counter
@@ -786,7 +806,7 @@ func (bs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb
 				continue
 			}
 
-			ihave[mid] = msg.Message
+			ihave[string(mid)] = msg.Message
 		}
 	}
 
@@ -818,7 +838,9 @@ func (bs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 			continue
 		}
 
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			// don't do PX when there is an unknown bitmask to avoid leaking our peers
 			doPX = false
@@ -907,7 +929,9 @@ func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -1046,57 +1070,73 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 
 	tosend := make(map[peer.ID]struct{})
 
-	// any peers in the bitmask?
-	tmap, ok := bs.p.bitmasks[string(bitmask)]
-	if !ok {
-		return
-	}
-
-	if bs.floodPublish && from == bs.p.host.ID() {
-		for p := range tmap {
-			_, direct := bs.direct[p]
-			if direct || bs.score.Score(p) >= bs.publishThreshold {
-				tosend[p] = struct{}{}
-			}
-		}
-	} else {
-		// direct peers
-		for p := range bs.direct {
-			_, inBitmask := tmap[p]
-			if inBitmask {
-				tosend[p] = struct{}{}
-			}
+	sliced := SliceBitmask(bitmask)
+	// bloom publish:
+	if len(sliced) != 1 {
+		// any peers in all slices of the bitmask?
+		peers := bs.p.getPeersInBitmask(bitmask)
+		if len(peers) == 0 {
+			return
 		}
 
-		// floodsub peers
-		for p := range tmap {
-			if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && bs.score.Score(p) >= bs.publishThreshold {
-				tosend[p] = struct{}{}
-			}
+		for _, p := range peers {
+			tosend[p] = struct{}{}
 		}
-
-		// BlossomSub peers
-		gmap, ok := bs.mesh[string(bitmask)]
+	} else { // classic gossip mesh
+		// any peers in the bitmask?
+		tmap, ok := bs.p.bitmasks[string(bitmask)]
 		if !ok {
-			// we are not in the mesh for bitmask, use fanout peers
-			gmap, ok = bs.fanout[string(bitmask)]
-			if !ok || len(gmap) == 0 {
-				// we don't have any, pick some with score above the publish threshold
-				peers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
-					_, direct := bs.direct[p]
-					return !direct && bs.score.Score(p) >= bs.publishThreshold
-				})
+			return
+		}
 
-				if len(peers) > 0 {
-					gmap = peerListToMap(peers)
-					bs.fanout[string(bitmask)] = gmap
+		if bs.floodPublish && from == bs.p.host.ID() {
+			for p := range tmap {
+				_, direct := bs.direct[p]
+				if direct || bs.score.Score(p) >= bs.publishThreshold {
+					tosend[p] = struct{}{}
 				}
 			}
-			bs.lastpub[string(bitmask)] = time.Now().UnixNano()
-		}
+		} else {
+			// direct peers
+			for p := range bs.direct {
+				_, inBitmask := tmap[p]
+				if inBitmask {
+					tosend[p] = struct{}{}
+				}
+			}
 
-		for p := range gmap {
-			tosend[p] = struct{}{}
+			// floodsub peers
+			for p := range tmap {
+				if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && bs.score.Score(p) >= bs.publishThreshold {
+					tosend[p] = struct{}{}
+				}
+			}
+
+			// BlossomSub peers
+			bs.meshMx.RLock()
+			gmap, ok := bs.mesh[string(bitmask)]
+			bs.meshMx.RUnlock()
+			if !ok {
+				// we are not in the mesh for bitmask, use fanout peers
+				gmap, ok = bs.fanout[string(bitmask)]
+				if !ok || len(gmap) == 0 {
+					// we don't have any, pick some with score above the publish threshold
+					peers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
+						_, direct := bs.direct[p]
+						return !direct && bs.score.Score(p) >= bs.publishThreshold
+					})
+
+					if len(peers) > 0 {
+						gmap = peerListToMap(peers)
+						bs.fanout[string(bitmask)] = gmap
+					}
+				}
+				bs.lastpub[string(bitmask)] = time.Now().UnixNano()
+			}
+
+			for p := range gmap {
+				tosend[p] = struct{}{}
+			}
 		}
 	}
 
@@ -1111,7 +1151,9 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 }
 
 func (bs *BlossomSubRouter) Join(bitmask []byte) {
+	bs.meshMx.RLock()
 	gmap, ok := bs.mesh[string(bitmask)]
+	bs.meshMx.RUnlock()
 	if ok {
 		return
 	}
@@ -1146,7 +1188,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 			}
 		}
 
+		bs.meshMx.Lock()
 		bs.mesh[string(bitmask)] = gmap
+		bs.meshMx.Unlock()
 		delete(bs.fanout, string(bitmask))
 		delete(bs.lastpub, string(bitmask))
 	} else {
@@ -1158,7 +1202,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 			return !direct && !doBackOff && bs.score.Score(p) >= 0
 		})
 		gmap = peerListToMap(peers)
+		bs.meshMx.Lock()
 		bs.mesh[string(bitmask)] = gmap
+		bs.meshMx.Unlock()
 	}
 
 	for p := range gmap {
@@ -1169,7 +1215,9 @@ func (bs *BlossomSubRouter) Join(bitmask []byte) {
 }
 
 func (bs *BlossomSubRouter) Leave(bitmask []byte) {
+	bs.meshMx.RLock()
 	gmap, ok := bs.mesh[string(bitmask)]
+	bs.meshMx.RUnlock()
 	if !ok {
 		return
 	}
@@ -1177,7 +1225,9 @@ func (bs *BlossomSubRouter) Leave(bitmask []byte) {
 	log.Debugf("LEAVE %s", bitmask)
 	bs.tracer.Leave(bitmask)
 
+	bs.meshMx.Lock()
 	delete(bs.mesh, string(bitmask))
+	bs.meshMx.Unlock()
 
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, bitmask)
@@ -1226,7 +1276,9 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 		delete(bs.gossip, p)
 	}
 
+	bs.p.peersMx.RLock()
 	mch, ok := bs.p.peers[p]
+	bs.p.peersMx.RUnlock()
 	if !ok {
 		return
 	}
@@ -1237,8 +1289,9 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 		return
 	}
 
+	outCopy := copyRPC(out)
 	// Potentially split the RPC into multiple RPCs that are below the max message size
-	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, *out)
+	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, outCopy)
 	for _, rpc := range outRPCs {
 		if rpc.Size() > bs.p.maxMessageSize {
 			// This should only happen if a single message/control is above the maxMessageSize.
@@ -1273,19 +1326,19 @@ func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
 // If an RPC is too large and can't be split further (e.g. Message data is
 // bigger than the RPC limit), then it will be returned as an oversized RPC.
 // The caller should filter out oversized RPCs.
-func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
+func appendOrMergeRPC(slice []*RPC, limit int, elems ...*RPC) []*RPC {
 	if len(elems) == 0 {
 		return slice
 	}
 
 	if len(slice) == 0 && len(elems) == 1 && elems[0].Size() < limit {
 		// Fast path: no merging needed and only one element
-		return append(slice, &elems[0])
+		return append(slice, elems[0])
 	}
 
 	out := slice
 	if len(out) == 0 {
-		out = append(out, &RPC{RPC: pb.RPC{}})
+		out = append(out, &RPC{RPC: &pb.RPC{}})
 		out[0].from = elems[0].from
 	}
 
@@ -1299,7 +1352,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 		for _, msg := range elem.GetPublish() {
 			if lastRPC.Publish = append(lastRPC.Publish, msg); lastRPC.Size() > limit {
 				lastRPC.Publish = lastRPC.Publish[:len(lastRPC.Publish)-1]
-				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC = &RPC{RPC: &pb.RPC{}, from: elem.from}
 				lastRPC.Publish = append(lastRPC.Publish, msg)
 				out = append(out, lastRPC)
 			}
@@ -1309,7 +1362,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 		for _, sub := range elem.GetSubscriptions() {
 			if lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub); lastRPC.Size() > limit {
 				lastRPC.Subscriptions = lastRPC.Subscriptions[:len(lastRPC.Subscriptions)-1]
-				lastRPC = &RPC{RPC: pb.RPC{}, from: elem.from}
+				lastRPC = &RPC{RPC: &pb.RPC{}, from: elem.from}
 				lastRPC.Subscriptions = append(lastRPC.Subscriptions, sub)
 				out = append(out, lastRPC)
 			}
@@ -1321,7 +1374,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 				lastRPC.Control = &pb.ControlMessage{}
 				if lastRPC.Size() > limit {
 					lastRPC.Control = nil
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					out = append(out, lastRPC)
 				}
 			}
@@ -1329,7 +1382,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 			for _, graft := range ctl.GetGraft() {
 				if lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft); lastRPC.Size() > limit {
 					lastRPC.Control.Graft = lastRPC.Control.Graft[:len(lastRPC.Control.Graft)-1]
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					lastRPC.Control.Graft = append(lastRPC.Control.Graft, graft)
 					out = append(out, lastRPC)
 				}
@@ -1338,7 +1391,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 			for _, prune := range ctl.GetPrune() {
 				if lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune); lastRPC.Size() > limit {
 					lastRPC.Control.Prune = lastRPC.Control.Prune[:len(lastRPC.Control.Prune)-1]
-					lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
+					lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{}}, from: elem.from}
 					lastRPC.Control.Prune = append(lastRPC.Control.Prune, prune)
 					out = append(out, lastRPC)
 				}
@@ -1352,7 +1405,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					newIWant := &pb.ControlIWant{}
 					if lastRPC.Control.Iwant = append(lastRPC.Control.Iwant, newIWant); lastRPC.Size() > limit {
 						lastRPC.Control.Iwant = lastRPC.Control.Iwant[:len(lastRPC.Control.Iwant)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Iwant: []*pb.ControlIWant{newIWant},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
@@ -1361,8 +1414,8 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 				for _, msgID := range iwant.GetMessageIDs() {
 					if lastRPC.Control.Iwant[0].MessageIDs = append(lastRPC.Control.Iwant[0].MessageIDs, msgID); lastRPC.Size() > limit {
 						lastRPC.Control.Iwant[0].MessageIDs = lastRPC.Control.Iwant[0].MessageIDs[:len(lastRPC.Control.Iwant[0].MessageIDs)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
-							Iwant: []*pb.ControlIWant{{MessageIDs: []string{msgID}}},
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
+							Iwant: []*pb.ControlIWant{{MessageIDs: [][]byte{msgID}}},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
 					}
@@ -1376,7 +1429,7 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					newIhave := &pb.ControlIHave{Bitmask: ihave.Bitmask}
 					if lastRPC.Control.Ihave = append(lastRPC.Control.Ihave, newIhave); lastRPC.Size() > limit {
 						lastRPC.Control.Ihave = lastRPC.Control.Ihave[:len(lastRPC.Control.Ihave)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
 							Ihave: []*pb.ControlIHave{newIhave},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
@@ -1386,8 +1439,8 @@ func appendOrMergeRPC(slice []*RPC, limit int, elems ...RPC) []*RPC {
 					lastIHave := lastRPC.Control.Ihave[len(lastRPC.Control.Ihave)-1]
 					if lastIHave.MessageIDs = append(lastIHave.MessageIDs, msgID); lastRPC.Size() > limit {
 						lastIHave.MessageIDs = lastIHave.MessageIDs[:len(lastIHave.MessageIDs)-1]
-						lastRPC = &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
-							Ihave: []*pb.ControlIHave{{Bitmask: ihave.Bitmask, MessageIDs: []string{msgID}}},
+						lastRPC = &RPC{RPC: &pb.RPC{Control: &pb.ControlMessage{
+							Ihave: []*pb.ControlIHave{{Bitmask: ihave.Bitmask, MessageIDs: [][]byte{msgID}}},
 						}}, from: elem.from}
 						out = append(out, lastRPC)
 					}
@@ -1408,7 +1461,6 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 	}
 
 	ticker := time.NewTicker(bs.params.HeartbeatInterval)
-	defer ticker.Stop()
 
 	for {
 		select {
@@ -1416,9 +1468,11 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 			select {
 			case bs.p.eval <- bs.heartbeat:
 			case <-bs.p.ctx.Done():
+				ticker.Stop()
 				return
 			}
 		case <-bs.p.ctx.Done():
+			ticker.Stop()
 			return
 		}
 	}
@@ -1426,14 +1480,6 @@ func (bs *BlossomSubRouter) heartbeatTimer() {
 
 func (bs *BlossomSubRouter) heartbeat() {
 	start := time.Now()
-	defer func() {
-		if bs.params.SlowHeartbeatWarning > 0 {
-			slowWarning := time.Duration(bs.params.SlowHeartbeatWarning * float64(bs.params.HeartbeatInterval))
-			if dt := time.Since(start); dt > slowWarning {
-				log.Warnw("slow heartbeat", "took", dt)
-			}
-		}
-	}()
 
 	bs.heartbeatTicks++
 
@@ -1465,6 +1511,7 @@ func (bs *BlossomSubRouter) heartbeat() {
 	}
 
 	// maintain the mesh for bitmasks we have joined
+	bs.meshMx.Lock()
 	for bitmask, peers := range bs.mesh {
 		bitmask := []byte(bitmask)
 		prunePeer := func(p peer.ID) {
@@ -1521,7 +1568,9 @@ func (bs *BlossomSubRouter) heartbeat() {
 
 			// We keep the first D_score peers by score and the remaining up to D randomly
 			// under the constraint that we keep D_out peers in the mesh (if we have that many)
-			shufflePeers(plst[bs.params.Dscore:])
+			if len(plst) > bs.params.Dscore {
+				shufflePeers(plst[bs.params.Dscore:])
+			}
 
 			// count the outbound peers we are keeping
 			outbound := 0
@@ -1637,7 +1686,15 @@ func (bs *BlossomSubRouter) heartbeat() {
 		// 2nd arg are mesh peers excluded from gossip. We already push
 		// messages to them, so its redundant to gossip IHAVEs.
 		bs.emitGossip(bitmask, peers)
+
+		if bs.params.SlowHeartbeatWarning > 0 {
+			slowWarning := time.Duration(bs.params.SlowHeartbeatWarning * float64(bs.params.HeartbeatInterval))
+			if dt := time.Since(start); dt > slowWarning {
+				log.Warnw("slow heartbeat", "took", dt)
+			}
+		}
 	}
+	bs.meshMx.Unlock()
 
 	// expire fanout for bitmasks we haven't published to in a while
 	now := time.Now().UnixNano()
@@ -1799,7 +1856,7 @@ func (bs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	}
 
 	// shuffle to emit in random order
-	shuffleStrings(mids)
+	shuffleBytes(mids)
 
 	// if we are emitting more than BlossomSubMaxIHaveLength mids, truncate the list
 	if len(mids) > bs.params.MaxIHaveLength {
@@ -1821,10 +1878,6 @@ func (bs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	}
 
 	target := bs.params.Dlazy
-	factor := int(bs.params.GossipFactor * float64(len(peers)))
-	if factor > target {
-		target = factor
-	}
 
 	if target > len(peers) {
 		target = len(peers)
@@ -1840,8 +1893,8 @@ func (bs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 			// we do this per peer so that we emit a different set for each peer.
 			// we have enough redundancy in the system that this will significantly increase the message
 			// coverage when we do truncate.
-			peerMids = make([]string, bs.params.MaxIHaveLength)
-			shuffleStrings(mids)
+			peerMids = make([][]byte, bs.params.MaxIHaveLength)
+			shuffleBytes(mids)
 			copy(peerMids, mids)
 		}
 		bs.enqueueGossip(p, &pb.ControlIHave{Bitmask: bitmask, MessageIDs: peerMids})
@@ -1896,7 +1949,9 @@ func (bs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 
 	for _, graft := range ctl.GetGraft() {
 		bitmask := graft.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			continue
 		}
@@ -1908,7 +1963,9 @@ func (bs *BlossomSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Contro
 
 	for _, prune := range ctl.GetPrune() {
 		bitmask := prune.GetBitmask()
+		bs.meshMx.RLock()
 		peers, ok := bs.mesh[string(bitmask)]
+		bs.meshMx.RUnlock()
 		if !ok {
 			toprune = append(toprune, prune)
 			continue
@@ -1980,25 +2037,47 @@ func (bs *BlossomSubRouter) makePrune(p peer.ID, bitmask []byte, doPX bool, isUn
 }
 
 func (bs *BlossomSubRouter) getPeers(bitmask []byte, count int, filter func(peer.ID) bool) []peer.ID {
-	tmap, ok := bs.p.bitmasks[string(bitmask)]
-	if !ok {
-		return nil
-	}
+	bitmaskSlices := SliceBitmask(bitmask)
 
-	peers := make([]peer.ID, 0, len(tmap))
-	for p := range tmap {
-		if bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && filter(p) && bs.p.peerFilter(p, bitmask) {
-			peers = append(peers, p)
+	set := []peer.ID{}
+	for _, slice := range bitmaskSlices {
+		tmap, ok := bs.p.bitmasks[string(slice)]
+		if !ok {
+			return nil
+		}
+
+		peers := make([]peer.ID, 0, len(tmap))
+		for p := range tmap {
+			if bs.feature(BlossomSubFeatureMesh, bs.peers[p]) && filter(p) && bs.p.peerFilter(p, slice) {
+				peers = append(peers, p)
+			}
+		}
+
+		if len(set) == 0 {
+			set = peers
+		} else {
+			newSet := []peer.ID{}
+			for _, p := range peers {
+				if slices.Contains(set, p) {
+					newSet = append(newSet, p)
+				}
+			}
+
+			if len(newSet) == 0 {
+				return nil
+			}
+
+			set = newSet
 		}
 	}
 
-	shufflePeers(peers)
+	shufflePeers(set)
 
-	if count > 0 && len(peers) > count {
-		peers = peers[:count]
+	if count > 0 && len(set) > count {
+		set = set[:count]
 	}
 
-	return peers
+	return set
 }
 
 // WithDefaultTagTracer returns the tag tracer of the BlossomSubRouter as a PubSub option.
@@ -2039,7 +2118,7 @@ func shufflePeerInfo(peers []*pb.PeerInfo) {
 	}
 }
 
-func shuffleStrings(lst []string) {
+func shuffleBytes(lst [][]byte) {
 	for i := range lst {
 		j := rand.Intn(i + 1)
 		lst[i], lst[j] = lst[j], lst[i]

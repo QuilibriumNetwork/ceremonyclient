@@ -32,6 +32,7 @@ func (w *WesolowskiFrameProver) ProveMasterClockFrame(
 	previousFrame *protobufs.ClockFrame,
 	timestamp int64,
 	difficulty uint32,
+	aggregateProofs []*protobufs.InclusionAggregateProof,
 ) (*protobufs.ClockFrame, error) {
 	input := []byte{}
 	input = append(input, previousFrame.Filter...)
@@ -57,7 +58,7 @@ func (w *WesolowskiFrameProver) ProveMasterClockFrame(
 		Difficulty:      difficulty,
 		ParentSelector:  parent.FillBytes(make([]byte, 32)),
 		Input:           previousFrame.Output,
-		AggregateProofs: []*protobufs.InclusionAggregateProof{},
+		AggregateProofs: aggregateProofs,
 		Output:          o[:],
 	}
 
@@ -74,13 +75,6 @@ func (w *WesolowskiFrameProver) VerifyMasterClockFrame(
 	input = append(input, frame.Input...)
 
 	if len(frame.Input) < 516 {
-		return errors.Wrap(
-			errors.New("invalid input"),
-			"verify clock frame",
-		)
-	}
-
-	if len(frame.AggregateProofs) > 0 {
 		return errors.Wrap(
 			errors.New("invalid input"),
 			"verify clock frame",
@@ -301,10 +295,10 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 	difficulty uint32,
 	inclusionProof *InclusionAggregateProof,
 	proverKeys [][]byte,
-	preDusk bool,
-) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error) {
+) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error) {
+	frameProverTries := []*tries.RollingFrecencyCritbitTrie{}
 	frameProverTrie := &tries.RollingFrecencyCritbitTrie{}
-	for _, s := range proverKeys {
+	for i, s := range proverKeys {
 		addr, err := poseidon.HashBytes(s)
 		if err != nil {
 			panic(err)
@@ -313,6 +307,11 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 		addrBytes := addr.Bytes()
 		addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
 		frameProverTrie.Add(addrBytes, 0)
+
+		if i%8 == 0 && i != 0 {
+			frameProverTries = append(frameProverTries, frameProverTrie)
+			frameProverTrie = &tries.RollingFrecencyCritbitTrie{}
+		}
 	}
 
 	w.logger.Info("proving genesis frame")
@@ -322,9 +321,7 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 	input = binary.BigEndian.AppendUint64(input, 0)
 	input = binary.BigEndian.AppendUint32(input, difficulty)
 	input = append(input, origin...)
-	if !preDusk {
-		input = append(input, inclusionProof.AggregateCommitment...)
-	}
+	input = append(input, inclusionProof.AggregateCommitment...)
 
 	b := sha3.Sum256(input)
 	o := vdf.WesolowskiSolve(b, difficulty)
@@ -368,7 +365,7 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 		PublicKeySignature: nil,
 	}
 
-	return frame, frameProverTrie, nil
+	return frame, frameProverTries, nil
 }
 
 func (w *WesolowskiFrameProver) VerifyDataClockFrame(
@@ -591,14 +588,9 @@ func (w *WesolowskiFrameProver) CalculateChallengeProofDifficulty(
 
 func (w *WesolowskiFrameProver) CalculateChallengeProof(
 	challenge []byte,
-	core uint32,
-	increment uint32,
+	difficulty uint32,
 ) ([]byte, error) {
-	difficulty := w.CalculateChallengeProofDifficulty(increment)
-
-	instanceInput := binary.BigEndian.AppendUint32([]byte{}, core)
-	instanceInput = append(instanceInput, challenge...)
-	b := sha3.Sum256(instanceInput)
+	b := sha3.Sum256(challenge)
 	o := vdf.WesolowskiSolve(b, uint32(difficulty))
 
 	output := make([]byte, 516)
@@ -608,6 +600,21 @@ func (w *WesolowskiFrameProver) CalculateChallengeProof(
 }
 
 func (w *WesolowskiFrameProver) VerifyChallengeProof(
+	challenge []byte,
+	difficulty uint32,
+	proof []byte,
+) bool {
+	if len(proof) != 516 {
+		return false
+	}
+
+	b := sha3.Sum256(challenge)
+
+	check := vdf.WesolowskiVerify(b, difficulty, [516]byte(proof))
+	return check
+}
+
+func (w *WesolowskiFrameProver) VerifyPreDuskChallengeProof(
 	challenge []byte,
 	increment uint32,
 	core uint32,

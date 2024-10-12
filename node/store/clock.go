@@ -32,14 +32,13 @@ type ClockStore interface {
 	PutMasterClockFrame(frame *protobufs.ClockFrame, txn Transaction) error
 	GetLatestDataClockFrame(
 		filter []byte,
-		proverTrie *tries.RollingFrecencyCritbitTrie,
-	) (*protobufs.ClockFrame, error)
+	) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error)
 	GetEarliestDataClockFrame(filter []byte) (*protobufs.ClockFrame, error)
 	GetDataClockFrame(
 		filter []byte,
 		frameNumber uint64,
 		truncate bool,
-	) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error)
+	) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error)
 	RangeDataClockFrames(
 		filter []byte,
 		startFrameNumber uint64,
@@ -49,7 +48,7 @@ type ClockStore interface {
 		filter []byte,
 		frameNumber uint64,
 		selector []byte,
-		proverTrie *tries.RollingFrecencyCritbitTrie,
+		proverTries []*tries.RollingFrecencyCritbitTrie,
 		txn Transaction,
 		backfill bool,
 	) error
@@ -64,11 +63,6 @@ type ClockStore interface {
 		parentSelector []byte,
 		truncate bool,
 	) (*protobufs.ClockFrame, error)
-	GetCompressedDataClockFrames(
-		filter []byte,
-		fromFrameNumber uint64,
-		toFrameNumber uint64,
-	) (*protobufs.CeremonyCompressedSync, error)
 	SetLatestDataClockFrameNumber(
 		filter []byte,
 		frameNumber uint64,
@@ -410,8 +404,9 @@ func clockDataCandidateFrameKey(
 	return key
 }
 
-func clockProverTrieKey(filter []byte, frameNumber uint64) []byte {
+func clockProverTrieKey(filter []byte, ring uint16, frameNumber uint64) []byte {
 	key := []byte{CLOCK_FRAME, CLOCK_DATA_FRAME_FRECENCY_DATA}
+	key = binary.BigEndian.AppendUint16(key, ring)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, filter...)
 	return key
@@ -592,7 +587,7 @@ func (p *PebbleClockStore) GetDataClockFrame(
 	filter []byte,
 	frameNumber uint64,
 	truncate bool,
-) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error) {
+) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error) {
 	value, closer, err := p.db.Get(clockDataFrameKey(filter, frameNumber))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -644,20 +639,26 @@ func (p *PebbleClockStore) GetDataClockFrame(
 			)
 		}
 
-		proverTrie := &tries.RollingFrecencyCritbitTrie{}
+		proverTries := []*tries.RollingFrecencyCritbitTrie{}
+		i := uint16(0)
+		for {
+			proverTrie := &tries.RollingFrecencyCritbitTrie{}
+			trieData, closer, err := p.db.Get(clockProverTrieKey(filter, i, frameNumber))
+			if err != nil {
+				break
+			}
 
-		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "get latest data clock frame")
+			if err := proverTrie.Deserialize(trieData); err != nil {
+				closer.Close()
+				return nil, nil, errors.Wrap(err, "get latest data clock frame")
+			}
+
+			closer.Close()
+			i++
+			proverTries = append(proverTries, proverTrie)
 		}
 
-		defer closer.Close()
-
-		if err := proverTrie.Deserialize(trieData); err != nil {
-			return nil, nil, errors.Wrap(err, "get latest data clock frame")
-		}
-
-		return frame, proverTrie, nil
+		return frame, proverTries, nil
 	}
 
 	return frame, nil, nil
@@ -752,46 +753,51 @@ func (p *PebbleClockStore) GetEarliestDataClockFrame(
 // GetLatestDataClockFrame implements ClockStore.
 func (p *PebbleClockStore) GetLatestDataClockFrame(
 	filter []byte,
-	proverTrie *tries.RollingFrecencyCritbitTrie,
-) (*protobufs.ClockFrame, error) {
+) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error) {
 	idxValue, closer, err := p.db.Get(clockDataLatestIndex(filter))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, nil, ErrNotFound
 		}
 
-		return nil, errors.Wrap(err, "get latest data clock frame")
+		return nil, nil, errors.Wrap(err, "get latest data clock frame")
 	}
 
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, nil, ErrNotFound
 		}
 
-		return nil, errors.Wrap(err, "get latest data clock frame")
+		return nil, nil, errors.Wrap(err, "get latest data clock frame")
 	}
 
 	closer.Close()
-	if proverTrie != nil {
-		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, frameNumber))
+
+	proverTries := []*tries.RollingFrecencyCritbitTrie{}
+	i := uint16(0)
+	for {
+		proverTrie := &tries.RollingFrecencyCritbitTrie{}
+		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, i, frameNumber))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
-				return nil, ErrNotFound
+				break
 			}
 
-			return nil, errors.Wrap(err, "get latest data clock frame")
+			return nil, nil, errors.Wrap(err, "get latest data clock frame")
 		}
-
-		defer closer.Close()
 
 		if err := proverTrie.Deserialize(trieData); err != nil {
-			return nil, errors.Wrap(err, "get latest data clock frame")
+			closer.Close()
+			return nil, nil, errors.Wrap(err, "get latest data clock frame")
 		}
+		closer.Close()
+		proverTries = append(proverTries, proverTrie)
+		i++
 	}
 
-	return frame, nil
+	return frame, proverTries, nil
 }
 
 // GetStagedDataClockFrame implements ClockStore.
@@ -880,7 +886,7 @@ func (p *PebbleClockStore) CommitDataClockFrame(
 	filter []byte,
 	frameNumber uint64,
 	selector []byte,
-	proverTrie *tries.RollingFrecencyCritbitTrie,
+	proverTries []*tries.RollingFrecencyCritbitTrie,
 	txn Transaction,
 	backfill bool,
 ) error {
@@ -894,16 +900,18 @@ func (p *PebbleClockStore) CommitDataClockFrame(
 		return errors.Wrap(err, "commit data clock frame")
 	}
 
-	proverData, err := proverTrie.Serialize()
-	if err != nil {
-		return errors.Wrap(err, "commit data clock frame")
-	}
+	for i, proverTrie := range proverTries {
+		proverData, err := proverTrie.Serialize()
+		if err != nil {
+			return errors.Wrap(err, "commit data clock frame")
+		}
 
-	if err = txn.Set(
-		clockProverTrieKey(filter, frameNumber),
-		proverData,
-	); err != nil {
-		return errors.Wrap(err, "commit data clock frame")
+		if err = txn.Set(
+			clockProverTrieKey(filter, uint16(i), frameNumber),
+			proverData,
+		); err != nil {
+			return errors.Wrap(err, "commit data clock frame")
+		}
 	}
 
 	_, closer, err := p.db.Get(clockDataEarliestIndex(filter))
@@ -959,193 +967,6 @@ func (p *PebbleClockStore) RangeDataClockFrames(
 	return &PebbleClockIterator{i: iter, db: p}, nil
 }
 
-func (p *PebbleClockStore) GetCompressedDataClockFrames(
-	filter []byte,
-	fromFrameNumber uint64,
-	toFrameNumber uint64,
-) (*protobufs.CeremonyCompressedSync, error) {
-	from := clockDataFrameKey(filter, fromFrameNumber)
-	to := clockDataFrameKey(filter, toFrameNumber+1)
-
-	iter, err := p.db.NewIter(from, to)
-	if err != nil {
-		return nil, errors.Wrap(err, "get compressed data clock frames")
-	}
-
-	syncMessage := &protobufs.CeremonyCompressedSync{}
-	proofs := map[string]*protobufs.InclusionProofsMap{}
-	commits := map[string]*protobufs.InclusionCommitmentsMap{}
-	segments := map[string]*protobufs.InclusionSegmentsMap{}
-
-	for iter.First(); iter.Valid(); iter.Next() {
-		value := iter.Value()
-		frame := &protobufs.ClockFrame{}
-		genesisFramePreIndex := false
-
-		// We do a bit of a cheap trick here while things are still stuck in the old
-		// ways: we use the size of the parent index key to determine if it's the
-		// new format, or the old raw frame
-		if len(value) == (len(filter) + 42) {
-			frameValue, frameCloser, err := p.db.Get(value)
-			if err != nil {
-				return nil, errors.Wrap(err, "get compressed data clock frames")
-			}
-			if err := proto.Unmarshal(frameValue, frame); err != nil {
-				return nil, errors.Wrap(
-					errors.Wrap(err, ErrInvalidData.Error()),
-					"get compressed data clock frames",
-				)
-			}
-			frameCloser.Close()
-		} else {
-			if err := proto.Unmarshal(value, frame); err != nil {
-				return nil, errors.Wrap(
-					errors.Wrap(err, ErrInvalidData.Error()),
-					"get compressed data clock frames",
-				)
-			}
-			genesisFramePreIndex = frame.FrameNumber == 0
-		}
-
-		if err := proto.Unmarshal(value, frame); err != nil {
-			return nil, errors.Wrap(err, "get compressed data clock frames")
-		}
-
-		syncMessage.TruncatedClockFrames = append(
-			syncMessage.TruncatedClockFrames,
-			frame,
-		)
-		if frame.FrameNumber == 0 && genesisFramePreIndex {
-			continue
-		}
-		for i := 0; i < len(frame.Input[516:])/74; i++ {
-			aggregateCommit := frame.Input[516+(i*74) : 516+((i+1)*74)]
-
-			if _, ok := proofs[string(aggregateCommit)]; !ok {
-				proofs[string(aggregateCommit)] = &protobufs.InclusionProofsMap{
-					FrameCommit: aggregateCommit,
-				}
-			}
-		}
-	}
-
-	if err := iter.Close(); err != nil {
-		return nil, errors.Wrap(err, "get compressed data clock frames")
-	}
-
-	for k, v := range proofs {
-		k := k
-		v := v
-		value, closer, err := p.db.Get(dataProofMetadataKey(filter, []byte(k)))
-		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
-				return nil, ErrNotFound
-			}
-
-			return nil, errors.Wrap(err, "get compressed data clock frames")
-		}
-
-		copied := make([]byte, len(value[8:]))
-		limit := binary.BigEndian.Uint64(value[0:8])
-		copy(copied, value[8:])
-		v.Proof = copied
-		if err = closer.Close(); err != nil {
-			return nil, errors.Wrap(err, "get compressed data clock frames")
-		}
-
-		iter, err := p.db.NewIter(
-			dataProofInclusionKey(filter, []byte(k), 0),
-			dataProofInclusionKey(filter, []byte(k), limit+1),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get compressed data clock frames")
-		}
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			incCommit := iter.Value()
-
-			urlLength := binary.BigEndian.Uint16(incCommit[:2])
-			commitLength := binary.BigEndian.Uint16(incCommit[2:4])
-
-			url := make([]byte, urlLength)
-			copy(url, incCommit[4:urlLength+4])
-
-			commit := make([]byte, commitLength)
-			copy(commit, incCommit[urlLength+4:urlLength+4+commitLength])
-
-			remainder := int(urlLength + 4 + commitLength)
-			if _, ok := commits[string(commit)]; !ok {
-				commits[string(commit)] = &protobufs.InclusionCommitmentsMap{
-					Commitment: commit,
-					TypeUrl:    string(url),
-				}
-
-				for j := 0; j < (len(incCommit)-remainder)/32; j++ {
-					start := remainder + (j * 32)
-					end := remainder + ((j + 1) * 32)
-					hash := make([]byte, len(incCommit[start:end]))
-					copy(hash, incCommit[start:end])
-
-					commits[string(commit)].SegmentHashes = append(
-						commits[string(commit)].SegmentHashes,
-						hash,
-					)
-
-					if _, ok := segments[string(hash)]; !ok {
-						segValue, dataCloser, err := p.db.Get(
-							dataProofSegmentKey(filter, incCommit[start:end]),
-						)
-
-						if err != nil {
-							if errors.Is(err, pebble.ErrNotFound) {
-								// If we've lost this key it means we're in a corrupted state
-								return nil, ErrInvalidData
-							}
-
-							return nil, errors.Wrap(err, "get compressed data clock frames")
-						}
-
-						segCopy := make([]byte, len(segValue))
-						copy(segCopy, segValue)
-
-						segments[string(hash)] = &protobufs.InclusionSegmentsMap{
-							Hash: hash,
-							Data: segCopy,
-						}
-						syncMessage.Segments = append(
-							syncMessage.Segments,
-							segments[string(hash)],
-						)
-
-						if err = dataCloser.Close(); err != nil {
-							return nil, errors.Wrap(err, "get compressed data clock frames")
-						}
-					}
-				}
-			}
-
-			v.Commitments = append(v.Commitments, commits[string(commit)])
-		}
-
-		syncMessage.Proofs = append(
-			syncMessage.Proofs,
-			v,
-		)
-
-		if len(syncMessage.TruncatedClockFrames) > 0 {
-			frames := syncMessage.TruncatedClockFrames
-			syncMessage.FromFrameNumber = frames[0].FrameNumber
-			syncMessage.ToFrameNumber = frames[len(frames)-1].FrameNumber
-		}
-
-		if err = iter.Close(); err != nil {
-			return nil, errors.Wrap(err, "get aggregate proof")
-		}
-	}
-
-	return syncMessage, nil
-}
-
 func (p *PebbleClockStore) SetLatestDataClockFrameNumber(
 	filter []byte,
 	frameNumber uint64,
@@ -1179,7 +1000,7 @@ func (p *PebbleClockStore) DeleteDataClockFrameRange(
 func (p *PebbleClockStore) ResetMasterClockFrames(filter []byte) error {
 	if err := p.db.DeleteRange(
 		clockMasterFrameKey(filter, 0),
-		clockMasterFrameKey(filter, 200000),
+		clockMasterFrameKey(filter, 20000000),
 	); err != nil {
 		return errors.Wrap(err, "reset master clock frames")
 	}

@@ -50,18 +50,19 @@ func newConnectednessEventEmitter(connectedness func(peer.ID) network.Connectedn
 
 func (c *connectednessEventEmitter) AddConn(p peer.ID) {
 	c.mx.RLock()
-	defer c.mx.RUnlock()
 	if c.ctx.Err() != nil {
+		c.mx.RUnlock()
 		return
 	}
 
 	c.newConns <- p
+	c.mx.RUnlock()
 }
 
 func (c *connectednessEventEmitter) RemoveConn(p peer.ID) {
 	c.mx.RLock()
-	defer c.mx.RUnlock()
 	if c.ctx.Err() != nil {
+		c.mx.RUnlock()
 		return
 	}
 
@@ -80,6 +81,7 @@ func (c *connectednessEventEmitter) RemoveConn(p peer.ID) {
 	case c.removeConnNotif <- struct{}{}:
 	default:
 	}
+	c.mx.RUnlock()
 }
 
 func (c *connectednessEventEmitter) Close() {
@@ -88,7 +90,6 @@ func (c *connectednessEventEmitter) Close() {
 }
 
 func (c *connectednessEventEmitter) runEmitter() {
-	defer c.wg.Done()
 	for {
 		select {
 		case p := <-c.newConns:
@@ -97,7 +98,6 @@ func (c *connectednessEventEmitter) runEmitter() {
 			c.sendConnRemovedNotifications()
 		case <-c.ctx.Done():
 			c.mx.Lock() // Wait for all pending AddConn & RemoveConn operations to complete
-			defer c.mx.Unlock()
 			for {
 				select {
 				case p := <-c.newConns:
@@ -105,6 +105,8 @@ func (c *connectednessEventEmitter) runEmitter() {
 				case <-c.removeConnNotif:
 					c.sendConnRemovedNotifications()
 				default:
+					c.mx.Unlock()
+					c.wg.Done()
 					return
 				}
 			}

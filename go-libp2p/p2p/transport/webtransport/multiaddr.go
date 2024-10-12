@@ -12,7 +12,7 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-var webtransportMA = ma.StringCast("/quic-v1/webtransport")
+var webtransportMA, _ = ma.StringCast("/quic-v1/webtransport")
 
 func toWebtransportMultiaddr(na net.Addr) (ma.Multiaddr, error) {
 	addr, err := manet.FromNetAddr(na)
@@ -43,12 +43,20 @@ func stringToWebtransportMultiaddr(str string) (ma.Multiaddr, error) {
 
 func extractCertHashes(addr ma.Multiaddr) ([]multihash.DecodedMultihash, error) {
 	certHashesStr := make([]string, 0, 2)
-	ma.ForEach(addr, func(c ma.Component) bool {
+	var err error
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			err = e
+			return false
+		}
 		if c.Protocol().Code == ma.P_CERTHASH {
 			certHashesStr = append(certHashesStr, c.Value())
 		}
 		return true
 	})
+	if err != nil {
+		return nil, err
+	}
 	certHashes := make([]multihash.DecodedMultihash, 0, len(certHashesStr))
 	for _, s := range certHashesStr {
 		_, ch, err := multibase.Decode(s)
@@ -88,7 +96,10 @@ func IsWebtransportMultiaddr(multiaddr ma.Multiaddr) (bool, int) {
 	state := init
 	certhashCount := 0
 
-	ma.ForEach(multiaddr, func(c ma.Component) bool {
+	ma.ForEach(multiaddr, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_UDP:
 			if state == init {

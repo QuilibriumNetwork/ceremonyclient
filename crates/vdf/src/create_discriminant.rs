@@ -175,6 +175,7 @@ mod test {
             .unwrap()
         );
     }
+
     #[test]
     fn check_random_bytes() {
         assert_eq!(

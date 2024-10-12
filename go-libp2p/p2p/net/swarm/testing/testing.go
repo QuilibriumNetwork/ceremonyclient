@@ -170,7 +170,8 @@ func GenSwarm(t *testing.T, opts ...Option) *swarm.Swarm {
 			t.Fatal(err)
 		}
 		if !cfg.dialOnly {
-			if err := s.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0")); err != nil {
+			l, _ := ma.StringCast("/ip4/127.0.0.1/tcp/0")
+			if err := s.Listen(l); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -188,7 +189,8 @@ func GenSwarm(t *testing.T, opts ...Option) *swarm.Swarm {
 			t.Fatal(err)
 		}
 		if !cfg.dialOnly {
-			if err := s.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")); err != nil {
+			l, _ := ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")
+			if err := s.Listen(l); err != nil {
 				t.Fatal(err)
 			}
 		}

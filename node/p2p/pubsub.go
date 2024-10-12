@@ -11,8 +11,8 @@ import (
 
 type PubSub interface {
 	PublishToBitmask(bitmask []byte, data []byte) error
-	Publish(data []byte) error
-	Subscribe(bitmask []byte, handler func(message *pb.Message) error, raw bool)
+	Publish(address []byte, data []byte) error
+	Subscribe(bitmask []byte, handler func(message *pb.Message) error) error
 	Unsubscribe(bitmask []byte, raw bool)
 	GetPeerID() []byte
 	GetBitmaskPeers() map[string][]string

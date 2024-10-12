@@ -48,9 +48,9 @@ func (t *Bitmask) SetScoreParams(p *BitmaskScoreParams) error {
 	}
 
 	t.mux.Lock()
-	defer t.mux.Unlock()
 
 	if t.closed {
+		t.mux.Unlock()
 		return ErrBitmaskClosed
 	}
 
@@ -74,9 +74,11 @@ func (t *Bitmask) SetScoreParams(p *BitmaskScoreParams) error {
 	select {
 	case t.p.eval <- update:
 		err = <-result
+		t.mux.Unlock()
 		return err
 
 	case <-t.p.ctx.Done():
+		t.mux.Unlock()
 		return t.p.ctx.Err()
 	}
 }
@@ -85,8 +87,8 @@ func (t *Bitmask) SetScoreParams(p *BitmaskScoreParams) error {
 // Multiple event handlers may be created and will operate independently of each other
 func (t *Bitmask) EventHandler(opts ...BitmaskEventHandlerOpt) (*BitmaskEventHandler, error) {
 	t.mux.RLock()
-	defer t.mux.RUnlock()
 	if t.closed {
+		t.mux.RUnlock()
 		return nil, ErrBitmaskClosed
 	}
 
@@ -101,6 +103,7 @@ func (t *Bitmask) EventHandler(opts ...BitmaskEventHandlerOpt) (*BitmaskEventHan
 	for _, opt := range opts {
 		err := opt(h)
 		if err != nil {
+			t.mux.RUnlock()
 			return nil, err
 		}
 	}
@@ -120,21 +123,23 @@ func (t *Bitmask) EventHandler(opts ...BitmaskEventHandlerOpt) (*BitmaskEventHan
 		done <- struct{}{}
 	}:
 	case <-t.p.ctx.Done():
+		t.mux.RUnlock()
 		return nil, t.p.ctx.Err()
 	}
 
 	<-done
-
+	t.mux.RUnlock()
 	return h, nil
 }
 
 func (t *Bitmask) sendNotification(evt PeerEvent) {
 	t.evtHandlerMux.RLock()
-	defer t.evtHandlerMux.RUnlock()
 
 	for h := range t.evtHandlers {
 		h.sendNotification(evt)
 	}
+
+	t.evtHandlerMux.RUnlock()
 }
 
 // Subscribe returns a new Subscription for the bitmask.
@@ -142,8 +147,9 @@ func (t *Bitmask) sendNotification(evt PeerEvent) {
 // before the subscription is processed by the pubsub main loop and propagated to our peers.
 func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 	t.mux.RLock()
-	defer t.mux.RUnlock()
+
 	if t.closed {
+		t.mux.RUnlock()
 		return nil, ErrBitmaskClosed
 	}
 
@@ -155,12 +161,13 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 	for _, opt := range opts {
 		err := opt(sub)
 		if err != nil {
+			t.mux.RUnlock()
 			return nil, err
 		}
 	}
 
 	if sub.ch == nil {
-		sub.ch = make(chan *Message, 128)
+		sub.ch = make(chan *Message, 32)
 	}
 
 	out := make(chan *Subscription, 1)
@@ -173,10 +180,13 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 		resp: out,
 	}:
 	case <-t.p.ctx.Done():
+		t.mux.RUnlock()
 		return nil, t.p.ctx.Err()
 	}
 
-	return <-out, nil
+	subOut := <-out
+	t.mux.RUnlock()
+	return subOut, nil
 }
 
 // Relay enables message relaying for the bitmask and returns a reference
@@ -184,8 +194,9 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 // To completely disable the relay, all references must be cancelled.
 func (t *Bitmask) Relay() (RelayCancelFunc, error) {
 	t.mux.RLock()
-	defer t.mux.RUnlock()
+
 	if t.closed {
+		t.mux.RUnlock()
 		return nil, ErrBitmaskClosed
 	}
 
@@ -199,10 +210,13 @@ func (t *Bitmask) Relay() (RelayCancelFunc, error) {
 		resp:    out,
 	}:
 	case <-t.p.ctx.Done():
+		t.mux.RUnlock()
 		return nil, t.p.ctx.Err()
 	}
 
-	return <-out, nil
+	cancelFunc := <-out
+	t.mux.RUnlock()
+	return cancelFunc, nil
 }
 
 // RouterReady is a function that decides if a router is ready to publish
@@ -220,10 +234,11 @@ type PublishOptions struct {
 type PubOpt func(pub *PublishOptions) error
 
 // Publish publishes data to bitmask.
-func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) error {
+func (t *Bitmask) Publish(ctx context.Context, bitmask []byte, data []byte, opts ...PubOpt) error {
 	t.mux.RLock()
-	defer t.mux.RUnlock()
+
 	if t.closed {
+		t.mux.RUnlock()
 		return ErrBitmaskClosed
 	}
 
@@ -234,6 +249,7 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 	for _, opt := range opts {
 		err := opt(pub)
 		if err != nil {
+			t.mux.RUnlock()
 			return err
 		}
 	}
@@ -241,16 +257,18 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 	if pub.customKey != nil && !pub.local {
 		key, pid = pub.customKey()
 		if key == nil {
+			t.mux.RUnlock()
 			return ErrNilSignKey
 		}
 		if len(pid) == 0 {
+			t.mux.RUnlock()
 			return ErrEmptyPeerID
 		}
 	}
 
 	m := &pb.Message{
 		Data:    data,
-		Bitmask: t.bitmask,
+		Bitmask: bitmask,
 		From:    nil,
 		Seqno:   nil,
 	}
@@ -262,6 +280,7 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 		m.From = []byte(pid)
 		err := signMessage(pid, key, m)
 		if err != nil {
+			t.mux.RUnlock()
 			return err
 		}
 	}
@@ -286,28 +305,43 @@ func (t *Bitmask) Publish(ctx context.Context, data []byte, opts ...PubOpt) erro
 					res <- done
 				}:
 					if <-res {
+						if ticker != nil {
+							ticker.Stop()
+						}
 						break readyLoop
 					}
 				case <-t.p.ctx.Done():
+					if ticker != nil {
+						ticker.Stop()
+					}
+					t.mux.RUnlock()
 					return t.p.ctx.Err()
 				case <-ctx.Done():
+					if ticker != nil {
+						ticker.Stop()
+					}
+					t.mux.RUnlock()
 					return ctx.Err()
 				}
 				if ticker == nil {
 					ticker = time.NewTicker(200 * time.Millisecond)
-					defer ticker.Stop()
 				}
 
 				select {
 				case <-ticker.C:
 				case <-ctx.Done():
+					ticker.Stop()
+					t.mux.RUnlock()
 					return fmt.Errorf("router is not ready: %w", ctx.Err())
 				}
 			}
 		}
 	}
 
-	return t.p.val.PushLocal(&Message{m, "", t.p.host.ID(), nil, pub.local})
+	err := t.p.val.PushLocal(&Message{m, nil, t.p.host.ID(), nil, pub.local})
+
+	t.mux.RUnlock()
+	return err
 }
 
 // WithReadiness returns a publishing option for only publishing when the router is ready.
@@ -347,8 +381,9 @@ func WithSecretKeyAndPeerId(key crypto.PrivKey, pid peer.ID) PubOpt {
 // Does not error if the bitmask is already closed.
 func (t *Bitmask) Close() error {
 	t.mux.Lock()
-	defer t.mux.Unlock()
+
 	if t.closed {
+		t.mux.Unlock()
 		return nil
 	}
 
@@ -357,6 +392,7 @@ func (t *Bitmask) Close() error {
 	select {
 	case t.p.rmBitmask <- req:
 	case <-t.p.ctx.Done():
+		t.mux.Unlock()
 		return t.p.ctx.Err()
 	}
 
@@ -366,18 +402,22 @@ func (t *Bitmask) Close() error {
 		t.closed = true
 	}
 
+	t.mux.Unlock()
 	return err
 }
 
 // ListPeers returns a list of peers we are connected to in the given bitmask.
 func (t *Bitmask) ListPeers() []peer.ID {
 	t.mux.RLock()
-	defer t.mux.RUnlock()
+
 	if t.closed {
+		t.mux.RUnlock()
 		return []peer.ID{}
 	}
 
-	return t.p.ListPeers(t.bitmask)
+	l := t.p.ListPeers(t.bitmask)
+	t.mux.RUnlock()
+	return l
 }
 
 type EventType int

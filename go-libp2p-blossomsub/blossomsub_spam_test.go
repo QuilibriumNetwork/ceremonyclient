@@ -2,6 +2,7 @@ package blossomsub
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -11,11 +12,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-msgio"
+	"google.golang.org/protobuf/proto"
 
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-
-	"github.com/libp2p/go-msgio/protoio"
 )
 
 // Test that when BlossomSub receives too many IWANT messages from a peer
@@ -25,7 +25,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 	defer cancel()
 
 	// Create legitimate and attacker hosts
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	legit := hosts[0]
 	attacker := hosts[1]
 
@@ -36,25 +36,11 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 	}
 
 	// Subscribe to mybitmask on the legit host
-	mybitmask := []byte{0xff, 0x00, 0x00}
-	_, err = ps.Subscribe(mybitmask)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Used to publish a message with random data
-	publishMsg := func() {
-		data := make([]byte, 16)
-		rand.Read(data)
-
-		if err = ps.Publish(mybitmask, data); err != nil {
-			t.Fatal(err)
-		}
-	}
+	mybitmask := []byte{0x20, 0x00, 0x00}
 
 	// Wait a bit after the last message before checking we got the
 	// right number of messages
-	msgWaitMax := time.Second
+	msgWaitMax := 10 * time.Second
 	msgCount := 0
 	msgTimer := time.NewTimer(msgWaitMax)
 
@@ -65,7 +51,22 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 		// <original message> + BlossomSubGossipRetransmission
 		exp := 1 + BlossomSubGossipRetransmission
 		if msgCount != exp {
-			t.Fatalf("Expected %d messages, got %d", exp, msgCount)
+			panic(fmt.Sprintf("Expected %d messages, got %d", exp, msgCount))
+		}
+	}
+
+	bitmasks, err := ps.Join(mybitmask)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Used to publish a message with random data
+	publishMsg := func() {
+		data := make([]byte, 16)
+		rand.Read(data)
+
+		if err := bitmasks[0].Publish(ctx, bitmasks[0].bitmask, data); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -84,6 +85,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
+			sub := sub
 			if sub.GetSubscribe() {
 				// Reply by subcribing to the bitmask and grafting to the peer
 				writeMsg(&pb.RPC{
@@ -94,7 +96,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 				go func() {
 					// Wait for a short interval to make sure the legit host
 					// received and processed the subscribe + graft
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(1 * time.Second)
 
 					// Publish a message from the legit host
 					publishMsg()
@@ -118,14 +120,21 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 			// Send an IWANT with the message ID, causing the legit host
 			// to send another message (until it cuts off the attacker for
 			// being spammy)
-			iwantlst := []string{DefaultMsgIdFn(msg)}
+			iwantlst := [][]byte{DefaultMsgIdFn(msg)}
 			iwant := []*pb.ControlIWant{{MessageIDs: iwantlst}}
 			orpc := rpcWithControl(nil, nil, iwant, nil, nil)
-			writeMsg(&orpc.RPC)
+			writeMsg(orpc.RPC)
 		}
 	})
 
 	connect(t, hosts[0], hosts[1])
+
+	time.Sleep(100 * time.Millisecond)
+
+	_, err = ps.Subscribe(mybitmask)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	<-ctx.Done()
 }
@@ -142,7 +151,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 	defer cancel()
 
 	// Create legitimate and attacker hosts
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	legit := hosts[0]
 	attacker := hosts[1]
 
@@ -166,7 +175,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 	}
 
 	// Subscribe to mybitmask on the legit host
-	mybitmask := []byte{0xff, 0x00, 0x00}
+	mybitmask := []byte{0x20, 0x00, 0x00}
 	_, err = ps.Subscribe(mybitmask)
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +197,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
+			sub := sub
 			if sub.GetSubscribe() {
 				// Reply by subcribing to the bitmask and grafting to the peer
 				writeMsg(&pb.RPC{
@@ -204,10 +214,10 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 
 					// Send a bunch of IHAVEs
 					for i := 0; i < 3*BlossomSubMaxIHaveLength; i++ {
-						ihavelst := []string{"someid" + strconv.Itoa(i)}
+						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
 						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
-						writeMsg(&orpc.RPC)
+						writeMsg(orpc.RPC)
 					}
 
 					select {
@@ -234,10 +244,10 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 
 					// Send a bunch of IHAVEs
 					for i := 0; i < 3*BlossomSubMaxIHaveLength; i++ {
-						ihavelst := []string{"someid" + strconv.Itoa(i+100)}
+						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i+100))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
 						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
-						writeMsg(&orpc.RPC)
+						writeMsg(orpc.RPC)
 					}
 
 					select {
@@ -292,7 +302,7 @@ func TestBlossomSubAttackGRAFTNonExistentBitmask(t *testing.T) {
 	defer cancel()
 
 	// Create legitimate and attacker hosts
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	legit := hosts[0]
 	attacker := hosts[1]
 
@@ -303,7 +313,7 @@ func TestBlossomSubAttackGRAFTNonExistentBitmask(t *testing.T) {
 	}
 
 	// Subscribe to mybitmask on the legit host
-	mybitmask := []byte{0xff, 0x00, 0x00}
+	mybitmask := []byte{0x20, 0x00, 0x00}
 	_, err = ps.Subscribe(mybitmask)
 	if err != nil {
 		t.Fatal(err)
@@ -322,6 +332,7 @@ func TestBlossomSubAttackGRAFTNonExistentBitmask(t *testing.T) {
 	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
+			sub := sub
 			if sub.GetSubscribe() {
 				// Reply by subcribing to the bitmask and grafting to the peer
 				writeMsg(&pb.RPC{
@@ -330,7 +341,7 @@ func TestBlossomSubAttackGRAFTNonExistentBitmask(t *testing.T) {
 				})
 
 				// Graft to the peer on a non-existent bitmask
-				nonExistentBitmask := []byte{0xff, 0x00, 0x00, 0xff, 0xff, 0xff}
+				nonExistentBitmask := []byte{0x20, 0x00, 0x00, 0x02, 0xff, 0xff}
 				writeMsg(&pb.RPC{
 					Control: &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: nonExistentBitmask}}},
 				})
@@ -376,7 +387,7 @@ func TestBlossomSubAttackGRAFTDuringBackoff(t *testing.T) {
 	defer cancel()
 
 	// Create legitimate and attacker hosts
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	legit := hosts[0]
 	attacker := hosts[1]
 
@@ -400,7 +411,7 @@ func TestBlossomSubAttackGRAFTDuringBackoff(t *testing.T) {
 	}
 
 	// Subscribe to mybitmask on the legit host
-	mybitmask := []byte{0xff, 0x00, 0x00}
+	mybitmask := []byte{0x20, 0x00, 0x00}
 	_, err = ps.Subscribe(mybitmask)
 	if err != nil {
 		t.Fatal(err)
@@ -422,6 +433,7 @@ func TestBlossomSubAttackGRAFTDuringBackoff(t *testing.T) {
 	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
+			sub := sub
 			if sub.GetSubscribe() {
 				// Reply by subcribing to the bitmask and grafting to the peer
 				graft := []*pb.ControlGraft{{Bitmask: sub.Bitmask}}
@@ -617,11 +629,11 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	defer cancel()
 
 	// Create legitimate and attacker hosts
-	hosts := getNetHosts(t, ctx, 2)
+	hosts := getDefaultHosts(t, 2)
 	legit := hosts[0]
 	attacker := hosts[1]
 
-	mybitmask := []byte{0xff, 0x00, 0x00}
+	mybitmask := []byte{0x20, 0x00, 0x00}
 
 	// Create parameters with reasonable default values
 	params := &PeerScoreParams{
@@ -664,6 +676,7 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	ps, err := NewBlossomSub(ctx, legit,
 		WithEventTracer(tracer),
 		WithPeerScore(params, thresholds),
+		WithMessageSignaturePolicy(StrictSign),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -766,7 +779,7 @@ type MockBSOnRead func(writeMsg func(*pb.RPC), irpc *pb.RPC)
 
 func newMockBS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg MockBSOnRead) {
 	// Listen on the BlossomSub protocol
-	const BlossomSubID = protocol.ID("/meshsub/1.0.0")
+	const BlossomSubID = BlossomSubID_v2
 	const maxMessageSize = 1024 * 1024
 	attacker.SetStreamHandler(BlossomSubID, func(stream network.Stream) {
 		// When an incoming stream is opened, set up an outgoing stream
@@ -776,13 +789,17 @@ func newMockBS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg 
 			t.Fatal(err)
 		}
 
-		r := protoio.NewDelimitedReader(stream, maxMessageSize)
-		w := protoio.NewDelimitedWriter(ostream)
+		r := msgio.NewVarintReaderSize(stream, maxMessageSize)
+		w := msgio.NewVarintWriter(ostream)
 
 		var irpc pb.RPC
 
 		writeMsg := func(rpc *pb.RPC) {
-			if err = w.WriteMsg(rpc); err != nil {
+			out, err := proto.Marshal(rpc)
+			if err != nil {
+				t.Fatalf("error writing RPC: %s", err)
+			}
+			if err = w.WriteMsg(out); err != nil {
 				t.Fatalf("error writing RPC: %s", err)
 			}
 		}
@@ -795,8 +812,21 @@ func newMockBS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg 
 			}
 
 			irpc.Reset()
+			v, err := r.ReadMsg()
 
-			err := r.ReadMsg(&irpc)
+			// Bail out when the test finishes
+			if ctx.Err() != nil {
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = proto.Unmarshal(v, &irpc)
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			// Bail out when the test finishes
 			if ctx.Err() != nil {

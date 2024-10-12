@@ -93,8 +93,6 @@ func NewService(h host.Host, ids identify.IDService, opts ...Option) (*Service, 
 }
 
 func (s *Service) watchForPublicAddr() {
-	defer s.refCount.Done()
-
 	log.Debug("waiting until we have at least one public address", "peer", s.host.ID())
 
 	// TODO: We should have an event here that fires when identify discovers a new
@@ -104,7 +102,6 @@ func (s *Service) watchForPublicAddr() {
 	duration := 250 * time.Millisecond
 	const maxDuration = 5 * time.Second
 	t := time.NewTimer(duration)
-	defer t.Stop()
 	for {
 		if containsPublicAddr(s.ids.OwnObservedAddrs()) {
 			log.Debug("Host now has a public address. Starting holepunch protocol.")
@@ -114,6 +111,8 @@ func (s *Service) watchForPublicAddr() {
 
 		select {
 		case <-s.ctx.Done():
+			s.refCount.Done()
+			t.Stop()
 			return
 		case <-t.C:
 			duration *= 2
@@ -128,15 +127,22 @@ func (s *Service) watchForPublicAddr() {
 	sub, err := s.host.EventBus().Subscribe(&event.EvtLocalReachabilityChanged{}, eventbus.Name("holepunch"))
 	if err != nil {
 		log.Debugf("failed to subscripe to Reachability event: %s", err)
+		s.refCount.Done()
+		t.Stop()
 		return
 	}
-	defer sub.Close()
 	for {
 		select {
 		case <-s.ctx.Done():
+			s.refCount.Done()
+			t.Stop()
+			sub.Close()
 			return
 		case e, ok := <-sub.Out():
 			if !ok {
+				s.refCount.Done()
+				t.Stop()
+				sub.Close()
 				return
 			}
 			if e.(event.EvtLocalReachabilityChanged).Reachability != network.ReachabilityPrivate {
@@ -146,6 +152,10 @@ func (s *Service) watchForPublicAddr() {
 			s.holePuncher = newHolePuncher(s.host, s.ids, s.tracer, s.filter)
 			s.holePuncherMx.Unlock()
 			close(s.hasPublicAddrsChan)
+
+			s.refCount.Done()
+			t.Stop()
+			sub.Close()
 			return
 		}
 	}
@@ -185,7 +195,6 @@ func (s *Service) incomingHolePunch(str network.Stream) (rtt time.Duration, remo
 		log.Debugf("error reserving memory for stream: %s", err)
 		return 0, nil, nil, err
 	}
-	defer str.Scope().ReleaseMemory(maxMsgSize)
 
 	wr := pbio.NewDelimitedWriter(str)
 	rd := pbio.NewDelimitedReader(str, maxMsgSize)
@@ -196,9 +205,11 @@ func (s *Service) incomingHolePunch(str network.Stream) (rtt time.Duration, remo
 	str.SetDeadline(time.Now().Add(StreamTimeout))
 
 	if err := rd.ReadMsg(msg); err != nil {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, fmt.Errorf("failed to read message from initiator: %w", err)
 	}
 	if t := msg.GetType(); t != pb.HolePunch_CONNECT {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, fmt.Errorf("expected CONNECT message from initiator but got %d", t)
 	}
 
@@ -209,6 +220,7 @@ func (s *Service) incomingHolePunch(str network.Stream) (rtt time.Duration, remo
 
 	log.Debugw("received hole punch request", "peer", str.Conn().RemotePeer(), "addrs", obsDial)
 	if len(obsDial) == 0 {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, errors.New("expected CONNECT message to contain at least one address")
 	}
 
@@ -218,17 +230,21 @@ func (s *Service) incomingHolePunch(str network.Stream) (rtt time.Duration, remo
 	msg.ObsAddrs = addrsToBytes(ownAddrs)
 	tstart := time.Now()
 	if err := wr.WriteMsg(msg); err != nil {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, fmt.Errorf("failed to write CONNECT message to initiator: %w", err)
 	}
 
 	// Read SYNC message
 	msg.Reset()
 	if err := rd.ReadMsg(msg); err != nil {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, fmt.Errorf("failed to read message from initiator: %w", err)
 	}
 	if t := msg.GetType(); t != pb.HolePunch_SYNC {
+		str.Scope().ReleaseMemory(maxMsgSize)
 		return 0, nil, nil, fmt.Errorf("expected SYNC message from initiator but got %d", t)
 	}
+	str.Scope().ReleaseMemory(maxMsgSize)
 	return time.Since(tstart), obsDial, ownAddrs, nil
 }
 

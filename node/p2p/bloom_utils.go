@@ -8,8 +8,7 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-// getOnesIndices returns the indices of all bits that are 1 in the byte slice.
-func getOnesIndices(input []byte) []int {
+func GetOnesIndices(input []byte) []int {
 	var indices []int
 	for i, b := range input {
 		for j := 0; j < 8; j++ {
@@ -19,50 +18,6 @@ func getOnesIndices(input []byte) []int {
 		}
 	}
 	return indices
-}
-
-// generateCombinations generates combinations of size k from the given slice.
-func generateCombinations(arr []int, k int) [][]int {
-	var ans [][]int
-	if k == 0 {
-		return [][]int{{}}
-	}
-	if len(arr) == 0 {
-		return nil
-	}
-	head := arr[0]
-	tail := arr[1:]
-	// With head
-	for _, sub := range generateCombinations(tail, k-1) {
-		ans = append(ans, append([]int{head}, sub...))
-	}
-	// Without head
-	ans = append(ans, generateCombinations(tail, k)...)
-	return ans
-}
-
-// generateBitSlices returns byte slices with only three 1-bits, and evaluates
-// the supplied function on the new byte slices.
-func generateBitSlices(
-	input []byte,
-	eval func(slice []byte) error,
-) error {
-	oneIndices := getOnesIndices(input)
-	combinations := generateCombinations(oneIndices, 3)
-
-	for _, combo := range combinations {
-		newSlice := make([]byte, len(input))
-		for _, index := range combo {
-			byteIndex := index / 8
-			bitIndex := index % 8
-			newSlice[byteIndex] |= (1 << bitIndex)
-		}
-		if err := eval(newSlice); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // GetBloomFilter returns a bloom filter based on the data, however
@@ -108,7 +63,7 @@ func GetBloomFilterIndices(data []byte, bitLength int, k int) []byte {
 		panic(err)
 	}
 
-	digest := make([]byte, size*k/8)
+	digest := make([]byte, size*k)
 	_, err = h.Read(digest)
 	if err != nil {
 		panic(err)

@@ -24,7 +24,7 @@ func certificateHashFromTLSConfig(c *tls.Config) [32]byte {
 
 func splitMultiaddr(addr ma.Multiaddr) []ma.Component {
 	var components []ma.Component
-	ma.ForEach(addr, func(c ma.Component) bool {
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
 		components = append(components, c)
 		return true
 	})

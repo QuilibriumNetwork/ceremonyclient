@@ -22,24 +22,22 @@ type Capability struct {
 }
 
 type PeerManifest struct {
-	PeerId             []byte
-	Difficulty         uint32
-	DifficultyMetric   int64
-	Commit_16Metric    int64
-	Commit_128Metric   int64
-	Commit_1024Metric  int64
-	Commit_65536Metric int64
-	Proof_16Metric     int64
-	Proof_128Metric    int64
-	Proof_1024Metric   int64
-	Proof_65536Metric  int64
-	Cores              uint32
-	Memory             []byte
-	Storage            []byte
-	Capabilities       []Capability
-	MasterHeadFrame    uint64
-	Bandwidth          uint64
-	LastSeen           int64
+	PeerId            []byte
+	Difficulty        uint32
+	DifficultyMetric  int64
+	Commit_16Metric   int64
+	Commit_128Metric  int64
+	Commit_1024Metric int64
+	Proof_16Metric    int64
+	Proof_128Metric   int64
+	Proof_1024Metric  int64
+	Cores             uint32
+	Memory            []byte
+	Storage           []byte
+	Capabilities      []Capability
+	MasterHeadFrame   uint64
+	Bandwidth         uint64
+	LastSeen          int64
 }
 
 type InMemoryPeerInfoManager struct {

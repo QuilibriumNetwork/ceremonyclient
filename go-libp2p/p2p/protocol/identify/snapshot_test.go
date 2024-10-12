@@ -13,8 +13,8 @@ import (
 )
 
 func TestSnapshotEquality(t *testing.T) {
-	addr1 := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
-	addr2 := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
+	addr1 := tStringCast("/ip4/127.0.0.1/tcp/1234")
+	addr2 := tStringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
 
 	_, pubKey1, err := crypto.GenerateEd25519Key(rand.Reader)
 	require.NoError(t, err)

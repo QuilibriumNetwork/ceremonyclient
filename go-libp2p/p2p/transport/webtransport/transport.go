@@ -158,7 +158,11 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		return nil, err
 	}
 
-	maddr, _ := ma.SplitFunc(raddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_WEBTRANSPORT })
+	maddr, _, err := ma.SplitFunc(raddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_WEBTRANSPORT })
+	if err != nil {
+		return nil, err
+	}
+
 	sess, err := t.dial(ctx, maddr, url, sni, certHashes)
 	if err != nil {
 		return nil, err
@@ -372,7 +376,10 @@ func (t *transport) removeConn(sess *webtransport.Session) {
 // DNS-like component, then that will be returned for the sni and
 // foundSniComponent will be false (since we didn't find an actual sni component).
 func extractSNI(maddr ma.Multiaddr) (sni string, foundSniComponent bool) {
-	ma.ForEach(maddr, func(c ma.Component) bool {
+	ma.ForEach(maddr, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_SNI:
 			sni = c.Value()
@@ -397,10 +404,17 @@ func (t *transport) Resolve(_ context.Context, maddr ma.Multiaddr) ([]ma.Multiad
 		return []ma.Multiaddr{maddr}, nil
 	}
 
-	beforeQuicMA, afterIncludingQuicMA := ma.SplitFunc(maddr, func(c ma.Component) bool {
+	beforeQuicMA, afterIncludingQuicMA, err := ma.SplitFunc(maddr, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_QUIC_V1
 	})
-	quicComponent, afterQuicMA := ma.SplitFirst(afterIncludingQuicMA)
+	if err != nil {
+		return nil, err
+	}
+
+	quicComponent, afterQuicMA, err := ma.SplitFirst(afterIncludingQuicMA)
+	if err != nil {
+		return nil, err
+	}
 	sniComponent, err := ma.NewComponent(ma.ProtocolWithCode(ma.P_SNI).Name, sni)
 	if err != nil {
 		return nil, err

@@ -9,6 +9,11 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestMultiaddrParsing(t *testing.T) {
 	addr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/5555/ws")
 	if err != nil {
@@ -69,13 +74,13 @@ func TestConvertWebsocketMultiaddrToNetAddr(t *testing.T) {
 }
 
 func TestListeningOnDNSAddr(t *testing.T) {
-	ln, err := newListener(ma.StringCast("/dns/localhost/tcp/0/ws"), nil)
+	ln, err := newListener(tStringCast("/dns/localhost/tcp/0/ws"), nil)
 	require.NoError(t, err)
 	addr := ln.Multiaddr()
-	first, rest := ma.SplitFirst(addr)
+	first, rest, _ := ma.SplitFirst(addr)
 	require.Equal(t, ma.P_DNS, first.Protocol().Code)
 	require.Equal(t, "localhost", first.Value())
-	next, _ := ma.SplitFirst(rest)
+	next, _, _ := ma.SplitFirst(rest)
 	require.Equal(t, ma.P_TCP, next.Protocol().Code)
 	require.NotEqual(t, 0, next.Value())
 }

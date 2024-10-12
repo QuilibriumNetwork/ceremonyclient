@@ -51,8 +51,9 @@ func (t *transportConn) Scope() network.ConnScope {
 }
 
 func (t *transportConn) Close() error {
-	defer t.scope.Done()
-	return t.MuxedConn.Close()
+	err := t.MuxedConn.Close()
+	t.scope.Done()
+	return err
 }
 
 func (t *transportConn) ConnState() network.ConnectionState {

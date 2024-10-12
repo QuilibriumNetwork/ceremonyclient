@@ -45,13 +45,14 @@ func (d *RoutingDiscovery) Advertise(ctx context.Context, ns string, opts ...dis
 	// closest peers to the key/CID before it goes on to provide the record to them.
 	// Not setting a timeout here will make the DHT wander forever.
 	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
 
 	err = d.Provide(pctx, cid, true)
 	if err != nil {
+		cancel()
 		return 0, err
 	}
 
+	cancel()
 	return ttl, nil
 }
 

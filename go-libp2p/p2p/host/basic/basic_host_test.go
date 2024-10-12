@@ -95,7 +95,8 @@ func TestSignedPeerRecordWithNoListenAddrs(t *testing.T) {
 
 	require.Empty(t, h.Addrs(), "expected no listen addrs")
 	// now add a listen addr
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/0.0.0.0/tcp/0")))
+	m, _ := ma.StringCast("/ip4/0.0.0.0/tcp/0")
+	require.NoError(t, h.Network().Listen(m))
 	require.NotEmpty(t, h.Addrs(), "expected at least 1 listen addr")
 
 	cab, ok := peerstore.GetCertifiedAddrBook(h.Peerstore())
@@ -168,7 +169,7 @@ func TestProtocolHandlerEvents(t *testing.T) {
 }
 
 func TestHostAddrsFactory(t *testing.T) {
-	maddr := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
+	maddr, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
 	addrsFactory := func(addrs []ma.Multiaddr) []ma.Multiaddr {
 		return []ma.Multiaddr{maddr}
 	}
@@ -209,7 +210,8 @@ func TestLocalIPChangesWhenListenAddrChanges(t *testing.T) {
 	h.addrMu.Unlock()
 
 	// change listen addrs and verify local IP addr is not nil again
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/0.0.0.0/tcp/0")))
+	m, _ := ma.StringCast("/ip4/0.0.0.0/tcp/0")
+	require.NoError(t, h.Network().Listen(m))
 	h.SignalAddressChange()
 	time.Sleep(1 * time.Second)
 
@@ -227,14 +229,15 @@ func TestAllAddrs(t *testing.T) {
 	require.Nil(t, h.AllAddrs())
 
 	// listen on loopback
-	laddr := ma.StringCast("/ip4/127.0.0.1/tcp/0")
+	laddr, _ := ma.StringCast("/ip4/127.0.0.1/tcp/0")
 	require.NoError(t, h.Network().Listen(laddr))
 	require.Len(t, h.AllAddrs(), 1)
 	firstAddr := h.AllAddrs()[0]
 	require.Equal(t, "/ip4/127.0.0.1", ma.Split(firstAddr)[0].String())
 
 	// listen on IPv4 0.0.0.0
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/0.0.0.0/tcp/0")))
+	m, _ := ma.StringCast("/ip4/0.0.0.0/tcp/0")
+	require.NoError(t, h.Network().Listen(m))
 	// should contain localhost and private local addr along with previous listen address
 	require.Len(t, h.AllAddrs(), 3)
 	// Should still contain the original addr.
@@ -551,7 +554,8 @@ func TestProtoDowngrade(t *testing.T) {
 
 func TestAddrChangeImmediatelyIfAddressNonEmpty(t *testing.T) {
 	ctx := context.Background()
-	taddrs := []ma.Multiaddr{ma.StringCast("/ip4/1.2.3.4/tcp/1234")}
+	m, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
+	taddrs := []ma.Multiaddr{m}
 
 	starting := make(chan struct{})
 	h, err := NewHost(swarmt.GenSwarm(t), &HostOpts{AddrsFactory: func(addrs []ma.Multiaddr) []ma.Multiaddr {
@@ -569,10 +573,11 @@ func TestAddrChangeImmediatelyIfAddressNonEmpty(t *testing.T) {
 	defer sub.Close()
 	h.Start()
 
+	n, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
 	expected := event.EvtLocalAddressesUpdated{
 		Diffs: true,
 		Current: []event.UpdatedAddress{
-			{Action: event.Added, Address: ma.StringCast("/ip4/1.2.3.4/tcp/1234")},
+			{Action: event.Added, Address: n},
 		},
 		Removed: []event.UpdatedAddress{}}
 
@@ -617,11 +622,14 @@ func TestHostAddrChangeDetection(t *testing.T) {
 	// This test uses the address factory to provide several
 	// sets of listen addresses for the host. It advances through
 	// the sets by changing the currentAddrSet index var below.
+	m1, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
+	m2, _ := ma.StringCast("/ip4/2.3.4.5/tcp/1234")
+	m3, _ := ma.StringCast("/ip4/3.4.5.6/tcp/4321")
 	addrSets := [][]ma.Multiaddr{
 		{},
-		{ma.StringCast("/ip4/1.2.3.4/tcp/1234")},
-		{ma.StringCast("/ip4/1.2.3.4/tcp/1234"), ma.StringCast("/ip4/2.3.4.5/tcp/1234")},
-		{ma.StringCast("/ip4/2.3.4.5/tcp/1234"), ma.StringCast("/ip4/3.4.5.6/tcp/4321")},
+		{m1},
+		{m1, m2},
+		{m2, m3},
 	}
 
 	// The events we expect the host to emit when SignalAddressChange is called
@@ -630,26 +638,26 @@ func TestHostAddrChangeDetection(t *testing.T) {
 		{
 			Diffs: true,
 			Current: []event.UpdatedAddress{
-				{Action: event.Added, Address: ma.StringCast("/ip4/1.2.3.4/tcp/1234")},
+				{Action: event.Added, Address: m1},
 			},
 			Removed: []event.UpdatedAddress{},
 		},
 		{
 			Diffs: true,
 			Current: []event.UpdatedAddress{
-				{Action: event.Maintained, Address: ma.StringCast("/ip4/1.2.3.4/tcp/1234")},
-				{Action: event.Added, Address: ma.StringCast("/ip4/2.3.4.5/tcp/1234")},
+				{Action: event.Maintained, Address: m1},
+				{Action: event.Added, Address: m2},
 			},
 			Removed: []event.UpdatedAddress{},
 		},
 		{
 			Diffs: true,
 			Current: []event.UpdatedAddress{
-				{Action: event.Added, Address: ma.StringCast("/ip4/3.4.5.6/tcp/4321")},
-				{Action: event.Maintained, Address: ma.StringCast("/ip4/2.3.4.5/tcp/1234")},
+				{Action: event.Added, Address: m3},
+				{Action: event.Maintained, Address: m2},
 			},
 			Removed: []event.UpdatedAddress{
-				{Action: event.Removed, Address: ma.StringCast("/ip4/1.2.3.4/tcp/1234")},
+				{Action: event.Removed, Address: m1},
 			},
 		},
 	}
@@ -821,8 +829,8 @@ func TestNormalizeMultiaddr(t *testing.T) {
 	h1, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
 	defer h1.Close()
-
-	require.Equal(t, "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", h1.NormalizeMultiaddr(ma.StringCast("/ip4/1.2.3.4/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")).String())
+	m, _ := ma.StringCast("/ip4/1.2.3.4/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")
+	require.Equal(t, "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", h1.NormalizeMultiaddr(m).String())
 }
 
 func TestInferWebtransportAddrsFromQuic(t *testing.T) {
@@ -883,7 +891,8 @@ func TestInferWebtransportAddrsFromQuic(t *testing.T) {
 			sort.StringSlice(tc.out).Sort()
 			min := make([]ma.Multiaddr, 0, len(tc.in))
 			for _, addr := range tc.in {
-				min = append(min, ma.StringCast(addr))
+				m1, _ := ma.StringCast(addr)
+				min = append(min, m1)
 			}
 			outMa := inferWebtransportAddrsFromQuic(min)
 			outStr := make([]string, 0, len(outMa))
@@ -905,14 +914,14 @@ func TestTrimHostAddrList(t *testing.T) {
 		out       []ma.Multiaddr
 	}
 
-	tcpPublic := ma.StringCast("/ip4/1.1.1.1/tcp/1")
-	quicPublic := ma.StringCast("/ip4/1.1.1.1/udp/1/quic-v1")
+	tcpPublic, _ := ma.StringCast("/ip4/1.1.1.1/tcp/1")
+	quicPublic, _ := ma.StringCast("/ip4/1.1.1.1/udp/1/quic-v1")
 
-	tcpPrivate := ma.StringCast("/ip4/192.168.1.1/tcp/1")
-	quicPrivate := ma.StringCast("/ip4/192.168.1.1/udp/1/quic-v1")
+	tcpPrivate, _ := ma.StringCast("/ip4/192.168.1.1/tcp/1")
+	quicPrivate, _ := ma.StringCast("/ip4/192.168.1.1/udp/1/quic-v1")
 
-	tcpLocal := ma.StringCast("/ip4/127.0.0.1/tcp/1")
-	quicLocal := ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1")
+	tcpLocal, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1")
+	quicLocal, _ := ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1")
 
 	testCases := []testCase{
 		{

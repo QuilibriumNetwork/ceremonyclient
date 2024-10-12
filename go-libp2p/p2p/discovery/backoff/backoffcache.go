@@ -143,7 +143,6 @@ func (d *BackoffDiscovery) FindPeers(ctx context.Context, ns string, opts ...dis
 	}
 
 	c.mux.Lock()
-	defer c.mux.Unlock()
 
 	timeExpired := d.clock.Now().After(c.nextDiscover)
 
@@ -165,6 +164,7 @@ func (d *BackoffDiscovery) FindPeers(ctx context.Context, ns string, opts ...dis
 			}
 		}
 		close(pch)
+		c.mux.Unlock()
 		return pch, nil
 	}
 
@@ -172,6 +172,7 @@ func (d *BackoffDiscovery) FindPeers(ctx context.Context, ns string, opts ...dis
 	if !c.ongoing {
 		pch, err := d.disc.FindPeers(ctx, ns, opts...)
 		if err != nil {
+			c.mux.Unlock()
 			return nil, err
 		}
 
@@ -189,12 +190,12 @@ func (d *BackoffDiscovery) FindPeers(ctx context.Context, ns string, opts ...dis
 	c.sendingChs[evtCh] = options.Limit
 
 	go findPeerReceiver(ctx, pch, evtCh, rcvPeers)
-
+	c.mux.Unlock()
 	return pch, nil
 }
 
 func findPeerDispatcher(ctx context.Context, c *backoffCache, pch <-chan peer.AddrInfo) {
-	defer func() {
+	cleanup := func() {
 		c.mux.Lock()
 
 		// If the peer addresses have changed reset the backoff
@@ -212,12 +213,13 @@ func findPeerDispatcher(ctx context.Context, c *backoffCache, pch <-chan peer.Ad
 		}
 		c.sendingChs = make(map[chan peer.AddrInfo]int)
 		c.mux.Unlock()
-	}()
+	}
 
 	for {
 		select {
 		case ai, ok := <-pch:
 			if !ok {
+				cleanup()
 				return
 			}
 			c.mux.Lock()
@@ -246,14 +248,13 @@ func findPeerDispatcher(ctx context.Context, c *backoffCache, pch <-chan peer.Ad
 
 			c.mux.Unlock()
 		case <-ctx.Done():
+			cleanup()
 			return
 		}
 	}
 }
 
 func findPeerReceiver(ctx context.Context, pch, evtCh chan peer.AddrInfo, rcvPeers []peer.AddrInfo) {
-	defer close(pch)
-
 	for {
 		select {
 		case ai, ok := <-evtCh:
@@ -279,12 +280,15 @@ func findPeerReceiver(ctx context.Context, pch, evtCh chan peer.AddrInfo, rcvPee
 					select {
 					case pch <- p:
 					case <-ctx.Done():
+						close(pch)
 						return
 					}
 				}
+				close(pch)
 				return
 			}
 		case <-ctx.Done():
+			close(pch)
 			return
 		}
 	}

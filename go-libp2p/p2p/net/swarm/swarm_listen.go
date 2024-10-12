@@ -105,7 +105,7 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 	})
 
 	go func() {
-		defer func() {
+		cleanup := func() {
 			s.listeners.Lock()
 			_, ok := s.listeners.m[list]
 			if ok {
@@ -124,13 +124,14 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 				n.ListenClose(s, maddr)
 			})
 			s.refs.Done()
-		}()
+		}
 		for {
 			c, err := list.Accept()
 			if err != nil {
 				if !errors.Is(err, transport.ErrListenerClosed) {
 					log.Errorf("swarm listener for %s accept error: %s", a, err)
 				}
+				cleanup()
 				return
 			}
 			canonicallog.LogPeerStatus(100, c.RemotePeer(), c.RemoteMultiaddr(), "connection_status", "established", "dir", "inbound")
@@ -141,17 +142,19 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 			log.Debugf("swarm listener accepted connection: %s <-> %s", c.LocalMultiaddr(), c.RemoteMultiaddr())
 			s.refs.Add(1)
 			go func() {
-				defer s.refs.Done()
 				_, err := s.addConn(c, network.DirInbound)
 				switch err {
 				case nil:
 				case ErrSwarmClosed:
 					// ignore.
+					s.refs.Done()
 					return
 				default:
 					log.Warnw("adding connection failed", "to", a, "error", err)
+					s.refs.Done()
 					return
 				}
+				s.refs.Done()
 			}()
 		}
 	}()

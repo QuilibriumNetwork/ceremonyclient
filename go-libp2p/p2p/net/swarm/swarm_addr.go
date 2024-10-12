@@ -11,8 +11,9 @@ import (
 // ListenAddresses returns a list of addresses at which this swarm listens.
 func (s *Swarm) ListenAddresses() []ma.Multiaddr {
 	s.listeners.RLock()
-	defer s.listeners.RUnlock()
-	return s.listenAddressesNoLock()
+	mas := s.listenAddressesNoLock()
+	s.listeners.RUnlock()
+	return mas
 }
 
 func (s *Swarm) listenAddressesNoLock() []ma.Multiaddr {

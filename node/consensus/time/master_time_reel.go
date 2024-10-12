@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/big"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -83,9 +84,20 @@ func (m *MasterTimeReel) Start() error {
 		panic(err)
 	}
 
+	for {
+		genesis, err := config.DownloadAndVerifyGenesis()
+		if err != nil {
+			time.Sleep(10 * time.Minute)
+			continue
+		}
+
+		m.engineConfig.GenesisSeed = genesis.GenesisSeedHex
+		break
+	}
+
 	rebuildGenesisFrame := false
-	if genesis != nil && genesis.Difficulty == 0 {
-		m.logger.Warn("corrupted genesis frame detected, rebuilding")
+	if genesis != nil && len(m.engineConfig.GenesisSeed) != 74 {
+		m.logger.Warn("rebuilding genesis frame")
 
 		err = m.clockStore.ResetMasterClockFrames(m.filter)
 		if err != nil {
@@ -146,8 +158,8 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 	}
 
 	difficulty := m.engineConfig.Difficulty
-	if difficulty == 0 || difficulty == 10000 {
-		difficulty = 100000
+	if difficulty != 10000000 {
+		difficulty = 10000000
 	}
 
 	frame, err := m.frameProver.CreateMasterGenesisFrame(

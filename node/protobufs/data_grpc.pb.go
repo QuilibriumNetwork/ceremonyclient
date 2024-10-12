@@ -19,6 +19,299 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
+	DataService_GetCompressedSyncFrames_FullMethodName       = "/quilibrium.node.data.pb.DataService/GetCompressedSyncFrames"
+	DataService_NegotiateCompressedSyncFrames_FullMethodName = "/quilibrium.node.data.pb.DataService/NegotiateCompressedSyncFrames"
+	DataService_GetPublicChannel_FullMethodName              = "/quilibrium.node.data.pb.DataService/GetPublicChannel"
+	DataService_GetDataFrame_FullMethodName                  = "/quilibrium.node.data.pb.DataService/GetDataFrame"
+)
+
+// DataServiceClient is the client API for DataService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type DataServiceClient interface {
+	GetCompressedSyncFrames(ctx context.Context, in *ClockFramesRequest, opts ...grpc.CallOption) (DataService_GetCompressedSyncFramesClient, error)
+	NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (DataService_NegotiateCompressedSyncFramesClient, error)
+	GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (DataService_GetPublicChannelClient, error)
+	GetDataFrame(ctx context.Context, in *GetDataFrameRequest, opts ...grpc.CallOption) (*DataFrameResponse, error)
+}
+
+type dataServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewDataServiceClient(cc grpc.ClientConnInterface) DataServiceClient {
+	return &dataServiceClient{cc}
+}
+
+func (c *dataServiceClient) GetCompressedSyncFrames(ctx context.Context, in *ClockFramesRequest, opts ...grpc.CallOption) (DataService_GetCompressedSyncFramesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &DataService_ServiceDesc.Streams[0], DataService_GetCompressedSyncFrames_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &dataServiceGetCompressedSyncFramesClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type DataService_GetCompressedSyncFramesClient interface {
+	Recv() (*DataCompressedSync, error)
+	grpc.ClientStream
+}
+
+type dataServiceGetCompressedSyncFramesClient struct {
+	grpc.ClientStream
+}
+
+func (x *dataServiceGetCompressedSyncFramesClient) Recv() (*DataCompressedSync, error) {
+	m := new(DataCompressedSync)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *dataServiceClient) NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (DataService_NegotiateCompressedSyncFramesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &DataService_ServiceDesc.Streams[1], DataService_NegotiateCompressedSyncFrames_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &dataServiceNegotiateCompressedSyncFramesClient{stream}
+	return x, nil
+}
+
+type DataService_NegotiateCompressedSyncFramesClient interface {
+	Send(*DataCompressedSyncRequestMessage) error
+	Recv() (*DataCompressedSyncResponseMessage, error)
+	grpc.ClientStream
+}
+
+type dataServiceNegotiateCompressedSyncFramesClient struct {
+	grpc.ClientStream
+}
+
+func (x *dataServiceNegotiateCompressedSyncFramesClient) Send(m *DataCompressedSyncRequestMessage) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *dataServiceNegotiateCompressedSyncFramesClient) Recv() (*DataCompressedSyncResponseMessage, error) {
+	m := new(DataCompressedSyncResponseMessage)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *dataServiceClient) GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (DataService_GetPublicChannelClient, error) {
+	stream, err := c.cc.NewStream(ctx, &DataService_ServiceDesc.Streams[2], DataService_GetPublicChannel_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &dataServiceGetPublicChannelClient{stream}
+	return x, nil
+}
+
+type DataService_GetPublicChannelClient interface {
+	Send(*P2PChannelEnvelope) error
+	Recv() (*P2PChannelEnvelope, error)
+	grpc.ClientStream
+}
+
+type dataServiceGetPublicChannelClient struct {
+	grpc.ClientStream
+}
+
+func (x *dataServiceGetPublicChannelClient) Send(m *P2PChannelEnvelope) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *dataServiceGetPublicChannelClient) Recv() (*P2PChannelEnvelope, error) {
+	m := new(P2PChannelEnvelope)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *dataServiceClient) GetDataFrame(ctx context.Context, in *GetDataFrameRequest, opts ...grpc.CallOption) (*DataFrameResponse, error) {
+	out := new(DataFrameResponse)
+	err := c.cc.Invoke(ctx, DataService_GetDataFrame_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DataServiceServer is the server API for DataService service.
+// All implementations must embed UnimplementedDataServiceServer
+// for forward compatibility
+type DataServiceServer interface {
+	GetCompressedSyncFrames(*ClockFramesRequest, DataService_GetCompressedSyncFramesServer) error
+	NegotiateCompressedSyncFrames(DataService_NegotiateCompressedSyncFramesServer) error
+	GetPublicChannel(DataService_GetPublicChannelServer) error
+	GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error)
+	mustEmbedUnimplementedDataServiceServer()
+}
+
+// UnimplementedDataServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedDataServiceServer struct {
+}
+
+func (UnimplementedDataServiceServer) GetCompressedSyncFrames(*ClockFramesRequest, DataService_GetCompressedSyncFramesServer) error {
+	return status.Errorf(codes.Unimplemented, "method GetCompressedSyncFrames not implemented")
+}
+func (UnimplementedDataServiceServer) NegotiateCompressedSyncFrames(DataService_NegotiateCompressedSyncFramesServer) error {
+	return status.Errorf(codes.Unimplemented, "method NegotiateCompressedSyncFrames not implemented")
+}
+func (UnimplementedDataServiceServer) GetPublicChannel(DataService_GetPublicChannelServer) error {
+	return status.Errorf(codes.Unimplemented, "method GetPublicChannel not implemented")
+}
+func (UnimplementedDataServiceServer) GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetDataFrame not implemented")
+}
+func (UnimplementedDataServiceServer) mustEmbedUnimplementedDataServiceServer() {}
+
+// UnsafeDataServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to DataServiceServer will
+// result in compilation errors.
+type UnsafeDataServiceServer interface {
+	mustEmbedUnimplementedDataServiceServer()
+}
+
+func RegisterDataServiceServer(s grpc.ServiceRegistrar, srv DataServiceServer) {
+	s.RegisterService(&DataService_ServiceDesc, srv)
+}
+
+func _DataService_GetCompressedSyncFrames_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ClockFramesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(DataServiceServer).GetCompressedSyncFrames(m, &dataServiceGetCompressedSyncFramesServer{stream})
+}
+
+type DataService_GetCompressedSyncFramesServer interface {
+	Send(*DataCompressedSync) error
+	grpc.ServerStream
+}
+
+type dataServiceGetCompressedSyncFramesServer struct {
+	grpc.ServerStream
+}
+
+func (x *dataServiceGetCompressedSyncFramesServer) Send(m *DataCompressedSync) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _DataService_NegotiateCompressedSyncFrames_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(DataServiceServer).NegotiateCompressedSyncFrames(&dataServiceNegotiateCompressedSyncFramesServer{stream})
+}
+
+type DataService_NegotiateCompressedSyncFramesServer interface {
+	Send(*DataCompressedSyncResponseMessage) error
+	Recv() (*DataCompressedSyncRequestMessage, error)
+	grpc.ServerStream
+}
+
+type dataServiceNegotiateCompressedSyncFramesServer struct {
+	grpc.ServerStream
+}
+
+func (x *dataServiceNegotiateCompressedSyncFramesServer) Send(m *DataCompressedSyncResponseMessage) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *dataServiceNegotiateCompressedSyncFramesServer) Recv() (*DataCompressedSyncRequestMessage, error) {
+	m := new(DataCompressedSyncRequestMessage)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func _DataService_GetPublicChannel_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(DataServiceServer).GetPublicChannel(&dataServiceGetPublicChannelServer{stream})
+}
+
+type DataService_GetPublicChannelServer interface {
+	Send(*P2PChannelEnvelope) error
+	Recv() (*P2PChannelEnvelope, error)
+	grpc.ServerStream
+}
+
+type dataServiceGetPublicChannelServer struct {
+	grpc.ServerStream
+}
+
+func (x *dataServiceGetPublicChannelServer) Send(m *P2PChannelEnvelope) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *dataServiceGetPublicChannelServer) Recv() (*P2PChannelEnvelope, error) {
+	m := new(P2PChannelEnvelope)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func _DataService_GetDataFrame_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDataFrameRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataServiceServer).GetDataFrame(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataService_GetDataFrame_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataServiceServer).GetDataFrame(ctx, req.(*GetDataFrameRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// DataService_ServiceDesc is the grpc.ServiceDesc for DataService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var DataService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.data.pb.DataService",
+	HandlerType: (*DataServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetDataFrame",
+			Handler:    _DataService_GetDataFrame_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "GetCompressedSyncFrames",
+			Handler:       _DataService_GetCompressedSyncFrames_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "NegotiateCompressedSyncFrames",
+			Handler:       _DataService_NegotiateCompressedSyncFrames_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "GetPublicChannel",
+			Handler:       _DataService_GetPublicChannel_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "data.proto",
+}
+
+const (
 	DataIPCService_CalculateChallengeProof_FullMethodName = "/quilibrium.node.data.pb.DataIPCService/CalculateChallengeProof"
 )
 
