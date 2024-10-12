@@ -93,6 +93,7 @@ func (n *Node) VerifyProofIntegrity() {
 	if e != nil {
 		panic(e)
 	}
+
 	dataProver := crypto.NewKZGInclusionProver(n.logger)
 	wesoProver := crypto.NewWesolowskiFrameProver(n.logger)
 
