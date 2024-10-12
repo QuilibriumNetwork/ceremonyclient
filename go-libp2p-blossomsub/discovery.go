@@ -120,7 +120,6 @@ func (d *discover) pollTimer() {
 	}
 
 	ticker := time.NewTicker(DiscoveryPollInterval)
-	defer ticker.Stop()
 
 	for {
 		select {
@@ -128,9 +127,11 @@ func (d *discover) pollTimer() {
 			select {
 			case d.p.eval <- d.requestDiscovery:
 			case <-d.p.ctx.Done():
+				ticker.Stop()
 				return
 			}
 		case <-d.p.ctx.Done():
+			ticker.Stop()
 			return
 		}
 	}
@@ -197,7 +198,6 @@ func (d *discover) Advertise(bitmask []byte) {
 		}
 
 		t := time.NewTimer(next)
-		defer t.Stop()
 
 		for advertisingCtx.Err() == nil {
 			select {
@@ -211,9 +211,11 @@ func (d *discover) Advertise(bitmask []byte) {
 				}
 				t.Reset(next)
 			case <-advertisingCtx.Done():
+				t.Stop()
 				return
 			}
 		}
+		t.Stop()
 	}()
 }
 
@@ -248,7 +250,6 @@ func (d *discover) Bootstrap(ctx context.Context, bitmask []byte, ready RouterRe
 	if !t.Stop() {
 		<-t.C
 	}
-	defer t.Stop()
 
 	for {
 		// Check if ready for publishing
@@ -259,11 +260,14 @@ func (d *discover) Bootstrap(ctx context.Context, bitmask []byte, ready RouterRe
 			bootstrapped <- done
 		}:
 			if <-bootstrapped {
+				t.Stop()
 				return true
 			}
 		case <-d.p.ctx.Done():
+			t.Stop()
 			return false
 		case <-ctx.Done():
+			t.Stop()
 			return false
 		}
 
@@ -272,16 +276,20 @@ func (d *discover) Bootstrap(ctx context.Context, bitmask []byte, ready RouterRe
 		select {
 		case d.discoverQ <- disc:
 		case <-d.p.ctx.Done():
+			t.Stop()
 			return false
 		case <-ctx.Done():
+			t.Stop()
 			return false
 		}
 
 		select {
 		case <-disc.done:
 		case <-d.p.ctx.Done():
+			t.Stop()
 			return false
 		case <-ctx.Done():
+			t.Stop()
 			return false
 		}
 
@@ -289,8 +297,10 @@ func (d *discover) Bootstrap(ctx context.Context, bitmask []byte, ready RouterRe
 		select {
 		case <-t.C:
 		case <-d.p.ctx.Done():
+			t.Stop()
 			return false
 		case <-ctx.Done():
+			t.Stop()
 			return false
 		}
 	}
@@ -298,15 +308,16 @@ func (d *discover) Bootstrap(ctx context.Context, bitmask []byte, ready RouterRe
 
 func (d *discover) handleDiscovery(ctx context.Context, bitmask []byte, opts []discovery.Option) {
 	discoverCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-	defer cancel()
 
 	peerCh, err := d.discovery.FindPeers(discoverCtx, string(bitmask), opts...)
 	if err != nil {
 		log.Debugf("error finding peers for bitmask %s: %v", bitmask, err)
+		cancel()
 		return
 	}
 
 	d.connector.Connect(ctx, peerCh)
+	cancel()
 }
 
 type discoverReq struct {
@@ -321,11 +332,11 @@ type pubSubDiscovery struct {
 }
 
 func (d *pubSubDiscovery) Advertise(ctx context.Context, ns string, opts ...discovery.Option) (time.Duration, error) {
-	return d.Discovery.Advertise(ctx, "floodsub:"+ns, append(opts, d.opts...)...)
+	return d.Discovery.Advertise(ctx, "blossomsub:"+ns, append(opts, d.opts...)...)
 }
 
 func (d *pubSubDiscovery) FindPeers(ctx context.Context, ns string, opts ...discovery.Option) (<-chan peer.AddrInfo, error) {
-	return d.Discovery.FindPeers(ctx, "floodsub:"+ns, append(opts, d.opts...)...)
+	return d.Discovery.FindPeers(ctx, "blossomsub:"+ns, append(opts, d.opts...)...)
 }
 
 // WithDiscoveryOpts passes libp2p Discovery options into the PubSub discovery subsystem

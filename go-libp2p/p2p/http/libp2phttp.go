@@ -249,13 +249,19 @@ func (h *Host) setupListeners(listenerErrCh chan error) error {
 
 		var listenAddr ma.Multiaddr
 		if parsedAddr.useHTTPS && parsedAddr.sni != "" && parsedAddr.sni != host {
-			listenAddr = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/tls/sni/%s/http", host, port, parsedAddr.sni))
+			listenAddr, err = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/tls/sni/%s/http", host, port, parsedAddr.sni))
+			if err != nil {
+				return err
+			}
 		} else {
 			scheme := "http"
 			if parsedAddr.useHTTPS {
 				scheme = "https"
 			}
-			listenAddr = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/%s", host, port, scheme))
+			listenAddr, err = ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%s/%s", host, port, scheme))
+			if err != nil {
+				return err
+			}
 		}
 
 		if parsedAddr.useHTTPS {
@@ -300,13 +306,11 @@ func (h *Host) Serve() error {
 	h.httpTransportInit()
 
 	closedWaitingForListeners := false
-	defer func() {
+
+	if len(h.ListenAddrs) == 0 && h.StreamHost == nil {
 		if !closedWaitingForListeners {
 			close(h.httpTransport.waitingForListeners)
 		}
-	}()
-
-	if len(h.ListenAddrs) == 0 && h.StreamHost == nil {
 		return ErrNoListeners
 	}
 
@@ -323,6 +327,9 @@ func (h *Host) Serve() error {
 	if h.StreamHost != nil {
 		listener, err := streamHostListen(h.StreamHost)
 		if err != nil {
+			if !closedWaitingForListeners {
+				close(h.httpTransport.waitingForListeners)
+			}
 			return err
 		}
 		h.httpTransport.listeners = append(h.httpTransport.listeners, listener)
@@ -342,6 +349,9 @@ func (h *Host) Serve() error {
 	err := h.setupListeners(errCh)
 	if err != nil {
 		closeAllListeners()
+		if !closedWaitingForListeners {
+			close(h.httpTransport.waitingForListeners)
+		}
 		return err
 	}
 
@@ -350,6 +360,9 @@ func (h *Host) Serve() error {
 
 	if len(h.httpTransport.listeners) == 0 || len(h.httpTransport.listenAddrs) == 0 {
 		closeAllListeners()
+		if !closedWaitingForListeners {
+			close(h.httpTransport.waitingForListeners)
+		}
 		return ErrNoListeners
 	}
 
@@ -366,7 +379,9 @@ func (h *Host) Serve() error {
 		<-errCh
 	}
 	close(errCh)
-
+	if !closedWaitingForListeners {
+		close(h.httpTransport.waitingForListeners)
+	}
 	return err
 }
 
@@ -431,8 +446,9 @@ func (s *streamReadCloser) Close() error {
 func (rt *streamRoundTripper) GetPeerMetadata() (PeerMeta, error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(WellKnownRequestTimeout))
-	defer cancel()
-	return rt.httpHost.getAndStorePeerMetadata(ctx, rt, rt.server)
+	peerMeta, err := rt.httpHost.getAndStorePeerMetadata(ctx, rt, rt.server)
+	cancel()
+	return peerMeta, err
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -454,11 +470,11 @@ func (rt *streamRoundTripper) RoundTrip(r *http.Request) (*http.Response, error)
 	r.Header.Add("connection", "close")
 
 	go func() {
-		defer s.CloseWrite()
 		r.Write(s)
 		if r.Body != nil {
 			r.Body.Close()
 		}
+		s.CloseWrite()
 	}()
 
 	if deadline, ok := r.Context().Deadline(); ok {
@@ -505,12 +521,13 @@ func (rt *roundTripperForSpecificServer) GetPeerMetadata() (PeerMeta, error) {
 
 	ctx := context.Background()
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(WellKnownRequestTimeout))
-	defer cancel()
 	wk, err := rt.httpHost.getAndStorePeerMetadata(ctx, rt, rt.server)
 	if err == nil {
 		rt.cachedProtos = wk
+		cancel()
 		return wk, nil
 	}
+	cancel()
 	return wk, err
 }
 
@@ -573,14 +590,15 @@ func (rt *namespacedRoundTripper) RoundTrip(r *http.Request) (*http.Response, er
 func (h *Host) NamespaceRoundTripper(roundtripper http.RoundTripper, p protocol.ID, server peer.ID) (*namespacedRoundTripper, error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(WellKnownRequestTimeout))
-	defer cancel()
 	protos, err := h.getAndStorePeerMetadata(ctx, roundtripper, server)
 	if err != nil {
+		cancel()
 		return &namespacedRoundTripper{}, err
 	}
 
 	v, ok := protos[p]
 	if !ok {
+		cancel()
 		return &namespacedRoundTripper{}, fmt.Errorf("no protocol %s for server %s", p, server)
 	}
 
@@ -592,9 +610,11 @@ func (h *Host) NamespaceRoundTripper(roundtripper http.RoundTripper, p protocol.
 
 	u, err := url.Parse(path)
 	if err != nil {
+		cancel()
 		return &namespacedRoundTripper{}, fmt.Errorf("invalid path %s for protocol %s for server %s", v.Path, p, server)
 	}
 
+	cancel()
 	return &namespacedRoundTripper{
 		RoundTripper:      roundtripper,
 		protocolPrefix:    u.Path,
@@ -720,7 +740,10 @@ type httpMultiaddr struct {
 
 func parseMultiaddr(addr ma.Multiaddr) httpMultiaddr {
 	out := httpMultiaddr{}
-	ma.ForEach(addr, func(c ma.Component) bool {
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_IP4, ma.P_IP6, ma.P_DNS, ma.P_DNS4, ma.P_DNS6:
 			out.host = c.Value()
@@ -748,7 +771,7 @@ var tlsComponent, _ = ma.NewComponent("tls", "")
 // Returns a bool indicating if the input multiaddr has an http (or https) component.
 func normalizeHTTPMultiaddr(addr ma.Multiaddr) (ma.Multiaddr, bool) {
 	isHTTPMultiaddr := false
-	beforeHTTPS, afterIncludingHTTPS := ma.SplitFunc(addr, func(c ma.Component) bool {
+	beforeHTTPS, afterIncludingHTTPS, err := ma.SplitFunc(addr, func(c ma.Component) bool {
 		if c.Protocol().Code == ma.P_HTTP {
 			isHTTPMultiaddr = true
 		}
@@ -760,12 +783,20 @@ func normalizeHTTPMultiaddr(addr ma.Multiaddr) (ma.Multiaddr, bool) {
 		return false
 	})
 
+	if err != nil {
+		return addr, false
+	}
+
 	if afterIncludingHTTPS == nil {
 		// No HTTPS component, just return the original
 		return addr, isHTTPMultiaddr
 	}
 
-	_, afterHTTPS := ma.SplitFirst(afterIncludingHTTPS)
+	_, afterHTTPS, err := ma.SplitFirst(afterIncludingHTTPS)
+	if err != nil {
+		return addr, false
+	}
+
 	if afterHTTPS == nil {
 		return ma.Join(beforeHTTPS, tlsComponent, httpComponent), isHTTPMultiaddr
 	}
@@ -849,9 +880,9 @@ func requestPeerMeta(ctx context.Context, roundtripper http.RoundTripper, wellKn
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
@@ -861,9 +892,11 @@ func requestPeerMeta(ctx context.Context, roundtripper http.RoundTripper, wellKn
 		N: peerMetadataLimit,
 	}).Decode(&meta)
 	if err != nil {
+		resp.Body.Close()
 		return nil, err
 	}
 
+	resp.Body.Close()
 	return meta, nil
 }
 

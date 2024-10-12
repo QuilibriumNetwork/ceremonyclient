@@ -40,10 +40,10 @@ func NewConn(raw *ws.Conn, secure bool) *Conn {
 
 func (c *Conn) Read(b []byte) (int, error) {
 	c.readLock.Lock()
-	defer c.readLock.Unlock()
 
 	if c.reader == nil {
 		if err := c.prepNextReader(); err != nil {
+			c.readLock.Unlock()
 			return 0, err
 		}
 	}
@@ -55,15 +55,18 @@ func (c *Conn) Read(b []byte) (int, error) {
 			c.reader = nil
 
 			if n > 0 {
+				c.readLock.Unlock()
 				return n, nil
 			}
 
 			if err := c.prepNextReader(); err != nil {
+				c.readLock.Unlock()
 				return 0, err
 			}
 
 			// explicitly looping
 		default:
+			c.readLock.Unlock()
 			return n, err
 		}
 	}
@@ -90,12 +93,13 @@ func (c *Conn) prepNextReader() error {
 
 func (c *Conn) Write(b []byte) (n int, err error) {
 	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
 
 	if err := c.Conn.WriteMessage(c.DefaultMessageType, b); err != nil {
+		c.writeLock.Unlock()
 		return 0, err
 	}
 
+	c.writeLock.Unlock()
 	return len(b), nil
 }
 
@@ -148,9 +152,9 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	// deadline.
 
 	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
-
-	return c.Conn.SetWriteDeadline(t)
+	err := c.Conn.SetWriteDeadline(t)
+	c.writeLock.Unlock()
+	return err
 }
 
 type capableConn struct {

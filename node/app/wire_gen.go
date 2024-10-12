@@ -14,6 +14,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -24,14 +25,8 @@ import (
 
 func NewDHTNode(configConfig *config.Config) (*DHTNode, error) {
 	p2PConfig := configConfig.P2P
-	dbConfig := configConfig.DB
-	pebbleDB := store.NewPebbleDB(dbConfig)
-	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
-	if err != nil {
-		return nil, err
-	}
 	zapLogger := debugLogger()
-	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	dhtNode, err := newDHTNode(blossomSub)
 	if err != nil {
 		return nil, err
@@ -48,17 +43,13 @@ func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTes
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
-	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
-	if err != nil {
-		return nil, err
-	}
-	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	engineConfig := configConfig.Engine
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
-	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleDataProofStore, pebbleClockStore, fileKeyManager, blossomSub, kzgInclusionProver, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, kzgInclusionProver, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
 	node, err := newNode(zapLogger, pebbleDataProofStore, pebbleClockStore, fileKeyManager, blossomSub, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
@@ -75,17 +66,13 @@ func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestRepo
 	keyConfig := configConfig.Key
 	fileKeyManager := keys.NewFileKeyManager(keyConfig, zapLogger)
 	p2PConfig := configConfig.P2P
-	peerstoreDatastore, err := store.NewPeerstoreDatastore(pebbleDB)
-	if err != nil {
-		return nil, err
-	}
-	blossomSub := p2p.NewBlossomSub(p2PConfig, peerstoreDatastore, zapLogger)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	engineConfig := configConfig.Engine
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
 	wesolowskiFrameProver := crypto.NewWesolowskiFrameProver(zapLogger)
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, wesolowskiFrameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
-	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleDataProofStore, pebbleClockStore, fileKeyManager, blossomSub, kzgInclusionProver, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
+	masterClockConsensusEngine := master.NewMasterClockConsensusEngine(engineConfig, zapLogger, pebbleClockStore, fileKeyManager, blossomSub, kzgInclusionProver, wesolowskiFrameProver, masterTimeReel, inMemoryPeerInfoManager, selfTestReport)
 	node, err := newNode(zapLogger, pebbleDataProofStore, pebbleClockStore, fileKeyManager, blossomSub, masterClockConsensusEngine)
 	if err != nil {
 		return nil, err
@@ -139,11 +126,11 @@ var debugLoggerSet = wire.NewSet(
 
 var keyManagerSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Key"), keys.NewFileKeyManager, wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)))
 
-var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, store.NewPeerstoreDatastore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)), wire.Bind(new(store.Peerstore), new(*store.PeerstoreDatastore)))
+var storeSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "DB"), store.NewPebbleDB, wire.Bind(new(store.KVDB), new(*store.PebbleDB)), store.NewPebbleClockStore, store.NewPebbleCoinStore, store.NewPebbleKeyStore, store.NewPebbleDataProofStore, store.NewPeerstoreDatastore, wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)), wire.Bind(new(store.CoinStore), new(*store.PebbleCoinStore)), wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)), wire.Bind(new(store.DataProofStore), new(*store.PebbleDataProofStore)), wire.Bind(new(store.Peerstore), new(*store.PeerstoreDatastore)))
 
 var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), p2p.NewInMemoryPeerInfoManager, p2p.NewBlossomSub, wire.Bind(new(p2p.PubSub), new(*p2p.BlossomSub)), wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)))
 
-var engineSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), crypto.NewWesolowskiFrameProver, wire.Bind(new(crypto.FrameProver), new(*crypto.WesolowskiFrameProver)), crypto.NewKZGInclusionProver, wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)), time.NewMasterTimeReel)
+var engineSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "Engine"), crypto.NewWesolowskiFrameProver, wire.Bind(new(crypto.FrameProver), new(*crypto.WesolowskiFrameProver)), crypto.NewKZGInclusionProver, wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)), time.NewMasterTimeReel, token.NewTokenExecutionEngine)
 
 var consensusSet = wire.NewSet(master.NewMasterClockConsensusEngine, wire.Bind(
 	new(consensus.ConsensusEngine),

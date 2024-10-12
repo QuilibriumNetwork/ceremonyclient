@@ -81,7 +81,7 @@ func TestMain(m *testing.M) {
 	// Post-ceremony, precompute everything and put it in the finalized ceremony
 	// state
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	sizes := []int64{16}
 
@@ -173,7 +173,7 @@ func TestMain(m *testing.M) {
 
 func TestKzgBytesToPoly(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
@@ -215,7 +215,7 @@ func TestKzgBytesToPoly(t *testing.T) {
 
 func TestPolynomialCommitment(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 
@@ -263,7 +263,7 @@ func TestPolynomialCommitment(t *testing.T) {
 
 func TestKZGProof(t *testing.T) {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	p := kzg.NewKZGProver(curves.BLS48581(curves.BLS48581G1().Point), sha3.New256, q)
 

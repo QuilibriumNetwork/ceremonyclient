@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"sync"
-	"time"
 
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
@@ -121,19 +120,6 @@ func NewPublicP2PChannel(
 	}
 
 	ch.participant = participant
-	if publicChannelClient == nil {
-		pubSub.Subscribe(
-			sendFilter,
-			func(message *pb.Message) error { return nil },
-			true,
-		)
-
-		pubSub.Subscribe(
-			receiveFilter,
-			ch.handleReceive,
-			true,
-		)
-	}
 
 	return ch, nil
 }
@@ -176,63 +162,37 @@ func (c *PublicP2PChannel) Send(message []byte) error {
 		return errors.Wrap(err, "send")
 	}
 
-	if c.publicChannelClient == nil {
-		rawBytes, err := proto.Marshal(envelope)
-		if err != nil {
-			return errors.Wrap(err, "send")
-		}
-
-		c.sendMap[c.senderSeqNo] = rawBytes
-		return errors.Wrap(
-			c.pubSub.PublishToBitmask(c.sendFilter, rawBytes),
-			"send",
-		)
-	} else {
-		return errors.Wrap(
-			c.publicChannelClient.Send(envelope),
-			"send",
-		)
-	}
+	return errors.Wrap(
+		c.publicChannelClient.Send(envelope),
+		"send",
+	)
 }
 
 func (c *PublicP2PChannel) Receive() ([]byte, error) {
 	c.receiverSeqNo++
-	if c.publicChannelClient == nil {
-		after := time.After(20 * time.Second)
-		select {
-		case msg := <-c.receiveChan:
-			return msg, nil
-		case <-after:
-			return nil, errors.Wrap(errors.New("timed out"), "receive")
-		}
-	} else {
-		msg, err := c.publicChannelClient.Recv()
-		if err != nil {
-			return nil, errors.Wrap(err, "receive")
-		}
 
-		rawData, err := c.participant.RatchetDecrypt(msg)
-		if err != nil {
-			return nil, errors.Wrap(err, "receive")
-		}
-
-		seqNo := binary.BigEndian.Uint64(rawData[:8])
-
-		if seqNo == c.receiverSeqNo {
-			return rawData[8:], nil
-		} else {
-			c.receiveMx.Lock()
-			c.receiveMap[seqNo] = rawData[8:]
-			c.receiveMx.Unlock()
-		}
-
-		return nil, nil
+	msg, err := c.publicChannelClient.Recv()
+	if err != nil {
+		return nil, errors.Wrap(err, "receive")
 	}
+
+	rawData, err := c.participant.RatchetDecrypt(msg)
+	if err != nil {
+		return nil, errors.Wrap(err, "receive")
+	}
+
+	seqNo := binary.BigEndian.Uint64(rawData[:8])
+
+	if seqNo == c.receiverSeqNo {
+		return rawData[8:], nil
+	} else {
+		c.receiveMx.Lock()
+		c.receiveMap[seqNo] = rawData[8:]
+		c.receiveMx.Unlock()
+	}
+
+	return nil, nil
 }
 
 func (c *PublicP2PChannel) Close() {
-	if c.publicChannelClient == nil {
-		c.pubSub.Unsubscribe(c.sendFilter, true)
-		c.pubSub.Unsubscribe(c.receiveFilter, true)
-	}
 }

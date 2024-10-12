@@ -204,7 +204,7 @@ func TestInit(file string) {
 	// Post-ceremony, precompute everything and put it in the finalized ceremony
 	// state
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	sizes := []int64{16, 32, 64, 128, 256, 512, 1024, 2048, 65536}
 
@@ -319,7 +319,7 @@ func NewKZGProver(
 
 func DefaultKZGProver() *KZGProver {
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	return NewKZGProver(
 		curves.BLS48581(curves.BLS48581G1().Point),
@@ -435,7 +435,7 @@ func (p *KZGProver) EvaluateLagrangeForm(
 
 	xBI := x.BigInt()
 	modulus := make([]byte, 73)
-	bls48581.NewBIGints(bls48581.CURVE_Order, nil).ToBytes(modulus)
+	bls48581.NewBIGints(bls48581.CURVE_Order).ToBytes(modulus)
 	q := new(big.Int).SetBytes(modulus)
 	xBI.Exp(xBI, width.BigInt(), q)
 	xBI.Sub(xBI, big.NewInt(1))

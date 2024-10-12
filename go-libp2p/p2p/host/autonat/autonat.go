@@ -156,17 +156,13 @@ func ipInList(candidate ma.Multiaddr, list []ma.Multiaddr) bool {
 }
 
 func (as *AmbientAutoNAT) background() {
-	defer close(as.backgroundRunning)
 	// wait a bit for the node to come online and establish some connections
 	// before starting autodetection
 	delay := as.config.bootDelay
 
 	subChan := as.subscriber.Out()
-	defer as.subscriber.Close()
-	defer as.emitReachabilityChanged.Close()
 
 	timer := time.NewTimer(delay)
-	defer timer.Stop()
 	timerRunning := true
 	retryProbe := false
 	for {
@@ -174,7 +170,8 @@ func (as *AmbientAutoNAT) background() {
 		// new inbound connection.
 		case conn := <-as.inboundConn:
 			localAddrs := as.host.Addrs()
-			if manet.IsPublicAddr(conn.RemoteMultiaddr()) &&
+			is, err := manet.IsPublicAddr(conn.RemoteMultiaddr())
+			if is && err == nil &&
 				!ipInList(conn.RemoteMultiaddr(), localAddrs) {
 				as.lastInbound = time.Now()
 			}
@@ -201,6 +198,10 @@ func (as *AmbientAutoNAT) background() {
 		// probe finished.
 		case err, ok := <-as.dialResponses:
 			if !ok {
+				timer.Stop()
+				as.emitReachabilityChanged.Close()
+				as.subscriber.Close()
+				close(as.backgroundRunning)
 				return
 			}
 			if IsDialRefused(err) {
@@ -214,6 +215,10 @@ func (as *AmbientAutoNAT) background() {
 			timerRunning = false
 			retryProbe = false
 		case <-as.ctx.Done():
+			timer.Stop()
+			as.emitReachabilityChanged.Close()
+			as.subscriber.Close()
+			close(as.backgroundRunning)
 			return
 		}
 
@@ -381,7 +386,6 @@ func (as *AmbientAutoNAT) tryProbe(p peer.ID) bool {
 func (as *AmbientAutoNAT) probe(pi *peer.AddrInfo) {
 	cli := NewAutoNATClient(as.host, as.config.addressFunc, as.metricsTracer)
 	ctx, cancel := context.WithTimeout(as.ctx, as.config.requestTimeout)
-	defer cancel()
 
 	err := cli.DialBack(ctx, pi.ID)
 	log.Debugf("Dialback through peer %s completed: err: %s", pi.ID, err)
@@ -389,6 +393,7 @@ func (as *AmbientAutoNAT) probe(pi *peer.AddrInfo) {
 	select {
 	case as.dialResponses <- err:
 	case <-as.ctx.Done():
+		cancel()
 		return
 	}
 }

@@ -59,7 +59,7 @@ func (l *listener) Close() error {
 //     mechanism while still allowing us to negotiate connections in parallel.
 func (l *listener) handleIncoming() {
 	var wg sync.WaitGroup
-	defer func() {
+	cleanup := func() {
 		// make sure we're closed
 		l.Listener.Close()
 		if l.err == nil {
@@ -68,7 +68,7 @@ func (l *listener) handleIncoming() {
 
 		wg.Wait()
 		close(l.incoming)
-	}()
+	}
 
 	var catcher tec.TempErrCatcher
 	for l.ctx.Err() == nil {
@@ -80,6 +80,7 @@ func (l *listener) handleIncoming() {
 				continue
 			}
 			l.err = err
+			cleanup()
 			return
 		}
 		catcher.Reset()
@@ -114,10 +115,7 @@ func (l *listener) handleIncoming() {
 
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
-
 			ctx, cancel := context.WithTimeout(l.ctx, l.upgrader.acceptTimeout)
-			defer cancel()
 
 			conn, err := l.upgrader.Upgrade(ctx, l.transport, maconn, network.DirInbound, "", connScope)
 			if err != nil {
@@ -128,6 +126,8 @@ func (l *listener) handleIncoming() {
 					maconn.LocalMultiaddr(),
 					maconn.RemoteMultiaddr())
 				connScope.Done()
+				wg.Done()
+				cancel()
 				return
 			}
 
@@ -139,7 +139,6 @@ func (l *listener) handleIncoming() {
 			// simply ensures that calls to Wait block while we're
 			// over the threshold.
 			l.threshold.Acquire()
-			defer l.threshold.Release()
 
 			select {
 			case l.incoming <- conn:
@@ -154,8 +153,12 @@ func (l *listener) handleIncoming() {
 				// instead of hanging onto them.
 				conn.Close()
 			}
+			wg.Done()
+			cancel()
+			l.threshold.Release()
 		}()
 	}
+	cleanup()
 }
 
 // Accept accepts a connection.

@@ -186,7 +186,11 @@ func (t *WebRTCTransport) CanDial(addr ma.Multiaddr) bool {
 // be multiplexed on the same port as other UDP based transports like QUIC and WebTransport.
 // See https://github.com/libp2p/go-libp2p/issues/2446 for details.
 func (t *WebRTCTransport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
-	addr, wrtcComponent := ma.SplitLast(addr)
+	addr, wrtcComponent, err := ma.SplitLast(addr)
+	if err != nil {
+		return nil, err
+	}
+
 	isWebrtc := wrtcComponent.Equal(webrtcComponent)
 	if !isWebrtc {
 		return nil, fmt.Errorf("must listen on webrtc multiaddr")
@@ -386,7 +390,10 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 	if err != nil {
 		return nil, err
 	}
-	remoteMultiaddrWithoutCerthash, _ := ma.SplitFunc(remoteMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+	remoteMultiaddrWithoutCerthash, _, err := ma.SplitFunc(remoteMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+	if err != nil {
+		return nil, err
+	}
 
 	conn, err := newConnection(
 		network.DirOutbound,
@@ -623,7 +630,11 @@ func newWebRTCConnection(settings webrtc.SettingEngine, config webrtc.Configurat
 func IsWebRTCDirectMultiaddr(addr ma.Multiaddr) (bool, int) {
 	var foundUDP, foundWebRTC bool
 	certHashCount := 0
-	ma.ForEach(addr, func(c ma.Component) bool {
+	ma.ForEach(addr, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
+
 		if !foundUDP {
 			if c.Protocol().Code == ma.P_UDP {
 				foundUDP = true

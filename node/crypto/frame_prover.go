@@ -12,6 +12,7 @@ type FrameProver interface {
 		previousFrame *protobufs.ClockFrame,
 		timestamp int64,
 		difficulty uint32,
+		aggregateProofs []*protobufs.InclusionAggregateProof,
 	) (*protobufs.ClockFrame, error)
 	ProveDataClockFrame(
 		previousFrame *protobufs.ClockFrame,
@@ -32,8 +33,7 @@ type FrameProver interface {
 		difficulty uint32,
 		inclusionProof *InclusionAggregateProof,
 		proverKeys [][]byte,
-		preDusk bool,
-	) (*protobufs.ClockFrame, *tries.RollingFrecencyCritbitTrie, error)
+	) (*protobufs.ClockFrame, []*tries.RollingFrecencyCritbitTrie, error)
 	VerifyMasterClockFrame(
 		frame *protobufs.ClockFrame,
 	) error
@@ -53,10 +53,14 @@ type FrameProver interface {
 	) bool
 	CalculateChallengeProof(
 		challenge []byte,
-		core uint32,
-		increment uint32,
+		difficulty uint32,
 	) ([]byte, error)
 	VerifyChallengeProof(
+		challenge []byte,
+		difficulty uint32,
+		proof []byte,
+	) bool
+	VerifyPreDuskChallengeProof(
 		challenge []byte,
 		increment uint32,
 		core uint32,

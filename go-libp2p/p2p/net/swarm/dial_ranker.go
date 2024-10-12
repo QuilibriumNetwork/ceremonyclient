@@ -73,7 +73,7 @@ func NoDelayDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 // We dial lowest ports first as they are more likely to be the listen port.
 func DefaultDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 	relay, addrs := filterAddrs(addrs, isRelayAddr)
-	pvt, addrs := filterAddrs(addrs, manet.IsPrivateAddr)
+	pvt, addrs := filterAddrs(addrs, func(a ma.Multiaddr) bool { is, err := manet.IsPrivateAddr(a); return is && err == nil })
 	public, addrs := filterAddrs(addrs, func(a ma.Multiaddr) bool { return isProtocolAddr(a, ma.P_IP4) || isProtocolAddr(a, ma.P_IP6) })
 
 	var relayOffset time.Duration
@@ -235,7 +235,10 @@ func score(a ma.Multiaddr) int {
 
 func isProtocolAddr(a ma.Multiaddr, p int) bool {
 	found := false
-	ma.ForEach(a, func(c ma.Component) bool {
+	ma.ForEach(a, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		if c.Protocol().Code == p {
 			found = true
 			return false

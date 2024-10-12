@@ -19,13 +19,16 @@ func ExampleWithAllowlistedMultiaddrs() {
 	}
 
 	limits := DefaultLimits.AutoScale()
+	m1, _ := multiaddr.StringCast("/ip4/1.2.3.4")
+	m2, _ := multiaddr.StringCast("/ip4/2.2.3.4/p2p/" + somePeer.String())
+	m3, _ := multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24")
 	rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
 		// Any peer connecting from this IP address
-		multiaddr.StringCast("/ip4/1.2.3.4"),
+		m1,
 		// Only the specified peer from this address
-		multiaddr.StringCast("/ip4/2.2.3.4/p2p/" + somePeer.String()),
+		m2,
 		// Only peers from this 1.2.3.0/24 IP address range
-		multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24"),
+		m3,
 	}))
 	if err != nil {
 		panic("Failed to start resource manager")
@@ -37,7 +40,7 @@ func ExampleWithAllowlistedMultiaddrs() {
 
 func TestAllowedSimple(t *testing.T) {
 	allowlist := newAllowlist()
-	ma := multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
+	ma, _ := multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
 	err := allowlist.Add(ma)
 	if err != nil {
 		t.Fatalf("failed to add ip4: %s", err)
@@ -62,8 +65,8 @@ func TestAllowedWithPeer(t *testing.T) {
 
 	peerA := test.RandPeerIDFatal(t)
 	peerB := test.RandPeerIDFatal(t)
-	multiaddrA := multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
-	multiaddrB := multiaddr.StringCast("/ip4/2.2.3.4/tcp/1234")
+	multiaddrA, _ := multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
+	multiaddrB, _ := multiaddr.StringCast("/ip4/2.2.3.4/tcp/1234")
 
 	testcases := []testcase{
 		{
@@ -183,7 +186,7 @@ func TestRemoved(t *testing.T) {
 		allowedMA string
 	}
 	peerA := test.RandPeerIDFatal(t)
-	maA := multiaddr.StringCast("/ip4/1.2.3.4")
+	maA, _ := multiaddr.StringCast("/ip4/1.2.3.4")
 
 	testCases := []testCase{
 		{name: "ip4", allowedMA: "/ip4/1.2.3.4"},
@@ -195,7 +198,7 @@ func TestRemoved(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			allowlist := newAllowlist()
-			ma := multiaddr.StringCast(tc.allowedMA)
+			ma, _ := multiaddr.StringCast(tc.allowedMA)
 
 			err := allowlist.Add(ma)
 			if err != nil {
@@ -256,9 +259,9 @@ func BenchmarkAllowlistCheck(b *testing.B) {
 
 		var ma multiaddr.Multiaddr
 		if i%ratioOfSpecifiedPeers == 0 {
-			ma = multiaddr.StringCast(ipString + "/p2p/" + test.RandPeerIDFatal(b).String())
+			ma, _ = multiaddr.StringCast(ipString + "/p2p/" + test.RandPeerIDFatal(b).String())
 		} else {
-			ma = multiaddr.StringCast(ipString)
+			ma, _ = multiaddr.StringCast(ipString)
 		}
 		if err != nil {
 			b.Fatalf("Failed to generate multiaddr: %v", ipString)

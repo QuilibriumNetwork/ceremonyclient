@@ -13,7 +13,7 @@ func TestCmd(t *testing.T) {
 
 	l := <-serverLocation
 
-	ip, rest := multiaddr.SplitFirst(l.Addrs[0])
+	ip, rest, _ := multiaddr.SplitFirst(l.Addrs[0])
 	if ip.Protocol().Code == multiaddr.P_IP4 && ip.Value() == "0.0.0.0" {
 		// Windows can't dial to 0.0.0.0 so replace with localhost
 		var err error

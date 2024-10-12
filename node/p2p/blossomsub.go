@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"math/bits"
 	"net"
 	"sync"
 	"time"
@@ -22,11 +23,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/mr-tron/base58"
-	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
+	madns "github.com/multiformats/go-multiaddr-dns"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,7 +37,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type BlossomSub struct {
@@ -61,10 +63,7 @@ var BITMASK_ALL = []byte{
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 }
 
-// While we iterate through these next phases, we're going to aggressively
-// enforce keeping updated. This will be achieved through announce strings
-// that will vary with each update
-var ANNOUNCE_PREFIX = "quilibrium-1.4.21-centauri-"
+var ANNOUNCE_PREFIX = "quilibrium-2.0.0-dusk-"
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -86,19 +85,8 @@ func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	return id
 }
 
-type realclock struct{}
-
-func (rc realclock) Now() time.Time {
-	return time.Now()
-}
-
-func (rc realclock) After(d time.Duration) <-chan time.Time {
-	return time.After(d)
-}
-
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
-	peerstore store.Peerstore,
 	logger *zap.Logger,
 ) *BlossomSub {
 	ctx := context.Background()
@@ -110,16 +98,47 @@ func NewBlossomSub(
 	isBootstrapPeer := false
 	peerId := getPeerID(p2pConfig)
 
-	for _, peerAddr := range config.BootstrapPeers {
+	if p2pConfig.Network == 0 {
+		for _, peerAddr := range config.BootstrapPeers {
+			peerinfo, err := peer.AddrInfoFromString(peerAddr)
+			if err != nil {
+				panic(err)
+			}
+
+			if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
+				isBootstrapPeer = true
+				break
+			}
+		}
+	} else {
+		for _, peerAddr := range p2pConfig.BootstrapPeers {
+			peerinfo, err := peer.AddrInfoFromString(peerAddr)
+			if err != nil {
+				panic(err)
+			}
+
+			if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
+				isBootstrapPeer = true
+				break
+			}
+		}
+	}
+
+	defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
+
+	if p2pConfig.Network == 0 {
+		defaultBootstrapPeers = config.BootstrapPeers
+	}
+
+	bootstrappers := []peer.AddrInfo{}
+
+	for _, peerAddr := range defaultBootstrapPeers {
 		peerinfo, err := peer.AddrInfoFromString(peerAddr)
 		if err != nil {
 			panic(err)
 		}
 
-		if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
-			isBootstrapPeer = true
-			break
-		}
+		bootstrappers = append(bootstrappers, *peerinfo)
 	}
 
 	var privKey crypto.PrivKey
@@ -137,20 +156,6 @@ func NewBlossomSub(
 		opts = append(opts, libp2p.Identity(privKey))
 	}
 
-	ps, err := pstoreds.NewPeerstore(ctx, peerstore, pstoreds.Options{
-		CacheSize:           120000,
-		MaxProtocols:        1024,
-		GCPurgeInterval:     2 * time.Hour,
-		GCLookaheadInterval: 0,
-		GCInitialDelay:      60 * time.Second,
-		Clock:               realclock{},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	opts = append(opts, libp2p.Peerstore(ps))
-
 	if p2pConfig.LowWatermarkConnections != 0 &&
 		p2pConfig.HighWatermarkConnections != 0 {
 		cm, err := connmgr.NewConnManager(
@@ -161,7 +166,17 @@ func NewBlossomSub(
 		if err != nil {
 			panic(err)
 		}
+
+		rm, err := resourceManager(
+			p2pConfig.HighWatermarkConnections,
+			bootstrappers,
+		)
+		if err != nil {
+			panic(err)
+		}
+
 		opts = append(opts, libp2p.ConnectionManager(cm))
+		opts = append(opts, libp2p.ResourceManager(rm))
 	}
 
 	bs := &BlossomSub{
@@ -181,7 +196,14 @@ func NewBlossomSub(
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
 
-	kademliaDHT := initDHT(ctx, p2pConfig, logger, h, isBootstrapPeer)
+	kademliaDHT := initDHT(
+		ctx,
+		p2pConfig,
+		logger,
+		h,
+		isBootstrapPeer,
+		bootstrappers,
+	)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
 
@@ -202,7 +224,9 @@ func NewBlossomSub(
 		}
 	}
 
-	blossomOpts := []blossomsub.Option{}
+	blossomOpts := []blossomsub.Option{
+		blossomsub.WithStrictSignatureVerification(true),
+	}
 
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
@@ -234,7 +258,7 @@ func NewBlossomSub(
 		}))
 
 	params := mergeDefaults(p2pConfig)
-	rt := blossomsub.NewBlossomSubRouter(h, params, ps)
+	rt := blossomsub.NewBlossomSubRouter(h, params)
 	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)
@@ -249,59 +273,136 @@ func NewBlossomSub(
 	return bs
 }
 
-func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
-	networkBitmask := append([]byte{b.network}, bitmask...)
-	bm, ok := b.bitmaskMap[string(networkBitmask)]
-	if !ok {
-		b.logger.Error(
-			"error while publishing to bitmask",
-			zap.Error(errors.New("not subscribed to bitmask")),
-			zap.Binary("bitmask", bitmask),
-		)
-		return errors.New("not subscribed to bitmask")
+// adjusted from Lotus' reference implementation, addressing
+// https://github.com/libp2p/go-libp2p/issues/1640
+func resourceManager(highWatermark uint, bootstrappers []peer.AddrInfo) (
+	network.ResourceManager,
+	error,
+) {
+	defaultLimits := rcmgr.DefaultLimits
+
+	libp2p.SetDefaultServiceLimits(&defaultLimits)
+
+	defaultLimits.SystemBaseLimit.Memory = 1 << 28
+	defaultLimits.SystemLimitIncrease.Memory = 1 << 28
+	defaultLimitConfig := defaultLimits.AutoScale()
+
+	changes := rcmgr.PartialLimitConfig{}
+
+	if defaultLimitConfig.ToPartialLimitConfig().System.Memory > 2<<30 {
+		changes.System.Memory = 2 << 30
 	}
 
-	return bm.Publish(b.ctx, data)
+	maxconns := uint(highWatermark)
+	if rcmgr.LimitVal(3*maxconns) > defaultLimitConfig.
+		ToPartialLimitConfig().System.ConnsInbound {
+		changes.System.ConnsInbound = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		changes.System.ConnsOutbound = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		changes.System.Conns = rcmgr.LimitVal(1 << bits.Len(6*maxconns))
+		changes.System.StreamsInbound = rcmgr.LimitVal(1 << bits.Len(36*maxconns))
+		changes.System.StreamsOutbound = rcmgr.LimitVal(1 << bits.Len(216*maxconns))
+		changes.System.Streams = rcmgr.LimitVal(1 << bits.Len(216*maxconns))
+
+		if rcmgr.LimitVal(3*maxconns) > defaultLimitConfig.
+			ToPartialLimitConfig().System.FD {
+			changes.System.FD = rcmgr.LimitVal(1 << bits.Len(3*maxconns))
+		}
+
+		changes.ServiceDefault.StreamsInbound = rcmgr.LimitVal(
+			1 << bits.Len(12*maxconns),
+		)
+		changes.ServiceDefault.StreamsOutbound = rcmgr.LimitVal(
+			1 << bits.Len(48*maxconns),
+		)
+		changes.ServiceDefault.Streams = rcmgr.LimitVal(1 << bits.Len(48*maxconns))
+		changes.ProtocolDefault.StreamsInbound = rcmgr.LimitVal(
+			1 << bits.Len(12*maxconns),
+		)
+		changes.ProtocolDefault.StreamsOutbound = rcmgr.LimitVal(
+			1 << bits.Len(48*maxconns),
+		)
+		changes.ProtocolDefault.Streams = rcmgr.LimitVal(1 << bits.Len(48*maxconns))
+	}
+
+	changedLimitConfig := changes.Build(defaultLimitConfig)
+
+	limiter := rcmgr.NewFixedLimiter(changedLimitConfig)
+
+	str, err := rcmgr.NewStatsTraceReporter()
+	if err != nil {
+		return nil, errors.Wrap(err, "resource manager")
+	}
+
+	rcmgr.MustRegisterWith(prometheus.DefaultRegisterer)
+
+	// Metrics
+	opts := append(
+		[]rcmgr.Option{},
+		rcmgr.WithTraceReporter(str),
+	)
+
+	resolver := madns.DefaultResolver
+	var bootstrapperMaddrs []ma.Multiaddr
+	for _, pi := range bootstrappers {
+		for _, addr := range pi.Addrs {
+			resolved, err := resolver.Resolve(context.Background(), addr)
+			if err != nil {
+				continue
+			}
+			bootstrapperMaddrs = append(bootstrapperMaddrs, resolved...)
+		}
+	}
+
+	opts = append(opts, rcmgr.WithAllowlistedMultiaddrs(bootstrapperMaddrs))
+
+	mgr, err := rcmgr.NewResourceManager(limiter, opts...)
+	if err != nil {
+		return nil, errors.Wrap(err, "resource manager")
+	}
+
+	return mgr, nil
 }
 
-func (b *BlossomSub) Publish(data []byte) error {
-	bitmask := GetBloomFilter(data, 256, 3)
-	bitmask = append(bitmask, GetBloomFilterIndices(data, 65536, 24)...)
+func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
+	return b.ps.Publish(b.ctx, bitmask, data)
+}
+
+func (b *BlossomSub) Publish(address []byte, data []byte) error {
+	bitmask := GetBloomFilter(address, 256, 3)
 	return b.PublishToBitmask(bitmask, data)
 }
 
 func (b *BlossomSub) Subscribe(
 	bitmask []byte,
 	handler func(message *pb.Message) error,
-	raw bool,
-) {
-	eval := func(bitmask []byte) error {
-		networkBitmask := append([]byte{b.network}, bitmask...)
-		_, ok := b.bitmaskMap[string(networkBitmask)]
-		if ok {
-			return nil
-		}
+) error {
+	b.logger.Info("joining broadcast")
+	bm, err := b.ps.Join(bitmask)
+	if err != nil {
+		b.logger.Error("join failed", zap.Error(err))
+		return errors.Wrap(err, "subscribe")
+	}
 
-		b.logger.Info("joining broadcast")
-		bm, err := b.ps.Join(networkBitmask)
-		if err != nil {
-			b.logger.Error("join failed", zap.Error(err))
-			return errors.Wrap(err, "subscribe")
-		}
-
-		b.bitmaskMap[string(networkBitmask)] = bm
-
-		b.logger.Info("subscribe to bitmask", zap.Binary("bitmask", bitmask))
-		sub, err := bm.Subscribe()
+	b.logger.Info("subscribe to bitmask", zap.Binary("bitmask", bitmask))
+	subs := []*blossomsub.Subscription{}
+	for _, bit := range bm {
+		sub, err := bit.Subscribe()
 		if err != nil {
 			b.logger.Error("subscription failed", zap.Error(err))
 			return errors.Wrap(err, "subscribe")
 		}
+		subs = append(subs, sub)
+	}
 
-		b.logger.Info(
-			"begin streaming from bitmask",
-			zap.Binary("bitmask", bitmask),
-		)
+	b.logger.Info(
+		"begin streaming from bitmask",
+		zap.Binary("bitmask", bitmask),
+	)
+
+	for _, sub := range subs {
+		copiedBitmask := make([]byte, len(bitmask))
+		copy(copiedBitmask[:], bitmask[:])
+		sub := sub
 
 		go func() {
 			for {
@@ -312,24 +413,16 @@ func (b *BlossomSub) Subscribe(
 						zap.Error(err),
 					)
 				}
-				if err = handler(m.Message); err != nil {
-					b.logger.Debug("message handler returned error", zap.Error(err))
+				if bytes.Equal(m.Bitmask, copiedBitmask) {
+					if err = handler(m.Message); err != nil {
+						b.logger.Debug("message handler returned error", zap.Error(err))
+					}
 				}
 			}
 		}()
-
-		return nil
 	}
 
-	if raw {
-		if err := eval(bitmask); err != nil {
-			b.logger.Error("subscribe returned error", zap.Error(err))
-		}
-	} else {
-		if err := generateBitSlices(bitmask, eval); err != nil {
-			b.logger.Error("bloom subscribe returned error", zap.Error(err))
-		}
-	}
+	return nil
 }
 
 func (b *BlossomSub) Unsubscribe(bitmask []byte, raw bool) {
@@ -370,15 +463,23 @@ func initDHT(
 	logger *zap.Logger,
 	h host.Host,
 	isBootstrapPeer bool,
+	bootstrappers []peer.AddrInfo,
 ) *dht.IpfsDHT {
 	logger.Info("establishing dht")
 	var kademliaDHT *dht.IpfsDHT
 	var err error
 	if isBootstrapPeer {
-		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
+		panic(
+			"this release is for normal peers only, if you are running a " +
+				"bootstrap node, please use v2.0-bootstrap",
+		)
 	} else {
-		// until libp2p gets their shit together, set this as a client only:
-		kademliaDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeClient))
+		kademliaDHT, err = dht.New(
+			ctx,
+			h,
+			dht.Mode(dht.ModeClient),
+			dht.BootstrapPeers(bootstrappers...),
+		)
 	}
 	if err != nil {
 		panic(err)
@@ -388,48 +489,25 @@ func initDHT(
 	}
 
 	reconnect := func() {
-		logger.Info(
-			"connecting to bootstrap",
-			zap.String("peer_id", h.ID().String()),
-		)
-
-		defaultBootstrapPeers := append([]string{}, p2pConfig.BootstrapPeers...)
-
-		if p2pConfig.Network == 0 {
-			for _, peer := range config.BootstrapPeers {
-				found := false
-				for _, existing := range defaultBootstrapPeers {
-					if existing == peer {
-						found = true
-						break
-					}
+		for _, peerinfo := range bootstrappers {
+			peerinfo := peerinfo
+			go func() {
+				if peerinfo.ID == h.ID() ||
+					h.Network().Connectedness(peerinfo.ID) == network.Connected ||
+					h.Network().Connectedness(peerinfo.ID) == network.Limited {
+					return
 				}
-				if !found {
-					defaultBootstrapPeers = append(defaultBootstrapPeers, peer)
+
+				if err := h.Connect(ctx, peerinfo); err != nil {
+					logger.Debug("error while connecting to dht peer", zap.Error(err))
+				} else {
+					h.ConnManager().Protect(peerinfo.ID, "bootstrap")
+					logger.Debug(
+						"connected to peer",
+						zap.String("peer_id", peerinfo.ID.String()),
+					)
 				}
-			}
-		}
-
-		for _, peerAddr := range defaultBootstrapPeers {
-			peerinfo, err := peer.AddrInfoFromString(peerAddr)
-			if err != nil {
-				panic(err)
-			}
-
-			if peerinfo.ID == h.ID() ||
-				h.Network().Connectedness(peerinfo.ID) == network.Connected ||
-				h.Network().Connectedness(peerinfo.ID) == network.CannotConnect {
-				continue
-			}
-
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-				logger.Debug("error while connecting to dht peer", zap.Error(err))
-			} else {
-				logger.Debug(
-					"connected to peer",
-					zap.String("peer_id", peerinfo.ID.String()),
-				)
-			}
+			}()
 		}
 	}
 
@@ -438,7 +516,6 @@ func initDHT(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			logger.Debug("reconnecting to peers")
 			reconnect()
 		}
 	}()
@@ -504,7 +581,7 @@ func (b *BlossomSub) GetNetworkPeersCount() int {
 func (b *BlossomSub) GetMultiaddrOfPeerStream(
 	ctx context.Context,
 	peerId []byte,
-) <-chan multiaddr.Multiaddr {
+) <-chan ma.Multiaddr {
 	return b.h.Peerstore().AddrStream(ctx, peer.ID(peerId))
 }
 
@@ -616,7 +693,7 @@ func discoverPeers(
 			peer := peer
 			if peer.ID == h.ID() ||
 				h.Network().Connectedness(peer.ID) == network.Connected ||
-				h.Network().Connectedness(peer.ID) == network.CannotConnect {
+				h.Network().Connectedness(peer.ID) == network.Limited {
 				continue
 			}
 
@@ -675,9 +752,6 @@ func mergeDefaults(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams {
 	}
 	if p2pConfig.DLazy == 0 {
 		p2pConfig.DLazy = blossomsub.BlossomSubDlazy
-	}
-	if p2pConfig.GossipFactor == 0 {
-		p2pConfig.GossipFactor = blossomsub.BlossomSubGossipFactor
 	}
 	if p2pConfig.GossipRetransmission == 0 {
 		p2pConfig.GossipRetransmission = blossomsub.BlossomSubGossipRetransmission
@@ -746,7 +820,6 @@ func mergeDefaults(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams {
 		HistoryLength:             p2pConfig.HistoryLength,
 		HistoryGossip:             p2pConfig.HistoryGossip,
 		Dlazy:                     p2pConfig.DLazy,
-		GossipFactor:              p2pConfig.GossipFactor,
 		GossipRetransmission:      p2pConfig.GossipRetransmission,
 		HeartbeatInitialDelay:     p2pConfig.HeartbeatInitialDelay,
 		HeartbeatInterval:         p2pConfig.HeartbeatInterval,
@@ -774,13 +847,10 @@ func getNetworkNamespace(network uint8) string {
 	switch network {
 	case 0:
 		network_name = "mainnet"
-		break
 	case 1:
 		network_name = "testnet-primary"
-		break
 	default:
 		network_name = fmt.Sprintf("network-%d", network)
-		break
 	}
 
 	return ANNOUNCE_PREFIX + network_name

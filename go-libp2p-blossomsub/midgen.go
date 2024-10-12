@@ -30,8 +30,8 @@ func (m *msgIDGenerator) Set(bitmask []byte, gen MsgIdFunction) {
 }
 
 // ID computes ID for the msg or short-circuits with the cached value.
-func (m *msgIDGenerator) ID(msg *Message) string {
-	if msg.ID != "" {
+func (m *msgIDGenerator) ID(msg *Message) []byte {
+	if len(msg.ID) != 0 {
 		return msg.ID
 	}
 
@@ -40,7 +40,7 @@ func (m *msgIDGenerator) ID(msg *Message) string {
 }
 
 // RawID computes ID for the proto 'msg'.
-func (m *msgIDGenerator) RawID(msg *pb.Message) string {
+func (m *msgIDGenerator) RawID(msg *pb.Message) []byte {
 	m.bitmaskGensLk.RLock()
 	gen, ok := m.bitmaskGens[string(msg.GetBitmask())]
 	m.bitmaskGensLk.RUnlock()

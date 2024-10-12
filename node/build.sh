@@ -12,7 +12,6 @@ BINARIES_DIR="$ROOT_DIR/target/release"
 pushd "$NODE_DIR" > /dev/null
 
 export CGO_ENABLED=1
-export GOEXPERIMENT=arenas 
 
 os_type="$(uname)"
 case "$os_type" in

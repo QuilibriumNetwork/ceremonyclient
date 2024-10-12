@@ -2,13 +2,11 @@ package master
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"strings"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -37,8 +35,8 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	}
 
 	switch any.TypeUrl {
-	case protobufs.SelfTestReportType:
-		if err := e.handleSelfTestReport(
+	case protobufs.ClockFrameType:
+		if err := e.handleClockFrameData(
 			message.From,
 			any,
 		); err != nil {
@@ -48,6 +46,64 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 	}
 
 	return errors.Wrap(errors.New("invalid message"), "handle message")
+}
+
+func (e *MasterClockConsensusEngine) handleClockFrameData(
+	peerID []byte,
+	any *anypb.Any,
+) error {
+	if !bytes.Equal(peerID, []byte(e.beacon)) {
+		return nil
+	}
+
+	frame := &protobufs.ClockFrame{}
+	if err := any.UnmarshalTo(frame); err != nil {
+		return errors.Wrap(err, "handle clock frame data")
+	}
+
+	head, err := e.masterTimeReel.Head()
+	if err != nil {
+		panic(err)
+	}
+
+	if frame.FrameNumber < head.FrameNumber {
+		return nil
+	}
+
+	if e.difficulty != frame.Difficulty {
+		e.logger.Debug(
+			"frame difficulty mismatched",
+			zap.Uint32("difficulty", frame.Difficulty),
+		)
+		return errors.Wrap(
+			errors.New("frame difficulty"),
+			"handle clock frame data",
+		)
+	}
+
+	e.logger.Debug(
+		"got clock frame",
+		zap.Binary("sender", peerID),
+		zap.Binary("filter", frame.Filter),
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.Int("proof_count", len(frame.AggregateProofs)),
+	)
+
+	go func() {
+		select {
+		case e.frameValidationCh <- frame:
+		default:
+			e.logger.Debug(
+				"dropped frame due to overwhelmed queue",
+				zap.Binary("sender", peerID),
+				zap.Binary("filter", frame.Filter),
+				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.Int("proof_count", len(frame.AggregateProofs)),
+			)
+		}
+	}()
+
+	return nil
 }
 
 func (e *MasterClockConsensusEngine) handleSelfTestReport(
@@ -62,73 +118,15 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		info := e.peerInfoManager.GetPeerInfo(peerID)
 		info.LastSeen = time.Now().UnixMilli()
-		info.DifficultyMetric = report.DifficultyMetric
 		info.MasterHeadFrame = report.MasterHeadFrame
 		return nil
 	}
-
-	if len(report.Proof) != 520 {
-		e.logger.Warn(
-			"received invalid proof from peer",
-			zap.String("peer_id", peer.ID(peerID).String()),
-			zap.Int("proof_size", len(report.Proof)),
-			zap.Uint32("cores", report.Cores),
-		)
-		e.pubSub.SetPeerScore(peerID, -1000)
-		return errors.Wrap(errors.New("invalid report"), "handle self test report")
-	}
-
-	e.logger.Debug(
-		"received proof from peer",
-		zap.String("peer_id", peer.ID(peerID).String()),
-	)
 
 	info := e.peerInfoManager.GetPeerInfo(peerID)
 	if info != nil {
 		if (time.Now().UnixMilli() - info.LastSeen) < (270 * 1000) {
 			return nil
 		}
-
-		info.DifficultyMetric = report.DifficultyMetric
-		info.MasterHeadFrame = report.MasterHeadFrame
-
-		if info.Bandwidth == 0 {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
-				defer cancel()
-				ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
-				select {
-				case <-ch:
-					select {
-					case e.bandwidthTestCh <- peerID:
-					default:
-					}
-				case <-ctx.Done():
-				}
-			}()
-		}
-
-		proof := report.Proof
-		challenge := []byte{}
-		challenge = append(challenge, peerID...)
-		challenge = append(challenge, report.Challenge...)
-
-		proofs := make([][]byte, (len(report.Proof)-8)/516)
-		for i := 0; i < len(proofs); i++ {
-			proofs[i] = proof[i*516 : (i+1)*516]
-		}
-		select {
-		case e.verifyTestCh <- verifyChallenge{
-			peerID:    peerID,
-			challenge: challenge,
-			cores:     report.Cores,
-			increment: report.Increment,
-			proof:     proof,
-		}:
-		default:
-		}
-
-		return nil
 	}
 
 	e.addPeerManifestReport(peerID, report)
@@ -137,16 +135,6 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 	e.logger.Debug(
 		"received self test report",
 		zap.String("peer_id", base58.Encode(peerID)),
-		zap.Uint32("difficulty", report.Difficulty),
-		zap.Int64("difficulty_metric", report.DifficultyMetric),
-		zap.Int64("commit_16_metric", report.Commit_16Metric),
-		zap.Int64("commit_128_metric", report.Commit_128Metric),
-		zap.Int64("commit_1024_metric", report.Commit_1024Metric),
-		zap.Int64("commit_65536_metric", report.Commit_65536Metric),
-		zap.Int64("proof_16_metric", report.Proof_16Metric),
-		zap.Int64("proof_128_metric", report.Proof_128Metric),
-		zap.Int64("proof_1024_metric", report.Proof_1024Metric),
-		zap.Int64("proof_65536_metric", report.Proof_65536Metric),
 		zap.Uint32("cores", report.Cores),
 		zap.Uint64("memory", memory),
 		zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
@@ -156,38 +144,14 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 		e.logger.Debug(
 			"peer reported invalid configuration",
 			zap.String("peer_id", base58.Encode(peerID)),
-			zap.Uint32("difficulty", report.Difficulty),
-			zap.Int64("difficulty_metric", report.DifficultyMetric),
-			zap.Int64("commit_16_metric", report.Commit_16Metric),
-			zap.Int64("commit_128_metric", report.Commit_128Metric),
-			zap.Int64("commit_1024_metric", report.Commit_1024Metric),
-			zap.Int64("commit_65536_metric", report.Commit_65536Metric),
-			zap.Int64("proof_16_metric", report.Proof_16Metric),
-			zap.Int64("proof_128_metric", report.Proof_128Metric),
-			zap.Int64("proof_1024_metric", report.Proof_1024Metric),
-			zap.Int64("proof_65536_metric", report.Proof_65536Metric),
 			zap.Uint32("cores", report.Cores),
 			zap.Uint64("memory", memory),
 			zap.Uint64("storage", binary.BigEndian.Uint64(report.Storage)),
 		)
 
-		// tag: dusk – nuke this peer for now
 		e.pubSub.SetPeerScore(peerID, -1000)
 		return nil
 	}
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
-		defer cancel()
-		ch := e.pubSub.GetMultiaddrOfPeerStream(ctx, peerID)
-		select {
-		case <-ch:
-			go func() {
-				e.bandwidthTestCh <- peerID
-			}()
-		case <-ctx.Done():
-		}
-	}()
 
 	return nil
 }
@@ -201,6 +165,13 @@ func (e *MasterClockConsensusEngine) publishProof(
 	)
 
 	e.masterTimeReel.Insert(frame, false)
+
+	if bytes.Equal(e.pubSub.GetPeerID(), []byte(e.beacon)) {
+		err := e.publishMessage(e.filter, frame)
+		if err != nil {
+			return errors.Wrap(err, "publish proof")
+		}
+	}
 
 	e.state = consensus.EngineStateCollecting
 

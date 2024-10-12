@@ -575,7 +575,7 @@ func BLS48581G1() *Curve {
 func bls48581g1Init() {
 	bls48581g1 = Curve{
 		Scalar: &ScalarBls48581{
-			Value: bls48581.NewBIGint(1, nil),
+			Value: bls48581.NewBIGint(1),
 			point: new(PointBls48581G1),
 		},
 		Point: new(PointBls48581G1).Identity(),
@@ -592,7 +592,7 @@ func BLS48581G2() *Curve {
 func bls48581g2Init() {
 	bls48581g2 = Curve{
 		Scalar: &ScalarBls48581{
-			Value: bls48581.NewBIGint(1, nil),
+			Value: bls48581.NewBIGint(1),
 			point: new(PointBls48581G2),
 		},
 		Point: new(PointBls48581G2).Identity(),
@@ -603,7 +603,7 @@ func bls48581g2Init() {
 func BLS48581(preferredPoint Point) *PairingCurve {
 	return &PairingCurve{
 		Scalar: &ScalarBls48581{
-			Value: bls48581.NewBIG(nil),
+			Value: bls48581.NewBIG(),
 			point: preferredPoint,
 		},
 		PointG1: &PointBls48581G1{
@@ -613,7 +613,7 @@ func BLS48581(preferredPoint Point) *PairingCurve {
 			Value: bls48581.ECP8_generator(),
 		},
 		GT: &ScalarBls48581Gt{
-			Value: bls48581.NewFP48int(1, nil),
+			Value: bls48581.NewFP48int(1),
 		},
 		Name: BLS48581Name,
 	}

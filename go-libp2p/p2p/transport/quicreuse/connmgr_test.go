@@ -20,6 +20,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func checkClosed(t *testing.T, cm *ConnManager) {
 	for _, r := range []*reuse{cm.reuseUDP4, cm.reuseUDP6} {
 		if r == nil {
@@ -63,16 +68,16 @@ func testListenOnSameProto(t *testing.T, enableReuseport bool) {
 
 	var tlsConf tls.Config
 	tlsConf.NextProtos = []string{alpn}
-	ln1, err := cm.ListenQUIC(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{alpn}}, nil)
+	ln1, err := cm.ListenQUIC(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{alpn}}, nil)
 	require.NoError(t, err)
 	defer ln1.Close()
 
-	addr := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", ln1.Addr().(*net.UDPAddr).Port))
+	addr := tStringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", ln1.Addr().(*net.UDPAddr).Port))
 	_, err = cm.ListenQUIC(addr, &tls.Config{NextProtos: []string{alpn}}, nil)
 	require.EqualError(t, err, "already listening for protocol "+alpn)
 
 	// listening on a different address works
-	ln2, err := cm.ListenQUIC(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{alpn}}, nil)
+	ln2, err := cm.ListenQUIC(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{alpn}}, nil)
 	require.NoError(t, err)
 	defer ln2.Close()
 }
@@ -87,7 +92,7 @@ func TestConnectionPassedToQUICForListening(t *testing.T) {
 	require.NoError(t, err)
 	defer cm.Close()
 
-	raddr := ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")
+	raddr := tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")
 
 	naddr, _, err := FromQuicMultiaddr(raddr)
 	require.NoError(t, err)
@@ -105,7 +110,7 @@ func TestConnectionPassedToQUICForListening(t *testing.T) {
 }
 
 func TestAcceptErrorGetCleanedUp(t *testing.T) {
-	raddr := ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")
+	raddr := tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")
 
 	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, DisableReuseport())
 	require.NoError(t, err)
@@ -147,7 +152,7 @@ func TestConnectionPassedToQUICForDialing(t *testing.T) {
 	require.NoError(t, err)
 	defer cm.Close()
 
-	raddr := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
+	raddr := tStringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
 
 	naddr, _, err := FromQuicMultiaddr(raddr)
 	require.NoError(t, err)
@@ -222,12 +227,12 @@ func testListener(t *testing.T, enableReuseport bool) {
 	require.NoError(t, err)
 
 	id1, tlsConf1 := getTLSConfForProto(t, "proto1")
-	ln1, err := cm.ListenQUIC(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"), tlsConf1, nil)
+	ln1, err := cm.ListenQUIC(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"), tlsConf1, nil)
 	require.NoError(t, err)
 
 	id2, tlsConf2 := getTLSConfForProto(t, "proto2")
 	ln2, err := cm.ListenQUIC(
-		ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", ln1.Addr().(*net.UDPAddr).Port)),
+		tStringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", ln1.Addr().(*net.UDPAddr).Port)),
 		tlsConf2,
 		nil,
 	)

@@ -25,7 +25,7 @@ func stripCertHash(addr ma.Multiaddr) ma.Multiaddr {
 		if _, err := addr.ValueForProtocol(ma.P_CERTHASH); err != nil {
 			break
 		}
-		addr, _ = ma.SplitLast(addr)
+		addr, _, _ = ma.SplitLast(addr)
 	}
 	return addr
 }

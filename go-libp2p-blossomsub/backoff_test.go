@@ -23,9 +23,11 @@ func TestBackoff_Update(t *testing.T) {
 
 	b := newBackoff(ctx, size, cleanupInterval, maxBackoffAttempts)
 
+	b.mu.Lock()
 	if len(b.info) > 0 {
 		t.Fatal("non-empty info map for backoff")
 	}
+	b.mu.Unlock()
 
 	if d, err := b.updateAndGet(id1); d != time.Duration(0) || err != nil {
 		t.Fatalf("invalid initialization: %v, \t, %s", d, err)
@@ -64,9 +66,11 @@ func TestBackoff_Update(t *testing.T) {
 		t.Fatalf("invalid backoff result, expected: %v, got: %v", MinBackoffDelay, got)
 	}
 
+	b.mu.Lock()
 	// sets last tried of id2 to long ago that it resets back upon next try.
 	// update attempts on id2 are below threshold, hence peer should never go beyond backoff attempt threshold.
 	b.info[id2].lastTried = time.Now().Add(-TimeToLive)
+	b.mu.Unlock()
 	got, err = b.updateAndGet(id2)
 	if err != nil {
 		t.Fatalf("unexpected error post update: %s", err)
@@ -75,10 +79,11 @@ func TestBackoff_Update(t *testing.T) {
 		t.Fatalf("invalid ttl expiration, expected: %v, got: %v", time.Duration(0), got)
 	}
 
+	b.mu.Lock()
 	if len(b.info) != 2 {
 		t.Fatalf("pre-invalidation attempt, info map size mismatch, expected: %d, got: %d", 2, len(b.info))
 	}
-
+	b.mu.Unlock()
 }
 
 func TestBackoff_Clean(t *testing.T) {
@@ -96,12 +101,16 @@ func TestBackoff_Clean(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error post update: %s", err)
 		}
+		b.mu.Lock()
 		b.info[id].lastTried = time.Now().Add(-TimeToLive) // enforces expiry
+		b.mu.Unlock()
 	}
 
+	b.mu.Lock()
 	if len(b.info) != size {
 		t.Fatalf("info map size mismatch, expected: %d, got: %d", size, len(b.info))
 	}
+	b.mu.Unlock()
 
 	// waits for a cleanup loop to kick-in
 	time.Sleep(2 * cleanupInterval)
@@ -115,8 +124,10 @@ func TestBackoff_Clean(t *testing.T) {
 		t.Fatalf("invalid backoff result, expected: %v, got: %v", time.Duration(0), got)
 	}
 
+	b.mu.Lock()
 	// except "some-new-peer" every other records must be cleaned up
 	if len(b.info) != 1 {
 		t.Fatalf("info map size mismatch, expected: %d, got: %d", 1, len(b.info))
 	}
+	b.mu.Unlock()
 }

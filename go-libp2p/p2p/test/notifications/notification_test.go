@@ -14,6 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func portFromString(t *testing.T, s string) int {
 	t.Helper()
 	p, err := strconv.ParseInt(s, 10, 32)
@@ -54,7 +59,7 @@ func TestListenAddressNotif(t *testing.T) {
 	require.Equal(t, []ma.Multiaddr{initialAddr}, listenAddrs)
 
 	// now start listening on another address
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
+	require.NoError(t, h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
 	var addedAddr ma.Multiaddr
 	select {
 	case e := <-sub.Out():

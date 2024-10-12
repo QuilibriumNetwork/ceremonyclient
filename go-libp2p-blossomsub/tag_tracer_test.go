@@ -55,9 +55,9 @@ func TestTagTracerDirectPeerTags(t *testing.T) {
 	tt.direct = make(map[peer.ID]struct{})
 	tt.direct[p1] = struct{}{}
 
-	tt.AddPeer(p1, BlossomSubID_v11)
-	tt.AddPeer(p2, BlossomSubID_v11)
-	tt.AddPeer(p3, BlossomSubID_v11)
+	tt.AddPeer(p1, BlossomSubID_v2)
+	tt.AddPeer(p2, BlossomSubID_v2)
+	tt.AddPeer(p3, BlossomSubID_v2)
 
 	tag := "pubsub:<direct>"
 	if !cmgr.IsProtected(p1, tag) {
@@ -179,7 +179,7 @@ func TestTagTracerDeliveryTagsNearFirst(t *testing.T) {
 
 	tt := newTagTracer(cmgr)
 
-	bitmask := []byte{0x7e, 0x57}
+	bitmask := []byte{0x01, 0x00}
 
 	p := peer.ID("a-peer")
 	p2 := peer.ID("another-peer")

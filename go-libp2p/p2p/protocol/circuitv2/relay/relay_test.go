@@ -68,7 +68,8 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 			t.Fatal(err)
 		}
 
-		err = netw.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+		m, _ := ma.StringCast("/ip4/127.0.0.1/tcp/0")
+		err = netw.Listen(m)
 		if err != nil {
 			t.Fatal(err)
 		}

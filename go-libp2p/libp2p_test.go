@@ -163,6 +163,10 @@ func TestChainOptions(t *testing.T) {
 		}
 	}
 }
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
 
 func TestTransportConstructorTCP(t *testing.T) {
 	h, err := New(
@@ -171,8 +175,8 @@ func TestTransportConstructorTCP(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer h.Close()
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0")))
-	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
+	require.NoError(t, h.Network().Listen(tStringCast("/ip4/127.0.0.1/tcp/0")))
+	err = h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
 }
@@ -184,8 +188,8 @@ func TestTransportConstructorQUIC(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer h.Close()
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
-	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+	require.NoError(t, h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
+	err = h.Network().Listen(tStringCast("/ip4/127.0.0.1/tcp/0"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
 }
@@ -290,8 +294,8 @@ func TestTransportConstructorWebTransport(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer h.Close()
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
-	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/"))
+	require.NoError(t, h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
+	err = h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1/"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
 }
@@ -311,12 +315,12 @@ func TestTransportCustomAddressWebTransport(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer h.Close()
-	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
+	require.NoError(t, h.Network().Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
 	addrs := h.Addrs()
 	require.Len(t, addrs, 1)
 	require.NotEqual(t, addrs[0], customAddr)
-	restOfAddr, lastComp := ma.SplitLast(addrs[0])
-	restOfAddr, secondToLastComp := ma.SplitLast(restOfAddr)
+	restOfAddr, lastComp, _ := ma.SplitLast(addrs[0])
+	restOfAddr, secondToLastComp, _ := ma.SplitLast(restOfAddr)
 	require.Equal(t, ma.P_CERTHASH, lastComp.Protocol().Code)
 	require.Equal(t, ma.P_CERTHASH, secondToLastComp.Protocol().Code)
 	require.True(t, restOfAddr.Equal(customAddr))
@@ -343,7 +347,7 @@ func TestTransportCustomAddressWebTransportDoesNotStall(t *testing.T) {
 	defer h.Close()
 	addrs := h.Addrs()
 	require.Len(t, addrs, 1)
-	_, lastComp := ma.SplitLast(addrs[0])
+	_, lastComp, _ := ma.SplitLast(addrs[0])
 	require.NotEqual(t, ma.P_CERTHASH, lastComp.Protocol().Code)
 	// We did not add the certhash to the multiaddr
 	require.Equal(t, addrs[0], customAddr)
@@ -447,7 +451,7 @@ func TestDialCircuitAddrWithWrappedResourceManager(t *testing.T) {
 
 	h.Peerstore().AddAddrs(relay.ID(), relay.Addrs(), 10*time.Minute)
 	h.Peerstore().AddAddr(peerBehindRelay.ID(),
-		ma.StringCast(
+		tStringCast(
 			fmt.Sprintf("/p2p/%s/p2p-circuit", relay.ID()),
 		),
 		peerstore.TempAddrTTL,

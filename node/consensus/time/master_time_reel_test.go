@@ -19,7 +19,7 @@ func TestMasterTimeReel(t *testing.T) {
 	db := store.NewInMemKVDB()
 	clockStore := store.NewPebbleClockStore(db, logger)
 	prover := crypto.NewWesolowskiFrameProver(logger)
-	filter := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	filter := "0000000000000000000000000000000000000000000000000000000000000000"
 
 	m := time.NewMasterTimeReel(
 		logger,
@@ -51,7 +51,12 @@ func TestMasterTimeReel(t *testing.T) {
 
 	// in order
 	for i := int64(0); i < 100; i++ {
-		frame, err = prover.ProveMasterClockFrame(frame, i+1, 10)
+		frame, err = prover.ProveMasterClockFrame(
+			frame,
+			i+1,
+			10,
+			[]*protobufs.InclusionAggregateProof{},
+		)
 		assert.NoError(t, err)
 
 		err := m.Insert(frame, false)
@@ -62,7 +67,12 @@ func TestMasterTimeReel(t *testing.T) {
 
 	// reverse order
 	for i := int64(100); i < 200; i++ {
-		frame, err = prover.ProveMasterClockFrame(frame, i+1, 10)
+		frame, err = prover.ProveMasterClockFrame(
+			frame,
+			i+1,
+			10,
+			[]*protobufs.InclusionAggregateProof{},
+		)
 		assert.NoError(t, err)
 
 		insertFrames = append(insertFrames, frame)

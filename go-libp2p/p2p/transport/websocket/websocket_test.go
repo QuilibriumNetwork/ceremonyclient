@@ -81,7 +81,7 @@ func newSecureMuxer(t *testing.T) (peer.ID, []sec.SecureTransport) {
 
 func lastComponent(t *testing.T, a ma.Multiaddr) ma.Multiaddr {
 	t.Helper()
-	_, wscomponent := ma.SplitLast(a)
+	_, wscomponent, _ := ma.SplitLast(a)
 	require.NotNil(t, wscomponent)
 	if wscomponent.Equal(wsComponent) {
 		return wsComponent
@@ -117,25 +117,25 @@ func generateTLSConfig(t *testing.T) *tls.Config {
 
 func TestCanDial(t *testing.T) {
 	d := &WebsocketTransport{}
-	if !d.CanDial(ma.StringCast("/ip4/127.0.0.1/tcp/5555/ws")) {
+	if !d.CanDial(tStringCast("/ip4/127.0.0.1/tcp/5555/ws")) {
 		t.Fatal("expected to match websocket maddr, but did not")
 	}
-	if !d.CanDial(ma.StringCast("/ip4/127.0.0.1/tcp/5555/wss")) {
+	if !d.CanDial(tStringCast("/ip4/127.0.0.1/tcp/5555/wss")) {
 		t.Fatal("expected to match secure websocket maddr, but did not")
 	}
-	if d.CanDial(ma.StringCast("/ip4/127.0.0.1/tcp/5555")) {
+	if d.CanDial(tStringCast("/ip4/127.0.0.1/tcp/5555")) {
 		t.Fatal("expected to not match tcp maddr, but did")
 	}
-	if !d.CanDial(ma.StringCast("/ip4/127.0.0.1/tcp/5555/tls/ws")) {
+	if !d.CanDial(tStringCast("/ip4/127.0.0.1/tcp/5555/tls/ws")) {
 		t.Fatal("expected to match secure websocket maddr, but did not")
 	}
-	if !d.CanDial(ma.StringCast("/ip4/127.0.0.1/tcp/5555/tls/sni/example.com/ws")) {
+	if !d.CanDial(tStringCast("/ip4/127.0.0.1/tcp/5555/tls/sni/example.com/ws")) {
 		t.Fatal("expected to match secure websocket maddr with sni, but did not")
 	}
-	if !d.CanDial(ma.StringCast("/dns4/example.com/tcp/5555/tls/sni/example.com/ws")) {
+	if !d.CanDial(tStringCast("/dns4/example.com/tcp/5555/tls/sni/example.com/ws")) {
 		t.Fatal("expected to match secure websocket maddr with sni, but did not")
 	}
-	if !d.CanDial(ma.StringCast("/dnsaddr/example.com/tcp/5555/tls/sni/example.com/ws")) {
+	if !d.CanDial(tStringCast("/dnsaddr/example.com/tcp/5555/tls/sni/example.com/ws")) {
 		t.Fatal("expected to match secure websocket maddr with sni, but did not")
 	}
 }
@@ -233,7 +233,7 @@ func TestHostHeaderWss(t *testing.T) {
 
 	_, port, err := net.SplitHostPort(l.Addr().String())
 	require.NoError(t, err)
-	serverMA := ma.StringCast("/ip4/127.0.0.1/tcp/" + port + "/tls/sni/example.com/ws")
+	serverMA := tStringCast("/ip4/127.0.0.1/tcp/" + port + "/tls/sni/example.com/ws")
 
 	tlsConfig := &tls.Config{InsecureSkipVerify: true} // Our test server doesn't have a cert signed by a CA
 	_, u := newSecureUpgrader(t)
@@ -251,7 +251,7 @@ func TestHostHeaderWss(t *testing.T) {
 }
 
 func TestDialWss(t *testing.T) {
-	serverMA, rid, errChan := testWSSServer(t, ma.StringCast("/ip4/127.0.0.1/tcp/0/tls/sni/example.com/ws"))
+	serverMA, rid, errChan := testWSSServer(t, tStringCast("/ip4/127.0.0.1/tcp/0/tls/sni/example.com/ws"))
 	require.Contains(t, serverMA.String(), "tls")
 
 	tlsConfig := &tls.Config{InsecureSkipVerify: true} // Our test server doesn't have a cert signed by a CA
@@ -275,7 +275,7 @@ func TestDialWss(t *testing.T) {
 }
 
 func TestDialWssNoClientCert(t *testing.T) {
-	serverMA, rid, _ := testWSSServer(t, ma.StringCast("/ip4/127.0.0.1/tcp/0/tls/sni/example.com/ws"))
+	serverMA, rid, _ := testWSSServer(t, tStringCast("/ip4/127.0.0.1/tcp/0/tls/sni/example.com/ws"))
 	require.Contains(t, serverMA.String(), "tls")
 
 	_, u := newSecureUpgrader(t)
@@ -374,10 +374,10 @@ func connectAndExchangeData(t *testing.T, laddr ma.Multiaddr, secure bool) {
 
 func TestWebsocketConnection(t *testing.T) {
 	t.Run("unencrypted", func(t *testing.T) {
-		connectAndExchangeData(t, ma.StringCast("/ip4/127.0.0.1/tcp/0/ws"), false)
+		connectAndExchangeData(t, tStringCast("/ip4/127.0.0.1/tcp/0/ws"), false)
 	})
 	t.Run("encrypted", func(t *testing.T) {
-		connectAndExchangeData(t, ma.StringCast("/ip4/127.0.0.1/tcp/0/wss"), true)
+		connectAndExchangeData(t, tStringCast("/ip4/127.0.0.1/tcp/0/wss"), true)
 	})
 }
 
@@ -385,7 +385,7 @@ func TestWebsocketListenSecureFailWithoutTLSConfig(t *testing.T) {
 	_, u := newUpgrader(t)
 	tpt, err := New(u, &network.NullResourceManager{})
 	require.NoError(t, err)
-	addr := ma.StringCast("/ip4/127.0.0.1/tcp/0/wss")
+	addr := tStringCast("/ip4/127.0.0.1/tcp/0/wss")
 	_, err = tpt.Listen(addr)
 	require.EqualError(t, err, fmt.Sprintf("cannot listen on wss address %s without a tls.Config", addr))
 }
@@ -395,9 +395,9 @@ func TestWebsocketListenSecureAndInsecure(t *testing.T) {
 	server, err := New(serverUpgrader, &network.NullResourceManager{}, WithTLSConfig(generateTLSConfig(t)))
 	require.NoError(t, err)
 
-	lnInsecure, err := server.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0/ws"))
+	lnInsecure, err := server.Listen(tStringCast("/ip4/127.0.0.1/tcp/0/ws"))
 	require.NoError(t, err)
-	lnSecure, err := server.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0/wss"))
+	lnSecure, err := server.Listen(tStringCast("/ip4/127.0.0.1/tcp/0/wss"))
 	require.NoError(t, err)
 
 	t.Run("insecure", func(t *testing.T) {
@@ -439,7 +439,7 @@ func TestConcurrentClose(t *testing.T) {
 	_, u := newUpgrader(t)
 	tpt, err := New(u, &network.NullResourceManager{})
 	require.NoError(t, err)
-	l, err := tpt.maListen(ma.StringCast("/ip4/127.0.0.1/tcp/0/ws"))
+	l, err := tpt.maListen(tStringCast("/ip4/127.0.0.1/tcp/0/ws"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestWriteZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := tpt.maListen(ma.StringCast("/ip4/127.0.0.1/tcp/0/ws"))
+	l, err := tpt.maListen(tStringCast("/ip4/127.0.0.1/tcp/0/ws"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestResolveMultiaddr(t *testing.T) {
 	for unresolved, expectedMA := range testCases {
 		t.Run(unresolved, func(t *testing.T) {
 
-			m1 := ma.StringCast(unresolved)
+			m1 := tStringCast(unresolved)
 			wsTpt := WebsocketTransport{}
 			ctx := context.Background()
 

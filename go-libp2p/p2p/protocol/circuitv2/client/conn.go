@@ -122,20 +122,19 @@ func (c *Conn) Stat() network.ConnStats {
 // implicitly because the connection manager closed the underlying relay connection.
 func (c *Conn) tagHop() {
 	c.client.mx.Lock()
-	defer c.client.mx.Unlock()
 
 	p := c.stream.Conn().RemotePeer()
 	c.client.hopCount[p]++
 	if c.client.hopCount[p] == 1 {
 		c.client.host.ConnManager().TagPeer(p, "relay-hop-stream", HopTagWeight)
 	}
+	c.client.mx.Unlock()
 }
 
 // untagHop removes the relay-hop-stream tag if necessary; it is invoked when a relayed connection
 // is closed.
 func (c *Conn) untagHop() {
 	c.client.mx.Lock()
-	defer c.client.mx.Unlock()
 
 	p := c.stream.Conn().RemotePeer()
 	c.client.hopCount[p]--
@@ -143,6 +142,7 @@ func (c *Conn) untagHop() {
 		c.client.host.ConnManager().UntagPeer(p, "relay-hop-stream")
 		delete(c.client.hopCount, p)
 	}
+	c.client.mx.Unlock()
 }
 
 type capableConnWithStat interface {

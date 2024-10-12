@@ -80,7 +80,7 @@ func TestScalarBls48581G1Invert(t *testing.T) {
 	sa, _ := actual.(*ScalarBls48581)
 	expected, err := bls48581G1.Scalar.SetBigInt(bhex("000000000000000007e51ad0414ec8f8799b3f49cc04d5850f9a0c8cf190b82a38f1b4c29e8b47c188b93dea0bb9f3ce3dec8654a0132439b9f49c13e8170ebbeae908716e2da522ab"))
 	require.NoError(t, err)
-	require.Equal(t, sa.Value.ToString(), expected.(*ScalarBls48581).Value.ToString())
+	require.Equal(t, sa.Cmp(expected), 0)
 }
 
 func TestScalarBls48581G1Add(t *testing.T) {
@@ -91,11 +91,11 @@ func TestScalarBls48581G1Add(t *testing.T) {
 	require.NotNil(t, fifteen)
 	expected := bls48581G1.Scalar.New(15)
 	require.Equal(t, expected.Cmp(fifteen), 0)
-	qq := bls48581.NewBIGints(bls48581.CURVE_Order, nil)
-	qq.Sub(bls48581.NewBIGint(3, nil))
+	qq := bls48581.NewBIGints(bls48581.CURVE_Order)
+	qq.Sub(bls48581.NewBIGint(3))
 
 	upper := &ScalarBls48581{
-		Value: bls48581.NewBIGcopy(qq, nil),
+		Value: bls48581.NewBIGcopy(qq),
 	}
 	actual := upper.Add(nine)
 	require.NotNil(t, actual)
@@ -106,8 +106,8 @@ func TestScalarBls48581G1Sub(t *testing.T) {
 	bls48581G1 := BLS48581G1()
 	nine := bls48581G1.Scalar.New(9)
 	six := bls48581G1.Scalar.New(6)
-	n := bls48581.NewFPbig(bls48581.NewBIGints(bls48581.CURVE_Order, nil), nil)
-	n.Sub(bls48581.NewFPint(3, nil), nil)
+	n := bls48581.NewFPbig(bls48581.NewBIGints(bls48581.CURVE_Order))
+	n.Sub(bls48581.NewFPint(3))
 
 	expected := bls48581G1.Scalar.New(0).Sub(bls48581G1.Scalar.New(3))
 	actual := six.Sub(nine)

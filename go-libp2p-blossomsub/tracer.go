@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -16,8 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
-
-	"github.com/libp2p/go-msgio/protoio"
+	"github.com/libp2p/go-msgio"
 )
 
 var TraceBufferSize = 1 << 16 // 64K ought to be enough for everyone; famous last words.
@@ -48,9 +48,9 @@ type basicTracer struct {
 
 func (t *basicTracer) Trace(evt *pb.TraceEvent) {
 	t.mx.Lock()
-	defer t.mx.Unlock()
 
 	if t.closed {
+		t.mx.Unlock()
 		return
 	}
 
@@ -59,6 +59,7 @@ func (t *basicTracer) Trace(evt *pb.TraceEvent) {
 	} else {
 		t.buf = append(t.buf, evt)
 	}
+	t.mx.Unlock()
 
 	select {
 	case t.ch <- struct{}{}:
@@ -68,11 +69,11 @@ func (t *basicTracer) Trace(evt *pb.TraceEvent) {
 
 func (t *basicTracer) Close() {
 	t.mx.Lock()
-	defer t.mx.Unlock()
 	if !t.closed {
 		t.closed = true
 		close(t.ch)
 	}
+	t.mx.Unlock()
 }
 
 // JSONTracer is a tracer that writes events to a file, encoded in ndjson.
@@ -160,7 +161,6 @@ func OpenPBTracer(file string, flags int, perm os.FileMode) (*PBTracer, error) {
 
 func (t *PBTracer) doWrite() {
 	var buf []*pb.TraceEvent
-	w := protoio.NewDelimitedWriter(t.w)
 	for {
 		_, ok := <-t.ch
 
@@ -170,11 +170,20 @@ func (t *PBTracer) doWrite() {
 		buf = tmp
 		t.mx.Unlock()
 
+		w := msgio.NewVarintWriter(t.w)
+
 		for i, evt := range buf {
-			err := w.WriteMsg(evt)
+			out, err := proto.Marshal(evt)
+			if err != nil {
+				log.Warnf("error writing event trace: %s", err.Error())
+				continue
+			}
+
+			err = w.WriteMsg(out)
 			if err != nil {
 				log.Warnf("error writing event trace: %s", err.Error())
 			}
+
 			buf[i] = nil
 		}
 
@@ -187,7 +196,7 @@ func (t *PBTracer) doWrite() {
 
 var _ EventTracer = (*PBTracer)(nil)
 
-const RemoteTracerProtoID = protocol.ID("/libp2p/pubsub/tracer/1.0.0")
+const RemoteTracerProtoID = protocol.ID("/libp2p/pubsub/tracer/2.0.0")
 
 // RemoteTracer is a tracer that sends trace events to a remote peer
 type RemoteTracer struct {
@@ -217,7 +226,7 @@ func (t *RemoteTracer) doWrite() {
 	var batch pb.TraceEventBatch
 
 	gzipW := gzip.NewWriter(s)
-	w := protoio.NewDelimitedWriter(gzipW)
+	w := msgio.NewVarintWriter(gzipW)
 
 	for {
 		_, ok := <-t.ch
@@ -235,6 +244,7 @@ func (t *RemoteTracer) doWrite() {
 		tmp := t.buf
 		t.buf = buf[:0]
 		buf = tmp
+		var out []byte
 		t.mx.Unlock()
 
 		if len(buf) == 0 {
@@ -242,8 +252,13 @@ func (t *RemoteTracer) doWrite() {
 		}
 
 		batch.Batch = buf
+		out, err = proto.Marshal(&batch)
+		if err != nil {
+			log.Debugf("error marshaling trace event batch: %s", err)
+			goto end
+		}
 
-		err = w.WriteMsg(&batch)
+		err = w.WriteMsg(out)
 		if err != nil {
 			log.Debugf("error writing trace event batch: %s", err)
 			goto end
@@ -251,7 +266,7 @@ func (t *RemoteTracer) doWrite() {
 
 		err = gzipW.Flush()
 		if err != nil {
-			log.Debugf("error flushin gzip stream: %s", err)
+			log.Debugf("error flushing gzip stream: %s", err)
 			goto end
 		}
 

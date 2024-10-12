@@ -89,17 +89,18 @@ func (c *ConnManager) ListenQUIC(addr ma.Multiaddr, tlsConf *tls.Config, allowWi
 	}
 
 	c.quicListenersMu.Lock()
-	defer c.quicListenersMu.Unlock()
 
 	key := laddr.String()
 	entry, ok := c.quicListeners[key]
 	if !ok {
 		tr, err := c.transportForListen(netw, laddr)
 		if err != nil {
+			c.quicListenersMu.Unlock()
 			return nil, err
 		}
 		ln, err := newQuicListener(tr, c.serverConfig)
 		if err != nil {
+			c.quicListenersMu.Unlock()
 			return nil, err
 		}
 		key = tr.LocalAddr().String()
@@ -110,16 +111,17 @@ func (c *ConnManager) ListenQUIC(addr ma.Multiaddr, tlsConf *tls.Config, allowWi
 		if entry.refCount <= 0 {
 			entry.ln.Close()
 		}
+		c.quicListenersMu.Unlock()
 		return nil, err
 	}
 	entry.refCount++
 	c.quicListeners[key] = entry
+	c.quicListenersMu.Unlock()
 	return l, nil
 }
 
 func (c *ConnManager) onListenerClosed(key string) {
 	c.quicListenersMu.Lock()
-	defer c.quicListenersMu.Unlock()
 
 	entry := c.quicListeners[key]
 	entry.refCount = entry.refCount - 1
@@ -129,6 +131,7 @@ func (c *ConnManager) onListenerClosed(key string) {
 	} else {
 		c.quicListeners[key] = entry
 	}
+	c.quicListenersMu.Unlock()
 }
 
 func (c *ConnManager) transportForListen(network string, laddr *net.UDPAddr) (refCountedQuicTransport, error) {

@@ -13,7 +13,7 @@ import (
 
 func containsPublicAddr(addrs []ma.Multiaddr) bool {
 	for _, addr := range addrs {
-		if isRelayAddress(addr) || !manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); err != nil || !is || isRelayAddress(addr) {
 			continue
 		}
 		return true
@@ -68,12 +68,13 @@ func holePunchConnect(ctx context.Context, host host.Host, pi peer.AddrInfo, isC
 	holePunchCtx := network.WithSimultaneousConnect(ctx, isClient, "hole-punching")
 	forceDirectConnCtx := network.WithForceDirectDial(holePunchCtx, "hole-punching")
 	dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, dialTimeout)
-	defer cancel()
 
 	if err := host.Connect(dialCtx, pi); err != nil {
 		log.Debugw("hole punch attempt with peer failed", "peer ID", pi.ID, "error", err)
+		cancel()
 		return err
 	}
 	log.Debugw("hole punch successful", "peer", pi.ID)
+	cancel()
 	return nil
 }

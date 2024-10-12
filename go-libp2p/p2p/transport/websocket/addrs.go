@@ -156,9 +156,10 @@ func parseWebsocketMultiaddr(a ma.Multiaddr) (parsedWebsocketMultiaddr, error) {
 	// If this is not a wss then withoutWs is the rest of the multiaddr
 	out.restMultiaddr = withoutWs
 	for {
+		var err error
 		var head *ma.Component
-		rest, head = ma.SplitLast(rest)
-		if head == nil || rest == nil {
+		rest, head, err = ma.SplitLast(rest)
+		if head == nil || rest == nil || err != nil {
 			break
 		}
 

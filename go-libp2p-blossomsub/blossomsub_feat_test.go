@@ -12,47 +12,46 @@ import (
 )
 
 func TestDefaultBlossomSubFeatures(t *testing.T) {
-	if BlossomSubDefaultFeatures(BlossomSubFeatureMesh, FloodSubID) {
-		t.Fatal("floodsub should not support Mesh")
-	}
-	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v12) {
-		t.Fatal("BlossomSub-v1.2 should support Mesh")
+	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v2) {
+		t.Fatal("BlossomSub-v2.0 should support Mesh")
 	}
 
-	if BlossomSubDefaultFeatures(BlossomSubFeaturePX, FloodSubID) {
-		t.Fatal("floodsub should not support PX")
-	}
-	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v12) {
-		t.Fatal("BlossomSub-v1.2 should support PX")
+	if !BlossomSubDefaultFeatures(BlossomSubFeaturePX, BlossomSubID_v2) {
+		t.Fatal("BlossomSub-v2.0 should support PX")
 	}
 }
 
 func TestBlossomSubCustomProtocols(t *testing.T) {
 	customsub := protocol.ID("customsub/1.0.0")
-	protos := []protocol.ID{customsub, FloodSubID}
+	protos := []protocol.ID{customsub}
 	features := func(feat BlossomSubFeature, proto protocol.ID) bool {
 		return proto == customsub
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 3)
+	hosts := getDefaultHosts(t, 3)
 
 	bsubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubProtocols(protos, features))
-	fsub := getPubsub(ctx, hosts[2])
-	psubs := append(bsubs, fsub)
 
 	connectAll(t, hosts)
 
-	bitmask := []byte{0xff, 0x00, 0x00, 0x00}
+	bitmask := []byte{0x00, 0x80, 0x00, 0x00}
+	var bitmasks []*Bitmask
 	var subs []*Subscription
-	for _, ps := range psubs {
+	for _, ps := range bsubs {
+		b, err := ps.Join(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		subch, err := ps.Subscribe(bitmask)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		subs = append(subs, subch)
+		subs = append(subs, subch...)
+		bitmasks = append(bitmasks, b...)
 	}
 
 	// wait for heartbeats to build mesh
@@ -92,9 +91,8 @@ func TestBlossomSubCustomProtocols(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		msg := []byte(fmt.Sprintf("%d it's not quite a floooooood %d", i, i))
 
-		owner := rand.Intn(len(psubs))
-
-		psubs[owner].Publish(bitmask, msg)
+		owner := rand.Intn(len(bsubs))
+		bitmasks[owner].Publish(ctx, bitmasks[owner].bitmask, msg)
 
 		for _, sub := range subs {
 			got, err := sub.Next(ctx)

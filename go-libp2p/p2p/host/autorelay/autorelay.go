@@ -59,8 +59,8 @@ func NewAutoRelay(bhost *basic.BasicHost, opts ...Option) (*AutoRelay, error) {
 func (r *AutoRelay) Start() {
 	r.refCount.Add(1)
 	go func() {
-		defer r.refCount.Done()
 		r.background()
+		r.refCount.Done()
 	}()
 }
 
@@ -70,14 +70,15 @@ func (r *AutoRelay) background() {
 		log.Debug("failed to subscribe to the EvtLocalReachabilityChanged")
 		return
 	}
-	defer subReachability.Close()
 
 	for {
 		select {
 		case <-r.ctx.Done():
+			subReachability.Close()
 			return
 		case ev, ok := <-subReachability.Out():
 			if !ok {
+				subReachability.Close()
 				return
 			}
 			// TODO: push changed addresses
@@ -109,12 +110,15 @@ func (r *AutoRelay) hostAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 
 func (r *AutoRelay) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	if r.status != network.ReachabilityPrivate {
+		r.mx.Unlock()
 		return addrs
 	}
-	return r.relayFinder.relayAddrs(addrs)
+
+	a := r.relayFinder.relayAddrs(addrs)
+	r.mx.Unlock()
+	return a
 }
 
 func (r *AutoRelay) Close() error {

@@ -215,7 +215,7 @@ func TestRoundTrippers(t *testing.T) {
 	httpHost := libp2phttp.Host{
 		InsecureAllowHTTP: true,
 		StreamHost:        serverHost,
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
 	httpHost.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -383,7 +383,7 @@ func TestPlainOldHTTPServer(t *testing.T) {
 			name: "using libp2phttp",
 			do: func(t *testing.T, request *http.Request) (*http.Response, error) {
 				var clientHttpHost libp2phttp.Host
-				rt, err := clientHttpHost.NewConstrainedRoundTripper(peer.AddrInfo{Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/" + serverAddrParts[1] + "/http")}})
+				rt, err := clientHttpHost.NewConstrainedRoundTripper(peer.AddrInfo{Addrs: []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/" + serverAddrParts[1] + "/http")}})
 				require.NoError(t, err)
 
 				client := &http.Client{Transport: rt}
@@ -391,7 +391,7 @@ func TestPlainOldHTTPServer(t *testing.T) {
 			},
 			getWellKnown: func(t *testing.T) (libp2phttp.PeerMeta, error) {
 				var clientHttpHost libp2phttp.Host
-				rt, err := clientHttpHost.NewConstrainedRoundTripper(peer.AddrInfo{Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/" + serverAddrParts[1] + "/http")}})
+				rt, err := clientHttpHost.NewConstrainedRoundTripper(peer.AddrInfo{Addrs: []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/" + serverAddrParts[1] + "/http")}})
 				require.NoError(t, err)
 				return rt.(libp2phttp.PeerMetadataGetter).GetPeerMetadata()
 			},
@@ -450,7 +450,7 @@ func TestPlainOldHTTPServer(t *testing.T) {
 func TestHostZeroValue(t *testing.T) {
 	server := libp2phttp.Host{
 		InsecureAllowHTTP: true,
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 	server.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("hello")) }))
 	go func() {
@@ -473,7 +473,7 @@ func TestHostZeroValue(t *testing.T) {
 func TestHTTPS(t *testing.T) {
 	server := libp2phttp.Host{
 		TLSConfig:   selfSignedTLSConfig(t),
-		ListenAddrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/https")},
+		ListenAddrs: []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/https")},
 	}
 	server.SetHTTPHandler(httpping.PingProtocolID, httpping.Ping{})
 	go func() {
@@ -535,7 +535,7 @@ func TestCustomServeMux(t *testing.T) {
 	serveMux.Handle("/ping/", httpping.Ping{})
 
 	server := libp2phttp.Host{
-		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 		ServeMux:          serveMux,
 		InsecureAllowHTTP: true,
 	}
@@ -595,7 +595,7 @@ func TestSetHandlerAtPath(t *testing.T) {
 			nestedMx := http.NewServeMux()
 			nestedMx.HandleFunc(tc.rest, hf)
 			server := libp2phttp.Host{
-				ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+				ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 				InsecureAllowHTTP: true,
 			}
 			server.SetHTTPHandlerAtPath("test", tc.prefix, nestedMx)
@@ -641,13 +641,13 @@ func TestServerLegacyWellKnownResource(t *testing.T) {
 		t.Cleanup(func() { server.Close() })
 		addrPort, err := netip.ParseAddrPort(l.Addr().String())
 		require.NoError(t, err)
-		return ma.StringCast(fmt.Sprintf("/ip4/%s/tcp/%d/http", addrPort.Addr().String(), addrPort.Port()))
+		return tStringCast(fmt.Sprintf("/ip4/%s/tcp/%d/http", addrPort.Addr().String(), addrPort.Port()))
 	}
 
 	mkServerlibp2phttp := func(enableLegacyWellKnown bool) ma.Multiaddr {
 		server := libp2phttp.Host{
 			EnableCompatibilityWithLegacyWellKnownEndpoint: enableLegacyWellKnown,
-			ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+			ListenAddrs:       []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/0/http")},
 			InsecureAllowHTTP: true,
 		}
 		server.SetHTTPHandler(httpping.PingProtocolID, httpping.Ping{})

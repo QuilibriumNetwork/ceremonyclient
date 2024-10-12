@@ -43,11 +43,11 @@ func numRelays(h host.Host) int {
 func usedRelays(h host.Host) []peer.ID {
 	m := make(map[peer.ID]struct{})
 	for _, addr := range h.Addrs() {
-		addr, comp := ma.SplitLast(addr)
+		addr, comp, _ := ma.SplitLast(addr)
 		if comp.Protocol().Code != ma.P_CIRCUIT { // not a relay addr
 			continue
 		}
-		_, comp = ma.SplitLast(addr)
+		_, comp, _ = ma.SplitLast(addr)
 		if comp.Protocol().Code != ma.P_P2P {
 			panic("expected p2p component")
 		}
@@ -96,7 +96,7 @@ func newRelay(t *testing.T) host.Host {
 				saddr := addr.String()
 				if strings.HasPrefix(saddr, "/ip4/127.0.0.1/") {
 					addrNoIP := strings.TrimPrefix(saddr, "/ip4/127.0.0.1")
-					addrs[i] = ma.StringCast("/dns4/localhost" + addrNoIP)
+					addrs[i], _ = ma.StringCast("/dns4/localhost" + addrNoIP)
 				}
 			}
 			return addrs
@@ -206,7 +206,7 @@ func TestBackoff(t *testing.T) {
 				saddr := addr.String()
 				if strings.HasPrefix(saddr, "/ip4/127.0.0.1/") {
 					addrNoIP := strings.TrimPrefix(saddr, "/ip4/127.0.0.1")
-					addrs[i] = ma.StringCast("/dns4/localhost" + addrNoIP)
+					addrs[i], _ = ma.StringCast("/dns4/localhost" + addrNoIP)
 				}
 			}
 			return addrs

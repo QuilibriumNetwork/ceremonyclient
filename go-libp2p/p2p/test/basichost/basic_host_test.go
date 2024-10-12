@@ -20,6 +20,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestNoStreamOverTransientConnection(t *testing.T) {
 	h1, err := libp2p.New(
 		libp2p.NoListenAddrs,
@@ -61,7 +66,7 @@ func TestNoStreamOverTransientConnection(t *testing.T) {
 	_, err = client.Reserve(context.Background(), h2, relay1info)
 	require.NoError(t, err)
 
-	relayaddr := ma.StringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
+	relayaddr := tStringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
 
 	h2Info := peer.AddrInfo{
 		ID:    h2.ID(),
@@ -122,7 +127,7 @@ func TestNewStreamTransientConnection(t *testing.T) {
 	_, err = client.Reserve(context.Background(), h2, relay1info)
 	require.NoError(t, err)
 
-	relayaddr := ma.StringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
+	relayaddr := tStringCast("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + h2.ID().String())
 
 	h1.Peerstore().AddAddr(h2.ID(), relayaddr, peerstore.TempAddrTTL)
 
@@ -167,8 +172,8 @@ func TestAddrFactorCertHashAppend(t *testing.T) {
 	webrtcAddr := "/ip4/1.2.3.4/udp/2/webrtc-direct"
 	addrsFactory := func(addrs []ma.Multiaddr) []ma.Multiaddr {
 		return append(addrs,
-			ma.StringCast(wtAddr),
-			ma.StringCast(webrtcAddr),
+			tStringCast(wtAddr),
+			tStringCast(webrtcAddr),
 		)
 	}
 	h, err := libp2p.New(

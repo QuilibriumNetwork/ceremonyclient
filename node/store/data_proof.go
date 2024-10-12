@@ -49,6 +49,7 @@ type DataProofStore interface {
 		output []byte,
 		err error,
 	)
+	RewindToIncrement(peerId []byte, increment uint32) error
 }
 
 var _ DataProofStore = (*PebbleDataProofStore)(nil)
@@ -487,6 +488,9 @@ func (p *PebbleDataProofStore) PutDataTimeProof(
 	// upgrading on time, akin to a "difficulty bomb" in reverse, but locally
 	// calculated.
 	difficulty := 200000 - (increment / 4)
+	if difficulty < 25000 || increment > 800000 {
+		difficulty = 25000
+	}
 
 	// Basis split on the estimated shard level for growth rate (in terms of
 	// units): 240 (QUIL) * 8000000000 (conversion factor) / 1600000 (shards)
@@ -566,4 +570,35 @@ func (p *PebbleDataProofStore) GetLatestDataTimeProof(peerId []byte) (
 	_, parallelism, _, output, err = p.GetDataTimeProof(peerId, increment)
 
 	return increment, parallelism, output, err
+}
+
+func (p *PebbleDataProofStore) RewindToIncrement(
+	peerId []byte,
+	increment uint32,
+) error {
+	reward := new(big.Int)
+	for j := uint32(0); j <= increment; j++ {
+		_, parallelism, _, _, err := p.GetDataTimeProof(peerId, uint32(j))
+		if err != nil {
+			panic(err)
+		}
+
+		pomwBasis := big.NewInt(1200000)
+
+		reward = reward.Add(
+			reward,
+			new(big.Int).Mul(pomwBasis, big.NewInt(int64(parallelism))),
+		)
+	}
+
+	latest := []byte{}
+	latest = binary.BigEndian.AppendUint32(latest, increment)
+
+	latest = append(latest, reward.FillBytes(make([]byte, 32))...)
+
+	if err := p.db.Set(dataTimeProofLatestKey(peerId), latest); err != nil {
+		return errors.Wrap(err, "put data time proof")
+	}
+
+	return nil
 }

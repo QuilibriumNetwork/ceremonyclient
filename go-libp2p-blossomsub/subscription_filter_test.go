@@ -11,12 +11,25 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+func mustSubscribe(t *testing.T, ps *PubSub, bitmask []byte) *Subscription {
+	sub, err := ps.Subscribe(bitmask)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sub) != 1 {
+		t.Fatal("must subscribe only allows single bit bitmasks")
+	}
+
+	return sub[0]
+}
+
 func TestBasicSubscriptionFilter(t *testing.T) {
 	peerA := peer.ID("A")
 
-	bitmask1 := []byte{0xff, 0x00, 0x00, 0x00}
-	bitmask2 := []byte{0x00, 0xff, 0x00, 0x00}
-	bitmask3 := []byte{0x00, 0x00, 0xff, 0x00}
+	bitmask1 := []byte{0x00, 0x80, 0x00, 0x00}
+	bitmask2 := []byte{0x00, 0x20, 0x00, 0x00}
+	bitmask3 := []byte{0x00, 0x00, 0x02, 0x00}
 	yes := true
 	subs := []*pb.RPC_SubOpts{
 		&pb.RPC_SubOpts{
@@ -69,9 +82,9 @@ func TestBasicSubscriptionFilter(t *testing.T) {
 func TestSubscriptionFilterDeduplication(t *testing.T) {
 	peerA := peer.ID("A")
 
-	bitmask1 := []byte{0xff, 0x00, 0x00, 0x00}
-	bitmask2 := []byte{0x00, 0xff, 0x00, 0x00}
-	bitmask3 := []byte{0x00, 0x00, 0xff, 0x00}
+	bitmask1 := []byte{0x00, 0x80, 0x00, 0x00}
+	bitmask2 := []byte{0x00, 0x20, 0x00, 0x00}
+	bitmask3 := []byte{0x00, 0x00, 0x02, 0x00}
 	yes := true
 	no := false
 	subs := []*pb.RPC_SubOpts{
@@ -117,17 +130,17 @@ func TestSubscriptionFilterRPC(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	ps1 := getPubsub(ctx, hosts[0], WithSubscriptionFilter(NewAllowlistSubscriptionFilter([]byte{0xff, 0x00, 0x00, 0x00}, []byte{0x00, 0xff, 0x00, 0x00})))
-	ps2 := getPubsub(ctx, hosts[1], WithSubscriptionFilter(NewAllowlistSubscriptionFilter([]byte{0x00, 0xff, 0x00, 0x00}, []byte{0x00, 0x00, 0xff, 0x00})))
+	hosts := getDefaultHosts(t, 2)
+	ps1 := getBlossomSub(ctx, hosts[0], WithSubscriptionFilter(NewAllowlistSubscriptionFilter([]byte{0x00, 0x80, 0x00, 0x00}, []byte{0x00, 0x20, 0x00, 0x00})))
+	ps2 := getBlossomSub(ctx, hosts[1], WithSubscriptionFilter(NewAllowlistSubscriptionFilter([]byte{0x00, 0x20, 0x00, 0x00}, []byte{0x00, 0x00, 0x02, 0x00})))
 
-	_ = mustSubscribe(t, ps1, []byte{0xff, 0x00, 0x00, 0x00})
-	_ = mustSubscribe(t, ps1, []byte{0x00, 0xff, 0x00, 0x00})
-	_ = mustSubscribe(t, ps2, []byte{0x00, 0xff, 0x00, 0x00})
-	_ = mustSubscribe(t, ps2, []byte{0x00, 0x00, 0xff, 0x00})
+	_ = mustSubscribe(t, ps1, []byte{0x00, 0x80, 0x00, 0x00})
+	_ = mustSubscribe(t, ps1, []byte{0x00, 0x20, 0x00, 0x00})
+	_ = mustSubscribe(t, ps2, []byte{0x00, 0x20, 0x00, 0x00})
+	_ = mustSubscribe(t, ps2, []byte{0x00, 0x00, 0x02, 0x00})
 
 	// check the rejection as well
-	_, err := ps1.Join([]byte{0x00, 0x00, 0xff, 0x00})
+	_, err := ps1.Join([]byte{0x00, 0x00, 0x02, 0x00})
 	if err == nil {
 		t.Fatal("expected subscription error")
 	}
@@ -140,9 +153,9 @@ func TestSubscriptionFilterRPC(t *testing.T) {
 	ready := make(chan struct{})
 
 	ps1.eval <- func() {
-		_, sub1 = ps1.bitmasks[string([]byte{0xff, 0x00, 0x00, 0x00})][hosts[1].ID()]
-		_, sub2 = ps1.bitmasks[string([]byte{0x00, 0xff, 0x00, 0x00})][hosts[1].ID()]
-		_, sub3 = ps1.bitmasks[string([]byte{0x00, 0x00, 0xff, 0x00})][hosts[1].ID()]
+		_, sub1 = ps1.bitmasks[string([]byte{0x00, 0x80, 0x00, 0x00})][hosts[1].ID()]
+		_, sub2 = ps1.bitmasks[string([]byte{0x00, 0x20, 0x00, 0x00})][hosts[1].ID()]
+		_, sub3 = ps1.bitmasks[string([]byte{0x00, 0x00, 0x02, 0x00})][hosts[1].ID()]
 		ready <- struct{}{}
 	}
 	<-ready
@@ -158,9 +171,9 @@ func TestSubscriptionFilterRPC(t *testing.T) {
 	}
 
 	ps2.eval <- func() {
-		_, sub1 = ps2.bitmasks[string([]byte{0xff, 0x00, 0x00, 0x00})][hosts[0].ID()]
-		_, sub2 = ps2.bitmasks[string([]byte{0x00, 0xff, 0x00, 0x00})][hosts[0].ID()]
-		_, sub3 = ps2.bitmasks[string([]byte{0x00, 0x00, 0xff, 0x00})][hosts[0].ID()]
+		_, sub1 = ps2.bitmasks[string([]byte{0x00, 0x80, 0x00, 0x00})][hosts[0].ID()]
+		_, sub2 = ps2.bitmasks[string([]byte{0x00, 0x20, 0x00, 0x00})][hosts[0].ID()]
+		_, sub3 = ps2.bitmasks[string([]byte{0x00, 0x00, 0x02, 0x00})][hosts[0].ID()]
 		ready <- struct{}{}
 	}
 	<-ready

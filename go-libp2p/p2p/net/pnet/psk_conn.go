@@ -60,11 +60,12 @@ func (c *pskConn) Write(in []byte) (int, error) {
 		c.writeS20 = salsa20.New(c.psk, nonce)
 	}
 	out := pool.Get(len(in))
-	defer pool.Put(out)
 
 	c.writeS20.XORKeyStream(out, in) // encrypt
 
-	return c.Conn.Write(out) // send
+	n, err := c.Conn.Write(out)
+	pool.Put(out)
+	return n, err // send
 }
 
 var _ net.Conn = (*pskConn)(nil)

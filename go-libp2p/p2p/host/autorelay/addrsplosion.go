@@ -17,13 +17,13 @@ func cleanupAddressSet(addrs []ma.Multiaddr) []ma.Multiaddr {
 			continue
 		}
 
-		if manet.IsPublicAddr(a) || isDNSAddr(a) {
+		if is, err := manet.IsPublicAddr(a); (is && err == nil) || isDNSAddr(a) {
 			public = append(public, a)
 			continue
 		}
 
 		// discard unroutable addrs
-		if manet.IsPrivateAddr(a) {
+		if is, err := manet.IsPrivateAddr(a); is && err == nil {
 			private = append(private, a)
 		}
 	}
@@ -38,7 +38,10 @@ func cleanupAddressSet(addrs []ma.Multiaddr) []ma.Multiaddr {
 func isRelayAddr(a ma.Multiaddr) bool {
 	isRelay := false
 
-	ma.ForEach(a, func(c ma.Component) bool {
+	ma.ForEach(a, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_CIRCUIT:
 			isRelay = true
@@ -52,7 +55,7 @@ func isRelayAddr(a ma.Multiaddr) bool {
 }
 
 func isDNSAddr(a ma.Multiaddr) bool {
-	if first, _ := ma.SplitFirst(a); first != nil {
+	if first, _, err := ma.SplitFirst(a); err == nil && first != nil {
 		switch first.Protocol().Code {
 		case ma.P_DNS, ma.P_DNS4, ma.P_DNS6, ma.P_DNSADDR:
 			return true
@@ -84,7 +87,10 @@ func addrKeyAndPort(a ma.Multiaddr) (string, int) {
 		port int
 	)
 
-	ma.ForEach(a, func(c ma.Component) bool {
+	ma.ForEach(a, func(c ma.Component, e error) bool {
+		if e != nil {
+			return false
+		}
 		switch c.Protocol().Code {
 		case ma.P_TCP, ma.P_UDP:
 			port = int(binary.BigEndian.Uint16(c.RawValue()))

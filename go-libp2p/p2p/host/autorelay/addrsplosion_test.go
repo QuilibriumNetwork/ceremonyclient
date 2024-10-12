@@ -84,7 +84,8 @@ func TestCleanupAddrs(t *testing.T) {
 func makeAddrList(strs ...string) []ma.Multiaddr {
 	result := make([]ma.Multiaddr, 0, len(strs))
 	for _, s := range strs {
-		result = append(result, ma.StringCast(s))
+		m, _ := ma.StringCast(s)
+		result = append(result, m)
 	}
 	return result
 }

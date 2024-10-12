@@ -109,9 +109,9 @@ func (t *tagTracer) addDeliveryTag(bitmask []byte) {
 		return
 	}
 
-	name := fmt.Sprintf("pubsub-deliveries:%s", bitmask)
+	name := "pubsub-deliveries:" + string(bitmask)
 	t.Lock()
-	defer t.Unlock()
+
 	tag, err := t.decayer.RegisterDecayingTag(
 		name,
 		BlossomSubConnTagDecayInterval,
@@ -120,16 +120,19 @@ func (t *tagTracer) addDeliveryTag(bitmask []byte) {
 
 	if err != nil {
 		log.Warnf("unable to create decaying delivery tag: %s", err)
+		t.Unlock()
 		return
 	}
 	t.decaying[string(bitmask)] = tag
+	t.Unlock()
 }
 
 func (t *tagTracer) removeDeliveryTag(bitmask []byte) {
 	t.Lock()
-	defer t.Unlock()
+
 	tag, ok := t.decaying[string(bitmask)]
 	if !ok {
+		t.Unlock()
 		return
 	}
 	err := tag.Close()
@@ -137,17 +140,20 @@ func (t *tagTracer) removeDeliveryTag(bitmask []byte) {
 		log.Warnf("error closing decaying connmgr tag: %s", err)
 	}
 	delete(t.decaying, string(bitmask))
+	t.Unlock()
 }
 
 func (t *tagTracer) bumpDeliveryTag(p peer.ID, bitmask []byte) error {
 	t.RLock()
-	defer t.RUnlock()
 
 	tag, ok := t.decaying[string(bitmask)]
 	if !ok {
+		t.RUnlock()
 		return fmt.Errorf("no decaying tag registered for bitmask %s", bitmask)
 	}
-	return tag.Bump(p, BlossomSubConnTagBumpMessageDelivery)
+	err := tag.Bump(p, BlossomSubConnTagBumpMessageDelivery)
+	t.RUnlock()
+	return err
 }
 
 func (t *tagTracer) bumpTagsForMessage(p peer.ID, msg *Message) {
@@ -161,15 +167,17 @@ func (t *tagTracer) bumpTagsForMessage(p peer.ID, msg *Message) {
 // nearFirstPeers returns the peers who delivered the message while it was still validating
 func (t *tagTracer) nearFirstPeers(msg *Message) []peer.ID {
 	t.Lock()
-	defer t.Unlock()
-	peersMap, ok := t.nearFirst[t.idGen.ID(msg)]
+
+	peersMap, ok := t.nearFirst[string(t.idGen.ID(msg))]
 	if !ok {
+		t.Unlock()
 		return nil
 	}
 	peers := make([]peer.ID, 0, len(peersMap))
 	for p := range peersMap {
 		peers = append(peers, p)
 	}
+	t.Unlock()
 	return peers
 }
 
@@ -194,7 +202,7 @@ func (t *tagTracer) DeliverMessage(msg *Message) {
 
 	// delete the delivery state for this message
 	t.Lock()
-	delete(t.nearFirst, t.idGen.ID(msg))
+	delete(t.nearFirst, string(t.idGen.ID(msg)))
 	t.Unlock()
 }
 
@@ -212,31 +220,32 @@ func (t *tagTracer) Prune(p peer.ID, bitmask []byte) {
 
 func (t *tagTracer) ValidateMessage(msg *Message) {
 	t.Lock()
-	defer t.Unlock()
 
 	// create map to start tracking the peers who deliver while we're validating
 	id := t.idGen.ID(msg)
-	if _, exists := t.nearFirst[id]; exists {
+	if _, exists := t.nearFirst[string(id)]; exists {
+		t.Unlock()
 		return
 	}
-	t.nearFirst[id] = make(map[peer.ID]struct{})
+	t.nearFirst[string(id)] = make(map[peer.ID]struct{})
+	t.Unlock()
 }
 
 func (t *tagTracer) DuplicateMessage(msg *Message) {
 	t.Lock()
-	defer t.Unlock()
 
 	id := t.idGen.ID(msg)
-	peers, ok := t.nearFirst[id]
+	peers, ok := t.nearFirst[string(id)]
 	if !ok {
+		t.Unlock()
 		return
 	}
 	peers[msg.ReceivedFrom] = struct{}{}
+	t.Unlock()
 }
 
 func (t *tagTracer) RejectMessage(msg *Message, reason string) {
 	t.Lock()
-	defer t.Unlock()
 
 	// We want to delete the near-first delivery tracking for messages that have passed through
 	// the validation pipeline. Other rejection reasons (missing signature, etc) skip the validation
@@ -247,8 +256,9 @@ func (t *tagTracer) RejectMessage(msg *Message, reason string) {
 	case RejectValidationIgnored:
 		fallthrough
 	case RejectValidationFailed:
-		delete(t.nearFirst, t.idGen.ID(msg))
+		delete(t.nearFirst, string(t.idGen.ID(msg)))
 	}
+	t.Unlock()
 }
 
 func (t *tagTracer) RemovePeer(peer.ID)                {}

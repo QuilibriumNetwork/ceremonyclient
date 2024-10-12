@@ -108,15 +108,15 @@ func WithClock(clock clock) AddrBookOption {
 
 // background periodically schedules a gc
 func (mab *memoryAddrBook) background(ctx context.Context) {
-	defer mab.refCount.Done()
 	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			mab.gc()
 		case <-ctx.Done():
+			mab.refCount.Done()
+			ticker.Stop()
 			return
 		}
 	}
@@ -203,9 +203,10 @@ func (mab *memoryAddrBook) ConsumePeerRecord(recordEnvelope *record.Envelope, tt
 	// ensure seq is greater than, or equal to, the last received
 	s := mab.segments.get(rec.PeerID)
 	s.Lock()
-	defer s.Unlock()
+
 	lastState, found := s.signedPeerRecords[rec.PeerID]
 	if found && lastState.Seq > rec.Seq {
+		s.Unlock()
 		return false, nil
 	}
 	s.signedPeerRecords[rec.PeerID] = &peerRecordState{
@@ -213,15 +214,15 @@ func (mab *memoryAddrBook) ConsumePeerRecord(recordEnvelope *record.Envelope, tt
 		Seq:      rec.Seq,
 	}
 	mab.addAddrsUnlocked(s, rec.PeerID, rec.Addrs, ttl, true)
+	s.Unlock()
 	return true, nil
 }
 
 func (mab *memoryAddrBook) addAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Duration) {
 	s := mab.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
-
 	mab.addAddrsUnlocked(s, p, addrs, ttl, false)
+	s.Unlock()
 }
 
 func (mab *memoryAddrBook) addAddrsUnlocked(s *addrSegment, p peer.ID, addrs []ma.Multiaddr, ttl time.Duration, signed bool) {
@@ -239,7 +240,11 @@ func (mab *memoryAddrBook) addAddrsUnlocked(s *addrSegment, p peer.ID, addrs []m
 	exp := mab.clock.Now().Add(ttl)
 	for _, addr := range addrs {
 		// Remove suffix of /p2p/peer-id from address
-		addr, addrPid := peer.SplitAddr(addr)
+		addr, addrPid, err := peer.SplitAddr(addr)
+		if err != nil {
+			log.Warnw("Was passed multiaddr with err", "peer", p, "err", err)
+			continue
+		}
 		if addr == nil {
 			log.Warnw("Was passed nil multiaddr", "peer", p)
 			continue
@@ -278,7 +283,6 @@ func (mab *memoryAddrBook) SetAddr(p peer.ID, addr ma.Multiaddr, ttl time.Durati
 func (mab *memoryAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Duration) {
 	s := mab.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
 
 	amap, ok := s.addrs[p]
 	if !ok {
@@ -288,7 +292,11 @@ func (mab *memoryAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Du
 
 	exp := mab.clock.Now().Add(ttl)
 	for _, addr := range addrs {
-		addr, addrPid := peer.SplitAddr(addr)
+		addr, addrPid, err := peer.SplitAddr(addr)
+		if err != nil {
+			log.Warnw("Was passed multiaddr with err", "peer", p, "err", err)
+			continue
+		}
 		if addr == nil {
 			log.Warnw("was passed nil multiaddr", "peer", p)
 			continue
@@ -308,6 +316,7 @@ func (mab *memoryAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Du
 			delete(amap, key)
 		}
 	}
+	s.Unlock()
 }
 
 // UpdateAddrs updates the addresses associated with the given peer that have
@@ -315,10 +324,11 @@ func (mab *memoryAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Du
 func (mab *memoryAddrBook) UpdateAddrs(p peer.ID, oldTTL time.Duration, newTTL time.Duration) {
 	s := mab.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
+
 	exp := mab.clock.Now().Add(newTTL)
 	amap, found := s.addrs[p]
 	if !found {
+		s.Unlock()
 		return
 	}
 
@@ -333,15 +343,17 @@ func (mab *memoryAddrBook) UpdateAddrs(p peer.ID, oldTTL time.Duration, newTTL t
 			}
 		}
 	}
+	s.Unlock()
 }
 
 // Addrs returns all known (and valid) addresses for a given peer
 func (mab *memoryAddrBook) Addrs(p peer.ID) []ma.Multiaddr {
 	s := mab.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
-	return validAddrs(mab.clock.Now(), s.addrs[p])
+	v := validAddrs(mab.clock.Now(), s.addrs[p])
+	s.RUnlock()
+	return v
 }
 
 func validAddrs(now time.Time, amap map[string]*expiringAddr) []ma.Multiaddr {
@@ -364,19 +376,21 @@ func validAddrs(now time.Time, amap map[string]*expiringAddr) []ma.Multiaddr {
 func (mab *memoryAddrBook) GetPeerRecord(p peer.ID) *record.Envelope {
 	s := mab.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
 	// although the signed record gets garbage collected when all addrs inside it are expired,
 	// we may be in between the expiration time and the GC interval
 	// so, we check to see if we have any valid signed addrs before returning the record
 	if len(validAddrs(mab.clock.Now(), s.addrs[p])) == 0 {
+		s.RUnlock()
 		return nil
 	}
 
 	state := s.signedPeerRecords[p]
 	if state == nil {
+		s.RUnlock()
 		return nil
 	}
+	s.RUnlock()
 	return state.Envelope
 }
 
@@ -384,10 +398,10 @@ func (mab *memoryAddrBook) GetPeerRecord(p peer.ID) *record.Envelope {
 func (mab *memoryAddrBook) ClearAddrs(p peer.ID) {
 	s := mab.segments.get(p)
 	s.Lock()
-	defer s.Unlock()
 
 	delete(s.addrs, p)
 	delete(s.signedPeerRecords, p)
+	s.Unlock()
 }
 
 // AddrStream returns a channel on which all new addresses discovered for a
@@ -395,15 +409,15 @@ func (mab *memoryAddrBook) ClearAddrs(p peer.ID) {
 func (mab *memoryAddrBook) AddrStream(ctx context.Context, p peer.ID) <-chan ma.Multiaddr {
 	s := mab.segments.get(p)
 	s.RLock()
-	defer s.RUnlock()
 
 	baseaddrslice := s.addrs[p]
 	initial := make([]ma.Multiaddr, 0, len(baseaddrslice))
 	for _, a := range baseaddrslice {
 		initial = append(initial, a.Addr)
 	}
-
-	return mab.subManager.AddrStream(ctx, p, initial)
+	c := mab.subManager.AddrStream(ctx, p, initial)
+	s.RUnlock()
+	return c
 }
 
 type addrSub struct {
@@ -436,14 +450,15 @@ func NewAddrSubManager() *AddrSubManager {
 // from the manager.
 func (mgr *AddrSubManager) removeSub(p peer.ID, s *addrSub) {
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 
 	subs := mgr.subs[p]
 	if len(subs) == 1 {
 		if subs[0] != s {
+			mgr.mu.Unlock()
 			return
 		}
 		delete(mgr.subs, p)
+		mgr.mu.Unlock()
 		return
 	}
 
@@ -452,21 +467,23 @@ func (mgr *AddrSubManager) removeSub(p peer.ID, s *addrSub) {
 			subs[i] = subs[len(subs)-1]
 			subs[len(subs)-1] = nil
 			mgr.subs[p] = subs[:len(subs)-1]
+			mgr.mu.Unlock()
 			return
 		}
 	}
+	mgr.mu.Unlock()
 }
 
 // BroadcastAddr broadcasts a new address to all subscribed streams.
 func (mgr *AddrSubManager) BroadcastAddr(p peer.ID, addr ma.Multiaddr) {
 	mgr.mu.RLock()
-	defer mgr.mu.RUnlock()
 
 	if subs, ok := mgr.subs[p]; ok {
 		for _, sub := range subs {
 			sub.pubAddr(addr)
 		}
 	}
+	mgr.mu.RUnlock()
 }
 
 // AddrStream creates a new subscription for a given peer ID, pre-populating the
@@ -482,8 +499,6 @@ func (mgr *AddrSubManager) AddrStream(ctx context.Context, p peer.ID, initial []
 	sort.Sort(addrList(initial))
 
 	go func(buffer []ma.Multiaddr) {
-		defer close(out)
-
 		sent := make(map[string]struct{}, len(buffer))
 		for _, a := range buffer {
 			sent[string(a.Bytes())] = struct{}{}
@@ -521,6 +536,7 @@ func (mgr *AddrSubManager) AddrStream(ctx context.Context, p peer.ID, initial []
 				}
 			case <-ctx.Done():
 				mgr.removeSub(p, sub)
+				close(out)
 				return
 			}
 		}

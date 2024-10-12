@@ -69,8 +69,9 @@ func (mkb *memoryKeyBook) AddPubKey(p peer.ID, pk ic.PubKey) error {
 
 func (mkb *memoryKeyBook) PrivKey(p peer.ID) ic.PrivKey {
 	mkb.RLock()
-	defer mkb.RUnlock()
-	return mkb.sks[p]
+	i := mkb.sks[p]
+	mkb.RUnlock()
+	return i
 }
 
 func (mkb *memoryKeyBook) AddPrivKey(p peer.ID, sk ic.PrivKey) error {

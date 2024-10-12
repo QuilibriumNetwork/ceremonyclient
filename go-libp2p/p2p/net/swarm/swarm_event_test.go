@@ -67,6 +67,11 @@ func TestConnectednessEventsSingleConn(t *testing.T) {
 	checkEvent(t, sub2, event.EvtPeerConnectednessChanged{Peer: s1.LocalPeer(), Connectedness: network.NotConnected})
 }
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func TestNoDeadlockWhenConsumingConnectednessEvents(t *testing.T) {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
@@ -78,7 +83,7 @@ func TestNoDeadlockWhenConsumingConnectednessEvents(t *testing.T) {
 
 	listener := swarmt.GenSwarm(t, swarmt.OptDialOnly)
 	addrsToListen := []ma.Multiaddr{
-		ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"),
+		tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"),
 	}
 
 	if err := listener.Listen(addrsToListen...); err != nil {

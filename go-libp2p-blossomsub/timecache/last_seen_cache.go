@@ -37,22 +37,20 @@ func (tc *LastSeenCache) Done() {
 
 func (tc *LastSeenCache) Add(s string) bool {
 	tc.lk.Lock()
-	defer tc.lk.Unlock()
 
 	_, ok := tc.m[s]
 	tc.m[s] = time.Now().Add(tc.ttl)
-
+	tc.lk.Unlock()
 	return !ok
 }
 
 func (tc *LastSeenCache) Has(s string) bool {
 	tc.lk.Lock()
-	defer tc.lk.Unlock()
 
 	_, ok := tc.m[s]
 	if ok {
 		tc.m[s] = time.Now().Add(tc.ttl)
 	}
-
+	tc.lk.Unlock()
 	return ok
 }

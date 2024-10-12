@@ -258,8 +258,6 @@ func (ids *idService) Start() {
 }
 
 func (ids *idService) loop(ctx context.Context) {
-	defer ids.refCount.Done()
-
 	sub, err := ids.Host.EventBus().Subscribe(
 		[]any{&event.EvtLocalProtocolsUpdated{}, &event.EvtLocalAddressesUpdated{}},
 		eventbus.BufSize(256),
@@ -267,9 +265,9 @@ func (ids *idService) loop(ctx context.Context) {
 	)
 	if err != nil {
 		log.Errorf("failed to subscribe to events on the bus, err=%s", err)
+		ids.refCount.Done()
 		return
 	}
-	defer sub.Close()
 
 	// Send pushes from a separate Go routine.
 	// That way, we can end up with
@@ -278,11 +276,10 @@ func (ids *idService) loop(ctx context.Context) {
 	triggerPush := make(chan struct{}, 1)
 	ids.refCount.Add(1)
 	go func() {
-		defer ids.refCount.Done()
-
 		for {
 			select {
 			case <-ctx.Done():
+				ids.refCount.Done()
 				return
 			case <-triggerPush:
 				ids.sendPushes(ctx)
@@ -294,6 +291,8 @@ func (ids *idService) loop(ctx context.Context) {
 		select {
 		case e, ok := <-sub.Out():
 			if !ok {
+				sub.Close()
+				ids.refCount.Done()
 				return
 			}
 			if updated := ids.updateSnapshot(); !updated {
@@ -307,6 +306,8 @@ func (ids *idService) loop(ctx context.Context) {
 			default: // we already have one more push queued, no need to queue another one
 			}
 		case <-ctx.Done():
+			sub.Close()
+			ids.refCount.Done()
 			return
 		}
 	}
@@ -346,19 +347,22 @@ func (ids *idService) sendPushes(ctx context.Context) {
 		sem <- struct{}{}
 		wg.Add(1)
 		go func(c network.Conn) {
-			defer wg.Done()
-			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
 			str, err := ids.Host.NewStream(ctx, c.RemotePeer(), IDPush)
 			if err != nil { // connection might have been closed recently
+				cancel()
+				func() { <-sem }()
+				wg.Done()
 				return
 			}
 			// TODO: find out if the peer supports push if we didn't have any information about push support
 			if err := ids.sendIdentifyResp(str, true); err != nil {
 				log.Debugw("failed to send identify push", "peer", c.RemotePeer(), "error", err)
-				return
 			}
+
+			cancel()
+			func() { <-sem }()
+			wg.Done()
 		}(c)
 	}
 	wg.Wait()
@@ -402,7 +406,6 @@ func (ids *idService) IdentifyConn(c network.Conn) {
 // If successful, the peer store will contain the peer's addresses and supported protocols.
 func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 	ids.connsMu.Lock()
-	defer ids.connsMu.Unlock()
 
 	e, found := ids.conns[c]
 	if !found {
@@ -412,6 +415,7 @@ func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 			log.Debugw("connection not found in identify service", "peer", c.RemotePeer())
 			ch := make(chan struct{})
 			close(ch)
+			ids.connsMu.Unlock()
 			return ch
 		} else {
 			ids.addConnWithLock(c)
@@ -419,6 +423,7 @@ func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 	}
 
 	if e.IdentifyWaitChan != nil {
+		ids.connsMu.Unlock()
 		return e.IdentifyWaitChan
 	}
 	// First call to IdentifyWait for this connection. Create the channel.
@@ -429,23 +434,23 @@ func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 	// already, but that doesn't really matter. We'll fail to open a
 	// stream then forget the connection.
 	go func() {
-		defer close(e.IdentifyWaitChan)
 		if err := ids.identifyConn(c); err != nil {
 			log.Warnf("failed to identify %s: %s", c.RemotePeer(), err)
 			ids.emitters.evtPeerIdentificationFailed.Emit(event.EvtPeerIdentificationFailed{Peer: c.RemotePeer(), Reason: err})
-			return
 		}
+		close(e.IdentifyWaitChan)
 	}()
 
+	ids.connsMu.Unlock()
 	return e.IdentifyWaitChan
 }
 
 func (ids *idService) identifyConn(c network.Conn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), Timeout)
-	defer cancel()
 	s, err := c.NewStream(network.WithAllowLimitedConn(ctx, "identify"))
 	if err != nil {
 		log.Debugw("error opening identify stream", "peer", c.RemotePeer(), "error", err)
+		cancel()
 		return err
 	}
 	s.SetDeadline(time.Now().Add(Timeout))
@@ -459,10 +464,13 @@ func (ids *idService) identifyConn(c network.Conn) error {
 	if err := msmux.SelectProtoOrFail(ID, s); err != nil {
 		log.Infow("failed negotiate identify protocol with peer", "peer", c.RemotePeer(), "error", err)
 		s.Reset()
+		cancel()
 		return err
 	}
 
-	return ids.handleIdentifyResponse(s, false)
+	err = ids.handleIdentifyResponse(s, false)
+	cancel()
+	return err
 }
 
 // handlePush handles incoming identify push streams
@@ -480,7 +488,6 @@ func (ids *idService) sendIdentifyResp(s network.Stream, isPush bool) error {
 		s.Reset()
 		return fmt.Errorf("failed to attaching stream to identify service: %w", err)
 	}
-	defer s.Close()
 
 	ids.currentSnapshot.Lock()
 	snapshot := ids.currentSnapshot.snapshot
@@ -493,6 +500,7 @@ func (ids *idService) sendIdentifyResp(s network.Stream, isPush bool) error {
 
 	log.Debugf("%s sending message to %s %s", ID, s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr())
 	if err := ids.writeChunkedIdentifyMsg(s, mes); err != nil {
+		s.Close()
 		return err
 	}
 
@@ -501,17 +509,21 @@ func (ids *idService) sendIdentifyResp(s network.Stream, isPush bool) error {
 	}
 
 	ids.connsMu.Lock()
-	defer ids.connsMu.Unlock()
 	e, ok := ids.conns[s.Conn()]
 	// The connection might already have been closed.
 	// We *should* receive the Connected notification from the swarm before we're able to accept the peer's
 	// Identify stream, but if that for some reason doesn't work, we also wouldn't have a map entry here.
 	// The only consequence would be that we send a spurious Push to that peer later.
 	if !ok {
+		ids.connsMu.Unlock()
+		s.Close()
 		return nil
 	}
 	e.Sequence = snapshot.seq
 	ids.conns[s.Conn()] = e
+
+	ids.connsMu.Unlock()
+	s.Close()
 	return nil
 }
 
@@ -527,7 +539,6 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 		s.Reset()
 		return err
 	}
-	defer s.Scope().ReleaseMemory(signedIDSize)
 
 	c := s.Conn()
 
@@ -537,10 +548,9 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 	if err := readAllIDMessages(r, mes); err != nil {
 		log.Warn("error reading identify message: ", err)
 		s.Reset()
+		s.Scope().ReleaseMemory(signedIDSize)
 		return err
 	}
-
-	defer s.Close()
 
 	log.Debugf("%s received message from %s %s", s.Protocol(), c.RemotePeer(), c.RemoteMultiaddr())
 
@@ -551,9 +561,12 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 	}
 
 	ids.connsMu.Lock()
-	defer ids.connsMu.Unlock()
+
 	e, ok := ids.conns[c]
 	if !ok { // might already have disconnected
+		ids.connsMu.Unlock()
+		s.Close()
+		s.Scope().ReleaseMemory(signedIDSize)
 		return nil
 	}
 	sup, err := ids.Host.Peerstore().SupportsProtocols(c.RemotePeer(), IDPush)
@@ -568,6 +581,10 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 	}
 
 	ids.conns[c] = e
+
+	ids.connsMu.Unlock()
+	s.Close()
+	s.Scope().ReleaseMemory(signedIDSize)
 	return nil
 }
 
@@ -612,9 +629,9 @@ func (ids *idService) updateSnapshot() (updated bool) {
 	}
 
 	ids.currentSnapshot.Lock()
-	defer ids.currentSnapshot.Unlock()
 
 	if ids.currentSnapshot.snapshot.Equal(&snapshot) {
+		ids.currentSnapshot.Unlock()
 		return false
 	}
 
@@ -622,6 +639,7 @@ func (ids *idService) updateSnapshot() (updated bool) {
 	ids.currentSnapshot.snapshot = snapshot
 
 	log.Debugw("updating snapshot", "seq", snapshot.seq, "addrs", snapshot.addrs)
+	ids.currentSnapshot.Unlock()
 	return true
 }
 
@@ -1036,12 +1054,12 @@ func (nn *netNotifiee) Disconnected(_ network.Network, c network.Conn) {
 	// Last disconnect.
 	// Undo the setting of addresses to peer.ConnectedAddrTTL we did
 	ids.addrMu.Lock()
-	defer ids.addrMu.Unlock()
 
 	// This check MUST happen after acquiring the Lock as identify on a different connection
 	// might be trying to add addresses.
 	switch ids.Host.Network().Connectedness(c.RemotePeer()) {
 	case network.Connected, network.Limited:
+		ids.addrMu.Unlock()
 		return
 	}
 	// peerstore returns the elements in a random order as it uses a map to store the addresses
@@ -1059,6 +1077,7 @@ func (nn *netNotifiee) Disconnected(_ network.Network, c network.Conn) {
 	ids.Host.Peerstore().UpdateAddrs(c.RemotePeer(), peerstore.ConnectedAddrTTL, peerstore.TempAddrTTL)
 	ids.Host.Peerstore().AddAddrs(c.RemotePeer(), addrs[:n], peerstore.RecentlyConnectedAddrTTL)
 	ids.Host.Peerstore().UpdateAddrs(c.RemotePeer(), peerstore.TempAddrTTL, 0)
+	ids.addrMu.Unlock()
 }
 
 func (nn *netNotifiee) Listen(n network.Network, a ma.Multiaddr)      {}
@@ -1072,10 +1091,10 @@ func filterAddrs(addrs []ma.Multiaddr, remote ma.Multiaddr) []ma.Multiaddr {
 	if manet.IsIPLoopback(remote) {
 		return addrs
 	}
-	if manet.IsPrivateAddr(remote) {
+	if is, err := manet.IsPrivateAddr(remote); is && err == nil {
 		return ma.FilterAddrs(addrs, func(a ma.Multiaddr) bool { return !manet.IsIPLoopback(a) })
 	}
-	return ma.FilterAddrs(addrs, manet.IsPublicAddr)
+	return ma.FilterAddrs(addrs, func(a ma.Multiaddr) bool { is, err := manet.IsPublicAddr(a); return is && err == nil })
 }
 
 func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
@@ -1089,13 +1108,16 @@ func trimHostAddrList(addrs []ma.Multiaddr, maxSize int) []ma.Multiaddr {
 
 	score := func(addr ma.Multiaddr) int {
 		var res int
-		if manet.IsPublicAddr(addr) {
+		if is, err := manet.IsPublicAddr(addr); is && err == nil {
 			res |= 1 << 12
 		} else if !manet.IsIPLoopback(addr) {
 			res |= 1 << 11
 		}
 		var protocolWeight int
-		ma.ForEach(addr, func(c ma.Component) bool {
+		ma.ForEach(addr, func(c ma.Component, e error) bool {
+			if e != nil {
+				return false
+			}
 			switch c.Protocol().Code {
 			case ma.P_QUIC_V1:
 				protocolWeight = 5

@@ -18,7 +18,7 @@ func TestBrokenPromises(t *testing.T) {
 	peerB := peer.ID("B")
 	peerC := peer.ID("C")
 
-	var mids []string
+	var mids [][]byte
 	for i := 0; i < 100; i++ {
 		m := makeTestMessage(i)
 		m.From = []byte(peerA)
@@ -72,7 +72,7 @@ func TestNoBrokenPromises(t *testing.T) {
 	peerB := peer.ID("B")
 
 	var msgs []*pb.Message
-	var mids []string
+	var mids [][]byte
 	for i := 0; i < 100; i++ {
 		m := makeTestMessage(i)
 		m.From = []byte(peerA)

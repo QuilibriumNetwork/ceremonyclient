@@ -3,6 +3,7 @@ package blossomsub
 import (
 	"fmt"
 
+	"google.golang.org/protobuf/proto"
 	pb "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -26,10 +27,8 @@ const (
 	// StrictNoSign does not produce signatures and drops and penalises incoming messages that carry one
 	StrictNoSign = msgVerification
 	// LaxSign produces signatures and validates incoming signatures iff one is present
-	// Deprecated: it is recommend to either strictly enable, or strictly disable, signatures.
 	LaxSign = msgSigning
 	// LaxNoSign does not produce signatures and validates incoming signatures iff one is present
-	// Deprecated: it is recommend to either strictly enable, or strictly disable, signatures.
 	LaxNoSign = 0
 )
 
@@ -52,7 +51,7 @@ func verifyMessageSignature(m *pb.Message) error {
 		return err
 	}
 
-	xm := *m
+	xm := (proto.Clone(m)).(*pb.Message)
 	xm.Signature = nil
 	xm.Key = nil
 	bytes, err := xm.Marshal()

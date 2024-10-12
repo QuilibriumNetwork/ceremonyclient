@@ -14,8 +14,10 @@
 [workspace]
 members = [
     "crates/vdf",
+    "crates/channel",
     "crates/classgroup",
     "crates/bls48581",
+    "crates/rpm",
 ]
 
 [profile.release]

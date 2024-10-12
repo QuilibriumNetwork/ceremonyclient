@@ -75,8 +75,13 @@ func newMockIDService(t *testing.T, h host.Host) identify.IDService {
 	return &mockIDService{IDService: ids}
 }
 
+func tStringCast(str string) ma.Multiaddr {
+	m, _ := ma.StringCast(str)
+	return m
+}
+
 func (s *mockIDService) OwnObservedAddrs() []ma.Multiaddr {
-	return append(s.IDService.OwnObservedAddrs(), ma.StringCast("/ip4/1.1.1.1/tcp/1234"))
+	return append(s.IDService.OwnObservedAddrs(), tStringCast("/ip4/1.1.1.1/tcp/1234"))
 }
 
 func TestNoHolePunchIfDirectConnExists(t *testing.T) {
@@ -276,7 +281,7 @@ func TestFailuresOnResponder(t *testing.T) {
 				w := pbio.NewDelimitedWriter(s)
 				w.WriteMsg(&holepunch_pb.HolePunch{
 					Type:     holepunch_pb.HolePunch_CONNECT.Enum(),
-					ObsAddrs: addrsToBytes([]ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/1234")}),
+					ObsAddrs: addrsToBytes([]ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/1234")}),
 				})
 				w.WriteMsg(&holepunch_pb.HolePunch{Type: holepunch_pb.HolePunch_CONNECT.Enum()})
 			},
@@ -287,7 +292,7 @@ func TestFailuresOnResponder(t *testing.T) {
 			initiator: func(s network.Stream) {
 				pbio.NewDelimitedWriter(s).WriteMsg(&holepunch_pb.HolePunch{
 					Type:     holepunch_pb.HolePunch_CONNECT.Enum(),
-					ObsAddrs: addrsToBytes([]ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/1234")}),
+					ObsAddrs: addrsToBytes([]ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/1234")}),
 				})
 				time.Sleep(10 * time.Second)
 			},
@@ -306,7 +311,7 @@ func TestFailuresOnResponder(t *testing.T) {
 			initiator: func(s network.Stream) {
 				pbio.NewDelimitedWriter(s).WriteMsg(&holepunch_pb.HolePunch{
 					Type:     holepunch_pb.HolePunch_CONNECT.Enum(),
-					ObsAddrs: addrsToBytes([]ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/1234")}),
+					ObsAddrs: addrsToBytes([]ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/1234")}),
 				})
 				time.Sleep(10 * time.Second)
 			},
@@ -421,7 +426,7 @@ func mkHostWithStaticAutoRelay(t *testing.T, relay host.Host) host.Host {
 	defer func() { manet.Private4 = cpy }()
 
 	h, err := libp2p.New(
-		libp2p.ListenAddrs(ma.StringCast("/ip4/127.0.0.1/tcp/0")),
+		libp2p.ListenAddrs(tStringCast("/ip4/127.0.0.1/tcp/0")),
 		libp2p.EnableRelay(),
 		libp2p.EnableAutoRelayWithStaticRelays([]peer.AddrInfo{pi}),
 		libp2p.ForceReachabilityPrivate(),
@@ -446,7 +451,7 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 	h1, _ = mkHostWithHolePunchSvc(t, h1opt...)
 	var err error
 	relay, err = libp2p.New(
-		libp2p.ListenAddrs(ma.StringCast("/ip4/127.0.0.1/tcp/0")),
+		libp2p.ListenAddrs(tStringCast("/ip4/127.0.0.1/tcp/0")),
 		libp2p.DisableRelay(),
 		libp2p.ResourceManager(&network.NullResourceManager{}),
 	)
@@ -500,7 +505,7 @@ func addHolePunchService(t *testing.T, h host.Host, opts ...holepunch.Option) *h
 func mkHostWithHolePunchSvc(t *testing.T, opts ...holepunch.Option) (host.Host, *holepunch.Service) {
 	t.Helper()
 	h, err := libp2p.New(
-		libp2p.ListenAddrs(ma.StringCast("/ip4/127.0.0.1/tcp/0"), ma.StringCast("/ip6/::1/tcp/0")),
+		libp2p.ListenAddrs(tStringCast("/ip4/127.0.0.1/tcp/0"), tStringCast("/ip6/::1/tcp/0")),
 		libp2p.ForceReachabilityPrivate(),
 		libp2p.ResourceManager(&network.NullResourceManager{}),
 	)

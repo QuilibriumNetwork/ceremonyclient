@@ -259,9 +259,7 @@ func (t *tracer) HolePunchAttempt(p peer.ID) {
 // gc cleans up the peers map. This is only run when tracer is initialised with a non nil
 // EventTracer
 func (t *tracer) gc() {
-	defer t.refCount.Done()
 	timer := time.NewTicker(tracerGCInterval)
-	defer timer.Stop()
 
 	for {
 		select {
@@ -275,6 +273,8 @@ func (t *tracer) gc() {
 			}
 			t.mutex.Unlock()
 		case <-t.ctx.Done():
+			t.refCount.Done()
+			timer.Stop()
 			return
 		}
 	}

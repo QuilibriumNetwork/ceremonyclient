@@ -146,17 +146,18 @@ func (v *validation) AddValidator(req *addValReq) {
 	}
 
 	v.mx.Lock()
-	defer v.mx.Unlock()
 
 	bitmask := val.bitmask
 
 	_, ok := v.bitmaskVals[string(bitmask)]
 	if ok {
+		v.mx.Unlock()
 		req.resp <- fmt.Errorf("duplicate validator for bitmask %s", bitmask)
 		return
 	}
 
 	v.bitmaskVals[string(bitmask)] = val
+	v.mx.Unlock()
 	req.resp <- nil
 }
 
@@ -213,15 +214,16 @@ func (v *validation) makeValidator(req *addValReq) (*validatorImpl, error) {
 // RemoveValidator removes an existing validator
 func (v *validation) RemoveValidator(req *rmValReq) {
 	v.mx.Lock()
-	defer v.mx.Unlock()
 
 	bitmask := req.bitmask
 
 	_, ok := v.bitmaskVals[string(bitmask)]
 	if ok {
 		delete(v.bitmaskVals, string(bitmask))
+		v.mx.Unlock()
 		req.resp <- nil
 	} else {
+		v.mx.Unlock()
 		req.resp <- fmt.Errorf("no validator for bitmask %s", bitmask)
 	}
 }
@@ -262,7 +264,6 @@ func (v *validation) Push(src peer.ID, msg *Message) bool {
 // getValidators returns all validators that apply to a given message
 func (v *validation) getValidators(msg *Message) []*validatorImpl {
 	v.mx.Lock()
-	defer v.mx.Unlock()
 
 	var vals []*validatorImpl
 	vals = append(vals, v.defaultVals...)
@@ -271,10 +272,13 @@ func (v *validation) getValidators(msg *Message) []*validatorImpl {
 
 	val, ok := v.bitmaskVals[string(bitmask)]
 	if !ok {
+		v.mx.Unlock()
 		return vals
 	}
 
-	return append(vals, val)
+	impls := append(vals, val)
+	v.mx.Unlock()
+	return impls
 }
 
 // validateWorker is an active goroutine performing inline validation
@@ -293,7 +297,7 @@ func (v *validation) validateWorker() {
 func (v *validation) validate(vals []*validatorImpl, src peer.ID, msg *Message, synchronous bool) error {
 	// If signature verification is enabled, but signing is disabled,
 	// the Signature is required to be nil upon receiving the message in PubSub.pushMsg.
-	if msg.Signature != nil {
+	if msg.Signature != nil && v.p.signPolicy&msgVerification != 0 {
 		if !v.validateSignature(msg) {
 			log.Debugf("message signature validation failed; dropping message from %s", src)
 			v.tracer.RejectMessage(msg, RejectInvalidSignature)
@@ -413,7 +417,6 @@ func (v *validation) validateBitmask(vals []*validatorImpl, src peer.ID, msg *Me
 	}
 
 	ctx, cancel := context.WithCancel(v.p.ctx)
-	defer cancel()
 
 	rch := make(chan ValidationResult, len(vals))
 	rcount := 0
@@ -433,6 +436,7 @@ func (v *validation) validateBitmask(vals []*validatorImpl, src peer.ID, msg *Me
 			rch <- validationThrottled
 		}
 	}
+	cancel()
 
 	result := ValidationAccept
 loop:
@@ -472,14 +476,10 @@ func (v *validation) validateSingleBitmask(val *validatorImpl, src peer.ID, msg 
 
 func (val *validatorImpl) validateMsg(ctx context.Context, src peer.ID, msg *Message) ValidationResult {
 	start := time.Now()
-	defer func() {
-		log.Debugf("validation done; took %s", time.Since(start))
-	}()
+	var cancel func() = nil
 
 	if val.validateTimeout > 0 {
-		var cancel func()
 		ctx, cancel = context.WithTimeout(ctx, val.validateTimeout)
-		defer cancel()
 	}
 
 	r := val.validate(ctx, src, msg)
@@ -489,10 +489,18 @@ func (val *validatorImpl) validateMsg(ctx context.Context, src peer.ID, msg *Mes
 	case ValidationReject:
 		fallthrough
 	case ValidationIgnore:
+		log.Debugf("validation done; took %s", time.Since(start))
+		if cancel != nil {
+			cancel()
+		}
 		return r
 
 	default:
 		log.Warnf("Unexpected result from validator: %d; ignoring message", r)
+		log.Debugf("validation done; took %s", time.Since(start))
+		if cancel != nil {
+			cancel()
+		}
 		return ValidationIgnore
 	}
 }

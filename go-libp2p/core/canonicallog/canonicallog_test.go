@@ -17,10 +17,11 @@ func TestLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	LogMisbehavingPeer(test.RandPeerIDFatal(t), multiaddr.StringCast("/ip4/1.2.3.4"), "somecomponent", fmt.Errorf("something"), "hi")
+	m, _ := multiaddr.StringCast("/ip4/1.2.3.4")
+	LogMisbehavingPeer(test.RandPeerIDFatal(t), m, "somecomponent", fmt.Errorf("something"), "hi")
 
 	netAddr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80}
 	LogMisbehavingPeerNetAddr(test.RandPeerIDFatal(t), netAddr, "somecomponent", fmt.Errorf("something"), "hello \"world\"")
 
-	LogPeerStatus(1, test.RandPeerIDFatal(t), multiaddr.StringCast("/ip4/1.2.3.4"), "extra", "info")
+	LogPeerStatus(1, test.RandPeerIDFatal(t), m, "extra", "info")
 }
