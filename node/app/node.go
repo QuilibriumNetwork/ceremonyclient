@@ -20,6 +20,7 @@ type Node struct {
 	logger         *zap.Logger
 	dataProofStore store.DataProofStore
 	clockStore     store.ClockStore
+	coinStore      store.CoinStore
 	keyManager     keys.KeyManager
 	pubSub         p2p.PubSub
 	execEngines    map[string]execution.ExecutionEngine
@@ -44,6 +45,7 @@ func newNode(
 	logger *zap.Logger,
 	dataProofStore store.DataProofStore,
 	clockStore store.ClockStore,
+	coinStore store.CoinStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
 	// execution engines wire in here
@@ -59,6 +61,7 @@ func newNode(
 		logger,
 		dataProofStore,
 		clockStore,
+		coinStore,
 		keyManager,
 		pubSub,
 		execEngines,
@@ -170,6 +173,10 @@ func (n *Node) GetLogger() *zap.Logger {
 
 func (n *Node) GetClockStore() store.ClockStore {
 	return n.clockStore
+}
+
+func (n *Node) GetCoinStore() store.CoinStore {
+	return n.coinStore
 }
 
 func (n *Node) GetDataProofStore() store.DataProofStore {

@@ -650,12 +650,10 @@ func FetchTokenBalance(client protobufs.NodeServiceClient) (TokenBalance, error)
 		return TokenBalance{}, errors.Wrap(err, "error getting token info")
 	}
 
-	// owned := new(big.Int).SetBytes(info.OwnedTokens)
-	unconfirmedOwned := new(big.Int).SetBytes(info.UnconfirmedOwnedTokens)
+	owned := new(big.Int).SetBytes(info.OwnedTokens)
 
 	return TokenBalance{
-		// Owned:            owned,
-		UnconfirmedOwned: unconfirmedOwned,
+		Owned: owned,
 	}, nil
 }
 
