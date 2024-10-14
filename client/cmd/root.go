@@ -102,7 +102,7 @@ var rootCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		NodeConfig, err := config.LoadConfig(configDirectory, "", false)
+		NodeConfig, err = config.LoadConfig(configDirectory, "", false)
 		if err != nil {
 			fmt.Printf("invalid config directory: %s\n", configDirectory)
 			os.Exit(1)
