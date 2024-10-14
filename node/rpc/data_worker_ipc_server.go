@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 
 	"github.com/multiformats/go-multiaddr"
@@ -61,9 +62,16 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 			for _, out := range outputs.Outputs {
 				switch e := out.Output.(type) {
 				case *protobufs.TokenOutput_Coin:
+					addr, err := token.GetAddressOfCoin(
+						e.Coin,
+						req.ClockFrame.FrameNumber,
+					)
+					if err != nil {
+						return nil, err
+					}
 					for _, idx := range p2p.GetOnesIndices(
 						p2p.GetBloomFilter(
-							e.Coin.Owner.GetImplicitAccount().Address,
+							addr,
 							1024,
 							64,
 						),
@@ -81,7 +89,7 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 				case *protobufs.TokenOutput_DeletedCoin:
 					for _, idx := range p2p.GetOnesIndices(
 						p2p.GetBloomFilter(
-							e.DeletedCoin.Owner.GetImplicitAccount().Address,
+							e.DeletedCoin.Address,
 							1024,
 							64,
 						),
@@ -174,8 +182,8 @@ func NewDataWorkerIPCServer(
 
 func (r *DataWorkerIPCServer) Start() error {
 	s := grpc.NewServer(
-		grpc.MaxRecvMsgSize(10*1024*1024),
-		grpc.MaxSendMsgSize(10*1024*1024),
+		grpc.MaxRecvMsgSize(600*1024*1024),
+		grpc.MaxSendMsgSize(600*1024*1024),
 	)
 	protobufs.RegisterDataIPCServiceServer(s, r)
 	reflection.Register(s)

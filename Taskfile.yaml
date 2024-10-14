@@ -38,15 +38,32 @@ tasks:
       - bls48581/generate.sh
       - node/build.sh -o build/arm64_macos/node
 
+  build_qclient_arm64_macos:
+    desc: Build the QClient node binary for MacOS ARM. Outputs to client/build
+    cmds:
+      - vdf/generate.sh
+      - bls48581/generate.sh
+      - client/build.sh -o build/arm64_macos/qclient
+
   build_node_arm64_linux:
     desc: Build the Quilibrium node binary for ARM64 Linux. Outputs to node/build.
     cmds:
       - docker build --platform linux/arm64 -f Dockerfile.source --output node/build/arm64_linux --target=node .
 
+  build_qclient_arm64_linux:
+    desc: Build the QClient node binary for ARM64 Linux. Outputs to client/build.
+    cmds:
+      - docker build --platform linux/arm64 -f Dockerfile.source --output client/build/arm64_linux --target=qclient .
+
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
     cmds:
       - docker build --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux --target=node .
+
+  build_qclient_amd64_linux:
+    desc: Build the QClient node binary for AMD64 Linux. Outputs to node/build.
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.source --output client/build/amd64_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.

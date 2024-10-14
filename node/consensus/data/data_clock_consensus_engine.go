@@ -6,6 +6,8 @@ import (
 	"crypto"
 	"encoding/binary"
 	"fmt"
+	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -77,6 +79,7 @@ type DataClockConsensusEngine struct {
 	lastFrameReceivedAt         time.Time
 	latestFrameReceived         uint64
 	frameProverTries            []*tries.RollingFrecencyCritbitTrie
+	frameProverTriesMx          sync.RWMutex
 	dependencyMap               map[string]*anypb.Any
 	pendingCommits              chan *anypb.Any
 	pendingCommitWorkers        int64
@@ -101,11 +104,39 @@ type DataClockConsensusEngine struct {
 	stagedTransactionsMx           sync.Mutex
 	peerMapMx                      sync.RWMutex
 	peerAnnounceMapMx              sync.Mutex
+	proverTrieJoinRequests         map[string]string
+	proverTrieLeaveRequests        map[string]string
+	proverTriePauseRequests        map[string]string
+	proverTrieResumeRequests       map[string]string
+	proverTrieRequestsMx           sync.Mutex
 	lastKeyBundleAnnouncementFrame uint64
+	peerSeniority                  *peerSeniority
 	peerMap                        map[string]*peerInfo
 	uncooperativePeersMap          map[string]*peerInfo
 	messageProcessorCh             chan *pb.Message
 	report                         *protobufs.SelfTestReport
+}
+
+type peerSeniorityItem struct {
+	seniority uint64
+	addr      string
+}
+
+type peerSeniority map[string]peerSeniorityItem
+
+func newFromMap(m map[string]uint64) *peerSeniority {
+	s := &peerSeniority{}
+	for k, v := range m {
+		(*s)[k] = peerSeniorityItem{
+			seniority: v,
+			addr:      k,
+		}
+	}
+	return s
+}
+
+func (p peerSeniorityItem) Priority() *big.Int {
+	return big.NewInt(int64(p.seniority))
 }
 
 var _ consensus.DataConsensusEngine = (*DataClockConsensusEngine)(nil)
@@ -126,6 +157,7 @@ func NewDataClockConsensusEngine(
 	report *protobufs.SelfTestReport,
 	filter []byte,
 	seed []byte,
+	peerSeniority map[string]uint64,
 ) *DataClockConsensusEngine {
 	if logger == nil {
 		panic(errors.New("logger is nil"))
@@ -216,6 +248,7 @@ func NewDataClockConsensusEngine(
 		masterTimeReel:            masterTimeReel,
 		dataTimeReel:              dataTimeReel,
 		peerInfoManager:           peerInfoManager,
+		peerSeniority:             newFromMap(peerSeniority),
 		messageProcessorCh:        make(chan *pb.Message),
 	}
 
@@ -420,8 +453,6 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 	difficulty uint32,
 	clients []protobufs.DataIPCServiceClient,
 ) []byte {
-	proof := []byte{}
-
 	wg := sync.WaitGroup{}
 	wg.Add(len(clients))
 	for i, client := range clients {
@@ -463,21 +494,60 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 					continue
 				}
 
-				proof = resp.Output
+				sig, err := e.pubSub.SignMessage(
+					append([]byte("mint"), resp.Output...),
+				)
+				if err != nil {
+					e.logger.Error("failed to reconnect", zap.Error(err))
+					continue
+				}
+				e.publishMessage(e.filter, &protobufs.TokenRequest{
+					Request: &protobufs.TokenRequest_Mint{
+						Mint: &protobufs.MintCoinRequest{
+							Proofs: [][]byte{resp.Output},
+							Signature: &protobufs.Ed448Signature{
+								PublicKey: &protobufs.Ed448PublicKey{
+									KeyValue: e.pubSub.GetPublicKey(),
+								},
+								Signature: sig,
+							},
+						},
+					},
+				})
 				break
 			}
 			wg.Done()
 		}()
 	}
 	wg.Wait()
-
-	return proof
+	return []byte{}
 }
 
 func (
 	e *DataClockConsensusEngine,
 ) GetFrameProverTries() []*tries.RollingFrecencyCritbitTrie {
-	return e.frameProverTries
+	e.frameProverTriesMx.RLock()
+	frameProverTries := make(
+		[]*tries.RollingFrecencyCritbitTrie,
+		len(e.frameProverTries),
+	)
+
+	for _, trie := range e.frameProverTries {
+		newTrie := &tries.RollingFrecencyCritbitTrie{}
+		b, err := trie.Serialize()
+		if err != nil {
+			panic(err)
+		}
+
+		err = newTrie.Deserialize(b)
+		if err != nil {
+			panic(err)
+		}
+		frameProverTries = append(frameProverTries, newTrie)
+	}
+
+	e.frameProverTriesMx.RUnlock()
+	return frameProverTries
 }
 
 func (e *DataClockConsensusEngine) runLoop() {
@@ -527,24 +597,92 @@ func (e *DataClockConsensusEngine) runLoop() {
 					}()
 				}
 
-				for _, trie := range e.frameProverTries {
-					var nextFrame *protobufs.ClockFrame
-					if nextFrame, err = e.prove(latestFrame); err != nil {
-						e.logger.Error("could not prove", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-						continue
-					}
-
+				for _, trie := range e.GetFrameProverTries() {
 					if bytes.Equal(
 						trie.FindNearest(e.provingKeyAddress).External.Key,
 						e.provingKeyAddress,
 					) {
+						var nextFrame *protobufs.ClockFrame
+						if nextFrame, err = e.prove(latestFrame); err != nil {
+							e.logger.Error("could not prove", zap.Error(err))
+							e.state = consensus.EngineStateCollecting
+							continue
+						}
+
+						e.proverTrieRequestsMx.Lock()
+						joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
+						leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
+						for _, addr := range e.proverTrieJoinRequests {
+							if _, ok := (*e.peerSeniority)[addr]; !ok {
+								joinAddrs.Push(peerSeniorityItem{
+									addr:      addr,
+									seniority: 0,
+								})
+							} else {
+								joinAddrs.Push((*e.peerSeniority)[addr])
+							}
+						}
+						for _, addr := range e.proverTrieLeaveRequests {
+							if _, ok := (*e.peerSeniority)[addr]; !ok {
+								leaveAddrs.Push(peerSeniorityItem{
+									addr:      addr,
+									seniority: 0,
+								})
+							} else {
+								leaveAddrs.Push((*e.peerSeniority)[addr])
+							}
+						}
+						for _, addr := range e.proverTrieResumeRequests {
+							if _, ok := e.proverTriePauseRequests[addr]; ok {
+								delete(e.proverTriePauseRequests, addr)
+							}
+						}
+
+						joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
+						copy(joinReqs, joinAddrs.All())
+						slices.Reverse(joinReqs)
+						leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
+						copy(leaveReqs, leaveAddrs.All())
+						slices.Reverse(leaveReqs)
+
+						e.proverTrieJoinRequests = make(map[string]string)
+						e.proverTrieLeaveRequests = make(map[string]string)
+						e.proverTrieRequestsMx.Unlock()
+
+						e.frameProverTriesMx.Lock()
+						for _, addr := range joinReqs {
+							rings := len(e.frameProverTries)
+							last := e.frameProverTries[rings-1]
+							set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
+							if len(set) == 8 {
+								e.frameProverTries = append(
+									e.frameProverTries,
+									&tries.RollingFrecencyCritbitTrie{},
+								)
+								last = e.frameProverTries[rings]
+							}
+							last.Add([]byte(addr.addr), nextFrame.FrameNumber)
+						}
+						for _, addr := range leaveReqs {
+							for _, t := range e.frameProverTries {
+								if bytes.Equal(
+									t.FindNearest([]byte(addr.addr)).External.Key,
+									[]byte(addr.addr),
+								) {
+									t.Remove([]byte(addr.addr))
+									break
+								}
+							}
+						}
+						e.frameProverTriesMx.Unlock()
+
 						e.dataTimeReel.Insert(nextFrame, false)
 
 						if err = e.publishProof(nextFrame); err != nil {
 							e.logger.Error("could not publish", zap.Error(err))
 							e.state = consensus.EngineStateCollecting
 						}
+						break
 					}
 				}
 			case <-time.After(20 * time.Second):
@@ -576,24 +714,92 @@ func (e *DataClockConsensusEngine) runLoop() {
 					}()
 				}
 
-				var nextFrame *protobufs.ClockFrame
-				if nextFrame, err = e.prove(latestFrame); err != nil {
-					e.logger.Error("could not prove", zap.Error(err))
-					e.state = consensus.EngineStateCollecting
-					continue
-				}
-
-				for _, trie := range e.frameProverTries {
+				for _, trie := range e.GetFrameProverTries() {
 					if bytes.Equal(
 						trie.FindNearest(e.provingKeyAddress).External.Key,
 						e.provingKeyAddress,
 					) {
+						var nextFrame *protobufs.ClockFrame
+						if nextFrame, err = e.prove(latestFrame); err != nil {
+							e.logger.Error("could not prove", zap.Error(err))
+							e.state = consensus.EngineStateCollecting
+							continue
+						}
+
+						e.proverTrieRequestsMx.Lock()
+						joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
+						leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
+						for _, addr := range e.proverTrieJoinRequests {
+							if _, ok := (*e.peerSeniority)[addr]; !ok {
+								joinAddrs.Push(peerSeniorityItem{
+									addr:      addr,
+									seniority: 0,
+								})
+							} else {
+								joinAddrs.Push((*e.peerSeniority)[addr])
+							}
+						}
+						for _, addr := range e.proverTrieLeaveRequests {
+							if _, ok := (*e.peerSeniority)[addr]; !ok {
+								leaveAddrs.Push(peerSeniorityItem{
+									addr:      addr,
+									seniority: 0,
+								})
+							} else {
+								leaveAddrs.Push((*e.peerSeniority)[addr])
+							}
+						}
+						for _, addr := range e.proverTrieResumeRequests {
+							if _, ok := e.proverTriePauseRequests[addr]; ok {
+								delete(e.proverTriePauseRequests, addr)
+							}
+						}
+
+						joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
+						copy(joinReqs, joinAddrs.All())
+						slices.Reverse(joinReqs)
+						leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
+						copy(leaveReqs, leaveAddrs.All())
+						slices.Reverse(leaveReqs)
+
+						e.proverTrieJoinRequests = make(map[string]string)
+						e.proverTrieLeaveRequests = make(map[string]string)
+						e.proverTrieRequestsMx.Unlock()
+
+						e.frameProverTriesMx.Lock()
+						for _, addr := range joinReqs {
+							rings := len(e.frameProverTries)
+							last := e.frameProverTries[rings-1]
+							set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
+							if len(set) == 8 {
+								e.frameProverTries = append(
+									e.frameProverTries,
+									&tries.RollingFrecencyCritbitTrie{},
+								)
+								last = e.frameProverTries[rings]
+							}
+							last.Add([]byte(addr.addr), nextFrame.FrameNumber)
+						}
+						for _, addr := range leaveReqs {
+							for _, t := range e.frameProverTries {
+								if bytes.Equal(
+									t.FindNearest([]byte(addr.addr)).External.Key,
+									[]byte(addr.addr),
+								) {
+									t.Remove([]byte(addr.addr))
+									break
+								}
+							}
+						}
+						e.frameProverTriesMx.Unlock()
+
 						e.dataTimeReel.Insert(nextFrame, false)
 
 						if err = e.publishProof(nextFrame); err != nil {
 							e.logger.Error("could not publish", zap.Error(err))
 							e.state = consensus.EngineStateCollecting
 						}
+						break
 					}
 				}
 			}
@@ -754,8 +960,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromListAndIndex(
 			insecure.NewCredentials(),
 		),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallSendMsgSize(10*1024*1024),
-			grpc.MaxCallRecvMsgSize(10*1024*1024),
+			grpc.MaxCallSendMsgSize(600*1024*1024),
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		),
 	)
 	if err != nil {

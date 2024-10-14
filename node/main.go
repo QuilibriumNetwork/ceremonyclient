@@ -230,7 +230,7 @@ func main() {
 	}
 
 	if *balance {
-		config, err := config.LoadConfig(*configDirectory, "")
+		config, err := config.LoadConfig(*configDirectory, "", false)
 		if err != nil {
 			panic(err)
 		}
@@ -241,7 +241,7 @@ func main() {
 	}
 
 	if *peerId {
-		config, err := config.LoadConfig(*configDirectory, "")
+		config, err := config.LoadConfig(*configDirectory, "", false)
 		if err != nil {
 			panic(err)
 		}
@@ -251,7 +251,7 @@ func main() {
 	}
 
 	if *importPrivKey != "" {
-		config, err := config.LoadConfig(*configDirectory, *importPrivKey)
+		config, err := config.LoadConfig(*configDirectory, *importPrivKey, false)
 		if err != nil {
 			panic(err)
 		}
@@ -262,7 +262,7 @@ func main() {
 	}
 
 	if *nodeInfo {
-		config, err := config.LoadConfig(*configDirectory, "")
+		config, err := config.LoadConfig(*configDirectory, "", false)
 		if err != nil {
 			panic(err)
 		}
@@ -277,7 +277,7 @@ func main() {
 		fmt.Println(" ")
 	}
 
-	nodeConfig, err := config.LoadConfig(*configDirectory, "")
+	nodeConfig, err := config.LoadConfig(*configDirectory, "", false)
 	if err != nil {
 		panic(err)
 	}
@@ -604,11 +604,10 @@ func printBalance(config *config.Config) {
 		panic(err)
 	}
 
-	// fmt.Println("Owned balance:", balance.Owned, "QUIL")
 	conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
-	r := new(big.Rat).SetFrac(balance.UnconfirmedOwned, conversionFactor)
-	fmt.Println("Note: Balance is strictly rewards earned with 1.4.19+, check https://www.quilibrium.com/rewards for more info about previous rewards.")
-	fmt.Println("Unclaimed balance:", r.FloatString(12), "QUIL")
+	r := new(big.Rat).SetFrac(balance.Owned, conversionFactor)
+	fmt.Println("Owned balance:", r.FloatString(12), "QUIL")
+	fmt.Println("Note: bridged balance is not reflected here, you must bridge back to QUIL to use QUIL on mainnet.")
 }
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {

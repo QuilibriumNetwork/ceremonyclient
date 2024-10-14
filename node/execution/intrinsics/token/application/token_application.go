@@ -331,7 +331,7 @@ func (a *TokenApplication) ApplyTransitions(
 					kzgCommitment,
 					int(index),
 					kzgProof,
-					nearestPowerOfTwo(uint64(parallelism)),
+					nearestApplicablePowerOfTwo(uint64(parallelism)),
 				)
 				if err != nil {
 					if !skipFailures {
@@ -575,7 +575,7 @@ func (a *TokenApplication) ApplyTransitions(
 				owner = coin.Owner
 				deleted = append(deleted, &protobufs.TokenOutput{
 					Output: &protobufs.TokenOutput_DeletedCoin{
-						DeletedCoin: coin,
+						DeletedCoin: c,
 					},
 				})
 			}
@@ -748,7 +748,7 @@ func (a *TokenApplication) ApplyTransitions(
 				outputs.Outputs,
 				&protobufs.TokenOutput{
 					Output: &protobufs.TokenOutput_DeletedCoin{
-						DeletedCoin: coin,
+						DeletedCoin: t.Split.OfCoin,
 					},
 				},
 			)
@@ -894,7 +894,7 @@ func (a *TokenApplication) ApplyTransitions(
 				},
 				&protobufs.TokenOutput{
 					Output: &protobufs.TokenOutput_DeletedCoin{
-						DeletedCoin: coin,
+						DeletedCoin: t.Transfer.OfCoin,
 					},
 				},
 			)
@@ -1079,7 +1079,7 @@ func (a *TokenApplication) ApplyTransitions(
 					kzgCommitment,
 					int(index),
 					kzgProof,
-					nearestPowerOfTwo(uint64(parallelism)),
+					nearestApplicablePowerOfTwo(uint64(parallelism)),
 				)
 				if err != nil {
 					if !skipFailures {
@@ -1368,12 +1368,15 @@ func (a *TokenApplication) ApplyTransitions(
 	return a, finalizedTransitions, failedTransitions, nil
 }
 
-func nearestPowerOfTwo(number uint64) uint64 {
-	power := uint64(1)
-	for number > power {
-		power = power << 1
+func nearestApplicablePowerOfTwo(number uint64) uint64 {
+	power := uint64(128)
+	if number > 2048 {
+		power = 65536
+	} else if number > 1024 {
+		power = 2048
+	} else if number > 128 {
+		power = 1024
 	}
-
 	return power
 }
 

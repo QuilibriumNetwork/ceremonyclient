@@ -40,7 +40,12 @@ RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 # Build and install qclient
 WORKDIR /opt/ceremonyclient/client
 
-RUN go build -o qclient ./main.go
+RUN ./build.sh -o qclient && cp qclient /go/bin
+
+# Allows exporting single binary
+FROM scratch as qclient
+COPY --from=build /go/bin/qclient /qclient
+ENTRYPOINT [ "/qclient" ]
 
 # Allows exporting single binary
 FROM scratch AS node

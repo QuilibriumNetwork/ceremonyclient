@@ -81,7 +81,9 @@ message NetworkInfoResponse {
   repeated NetworkInfo network_info = 1;
 }
 
-message GetTokenInfoRequest {}
+message GetTokenInfoRequest {
+  bytes address = 1; // optional, v2.0 only
+}
 
 message TokenInfoResponse {
   // Total active token supply, as a 256 bit integer representing maximum
@@ -174,6 +176,30 @@ message AnnounceProverRequest {
   MintCoinRequest initial_proof = 2;
 }
 
+message AnnounceProverJoin {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 3;
+}
+
+message AnnounceProverLeave {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 3;
+}
+
+message AnnounceProverPause {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 3;
+}
+
+message AnnounceProverResume {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 3;
+}
+
 message OriginatedAccountRef {
   bytes address = 1;
 }
@@ -234,7 +260,7 @@ message TokenOutput {
   oneof output {
     Coin coin = 1;
     PreCoinProof proof = 2;
-    Coin deleted_coin = 3;
+    CoinRef deleted_coin = 3;
     PreCoinProof deleted_proof = 4;
   }
 }
@@ -588,6 +614,17 @@ message RejectPendingTransactionResponse {
   repeated DeliveryData deliveries = 2;
 }
 
+message SendMessageResponse{}
+
+message GetTokensByAccountRequest {
+  bytes address = 1;
+}
+
+message TokensByAccountResponse {
+  repeated Coin coins = 1;
+  repeated uint64 frame_numbers = 2;
+}
+
 service NodeService {
   rpc GetFrames(GetFramesRequest) returns (FramesResponse);
   rpc GetFrameInfo(GetFrameInfoRequest) returns (FrameInfoResponse);
@@ -596,6 +633,8 @@ service NodeService {
   rpc GetNetworkInfo(GetNetworkInfoRequest) returns (NetworkInfoResponse);
   rpc GetTokenInfo(GetTokenInfoRequest) returns (TokenInfoResponse);
   rpc GetPeerManifests(GetPeerManifestsRequest) returns (PeerManifestsResponse);
+  rpc SendMessage(TokenRequest) returns (SendMessageResponse);
+  rpc GetTokensByAccount(GetTokensByAccountRequest) returns (TokensByAccountResponse);
 }
 
 service AccountService {
