@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -22,15 +20,7 @@ var mutualTransferCmd = &cobra.Command{
 	Either Amount or OfCoin must be specified
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 2 {
-			fmt.Println("invalid command")
-			os.Exit(1)
-		}
-
-		fmt.Printf("Confirming rendezvous... ")
-		time.Sleep(500 * time.Millisecond)
-		fmt.Println("OK")
-		fmt.Println("50 QUIL (Coin [private])")
+		fmt.Println("command not yet available")
 	},
 }
 

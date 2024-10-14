@@ -79,12 +79,15 @@ func GetOutputs(output []byte) (
 	return index, indexProof, kzgCommitment, kzgProof
 }
 
-func nearestPowerOfTwo(number uint64) uint64 {
-	power := uint64(1)
-	for number > power {
-		power = power << 1
+func nearestApplicablePowerOfTwo(number uint64) uint64 {
+	power := uint64(128)
+	if number > 2048 {
+		power = 65536
+	} else if number > 1024 {
+		power = 2048
+	} else if number > 128 {
+		power = 1024
 	}
-
 	return power
 }
 
@@ -112,7 +115,7 @@ func (n *Node) VerifyProofIntegrity() {
 			idxCommit,
 			int(idx),
 			idxKP,
-			nearestPowerOfTwo(uint64(parallelism)),
+			nearestApplicablePowerOfTwo(uint64(parallelism)),
 		)
 		if err != nil {
 			panic(err)

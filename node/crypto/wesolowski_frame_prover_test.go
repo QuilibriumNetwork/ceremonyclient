@@ -53,24 +53,3 @@ func TestCalculateChallengeProofDifficulty(t *testing.T) {
 	difficulty800k := w.CalculateChallengeProofDifficulty(800000)
 	assert.Equal(t, 25000, difficulty800k)
 }
-
-func TestCalculateChallengeProofDifficulty(t *testing.T) {
-	l, _ := zap.NewProduction()
-	w := crypto.NewWesolowskiFrameProver(l)
-
-	// At 0 increments, the difficulty should be 200,000
-	difficulty0 := w.CalculateChallengeProofDifficulty(0)
-	assert.Equal(t, 200000, difficulty0)
-
-	// At 100,000 increments, the difficulty should be 175,000
-	difficulty100k := w.CalculateChallengeProofDifficulty(100000)
-	assert.Equal(t, 175000, difficulty100k)
-
-	// At 700,000 increments, the difficulty should be 25,000
-	difficulty700k := w.CalculateChallengeProofDifficulty(700000)
-	assert.Equal(t, 25000, difficulty700k)
-
-	// At 800,000 increments, the difficulty should stay at 25,000
-	difficulty800k := w.CalculateChallengeProofDifficulty(800000)
-	assert.Equal(t, 25000, difficulty800k)
-}

@@ -146,6 +146,7 @@ func NewTokenExecutionEngine(
 		report,
 		intrinsicFilter,
 		seed,
+		peerSeniority,
 	)
 
 	e := &TokenExecutionEngine{
@@ -174,8 +175,7 @@ func NewTokenExecutionEngine(
 		panic(err)
 	}
 
-	addrBytes := addr.Bytes()
-	addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
+	addrBytes := addr.FillBytes(make([]byte, 32))
 	e.peerIdHash = addrBytes
 	provingKey, _, publicKeyBytes, provingKeyAddress := e.clock.GetProvingKey(
 		engineConfig,
@@ -190,7 +190,7 @@ func NewTokenExecutionEngine(
 				keys := [][]byte{}
 				ksigs := [][]byte{}
 				for _, conf := range e.engineConfig.MultisigProverEnrollmentPaths {
-					extraConf, err := config.LoadConfig(conf, "")
+					extraConf, err := config.LoadConfig(conf, "", false)
 					if err != nil {
 						panic(err)
 					}
@@ -277,6 +277,21 @@ func NewTokenExecutionEngine(
 						make([]byte, 32),
 						proof,
 					}
+					payload := []byte("mint")
+					for _, p := range announce.Announce.InitialProof.Proofs {
+						payload = append(payload, p...)
+					}
+					sig, err := e.pubSub.SignMessage(payload)
+					if err != nil {
+						panic(err)
+					}
+
+					announce.Announce.InitialProof.Signature = &protobufs.Ed448Signature{
+						PublicKey: &protobufs.Ed448PublicKey{
+							KeyValue: e.pubSub.GetPublicKey(),
+						},
+						Signature: sig,
+					}
 				}
 
 				req := &protobufs.TokenRequest{
@@ -287,6 +302,73 @@ func NewTokenExecutionEngine(
 				if err != nil {
 					panic(err)
 				}
+			}
+		}()
+	}
+
+	inc, _, _, err := dataProofStore.GetLatestDataTimeProof(pubSub.GetPeerID())
+	if err != nil {
+		go func() {
+			addrBI, err := poseidon.HashBytes(pubSub.GetPeerID())
+			if err != nil {
+				panic(err)
+			}
+
+			addr := addrBI.FillBytes(make([]byte, 32))
+
+			for {
+				_, proofs, err := coinStore.GetPreCoinProofsForOwner(addr)
+				if err == nil {
+					for _, proof := range proofs {
+						if proof.IndexProof != nil && len(proof.IndexProof) != 0 {
+							if proof.Index < inc {
+								_, par, input, output, err := dataProofStore.GetDataTimeProof(
+									pubSub.GetPeerID(),
+									proof.Index-1,
+								)
+								if err == nil {
+									p := []byte{}
+									p = binary.BigEndian.AppendUint32(p, proof.Index-1)
+									p = binary.BigEndian.AppendUint32(p, par)
+									p = binary.BigEndian.AppendUint64(
+										p,
+										uint64(len(input)),
+									)
+									p = append(p, input...)
+									p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
+									p = append(p, output...)
+									proofs := [][]byte{
+										[]byte("pre-dusk"),
+										make([]byte, 32),
+										p,
+									}
+									payload := []byte("mint")
+									for _, i := range proofs {
+										payload = append(payload, i...)
+									}
+									sig, err := e.pubSub.SignMessage(payload)
+									if err != nil {
+										panic(err)
+									}
+									e.publishMessage(e.intrinsicFilter, &protobufs.TokenRequest{
+										Request: &protobufs.TokenRequest_Mint{
+											Mint: &protobufs.MintCoinRequest{
+												Proofs: proofs,
+												Signature: &protobufs.Ed448Signature{
+													PublicKey: &protobufs.Ed448PublicKey{
+														KeyValue: e.pubSub.GetPublicKey(),
+													},
+													Signature: sig,
+												},
+											},
+										},
+									})
+								}
+							}
+						}
+					}
+				}
+				gotime.Sleep(10 * gotime.Second)
 			}
 		}()
 	}
@@ -663,7 +745,7 @@ func CreateGenesisState(
 			panic(err)
 		}
 
-		address, err := GetAddressOfCoin(output.GetCoin())
+		address, err := GetAddressOfCoin(output.GetCoin(), 0)
 		if err != nil {
 			panic(err)
 		}
@@ -749,9 +831,11 @@ func CreateGenesisState(
 
 func GetAddressOfCoin(
 	coin *protobufs.Coin,
+	frameNumber uint64,
 ) ([]byte, error) {
 	eval := []byte{}
 	eval = append(eval, application.TOKEN_ADDRESS...)
+	eval = binary.BigEndian.AppendUint64(eval, frameNumber)
 	eval = append(eval, coin.Amount...)
 	eval = append(eval, coin.Intersection...)
 	eval = binary.BigEndian.AppendUint32(eval, 0)
@@ -925,7 +1009,7 @@ func (e *TokenExecutionEngine) RunWorker() {
 						panic(err)
 					}
 
-					address, err := GetAddressOfCoin(o.Coin)
+					address, err := GetAddressOfCoin(o.Coin, frame.FrameNumber)
 					if err != nil {
 						panic(err)
 					}
@@ -947,14 +1031,14 @@ func (e *TokenExecutionEngine) RunWorker() {
 						panic(err)
 					}
 
-					address, err := GetAddressOfCoin(o.DeletedCoin)
+					coin, err := e.coinStore.GetCoinByAddress(o.DeletedCoin.Address)
 					if err != nil {
 						panic(err)
 					}
 					err = e.coinStore.DeleteCoin(
 						txn,
-						address,
-						o.DeletedCoin,
+						o.DeletedCoin.Address,
+						coin,
 					)
 					if err != nil {
 						panic(err)

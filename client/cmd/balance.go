@@ -1,16 +1,50 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"math/big"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 var balanceCmd = &cobra.Command{
 	Use:   "balance",
 	Short: "Lists the total balance of tokens in the managing account",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("1545.381923 QUIL (Account 0x026a5cf3d486b8e8733060d6ce0060074616f0f925671a0886faef744412dc8a)")
+		conn, err := GetGRPCClient()
+		if err != nil {
+			panic(err)
+		}
+		defer conn.Close()
+
+		client := protobufs.NewNodeServiceClient(conn)
+		peerId := GetPeerIDFromConfig(NodeConfig)
+		addr, err := poseidon.HashBytes([]byte(peerId))
+		if err != nil {
+			panic(err)
+		}
+
+		addrBytes := addr.FillBytes(make([]byte, 32))
+		info, err := client.GetTokenInfo(
+			context.Background(),
+			&protobufs.GetTokenInfoRequest{
+				Address: addrBytes,
+			},
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		if info.OwnedTokens == nil {
+			panic("invalid response from RPC")
+		}
+		tokens := new(big.Int).SetBytes(info.OwnedTokens)
+		conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
+		r := new(big.Rat).SetFrac(tokens, conversionFactor)
+		fmt.Println("Total balance:", r.FloatString(12), "QUIL")
 	},
 }
 

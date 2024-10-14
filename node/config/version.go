@@ -36,5 +36,5 @@ func FormatVersion(version []byte) string {
 }
 
 func GetPatchNumber() byte {
-	return 0x00
+	return 0x01
 }

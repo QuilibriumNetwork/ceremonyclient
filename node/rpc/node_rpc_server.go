@@ -5,8 +5,10 @@ import (
 	"context"
 	"math/big"
 	"net/http"
+	"strings"
 
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -19,6 +21,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -194,61 +198,129 @@ func (r *RPCServer) GetPeerInfo(
 	return resp, nil
 }
 
+func (r *RPCServer) SendMessage(
+	ctx context.Context,
+	req *protobufs.TokenRequest,
+) (*protobufs.SendMessageResponse, error) {
+	any := &anypb.Any{}
+	if err := any.MarshalFrom(req); err != nil {
+		return nil, errors.Wrap(err, "publish message")
+	}
+
+	// annoying protobuf any hack
+	any.TypeUrl = strings.Replace(
+		any.TypeUrl,
+		"type.googleapis.com",
+		"types.quilibrium.com",
+		1,
+	)
+
+	payload, err := proto.Marshal(any)
+	if err != nil {
+		return nil, errors.Wrap(err, "publish message")
+	}
+
+	h, err := poseidon.HashBytes(payload)
+	if err != nil {
+		return nil, errors.Wrap(err, "publish message")
+	}
+
+	intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
+
+	msg := &protobufs.Message{
+		Hash:    h.Bytes(),
+		Address: intrinsicFilter,
+		Payload: payload,
+	}
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		return nil, errors.Wrap(err, "publish message")
+	}
+	return &protobufs.SendMessageResponse{}, r.pubSub.PublishToBitmask(
+		intrinsicFilter,
+		data,
+	)
+}
+
+func (r *RPCServer) GetTokensByAccount(
+	ctx context.Context,
+	req *protobufs.GetTokensByAccountRequest,
+) (*protobufs.TokensByAccountResponse, error) {
+	frameNumbers, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	return &protobufs.TokensByAccountResponse{
+		Coins:        coins,
+		FrameNumbers: frameNumbers,
+	}, nil
+}
+
 func (r *RPCServer) GetTokenInfo(
 	ctx context.Context,
 	req *protobufs.GetTokenInfoRequest,
 ) (*protobufs.TokenInfoResponse, error) {
-	provingKey, err := r.keyManager.GetRawKey(
-		"default-proving-key",
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get token info")
-	}
-
-	peerBytes := r.pubSub.GetPeerID()
-	peerAddr, err := poseidon.HashBytes(peerBytes)
-	if err != nil {
-		panic(err)
-	}
-
-	addr, err := poseidon.HashBytes(provingKey.PublicKey)
-	if err != nil {
-		panic(err)
-	}
-
-	addrBytes := addr.FillBytes(make([]byte, 32))
-	peerAddrBytes := peerAddr.FillBytes(make([]byte, 32))
-
 	// 1 QUIL = 0x1DCD65000 units
-	conversionFactor, ok := new(big.Int).SetString("1DCD65000", 16)
-	if !ok {
-		return nil, errors.Wrap(err, "get token info")
+	if req.Address != nil {
+		_, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
+		if err != nil {
+			return nil, errors.New("no coins found for address")
+		}
+
+		total := big.NewInt(0)
+		for _, coin := range coins {
+			total.Add(total, new(big.Int).SetBytes(coin.Amount))
+		}
+
+		return &protobufs.TokenInfoResponse{
+			OwnedTokens: total.FillBytes(make([]byte, 32)),
+		}, nil
+	} else {
+		provingKey, err := r.keyManager.GetRawKey(
+			"default-proving-key",
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "get token info")
+		}
+
+		peerBytes := r.pubSub.GetPeerID()
+		peerAddr, err := poseidon.HashBytes(peerBytes)
+		if err != nil {
+			panic(err)
+		}
+
+		addr, err := poseidon.HashBytes(provingKey.PublicKey)
+		if err != nil {
+			panic(err)
+		}
+
+		addrBytes := addr.FillBytes(make([]byte, 32))
+		peerAddrBytes := peerAddr.FillBytes(make([]byte, 32))
+
+		_, coins, err := r.coinStore.GetCoinsForOwner(addrBytes)
+		if err != nil {
+			panic(err)
+		}
+
+		_, otherCoins, err := r.coinStore.GetCoinsForOwner(peerAddrBytes)
+		if err != nil {
+			panic(err)
+		}
+
+		total := big.NewInt(0)
+		for _, coin := range coins {
+			total.Add(total, new(big.Int).SetBytes(coin.Amount))
+		}
+
+		for _, coin := range otherCoins {
+			total.Add(total, new(big.Int).SetBytes(coin.Amount))
+		}
+
+		return &protobufs.TokenInfoResponse{
+			OwnedTokens: total.FillBytes(make([]byte, 32)),
+		}, nil
 	}
-
-	_, coins, err := r.coinStore.GetCoinsForOwner(addrBytes)
-	if err != nil {
-		panic(err)
-	}
-
-	_, otherCoins, err := r.coinStore.GetCoinsForOwner(peerAddrBytes)
-	if err != nil {
-		panic(err)
-	}
-
-	total := big.NewInt(0)
-	for _, coin := range coins {
-		total.Add(total, new(big.Int).SetBytes(coin.Amount))
-	}
-
-	for _, coin := range otherCoins {
-		total.Add(total, new(big.Int).SetBytes(coin.Amount))
-	}
-
-	total = total.Mul(total, conversionFactor)
-
-	return &protobufs.TokenInfoResponse{
-		OwnedTokens: total.FillBytes(make([]byte, 32)),
-	}, nil
 }
 
 func (r *RPCServer) GetPeerManifests(

@@ -1,42 +1,77 @@
 package cmd
 
 import (
-	"fmt"
-	"math/big"
-	"os"
+	"context"
+	"encoding/hex"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 var mergeCmd = &cobra.Command{
 	Use:   "merge",
-	Short: "Merges two coins",
-	Long: `Merges two coins:
+	Short: "Merges multiple coins",
+	Long: `Merges multiple coins:
 	
-	merge <LeftCoin> <RightCoin>
-	
-	LeftCoin - the first coin address
-	RightCoin - the second coin address
+	merge <Coin Addresses>...
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 2 {
-			fmt.Println("invalid command")
-			os.Exit(1)
+		conn, err := GetGRPCClient()
+		if err != nil {
+			panic(err)
+		}
+		defer conn.Close()
+
+		client := protobufs.NewNodeServiceClient(conn)
+		key, err := GetPrivKeyFromConfig(NodeConfig)
+		if err != nil {
+			panic(err)
 		}
 
-		_, ok := new(big.Int).SetString(args[0], 0)
-		if !ok {
-			fmt.Println("invalid LeftCoin")
-			os.Exit(1)
+		coinaddrs := []*protobufs.CoinRef{}
+		payload := []byte("merge")
+		for _, arg := range args {
+			coinaddrHex, _ := strings.CutPrefix(arg, "0x")
+			coinaddr, err := hex.DecodeString(coinaddrHex)
+			if err != nil {
+				panic(err)
+			}
+			coinaddrs = append(coinaddrs, &protobufs.CoinRef{
+				Address: coinaddr,
+			})
+			payload = append(payload, coinaddr...)
 		}
 
-		_, ok = new(big.Int).SetString(args[1], 0)
-		if !ok {
-			fmt.Println("invalid Rightcoin")
-			os.Exit(1)
+		sig, err := key.Sign(payload)
+		if err != nil {
+			panic(err)
 		}
 
-		fmt.Println("1545.381923 QUIL (Coin 0x151f4ae225e20759077e1724e4c5d0feae26c477fd10d728dfea962eec79b83f)")
+		pub, err := key.GetPublic().Raw()
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = client.SendMessage(
+			context.Background(),
+			&protobufs.TokenRequest{
+				Request: &protobufs.TokenRequest_Merge{
+					Merge: &protobufs.MergeCoinRequest{
+						Coins: coinaddrs,
+						Signature: &protobufs.Ed448Signature{
+							Signature: sig,
+							PublicKey: &protobufs.Ed448PublicKey{
+								KeyValue: pub,
+							},
+						},
+					},
+				},
+			},
+		)
+		if err != nil {
+			panic(err)
+		}
 	},
 }
 

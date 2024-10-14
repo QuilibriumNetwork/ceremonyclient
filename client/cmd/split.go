@@ -1,52 +1,101 @@
 package cmd
 
 import (
+	"context"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
+	"strings"
 
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 var splitCmd = &cobra.Command{
 	Use:   "split",
-	Short: "Splits a coin into two coins",
-	Long: `Splits a coin into two coins:
+	Short: "Splits a coin into multiple coins",
+	Long: `Splits a coin into multiple coins:
 	
-	split <OfCoin> <LeftAmount> <RightAmount>
+	split <OfCoin> <Amounts>...
 	
 	OfCoin - the address of the coin to split
-	LeftAmount - the first half of the split amount
-	RightAmount - the second half of the split amount
+	Amounts - the sets of amounts to split
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 3 {
+		if len(args) < 3 {
 			fmt.Println("invalid command")
 			os.Exit(1)
 		}
 
-		_, ok := new(big.Int).SetString(args[0], 0)
-		if !ok {
-			fmt.Println("invalid OfCoin")
-			os.Exit(1)
+		payload := []byte("split")
+		coinaddrHex, _ := strings.CutPrefix(args[0], "0x")
+		coinaddr, err := hex.DecodeString(coinaddrHex)
+		if err != nil {
+			panic(err)
+		}
+		coin := &protobufs.CoinRef{
+			Address: coinaddr,
+		}
+		payload = append(payload, coinaddr...)
+
+		conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
+		amounts := [][]byte{}
+		for _, amt := range args[1:] {
+			amount, err := decimal.NewFromString(amt)
+			if err != nil {
+				fmt.Println("invalid amount")
+				os.Exit(1)
+			}
+			amount.Mul(decimal.NewFromBigInt(conversionFactor, 0))
+			amountBytes := amount.BigInt().FillBytes(make([]byte, 32))
+			amounts = append(amounts, amountBytes)
+			payload = append(payload, amountBytes...)
 		}
 
-		leftAmount := args[1]
-		_, err := decimal.NewFromString(leftAmount)
+		conn, err := GetGRPCClient()
 		if err != nil {
-			fmt.Println("invalid LeftAmount")
-			os.Exit(1)
+			panic(err)
+		}
+		defer conn.Close()
+
+		client := protobufs.NewNodeServiceClient(conn)
+		key, err := GetPrivKeyFromConfig(NodeConfig)
+		if err != nil {
+			panic(err)
 		}
 
-		rightAmount := args[2]
-		_, err = decimal.NewFromString(rightAmount)
+		sig, err := key.Sign(payload)
 		if err != nil {
-			fmt.Println("invalid RightAmount")
-			os.Exit(1)
+			panic(err)
 		}
-		fmt.Println(leftAmount + " QUIL (Coin 0x024479f49f03dc53fd702198cd9b548c9e96004e19ef6a4e9c5211a9795ba34d)")
-		fmt.Println(rightAmount + " QUIL (Coin 0x0140e01731256793bba03914f3844d645fbece26553acdea8ac4de4d84f91690)")
+
+		pub, err := key.GetPublic().Raw()
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = client.SendMessage(
+			context.Background(),
+			&protobufs.TokenRequest{
+				Request: &protobufs.TokenRequest_Split{
+					Split: &protobufs.SplitCoinRequest{
+						OfCoin:  coin,
+						Amounts: amounts,
+						Signature: &protobufs.Ed448Signature{
+							Signature: sig,
+							PublicKey: &protobufs.Ed448PublicKey{
+								KeyValue: pub,
+							},
+						},
+					},
+				},
+			},
+		)
+		if err != nil {
+			panic(err)
+		}
 	},
 }
 

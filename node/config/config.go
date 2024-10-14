@@ -200,7 +200,10 @@ func DownloadAndVerifyGenesis() (*SignedGenesisUnlock, error) {
 
 var StasisSeed = "737461736973"
 
-func LoadConfig(configPath string, proverKey string) (*Config, error) {
+func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
+	*Config,
+	error,
+) {
 	info, err := os.Stat(configPath)
 	if os.IsNotExist(err) {
 		fmt.Println("Creating config directory " + configPath)
@@ -229,9 +232,11 @@ func LoadConfig(configPath string, proverKey string) (*Config, error) {
 
 	genesisSeed := StasisSeed
 
-	output, err := DownloadAndVerifyGenesis()
-	if err == nil {
-		genesisSeed = output.GenesisSeedHex
+	if !skipGenesisCheck {
+		output, err := DownloadAndVerifyGenesis()
+		if err == nil {
+			genesisSeed = output.GenesisSeedHex
+		}
 	}
 
 	config := &Config{

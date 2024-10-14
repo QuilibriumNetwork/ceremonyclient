@@ -82,3 +82,7 @@ func (h *MinHeap[I]) downheap(i int) {
 		i = smallest
 	}
 }
+
+func (h *MinHeap[I]) All() []I {
+	return h.items
+}

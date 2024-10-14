@@ -10,13 +10,10 @@ import (
 	"strings"
 
 	"github.com/cloudflare/circl/sign/ed448"
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	libP2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 )
 
@@ -25,10 +22,9 @@ var crossMintCmd = &cobra.Command{
 	Short: "Signs a payload from the Quilibrium bridge to mint tokens on Ethereum L1 and prints the result to stdout",
 	Long: `Signs a payload from the Quilibrium bridge to mint tokens on Ethereum L1 and prints the result to stdout":
 	
-	cross-mint <Payload> [<Voucher File Path>]
+	cross-mint <Payload>
 	
 	Payload – the hex-encoded payload from the Quilibrium bridge with optional 0x-prefix, must be specified
-	Voucher File Path – (optional) the path to a voucher private key, from the initial KZG ceremony
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) < 1 {
@@ -41,63 +37,7 @@ var crossMintCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		if len(args) == 2 {
-			rawVoucherHex, err := os.ReadFile(args[1])
-			if err != nil {
-				fmt.Printf("invalid file: %s\n", args[1])
-				os.Exit(1)
-			}
-
-			rawVoucherKey, err := hex.DecodeString(string(rawVoucherHex))
-			if err != nil {
-				panic(errors.Wrap(err, "cross mint"))
-			}
-
-			ed448Key := ed448.PrivateKey(rawVoucherKey)
-
-			result, err := CrossMint(&CrossMintArgs{
-				Payload:    args[0],
-				PeerKey:    ed448Key,
-				ProvingKey: ed448Key,
-			})
-			if err != nil {
-				panic(errors.Wrap(err, "error cross minting"))
-			}
-
-			pubkeyBytes := ed448Key.Public().(ed448.PublicKey)
-
-			addr, err := poseidon.HashBytes(pubkeyBytes)
-			if err != nil {
-				panic(errors.Wrap(err, "error cross minting"))
-			}
-
-			addrBytes := addr.Bytes()
-			addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
-
-			// Print the result
-			fmt.Println("Voucher ID: " + base58.Encode(addrBytes))
-
-			jsonResult, err := json.Marshal(result)
-			if err != nil {
-				panic(errors.Wrap(err, "error marshaling result to json"))
-			}
-			fmt.Println(string(jsonResult))
-			os.Exit(0)
-		}
-
-		_, err := os.Stat(configDirectory)
-		if os.IsNotExist(err) {
-			fmt.Printf("config directory doesn't exist: %s\n", configDirectory)
-			os.Exit(1)
-		}
-
-		config, err := config.LoadConfig(configDirectory, "")
-		if err != nil {
-			fmt.Printf("invalid config directory: %s\n", configDirectory)
-			os.Exit(1)
-		}
-
-		rawPeerKey, err := hex.DecodeString(config.P2P.PeerPrivKey)
+		rawPeerKey, err := hex.DecodeString(NodeConfig.P2P.PeerPrivKey)
 		if err != nil {
 			panic(errors.Wrap(err, "cross mint"))
 		}
@@ -117,10 +57,10 @@ var crossMintCmd = &cobra.Command{
 		// `config.Key.KeyStoreFile.Path` defaults to `.config/keys.yml`.
 		// We do our best here to make sure the  configuration value is taken into
 		// account if it was changed.
-		if !filepath.IsAbs(config.Key.KeyStoreFile.Path) {
-			config.Key.KeyStoreFile.Path = filepath.Join(
+		if !filepath.IsAbs(NodeConfig.Key.KeyStoreFile.Path) {
+			NodeConfig.Key.KeyStoreFile.Path = filepath.Join(
 				configDirectory,
-				filepath.Base(config.Key.KeyStoreFile.Path),
+				filepath.Base(NodeConfig.Key.KeyStoreFile.Path),
 			)
 		}
 
@@ -129,8 +69,8 @@ var crossMintCmd = &cobra.Command{
 			panic(errors.Wrap(err, "cross mint"))
 		}
 
-		fileKeyManager := keys.NewFileKeyManager(config.Key, logger)
-		provingKey, err := fileKeyManager.GetSigningKey(config.Engine.ProvingKeyId)
+		fileKeyManager := keys.NewFileKeyManager(NodeConfig.Key, logger)
+		provingKey, err := fileKeyManager.GetSigningKey(NodeConfig.Engine.ProvingKeyId)
 		if err != nil {
 			panic(errors.Wrap(err, "cross mint"))
 		}
