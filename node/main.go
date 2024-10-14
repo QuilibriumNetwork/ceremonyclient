@@ -424,6 +424,7 @@ func main() {
 			node.GetLogger(),
 			node.GetDataProofStore(),
 			node.GetClockStore(),
+			node.GetCoinStore(),
 			node.GetKeyManager(),
 			node.GetPubSub(),
 			node.GetMasterClock(),
