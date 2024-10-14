@@ -553,7 +553,7 @@ func CreateGenesisState(
 		}
 
 		// these don't have decimals so we can shortcut
-		max := 137558
+		max := 157208
 		actual, err := strconv.Atoi(f.Reward)
 		if err != nil {
 			panic(err)
