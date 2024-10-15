@@ -102,6 +102,7 @@ type Signature struct {
 	PublicKeyHex string `json:"publicKeyHex"`
 	SignatureHex string `json:"signatureHex"`
 }
+
 type SignedGenesisUnlock struct {
 	GenesisSeedHex string      `json:"genesisSeedHex"`
 	Signatures     []Signature `json:"signatures"`
@@ -167,7 +168,7 @@ func DownloadAndVerifyGenesis() (*SignedGenesisUnlock, error) {
 		checksig := ""
 		for _, sig := range checkUnlock.Signatures {
 			if sig.PublicKeyHex == Signatories[i-1] {
-				checksig = sig.PublicKeyHex
+				checksig = sig.SignatureHex
 				break
 			}
 		}
@@ -176,12 +177,13 @@ func DownloadAndVerifyGenesis() (*SignedGenesisUnlock, error) {
 			continue
 		}
 
-		sig, err := hex.DecodeString(Signatories[i-1])
+		sig, err := hex.DecodeString(checksig)
 		if err != nil {
 			return nil, err
 		}
 
-		if !ed448.Verify(pubkey, digest[:], sig, "") {
+		opensslMsg := "SHA3-256(genesis)= " + hex.EncodeToString(digest[:])
+		if !ed448.Verify(pubkey, append([]byte(opensslMsg), 0x0a), sig, "") {
 			fmt.Printf("Failed signature check for signatory #%d\n", i)
 			return nil, err
 		}
