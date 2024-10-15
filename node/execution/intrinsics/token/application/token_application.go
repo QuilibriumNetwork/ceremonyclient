@@ -248,7 +248,7 @@ func (a *TokenApplication) ApplyTransitions(
 					break req
 				}
 
-				data := t.Announce.InitialProof.Proofs[3]
+				data := t.Announce.InitialProof.Proofs[2]
 				if len(data) < 28 {
 					if !skipFailures {
 						return nil, nil, nil, errors.Wrap(
@@ -996,7 +996,7 @@ func (a *TokenApplication) ApplyTransitions(
 					})
 				}
 
-				data := t.Mint.Proofs[3]
+				data := t.Mint.Proofs[2]
 				if len(data) < 28 {
 					if !skipFailures {
 						return nil, nil, nil, errors.Wrap(
