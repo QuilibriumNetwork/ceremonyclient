@@ -195,7 +195,7 @@ func main() {
 				count++
 			}
 
-			if count < len(config.Signatories)/2+len(config.Signatories)%2 {
+			if count < len(config.Signatories)/2 {
 				fmt.Printf("Quorum on signatures not met")
 				os.Exit(1)
 			}
