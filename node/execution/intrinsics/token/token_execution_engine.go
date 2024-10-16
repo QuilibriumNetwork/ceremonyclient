@@ -321,14 +321,14 @@ func NewTokenExecutionEngine(
 				if err == nil {
 					for _, proof := range proofs {
 						if proof.IndexProof != nil && len(proof.IndexProof) != 0 {
-							if proof.Index < inc {
+							if proof.Difficulty < inc {
 								_, par, input, output, err := dataProofStore.GetDataTimeProof(
 									pubSub.GetPeerID(),
-									proof.Index-1,
+									proof.Difficulty-1,
 								)
 								if err == nil {
 									p := []byte{}
-									p = binary.BigEndian.AppendUint32(p, proof.Index-1)
+									p = binary.BigEndian.AppendUint32(p, proof.Difficulty-1)
 									p = binary.BigEndian.AppendUint32(p, par)
 									p = binary.BigEndian.AppendUint64(
 										p,
