@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -319,51 +320,56 @@ func NewTokenExecutionEngine(
 			for {
 				_, proofs, err := coinStore.GetPreCoinProofsForOwner(addr)
 				if err == nil {
+					var minDifficulty uint32 = math.MaxUint32
 					for _, proof := range proofs {
-						if proof.IndexProof != nil && len(proof.IndexProof) != 0 {
-							if proof.Index < inc {
-								_, par, input, output, err := dataProofStore.GetDataTimeProof(
-									pubSub.GetPeerID(),
-									proof.Index-1,
+						if proof.IndexProof != nil && len(proof.IndexProof) != 0 && proof.Difficulty < minDifficulty {
+							minDifficulty = proof.Difficulty
+						}
+					}
+
+					if minDifficulty != math.MaxUint32 {
+						if minDifficulty < inc {
+							_, par, input, output, err := dataProofStore.GetDataTimeProof(
+								pubSub.GetPeerID(),
+								minDifficulty-1,
+							)
+							if err == nil {
+								p := []byte{}
+								p = binary.BigEndian.AppendUint32(p, minDifficulty-1)
+								p = binary.BigEndian.AppendUint32(p, par)
+								p = binary.BigEndian.AppendUint64(
+									p,
+									uint64(len(input)),
 								)
-								if err == nil {
-									p := []byte{}
-									p = binary.BigEndian.AppendUint32(p, proof.Index-1)
-									p = binary.BigEndian.AppendUint32(p, par)
-									p = binary.BigEndian.AppendUint64(
-										p,
-										uint64(len(input)),
-									)
-									p = append(p, input...)
-									p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
-									p = append(p, output...)
-									proofs := [][]byte{
-										[]byte("pre-dusk"),
-										make([]byte, 32),
-										p,
-									}
-									payload := []byte("mint")
-									for _, i := range proofs {
-										payload = append(payload, i...)
-									}
-									sig, err := e.pubSub.SignMessage(payload)
-									if err != nil {
-										panic(err)
-									}
-									e.publishMessage(e.intrinsicFilter, &protobufs.TokenRequest{
-										Request: &protobufs.TokenRequest_Mint{
-											Mint: &protobufs.MintCoinRequest{
-												Proofs: proofs,
-												Signature: &protobufs.Ed448Signature{
-													PublicKey: &protobufs.Ed448PublicKey{
-														KeyValue: e.pubSub.GetPublicKey(),
-													},
-													Signature: sig,
+								p = append(p, input...)
+								p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
+								p = append(p, output...)
+								proofs := [][]byte{
+									[]byte("pre-dusk"),
+									make([]byte, 32),
+									p,
+								}
+								payload := []byte("mint")
+								for _, i := range proofs {
+									payload = append(payload, i...)
+								}
+								sig, err := e.pubSub.SignMessage(payload)
+								if err != nil {
+									panic(err)
+								}
+								e.publishMessage(e.intrinsicFilter, &protobufs.TokenRequest{
+									Request: &protobufs.TokenRequest_Mint{
+										Mint: &protobufs.MintCoinRequest{
+											Proofs: proofs,
+											Signature: &protobufs.Ed448Signature{
+												PublicKey: &protobufs.Ed448PublicKey{
+													KeyValue: e.pubSub.GetPublicKey(),
 												},
+												Signature: sig,
 											},
 										},
-									})
-								}
+									},
+								})
 							}
 						}
 					}
