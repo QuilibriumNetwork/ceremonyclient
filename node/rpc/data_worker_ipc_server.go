@@ -202,13 +202,15 @@ func NewDataWorkerIPCServer(
 		panic(err)
 	}
 
+	indices := p2p.GetOnesIndices(p2p.GetBloomFilter(digest, 1024, 64))
+
 	return &DataWorkerIPCServer{
 		listenAddrGRPC: listenAddrGRPC,
 		logger:         logger,
 		coreId:         coreId,
 		prover:         prover,
 		indices: []int{
-			p2p.GetOnesIndices(p2p.GetBloomFilter(digest, 1024, 64))[coreId%64],
+			indices[int(coreId)%len(indices)],
 		},
 		parentProcessId: parentProcessId,
 	}, nil
