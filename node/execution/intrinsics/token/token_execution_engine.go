@@ -261,6 +261,7 @@ func NewTokenExecutionEngine(
 				proof = append(proof, input...)
 				proof = binary.BigEndian.AppendUint64(proof, uint64(len(output)))
 				proof = append(proof, output...)
+				announce.Announce.InitialProof = &protobufs.MintCoinRequest{}
 				announce.Announce.InitialProof.Proofs = [][]byte{
 					[]byte("pre-dusk"),
 					make([]byte, 32),
