@@ -391,6 +391,10 @@ func (b *BlossomSub) Subscribe(
 			b.logger.Error("subscription failed", zap.Error(err))
 			return errors.Wrap(err, "subscribe")
 		}
+		_, ok := b.bitmaskMap[string(bit.Bitmask())]
+		if !ok {
+			b.bitmaskMap[string(bit.Bitmask())] = bit
+		}
 		subs = append(subs, sub)
 	}
 

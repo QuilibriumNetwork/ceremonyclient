@@ -308,10 +308,15 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 		addrBytes = append(make([]byte, 32-len(addrBytes)), addrBytes...)
 		frameProverTrie.Add(addrBytes, 0)
 
-		if i%8 == 0 && i != 0 {
+		if i%8 == 0 {
 			frameProverTries = append(frameProverTries, frameProverTrie)
 			frameProverTrie = &tries.RollingFrecencyCritbitTrie{}
 		}
+	}
+	if len(frameProverTrie.FindNearestAndApproximateNeighbors(
+		make([]byte, 32),
+	)) != 0 {
+		frameProverTries = append(frameProverTries, frameProverTrie)
 	}
 
 	w.logger.Info("proving genesis frame")

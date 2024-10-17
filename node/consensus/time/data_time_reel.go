@@ -17,13 +17,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
 
-var allBitmaskFilter = []byte{
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-}
-
 var unknownDistance = new(big.Int).SetBytes([]byte{
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -41,12 +34,11 @@ type DataTimeReel struct {
 	rwMutex sync.RWMutex
 	running bool
 
-	filter         []byte
-	engineConfig   *config.EngineConfig
-	logger         *zap.Logger
-	clockStore     store.ClockStore
-	frameProver    crypto.FrameProver
-	parentTimeReel TimeReel
+	filter       []byte
+	engineConfig *config.EngineConfig
+	logger       *zap.Logger
+	clockStore   store.ClockStore
+	frameProver  crypto.FrameProver
 
 	origin                []byte
 	initialInclusionProof *crypto.InclusionAggregateProof
@@ -227,7 +219,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 
 	difficulty := d.engineConfig.Difficulty
 	if difficulty == 0 || difficulty == 10000 {
-		difficulty = 100000
+		difficulty = 200000
 	}
 
 	frame, tries, err := d.frameProver.CreateDataGenesisFrame(
@@ -292,22 +284,6 @@ func (d *DataTimeReel) runLoop() {
 					zap.Uint64("head_frame_number", d.head.FrameNumber),
 					zap.Uint64("frame_number", frame.frameNumber),
 				)
-
-				// tag: equinox – master filter changes
-				_, err := d.clockStore.GetMasterClockFrame(
-					allBitmaskFilter,
-					frame.frameNumber)
-				if err != nil {
-					d.logger.Debug("no master, add pending")
-
-					// If the frame arrived ahead of a master, e.g. the master data is not
-					// synced, we'll go ahead and mark it as pending and process it when
-					// we can, but if we had a general fault, panic:
-					if !errors.Is(err, store.ErrNotFound) {
-						panic(err)
-					}
-					continue
-				}
 
 				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
 					d.filter,
@@ -617,21 +593,26 @@ func (d *DataTimeReel) GetDistance(frame *protobufs.ClockFrame) (
 	*big.Int,
 	error,
 ) {
-	// tag: equinox – master filter changes
-	master, err := d.clockStore.GetMasterClockFrame(
-		allBitmaskFilter,
-		frame.FrameNumber)
+	if frame.FrameNumber == 0 {
+		return big.NewInt(0), nil
+	}
+
+	prev, _, err := d.clockStore.GetDataClockFrame(
+		d.filter,
+		frame.FrameNumber-1,
+		false,
+	)
 	if err != nil {
 		return unknownDistance, errors.Wrap(err, "get distance")
 	}
 
-	masterSelector, err := master.GetSelector()
+	prevSelector, err := prev.GetSelector()
 	if err != nil {
 		return unknownDistance, errors.Wrap(err, "get distance")
 	}
 
 	discriminatorNode :=
-		d.proverTries[0].FindNearest(masterSelector.FillBytes(make([]byte, 32)))
+		d.proverTries[0].FindNearest(prevSelector.FillBytes(make([]byte, 32)))
 	discriminator := discriminatorNode.External.Key
 	addr, err := frame.GetAddress()
 	if err != nil {

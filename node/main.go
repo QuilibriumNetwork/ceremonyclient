@@ -195,7 +195,7 @@ func main() {
 				count++
 			}
 
-			if count < len(config.Signatories)/2 {
+			if count < len(config.Signatories)/2+len(config.Signatories)%2 {
 				fmt.Printf("Quorum on signatures not met")
 				os.Exit(1)
 			}
@@ -332,9 +332,6 @@ func main() {
 	}
 
 	if *core != 0 {
-		runtime.GOMAXPROCS(1)
-		rdebug.SetGCPercent(9999)
-
 		if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
 			nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
 		}
@@ -372,6 +369,7 @@ func main() {
 			l,
 			uint32(*core)-1,
 			qcrypto.NewWesolowskiFrameProver(l),
+			nodeConfig,
 			*parentProcess,
 		)
 		if err != nil {
@@ -394,6 +392,19 @@ func main() {
 	kzg.Init()
 
 	report := RunSelfTestIfNeeded(*configDirectory, nodeConfig)
+
+	if *core == 0 {
+		for {
+			genesis, err := config.DownloadAndVerifyGenesis(*network)
+			if err != nil {
+				time.Sleep(10 * time.Minute)
+				continue
+			}
+
+			nodeConfig.Engine.GenesisSeed = genesis.GenesisSeedHex
+			break
+		}
+	}
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)

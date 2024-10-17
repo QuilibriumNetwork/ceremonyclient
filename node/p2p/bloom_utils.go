@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"fmt"
 	"math/big"
 	"sort"
 
@@ -36,17 +35,9 @@ func GetBloomFilter(data []byte, bitLength int, k int) []byte {
 		}
 		if outputBI.Bit(int(position)) != 1 {
 			outputBI.SetBit(outputBI, int(position), 1)
-		} else if k*size <= 32 {
+		} else if k < size {
 			// we need to extend the search
 			k++
-		} else {
-			fmt.Printf(
-				"digest %+x cannot be used as bloom index, panicking\n",
-				digest,
-			)
-			panic(
-				"could not generate bloom filter index, k offset cannot be adjusted",
-			)
 		}
 	}
 	outputBI.FillBytes(output)

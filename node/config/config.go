@@ -132,12 +132,12 @@ var Signatories = []string{
 
 var unlock *SignedGenesisUnlock
 
-func DownloadAndVerifyGenesis() (*SignedGenesisUnlock, error) {
+func DownloadAndVerifyGenesis(network uint) (*SignedGenesisUnlock, error) {
 	if unlock != nil {
 		return unlock, nil
 	}
 
-	resp, err := http.Get("https://releases.quilibrium.com/stasis")
+	resp, err := http.Get("https://releases.quilibrium.com/genesisunlock")
 	if err != nil || resp.StatusCode != 200 {
 		fmt.Println("Stasis lock not yet released.")
 		return nil, errors.New("stasis lock not yet released")
@@ -185,19 +185,23 @@ func DownloadAndVerifyGenesis() (*SignedGenesisUnlock, error) {
 		opensslMsg := "SHA3-256(genesis)= " + hex.EncodeToString(digest[:])
 		if !ed448.Verify(pubkey, append([]byte(opensslMsg), 0x0a), sig, "") {
 			fmt.Printf("Failed signature check for signatory #%d\n", i)
-			return nil, err
+			return nil, errors.New("failed signature check")
 		}
 		count++
 	}
 
-	if count < len(Signatories)/2 {
+	if count < len(Signatories)/2+len(Signatories)%2 {
 		fmt.Printf("Quorum on signatures not met")
-		return nil, err
+		return nil, errors.New("quorum on signatures not met")
 	}
 
 	fmt.Println("Stasis lock released. Welcome to 2.0.")
 	unlock = checkUnlock
 	return unlock, err
+}
+
+func GetGenesis() *SignedGenesisUnlock {
+	return unlock
 }
 
 var StasisSeed = "737461736973"
@@ -235,7 +239,7 @@ func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
 	genesisSeed := StasisSeed
 
 	if !skipGenesisCheck {
-		output, err := DownloadAndVerifyGenesis()
+		output, err := DownloadAndVerifyGenesis(0)
 		if err == nil {
 			genesisSeed = output.GenesisSeedHex
 		}

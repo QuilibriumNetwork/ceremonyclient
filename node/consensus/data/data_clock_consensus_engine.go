@@ -34,6 +34,8 @@ import (
 const PEER_INFO_TTL = 60 * 60 * 1000
 const UNCOOPERATIVE_PEER_INFO_TTL = 5 * 60 * 1000
 
+var ErrNoApplicableChallenge = errors.New("no applicable challenge")
+
 type SyncStatusType int
 
 const (
@@ -214,7 +216,7 @@ func NewDataClockConsensusEngine(
 
 	difficulty := engineConfig.Difficulty
 	if difficulty == 0 {
-		difficulty = 100000
+		difficulty = 200000
 	}
 
 	e := &DataClockConsensusEngine{
@@ -250,6 +252,7 @@ func NewDataClockConsensusEngine(
 		peerInfoManager:           peerInfoManager,
 		peerSeniority:             newFromMap(peerSeniority),
 		messageProcessorCh:        make(chan *pb.Message),
+		engineConfig:              engineConfig,
 	}
 
 	logger.Info("constructing consensus engine")
@@ -456,8 +459,35 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 	wg := sync.WaitGroup{}
 	wg.Add(len(clients))
 	for i, client := range clients {
+		client := client
 		go func() {
 			for j := 3; j >= 0; j-- {
+				var err error
+				if client == nil {
+					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+						e.logger.Error(
+							"client failed, reconnecting after 50ms",
+							zap.Uint32("client", uint32(i)),
+						)
+						time.Sleep(50 * time.Millisecond)
+						client, err = e.createParallelDataClientsFromListAndIndex(uint32(i))
+						if err != nil {
+							e.logger.Error("failed to reconnect", zap.Error(err))
+						}
+					} else if len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+						e.logger.Error(
+							"client failed, reconnecting after 50ms",
+						)
+						time.Sleep(50 * time.Millisecond)
+						client, err =
+							e.createParallelDataClientsFromBaseMultiaddrAndIndex(uint32(i))
+						if err != nil {
+							e.logger.Error("failed to reconnect", zap.Error(err))
+						}
+					}
+					clients[i] = client
+					continue
+				}
 				resp, err :=
 					client.CalculateChallengeProof(
 						context.Background(),
@@ -467,8 +497,11 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 						},
 					)
 				if err != nil {
+					if errors.Is(err, ErrNoApplicableChallenge) {
+						break
+					}
 					if j == 0 {
-						e.logger.Error("unable to get a response in time from worker")
+						e.logger.Error("unable to get a response in time from worker", zap.Error(err))
 					}
 					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
 						e.logger.Error(
@@ -532,7 +565,7 @@ func (
 		len(e.frameProverTries),
 	)
 
-	for _, trie := range e.frameProverTries {
+	for i, trie := range e.frameProverTries {
 		newTrie := &tries.RollingFrecencyCritbitTrie{}
 		b, err := trie.Serialize()
 		if err != nil {
@@ -543,7 +576,7 @@ func (
 		if err != nil {
 			panic(err)
 		}
-		frameProverTries = append(frameProverTries, newTrie)
+		frameProverTries[i] = newTrie
 	}
 
 	e.frameProverTriesMx.RUnlock()
@@ -552,11 +585,6 @@ func (
 
 func (e *DataClockConsensusEngine) runLoop() {
 	dataFrameCh := e.dataTimeReel.NewFrameCh()
-
-	e.logger.Info("waiting for peer list mappings")
-	// We need to re-tune this so that libp2p's peerstore activation threshold
-	// considers DHT peers to be correct:
-	time.Sleep(30 * time.Second)
 
 	for e.state < consensus.EngineStateStopping {
 		peerCount := e.pubSub.GetNetworkPeersCount()
@@ -597,93 +625,92 @@ func (e *DataClockConsensusEngine) runLoop() {
 					}()
 				}
 
-				for _, trie := range e.GetFrameProverTries() {
-					if bytes.Equal(
-						trie.FindNearest(e.provingKeyAddress).External.Key,
-						e.provingKeyAddress,
-					) {
-						var nextFrame *protobufs.ClockFrame
-						if nextFrame, err = e.prove(latestFrame); err != nil {
-							e.logger.Error("could not prove", zap.Error(err))
-							e.state = consensus.EngineStateCollecting
-							continue
-						}
-
-						e.proverTrieRequestsMx.Lock()
-						joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
-						leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
-						for _, addr := range e.proverTrieJoinRequests {
-							if _, ok := (*e.peerSeniority)[addr]; !ok {
-								joinAddrs.Push(peerSeniorityItem{
-									addr:      addr,
-									seniority: 0,
-								})
-							} else {
-								joinAddrs.Push((*e.peerSeniority)[addr])
-							}
-						}
-						for _, addr := range e.proverTrieLeaveRequests {
-							if _, ok := (*e.peerSeniority)[addr]; !ok {
-								leaveAddrs.Push(peerSeniorityItem{
-									addr:      addr,
-									seniority: 0,
-								})
-							} else {
-								leaveAddrs.Push((*e.peerSeniority)[addr])
-							}
-						}
-						for _, addr := range e.proverTrieResumeRequests {
-							if _, ok := e.proverTriePauseRequests[addr]; ok {
-								delete(e.proverTriePauseRequests, addr)
-							}
-						}
-
-						joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
-						copy(joinReqs, joinAddrs.All())
-						slices.Reverse(joinReqs)
-						leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
-						copy(leaveReqs, leaveAddrs.All())
-						slices.Reverse(leaveReqs)
-
-						e.proverTrieJoinRequests = make(map[string]string)
-						e.proverTrieLeaveRequests = make(map[string]string)
-						e.proverTrieRequestsMx.Unlock()
-
-						e.frameProverTriesMx.Lock()
-						for _, addr := range joinReqs {
-							rings := len(e.frameProverTries)
-							last := e.frameProverTries[rings-1]
-							set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
-							if len(set) == 8 {
-								e.frameProverTries = append(
-									e.frameProverTries,
-									&tries.RollingFrecencyCritbitTrie{},
-								)
-								last = e.frameProverTries[rings]
-							}
-							last.Add([]byte(addr.addr), nextFrame.FrameNumber)
-						}
-						for _, addr := range leaveReqs {
-							for _, t := range e.frameProverTries {
-								if bytes.Equal(
-									t.FindNearest([]byte(addr.addr)).External.Key,
-									[]byte(addr.addr),
-								) {
-									t.Remove([]byte(addr.addr))
-									break
-								}
-							}
-						}
-						e.frameProverTriesMx.Unlock()
-
-						e.dataTimeReel.Insert(nextFrame, false)
-
-						if err = e.publishProof(nextFrame); err != nil {
-							e.logger.Error("could not publish", zap.Error(err))
-							e.state = consensus.EngineStateCollecting
-						}
-						break
+				trie := e.GetFrameProverTries()[0]
+				if bytes.Equal(
+					trie.FindNearest(e.provingKeyAddress).External.Key,
+					e.provingKeyAddress,
+				) {
+					var nextFrame *protobufs.ClockFrame
+					if nextFrame, err = e.prove(latestFrame); err != nil {
+						e.logger.Error("could not prove", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+						continue
 					}
+
+					e.proverTrieRequestsMx.Lock()
+					joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
+					leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
+					for _, addr := range e.proverTrieJoinRequests {
+						if _, ok := (*e.peerSeniority)[addr]; !ok {
+							joinAddrs.Push(peerSeniorityItem{
+								addr:      addr,
+								seniority: 0,
+							})
+						} else {
+							joinAddrs.Push((*e.peerSeniority)[addr])
+						}
+					}
+					for _, addr := range e.proverTrieLeaveRequests {
+						if _, ok := (*e.peerSeniority)[addr]; !ok {
+							leaveAddrs.Push(peerSeniorityItem{
+								addr:      addr,
+								seniority: 0,
+							})
+						} else {
+							leaveAddrs.Push((*e.peerSeniority)[addr])
+						}
+					}
+					for _, addr := range e.proverTrieResumeRequests {
+						if _, ok := e.proverTriePauseRequests[addr]; ok {
+							delete(e.proverTriePauseRequests, addr)
+						}
+					}
+
+					joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
+					copy(joinReqs, joinAddrs.All())
+					slices.Reverse(joinReqs)
+					leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
+					copy(leaveReqs, leaveAddrs.All())
+					slices.Reverse(leaveReqs)
+
+					e.proverTrieJoinRequests = make(map[string]string)
+					e.proverTrieLeaveRequests = make(map[string]string)
+					e.proverTrieRequestsMx.Unlock()
+
+					e.frameProverTriesMx.Lock()
+					for _, addr := range joinReqs {
+						rings := len(e.frameProverTries)
+						last := e.frameProverTries[rings-1]
+						set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
+						if len(set) == 8 {
+							e.frameProverTries = append(
+								e.frameProverTries,
+								&tries.RollingFrecencyCritbitTrie{},
+							)
+							last = e.frameProverTries[rings]
+						}
+						last.Add([]byte(addr.addr), nextFrame.FrameNumber)
+					}
+					for _, addr := range leaveReqs {
+						for _, t := range e.frameProverTries {
+							if bytes.Equal(
+								t.FindNearest([]byte(addr.addr)).External.Key,
+								[]byte(addr.addr),
+							) {
+								t.Remove([]byte(addr.addr))
+								break
+							}
+						}
+					}
+					e.frameProverTriesMx.Unlock()
+
+					e.dataTimeReel.Insert(nextFrame, false)
+
+					if err = e.publishProof(nextFrame); err != nil {
+						e.logger.Error("could not publish", zap.Error(err))
+						e.state = consensus.EngineStateCollecting
+					}
+					break
 				}
 			case <-time.After(20 * time.Second):
 				dataFrame, err := e.dataTimeReel.Head()
@@ -811,6 +838,25 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.logger.Info("stopping ceremony consensus engine")
 	e.state = consensus.EngineStateStopping
 	errChan := make(chan error)
+
+	msg := []byte("pause")
+	msg = binary.BigEndian.AppendUint64(msg, e.GetFrame().FrameNumber)
+	msg = append(msg, e.filter...)
+	sig, err := e.pubSub.SignMessage(msg)
+	if err != nil {
+		panic(err)
+	}
+
+	e.publishMessage(e.filter, &protobufs.AnnounceProverPause{
+		Filter:      e.filter,
+		FrameNumber: e.GetFrame().FrameNumber,
+		PublicKeySignatureEd448: &protobufs.Ed448Signature{
+			PublicKey: &protobufs.Ed448PublicKey{
+				KeyValue: e.pubSub.GetPublicKey(),
+			},
+			Signature: sig,
+		},
+	})
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))
@@ -1057,7 +1103,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 
 		_, addr, err := mn.DialArgs(ma)
 		if err != nil {
-			panic(err)
+			e.logger.Error("could not get dial args", zap.Error(err))
+			continue
 		}
 
 		conn, err := grpc.Dial(
@@ -1071,7 +1118,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 			),
 		)
 		if err != nil {
-			panic(err)
+			e.logger.Error("could not dial", zap.Error(err))
+			continue
 		}
 
 		clients[i] = protobufs.NewDataIPCServiceClient(conn)
@@ -1115,7 +1163,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
 
 		_, addr, err := mn.DialArgs(ma)
 		if err != nil {
-			e.logger.Warn("could not connect to client", zap.String("addr", addr))
+			e.logger.Error("could not get dial args", zap.Error(err))
 			continue
 		}
 
@@ -1130,7 +1178,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
 			),
 		)
 		if err != nil {
-			e.logger.Warn("could not dial to client", zap.String("addr", addr))
+			e.logger.Error("could not dial", zap.Error(err))
+			continue
 		}
 
 		clients[i] = protobufs.NewDataIPCServiceClient(conn)

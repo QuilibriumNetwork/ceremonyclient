@@ -283,22 +283,6 @@ func (e *DataClockConsensusEngine) collect(
 				e.logger.Info("no peers available for sync, waiting")
 				time.Sleep(5 * time.Second)
 			} else if maxFrame > latest.FrameNumber {
-				masterHead, err := e.masterTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
-				if masterHead.FrameNumber < maxFrame {
-					e.logger.Info(
-						"master frame synchronization needed to continue, waiting",
-						zap.Uint64("master_frame_head", masterHead.FrameNumber),
-						zap.Uint64("max_data_frame_target", maxFrame),
-					)
-
-					time.Sleep(30 * time.Second)
-					continue
-				}
-
 				latest, err = e.sync(latest, maxFrame, peerId)
 				if err == nil {
 					break

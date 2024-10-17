@@ -13,8 +13,8 @@ import (
 func (e *MasterClockConsensusEngine) prove(
 	previousFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
-	e.logger.Debug("proving new frame")
 	if bytes.Equal(e.pubSub.GetPeerID(), []byte(e.beacon)) {
+		e.logger.Debug("proving new frame")
 		e.collectedProverSlotsMx.Lock()
 		collectedProverSlots := e.collectedProverSlots
 		e.collectedProverSlots = []*protobufs.InclusionAggregateProof{}

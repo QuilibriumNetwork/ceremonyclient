@@ -11,6 +11,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -48,7 +49,7 @@ func newNode(
 	coinStore store.CoinStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
-	// execution engines wire in here
+	tokenExecutionEngine *token.TokenExecutionEngine,
 	engine consensus.ConsensusEngine,
 ) (*Node, error) {
 	if engine == nil {
@@ -56,6 +57,9 @@ func newNode(
 	}
 
 	execEngines := make(map[string]execution.ExecutionEngine)
+	if tokenExecutionEngine != nil {
+		execEngines[tokenExecutionEngine.GetName()] = tokenExecutionEngine
+	}
 
 	return &Node{
 		logger,

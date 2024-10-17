@@ -67,8 +67,10 @@ func GetOutputsFromClockFrame(
 	}
 
 	transition := &protobufs.TokenRequests{}
-	if err := proto.Unmarshal(associatedProof, transition); err != nil {
-		return nil, nil, errors.Wrap(err, "get outputs from clock frame")
+	if frame.FrameNumber != 0 {
+		if err := proto.Unmarshal(associatedProof, transition); err != nil {
+			return nil, nil, errors.Wrap(err, "get outputs from clock frame")
+		}
 	}
 
 	return transition, tokenOutputs, nil
@@ -114,7 +116,35 @@ func (a *TokenApplication) ApplyTransitions(
 		case *protobufs.TokenRequest_Announce:
 			var primary *protobufs.Ed448Signature
 			payload := []byte{}
+
+			if t.Announce == nil || t.Announce.PublicKeySignaturesEd448 == nil {
+				if !skipFailures {
+					return nil, nil, nil, errors.Wrap(
+						ErrInvalidStateTransition,
+						"apply transitions",
+					)
+				}
+				failedTransitions.Requests = append(
+					failedTransitions.Requests,
+					transition,
+				)
+				break req
+			}
 			for i, p := range t.Announce.PublicKeySignaturesEd448 {
+				if p.PublicKey == nil || p.Signature == nil ||
+					p.PublicKey.KeyValue == nil {
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							ErrInvalidStateTransition,
+							"apply transitions",
+						)
+					}
+					failedTransitions.Requests = append(
+						failedTransitions.Requests,
+						transition,
+					)
+					break req
+				}
 				if i == 0 {
 					primary = p
 				} else {
@@ -161,80 +191,13 @@ func (a *TokenApplication) ApplyTransitions(
 				break req
 			}
 
-			payload = []byte("mint")
-			for _, p := range t.Announce.InitialProof.Proofs {
-				payload = append(payload, p...)
-			}
-			if err := t.Announce.InitialProof.Signature.Verify(payload); err != nil {
-				if !skipFailures {
-					return nil, nil, nil, errors.Wrap(
-						errors.New("invalid data"),
-						"apply transitions",
-					)
+			if t.Announce.InitialProof != nil &&
+				t.Announce.InitialProof.Proofs != nil {
+				payload = []byte("mint")
+				for _, p := range t.Announce.InitialProof.Proofs {
+					payload = append(payload, p...)
 				}
-				failedTransitions.Requests = append(
-					failedTransitions.Requests,
-					transition,
-				)
-				break req
-			}
-			pk, err := pcrypto.UnmarshalEd448PublicKey(
-				t.Announce.InitialProof.Signature.PublicKey.KeyValue,
-			)
-			if err != nil {
-				if !skipFailures {
-					return nil, nil, nil, errors.Wrap(
-						errors.New("invalid data"),
-						"apply transitions",
-					)
-				}
-				failedTransitions.Requests = append(
-					failedTransitions.Requests,
-					transition,
-				)
-				break req
-			}
-
-			peerId, err := peer.IDFromPublicKey(pk)
-			if err != nil {
-				if !skipFailures {
-					return nil, nil, nil, errors.Wrap(
-						errors.New("invalid data"),
-						"apply transitions",
-					)
-				}
-				failedTransitions.Requests = append(
-					failedTransitions.Requests,
-					transition,
-				)
-				break req
-			}
-
-			addr, err := poseidon.HashBytes(
-				t.Announce.InitialProof.Signature.PublicKey.KeyValue,
-			)
-			if err != nil {
-				if !skipFailures {
-					return nil, nil, nil, errors.Wrap(
-						errors.New("invalid data"),
-						"apply transitions",
-					)
-				}
-				failedTransitions.Requests = append(
-					failedTransitions.Requests,
-					transition,
-				)
-				break req
-			}
-
-			if len(t.Announce.InitialProof.Proofs) == 3 &&
-				bytes.Equal(
-					t.Announce.InitialProof.Proofs[0],
-					[]byte("pre-dusk"),
-				) && bytes.Equal(t.Announce.InitialProof.Proofs[1], make([]byte, 32)) &&
-				currentFrameNumber < 604800 {
-				delete := []*protobufs.TokenOutput{}
-				if !bytes.Equal(t.Announce.InitialProof.Proofs[1], make([]byte, 32)) {
+				if err := t.Announce.InitialProof.Signature.Verify(payload); err != nil {
 					if !skipFailures {
 						return nil, nil, nil, errors.Wrap(
 							errors.New("invalid data"),
@@ -247,91 +210,8 @@ func (a *TokenApplication) ApplyTransitions(
 					)
 					break req
 				}
-
-				data := t.Announce.InitialProof.Proofs[2]
-				if len(data) < 28 {
-					if !skipFailures {
-						return nil, nil, nil, errors.Wrap(
-							errors.New("invalid data"),
-							"apply transitions",
-						)
-					}
-					failedTransitions.Requests = append(
-						failedTransitions.Requests,
-						transition,
-					)
-					break req
-				}
-
-				increment := binary.BigEndian.Uint32(data[:4])
-				parallelism := binary.BigEndian.Uint32(data[8:12])
-				inputLen := binary.BigEndian.Uint64(data[12:20])
-
-				if len(delete) != 0 {
-					if delete[0].GetDeletedProof().Difficulty-1 != increment {
-						if !skipFailures {
-							return nil, nil, nil, errors.Wrap(
-								errors.New("invalid data"),
-								"apply transitions",
-							)
-						}
-						failedTransitions.Requests = append(
-							failedTransitions.Requests,
-							transition,
-						)
-						break req
-					}
-				}
-
-				if uint64(len(data[20:])) < inputLen+8 {
-					if !skipFailures {
-						return nil, nil, nil, errors.Wrap(
-							errors.New("invalid data"),
-							"apply transitions",
-						)
-					}
-					failedTransitions.Requests = append(
-						failedTransitions.Requests,
-						transition,
-					)
-					break req
-				}
-
-				input := make([]byte, inputLen)
-				copy(input[:], data[20:20+inputLen])
-
-				outputLen := binary.BigEndian.Uint64(data[20+inputLen : 20+inputLen+8])
-
-				if uint64(len(data[20+inputLen+8:])) < outputLen {
-					if !skipFailures {
-						return nil, nil, nil, errors.Wrap(
-							errors.New("invalid data"),
-							"apply transitions",
-						)
-					}
-					failedTransitions.Requests = append(
-						failedTransitions.Requests,
-						transition,
-					)
-					break req
-				}
-
-				output := make([]byte, outputLen)
-				copy(output[:], data[20+inputLen+8:])
-				dataProver := crypto.NewKZGInclusionProver(a.Logger)
-				wesoProver := crypto.NewWesolowskiFrameProver(a.Logger)
-				index := binary.BigEndian.Uint32(output[:4])
-				indexProof := output[4:520]
-				kzgCommitment := output[520:594]
-				kzgProof := output[594:668]
-				ip := sha3.Sum512(indexProof)
-
-				v, err := dataProver.VerifyRaw(
-					ip[:],
-					kzgCommitment,
-					int(index),
-					kzgProof,
-					nearestApplicablePowerOfTwo(uint64(parallelism)),
+				pk, err := pcrypto.UnmarshalEd448PublicKey(
+					t.Announce.InitialProof.Signature.PublicKey.KeyValue,
 				)
 				if err != nil {
 					if !skipFailures {
@@ -347,7 +227,8 @@ func (a *TokenApplication) ApplyTransitions(
 					break req
 				}
 
-				if !v {
+				peerId, err := peer.IDFromPublicKey(pk)
+				if err != nil {
 					if !skipFailures {
 						return nil, nil, nil, errors.Wrap(
 							errors.New("invalid data"),
@@ -361,16 +242,10 @@ func (a *TokenApplication) ApplyTransitions(
 					break req
 				}
 
-				wp := []byte{}
-				wp = append(wp, peerId...)
-				wp = append(wp, input...)
-				v = wesoProver.VerifyPreDuskChallengeProof(
-					wp,
-					increment,
-					index,
-					indexProof,
+				addr, err := poseidon.HashBytes(
+					t.Announce.InitialProof.Signature.PublicKey.KeyValue,
 				)
-				if !v {
+				if err != nil {
 					if !skipFailures {
 						return nil, nil, nil, errors.Wrap(
 							errors.New("invalid data"),
@@ -384,63 +259,239 @@ func (a *TokenApplication) ApplyTransitions(
 					break req
 				}
 
-				pomwBasis := big.NewInt(1200000)
+				if len(t.Announce.InitialProof.Proofs) == 3 &&
+					bytes.Equal(
+						t.Announce.InitialProof.Proofs[0],
+						[]byte("pre-dusk"),
+					) && bytes.Equal(t.Announce.InitialProof.Proofs[1], make([]byte, 32)) &&
+					currentFrameNumber < 604800 {
+					delete := []*protobufs.TokenOutput{}
+					if !bytes.Equal(t.Announce.InitialProof.Proofs[1], make([]byte, 32)) {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
 
-				reward := new(big.Int).Mul(pomwBasis, big.NewInt(int64(parallelism)))
-				if len(delete) != 0 {
-					reward.Add(
-						reward,
-						new(big.Int).SetBytes(delete[0].GetDeletedProof().Amount),
+					data := t.Announce.InitialProof.Proofs[2]
+					if len(data) < 28 {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
+
+					increment := binary.BigEndian.Uint32(data[:4])
+					parallelism := binary.BigEndian.Uint32(data[8:12])
+					inputLen := binary.BigEndian.Uint64(data[12:20])
+
+					if len(delete) != 0 {
+						if delete[0].GetDeletedProof().Difficulty-1 != increment {
+							if !skipFailures {
+								return nil, nil, nil, errors.Wrap(
+									errors.New("invalid data"),
+									"apply transitions",
+								)
+							}
+							failedTransitions.Requests = append(
+								failedTransitions.Requests,
+								transition,
+							)
+							break req
+						}
+					}
+
+					if uint64(len(data[20:])) < inputLen+8 {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
+
+					input := make([]byte, inputLen)
+					copy(input[:], data[20:20+inputLen])
+
+					outputLen := binary.BigEndian.Uint64(data[20+inputLen : 20+inputLen+8])
+
+					if uint64(len(data[20+inputLen+8:])) < outputLen {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
+
+					output := make([]byte, outputLen)
+					copy(output[:], data[20+inputLen+8:])
+					dataProver := crypto.NewKZGInclusionProver(a.Logger)
+					wesoProver := crypto.NewWesolowskiFrameProver(a.Logger)
+					index := binary.BigEndian.Uint32(output[:4])
+					indexProof := output[4:520]
+					kzgCommitment := output[520:594]
+					kzgProof := output[594:668]
+					ip := sha3.Sum512(indexProof)
+
+					v, err := dataProver.VerifyRaw(
+						ip[:],
+						kzgCommitment,
+						int(index),
+						kzgProof,
+						nearestApplicablePowerOfTwo(uint64(parallelism)),
 					)
-				}
+					if err != nil {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
 
-				if increment != 0 {
-					add := &protobufs.PreCoinProof{
-						Amount:      reward.FillBytes(make([]byte, 32)),
-						Index:       index,
-						IndexProof:  indexProof,
-						Commitment:  kzgCommitment,
-						Proof:       append(append([]byte{}, kzgProof...), indexProof...),
-						Parallelism: parallelism,
-						Difficulty:  increment,
-						Owner: &protobufs.AccountRef{
-							Account: &protobufs.AccountRef_ImplicitAccount{
-								ImplicitAccount: &protobufs.ImplicitAccount{
-									ImplicitType: 0,
-									Address:      addr.FillBytes(make([]byte, 32)),
+					if !v {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
+
+					wp := []byte{}
+					wp = append(wp, peerId...)
+					wp = append(wp, input...)
+					v = wesoProver.VerifyPreDuskChallengeProof(
+						wp,
+						increment,
+						index,
+						indexProof,
+					)
+					if !v {
+						if !skipFailures {
+							return nil, nil, nil, errors.Wrap(
+								errors.New("invalid data"),
+								"apply transitions",
+							)
+						}
+						failedTransitions.Requests = append(
+							failedTransitions.Requests,
+							transition,
+						)
+						break req
+					}
+
+					pomwBasis := big.NewInt(1200000)
+
+					reward := new(big.Int).Mul(pomwBasis, big.NewInt(int64(parallelism)))
+					if len(delete) != 0 {
+						reward.Add(
+							reward,
+							new(big.Int).SetBytes(delete[0].GetDeletedProof().Amount),
+						)
+					}
+
+					if increment != 0 {
+						add := &protobufs.PreCoinProof{
+							Amount:      reward.FillBytes(make([]byte, 32)),
+							Index:       index,
+							IndexProof:  indexProof,
+							Commitment:  kzgCommitment,
+							Proof:       append(append([]byte{}, kzgProof...), indexProof...),
+							Parallelism: parallelism,
+							Difficulty:  increment,
+							Owner: &protobufs.AccountRef{
+								Account: &protobufs.AccountRef_ImplicitAccount{
+									ImplicitAccount: &protobufs.ImplicitAccount{
+										ImplicitType: 0,
+										Address:      addr.FillBytes(make([]byte, 32)),
+									},
 								},
 							},
-						},
+						}
+						outputs.Outputs = append(outputs.Outputs, &protobufs.TokenOutput{
+							Output: &protobufs.TokenOutput_Proof{
+								Proof: add,
+							},
+						})
+					} else {
+						add := &protobufs.Coin{
+							Amount:       reward.FillBytes(make([]byte, 32)),
+							Intersection: make([]byte, 1024),
+							Owner: &protobufs.AccountRef{
+								Account: &protobufs.AccountRef_ImplicitAccount{
+									ImplicitAccount: &protobufs.ImplicitAccount{
+										ImplicitType: 0,
+										Address:      addr.FillBytes(make([]byte, 32)),
+									},
+								},
+							},
+						}
+						outputs.Outputs = append(outputs.Outputs, &protobufs.TokenOutput{
+							Output: &protobufs.TokenOutput_Coin{
+								Coin: add,
+							},
+						})
 					}
-					outputs.Outputs = append(outputs.Outputs, &protobufs.TokenOutput{
-						Output: &protobufs.TokenOutput_Proof{
-							Proof: add,
-						},
-					})
+					outputs.Outputs = append(outputs.Outputs, delete...)
 				} else {
-					add := &protobufs.Coin{
-						Amount:       reward.FillBytes(make([]byte, 32)),
-						Intersection: make([]byte, 1024),
-						Owner: &protobufs.AccountRef{
-							Account: &protobufs.AccountRef_ImplicitAccount{
-								ImplicitAccount: &protobufs.ImplicitAccount{
-									ImplicitType: 0,
-									Address:      addr.FillBytes(make([]byte, 32)),
-								},
-							},
-						},
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							errors.New("invalid data"),
+							"apply transitions",
+						)
 					}
-					outputs.Outputs = append(outputs.Outputs, &protobufs.TokenOutput{
-						Output: &protobufs.TokenOutput_Coin{
-							Coin: add,
-						},
-					})
+					failedTransitions.Requests = append(
+						failedTransitions.Requests,
+						transition,
+					)
+					break req
 				}
-				outputs.Outputs = append(outputs.Outputs, delete...)
-			} else {
+			}
+		case *protobufs.TokenRequest_Merge:
+			newCoin := &protobufs.Coin{}
+			newTotal := new(big.Int)
+			newIntersection := make([]byte, 1024)
+			payload := []byte("merge")
+			if t.Merge == nil || t.Merge.Coins == nil || t.Merge.Signature == nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						errors.New("invalid data"),
+						ErrInvalidStateTransition,
 						"apply transitions",
 					)
 				}
@@ -450,13 +501,35 @@ func (a *TokenApplication) ApplyTransitions(
 				)
 				break req
 			}
-		case *protobufs.TokenRequest_Merge:
-			newCoin := &protobufs.Coin{}
-			newTotal := new(big.Int)
-			newIntersection := make([]byte, 1024)
-			payload := []byte("merge")
 			for _, c := range t.Merge.Coins {
+				if c.Address == nil {
+					if !skipFailures {
+						return nil, nil, nil, errors.Wrap(
+							ErrInvalidStateTransition,
+							"apply transitions",
+						)
+					}
+					failedTransitions.Requests = append(
+						failedTransitions.Requests,
+						transition,
+					)
+					break req
+				}
 				payload = append(payload, c.Address...)
+			}
+			if t.Merge.Signature.PublicKey == nil ||
+				t.Merge.Signature.Signature == nil {
+				if !skipFailures {
+					return nil, nil, nil, errors.Wrap(
+						ErrInvalidStateTransition,
+						"apply transitions",
+					)
+				}
+				failedTransitions.Requests = append(
+					failedTransitions.Requests,
+					transition,
+				)
+				break req
 			}
 			if err := t.Merge.Signature.Verify(payload); err != nil {
 				if !skipFailures {
@@ -596,6 +669,21 @@ func (a *TokenApplication) ApplyTransitions(
 			newCoins := []*protobufs.Coin{}
 			newAmounts := []*big.Int{}
 			payload := []byte{}
+			if t.Split.Signature.PublicKey == nil ||
+				t.Split.Signature.Signature == nil ||
+				t.Split.OfCoin == nil {
+				if !skipFailures {
+					return nil, nil, nil, errors.Wrap(
+						ErrInvalidStateTransition,
+						"apply transitions",
+					)
+				}
+				failedTransitions.Requests = append(
+					failedTransitions.Requests,
+					transition,
+				)
+				break req
+			}
 			coin, err := a.CoinStore.GetCoinByAddress(t.Split.OfCoin.Address)
 			if err != nil && !skipFailures {
 				if !skipFailures {
@@ -903,6 +991,21 @@ func (a *TokenApplication) ApplyTransitions(
 				transition,
 			)
 		case *protobufs.TokenRequest_Mint:
+			if t.Mint.Signature == nil || t.Mint.Signature.PublicKey == nil ||
+				t.Mint.Signature.Signature == nil ||
+				t.Mint.Proofs == nil {
+				if !skipFailures {
+					return nil, nil, nil, errors.Wrap(
+						ErrInvalidStateTransition,
+						"apply transitions",
+					)
+				}
+				failedTransitions.Requests = append(
+					failedTransitions.Requests,
+					transition,
+				)
+				break req
+			}
 			payload := []byte("mint")
 			for _, p := range t.Mint.Proofs {
 				payload = append(payload, p...)
@@ -971,7 +1074,7 @@ func (a *TokenApplication) ApplyTransitions(
 				bytes.Equal(
 					t.Mint.Proofs[0],
 					[]byte("pre-dusk"),
-				) && (bytes.Equal(t.Mint.Proofs[1], make([]byte, 32)) ||
+				) && (!bytes.Equal(t.Mint.Proofs[1], make([]byte, 32)) ||
 				currentFrameNumber < 604800) {
 				delete := []*protobufs.TokenOutput{}
 				if !bytes.Equal(t.Mint.Proofs[1], make([]byte, 32)) {

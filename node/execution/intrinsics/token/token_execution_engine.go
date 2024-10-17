@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,20 +80,7 @@ func NewTokenExecutionEngine(
 		panic(errors.New("logger is nil"))
 	}
 
-	var genesis *config.SignedGenesisUnlock
-	var err error
-	for {
-		genesis, err = config.DownloadAndVerifyGenesis()
-		if err != nil {
-			gotime.Sleep(10 * gotime.Minute)
-		}
-
-		if genesis != nil {
-			break
-		}
-	}
-
-	seed, err := hex.DecodeString(genesis.GenesisSeedHex)
+	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
 	if err != nil {
 		panic(err)
 	}
@@ -186,9 +174,9 @@ func NewTokenExecutionEngine(
 
 	if genesisCreated {
 		go func() {
-			if len(e.engineConfig.MultisigProverEnrollmentPaths) != 0 && genesisCreated {
-				keys := [][]byte{}
-				ksigs := [][]byte{}
+			keys := [][]byte{}
+			ksigs := [][]byte{}
+			if len(e.engineConfig.MultisigProverEnrollmentPaths) != 0 {
 				for _, conf := range e.engineConfig.MultisigProverEnrollmentPaths {
 					extraConf, err := config.LoadConfig(conf, "", false)
 					if err != nil {
@@ -218,92 +206,115 @@ func NewTokenExecutionEngine(
 					}
 					ksigs = append(ksigs, sig)
 				}
+			}
 
-				keyjoin := []byte{}
-				for _, k := range keys {
-					keyjoin = append(keyjoin, k...)
-				}
+			keyjoin := []byte{}
+			for _, k := range keys {
+				keyjoin = append(keyjoin, k...)
+			}
 
-				mainsig, err := e.pubSub.SignMessage(keyjoin)
-				if err != nil {
-					panic(err)
-				}
+			mainsig, err := e.pubSub.SignMessage(keyjoin)
+			if err != nil {
+				panic(err)
+			}
 
-				announce := &protobufs.TokenRequest_Announce{
-					Announce: &protobufs.AnnounceProverRequest{
-						PublicKeySignaturesEd448: []*protobufs.Ed448Signature{},
+			announce := &protobufs.TokenRequest_Announce{
+				Announce: &protobufs.AnnounceProverRequest{
+					PublicKeySignaturesEd448: []*protobufs.Ed448Signature{},
+				},
+			}
+
+			announce.Announce.PublicKeySignaturesEd448 = append(
+				announce.Announce.PublicKeySignaturesEd448,
+				&protobufs.Ed448Signature{
+					PublicKey: &protobufs.Ed448PublicKey{
+						KeyValue: e.pubSub.GetPublicKey(),
 					},
-				}
+					Signature: mainsig,
+				},
+			)
 
+			for i := range keys {
 				announce.Announce.PublicKeySignaturesEd448 = append(
 					announce.Announce.PublicKeySignaturesEd448,
 					&protobufs.Ed448Signature{
 						PublicKey: &protobufs.Ed448PublicKey{
-							KeyValue: e.pubSub.GetPublicKey(),
+							KeyValue: keys[i],
 						},
-						Signature: mainsig,
+						Signature: ksigs[i],
 					},
 				)
+			}
 
-				for i := range keys {
-					announce.Announce.PublicKeySignaturesEd448 = append(
-						announce.Announce.PublicKeySignaturesEd448,
-						&protobufs.Ed448Signature{
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: keys[i],
-							},
-							Signature: ksigs[i],
-						},
-					)
+			inc, _, _, err := dataProofStore.GetLatestDataTimeProof(
+				e.pubSub.GetPeerID(),
+			)
+			_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
+				e.pubSub.GetPeerID(),
+				inc,
+			)
+			if err == nil {
+				proof := []byte{}
+				proof = binary.BigEndian.AppendUint32(proof, inc)
+				proof = binary.BigEndian.AppendUint32(proof, parallelism)
+				proof = binary.BigEndian.AppendUint64(proof, uint64(len(input)))
+				proof = append(proof, input...)
+				proof = binary.BigEndian.AppendUint64(proof, uint64(len(output)))
+				proof = append(proof, output...)
+				announce.Announce.InitialProof.Proofs = [][]byte{
+					[]byte("pre-dusk"),
+					make([]byte, 32),
+					proof,
 				}
-
-				inc, _, _, err := dataProofStore.GetLatestDataTimeProof(
-					e.pubSub.GetPeerID(),
-				)
-				_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
-					e.pubSub.GetPeerID(),
-					inc,
-				)
-				if err == nil {
-					proof := []byte{}
-					proof = binary.BigEndian.AppendUint32(proof, inc)
-					proof = binary.BigEndian.AppendUint32(proof, parallelism)
-					proof = binary.BigEndian.AppendUint64(proof, uint64(len(input)))
-					proof = append(proof, input...)
-					proof = binary.BigEndian.AppendUint64(proof, uint64(len(output)))
-					proof = append(proof, output...)
-					announce.Announce.InitialProof.Proofs = [][]byte{
-						[]byte("pre-dusk"),
-						make([]byte, 32),
-						proof,
-					}
-					payload := []byte("mint")
-					for _, p := range announce.Announce.InitialProof.Proofs {
-						payload = append(payload, p...)
-					}
-					sig, err := e.pubSub.SignMessage(payload)
-					if err != nil {
-						panic(err)
-					}
-
-					announce.Announce.InitialProof.Signature = &protobufs.Ed448Signature{
-						PublicKey: &protobufs.Ed448PublicKey{
-							KeyValue: e.pubSub.GetPublicKey(),
-						},
-						Signature: sig,
-					}
+				payload := []byte("mint")
+				for _, p := range announce.Announce.InitialProof.Proofs {
+					payload = append(payload, p...)
 				}
-
-				req := &protobufs.TokenRequest{
-					Request: announce,
-				}
-
-				err = e.publishMessage(intrinsicFilter, req)
+				sig, err := e.pubSub.SignMessage(payload)
 				if err != nil {
 					panic(err)
 				}
+
+				announce.Announce.InitialProof.Signature = &protobufs.Ed448Signature{
+					PublicKey: &protobufs.Ed448PublicKey{
+						KeyValue: e.pubSub.GetPublicKey(),
+					},
+					Signature: sig,
+				}
 			}
+
+			req := &protobufs.TokenRequest{
+				Request: announce,
+			}
+
+			// need to wait for peering
+			gotime.Sleep(30 * gotime.Second)
+			e.publishMessage(intrinsicFilter, req)
 		}()
+	} else {
+		f, _, err := e.clockStore.GetLatestDataClockFrame(e.intrinsicFilter)
+		if err == nil {
+			msg := []byte("resume")
+			msg = binary.BigEndian.AppendUint64(msg, f.FrameNumber)
+			msg = append(msg, e.intrinsicFilter...)
+			sig, err := e.pubSub.SignMessage(msg)
+			if err != nil {
+				panic(err)
+			}
+
+			// need to wait for peering
+			gotime.Sleep(30 * gotime.Second)
+			e.publishMessage(e.intrinsicFilter, &protobufs.AnnounceProverResume{
+				Filter:      e.intrinsicFilter,
+				FrameNumber: f.FrameNumber,
+				PublicKeySignatureEd448: &protobufs.Ed448Signature{
+					PublicKey: &protobufs.Ed448PublicKey{
+						KeyValue: e.pubSub.GetPublicKey(),
+					},
+					Signature: sig,
+				},
+			})
+		}
 	}
 
 	inc, _, _, err := dataProofStore.GetLatestDataTimeProof(pubSub.GetPeerID())
@@ -459,13 +470,9 @@ func CreateGenesisState(
 	[][]byte,
 	map[string]uint64,
 ) {
-	genesis, err := config.DownloadAndVerifyGenesis()
-	if err != nil {
-		panic(err)
-	}
-
-	if err != nil {
-		panic(errors.New("genesis seed is nil"))
+	genesis := config.GetGenesis()
+	if genesis == nil {
+		panic("genesis is nil")
 	}
 
 	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
@@ -474,13 +481,17 @@ func CreateGenesisState(
 	}
 
 	logger.Info("creating genesis frame from message:")
-	for _, l := range strings.Split(string(seed), "\n") {
-		logger.Info(l)
+	for i, l := range strings.Split(string(seed), "|") {
+		if i == 0 {
+			logger.Info(l)
+		} else {
+			logger.Info(fmt.Sprintf("Blockstamp ending in 0x%x", l))
+		}
 	}
 
 	difficulty := engineConfig.Difficulty
-	if difficulty != 100000 {
-		difficulty = 100000
+	if difficulty != 200000 {
+		difficulty = 200000
 	}
 
 	b := sha3.Sum256(seed)
@@ -531,6 +542,7 @@ func CreateGenesisState(
 
 	bridgedAddrs := map[string]struct{}{}
 
+	logger.Info("encoding bridged token state")
 	bridgeTotal := decimal.Zero
 	for _, b := range bridged {
 		amt, err := decimal.NewFromString(b.Amount)
@@ -544,6 +556,7 @@ func CreateGenesisState(
 	voucherTotals := map[string]decimal.Decimal{}
 	peerIdTotals := map[string]decimal.Decimal{}
 	peerSeniority := map[string]uint64{}
+	logger.Info("encoding first retro state")
 	for _, f := range firstRetro {
 		if _, ok := bridgedAddrs[f.PeerId]; !ok {
 			peerIdTotals[f.PeerId], err = decimal.NewFromString(f.Reward)
@@ -562,12 +575,14 @@ func CreateGenesisState(
 		peerSeniority[f.PeerId] = uint64(10 * 6 * 60 * 24 * 92 / (max / actual))
 	}
 
+	logger.Info("encoding voucher state")
 	for _, v := range vouchers {
 		if _, ok := bridgedAddrs[v]; !ok {
 			voucherTotals[v] = decimal.NewFromInt(50)
 		}
 	}
 
+	logger.Info("encoding second retro state")
 	for _, f := range secondRetro {
 		if _, ok := bridgedAddrs[f.PeerId]; !ok {
 			existing, ok := peerIdTotals[f.PeerId]
@@ -609,6 +624,7 @@ func CreateGenesisState(
 		}
 	}
 
+	logger.Info("encoding third retro state")
 	for _, f := range thirdRetro {
 		existing, ok := peerIdTotals[f.PeerId]
 
@@ -630,6 +646,7 @@ func CreateGenesisState(
 		peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 30)
 	}
 
+	logger.Info("encoding fourth retro state")
 	for _, f := range fourthRetro {
 		existing, ok := peerIdTotals[f.PeerId]
 
@@ -661,6 +678,14 @@ func CreateGenesisState(
 		panic(err)
 	}
 
+	totalExecutions := 0
+	logger.Info(
+		"creating execution state",
+		zap.Int(
+			"coin_executions",
+			totalExecutions,
+		),
+	)
 	genesisState.Outputs = append(genesisState.Outputs, &protobufs.TokenOutput{
 		Output: &protobufs.TokenOutput_Coin{
 			Coin: &protobufs.Coin{
@@ -678,8 +703,18 @@ func CreateGenesisState(
 			},
 		},
 	})
+	totalExecutions++
 
 	for peerId, total := range peerIdTotals {
+		if totalExecutions%1000 == 0 {
+			logger.Info(
+				"creating execution state",
+				zap.Int(
+					"coin_executions",
+					totalExecutions,
+				),
+			)
+		}
 		peerBytes, err := base58.Decode(peerId)
 		if err != nil {
 			panic(err)
@@ -707,9 +742,19 @@ func CreateGenesisState(
 				},
 			},
 		})
+		totalExecutions++
 	}
 
 	for voucher, total := range voucherTotals {
+		if totalExecutions%1000 == 0 {
+			logger.Info(
+				"creating execution state",
+				zap.Int(
+					"coin_executions",
+					totalExecutions,
+				),
+			)
+		}
 		keyBytes, err := hex.DecodeString(voucher[2:])
 		if err != nil {
 			panic(err)
@@ -737,10 +782,18 @@ func CreateGenesisState(
 				},
 			},
 		})
+		totalExecutions++
 	}
 
+	logger.Info(
+		"serializing execution state to store, this may take some time...",
+		zap.Int(
+			"coin_executions",
+			totalExecutions,
+		),
+	)
+	txn, err := coinStore.NewTransaction()
 	for _, output := range genesisState.Outputs {
-		txn, err := coinStore.NewTransaction()
 		if err != nil {
 			panic(err)
 		}
@@ -758,9 +811,9 @@ func CreateGenesisState(
 		if err != nil {
 			panic(err)
 		}
-		if err := txn.Commit(); err != nil {
-			panic(err)
-		}
+	}
+	if err := txn.Commit(); err != nil {
+		panic(err)
 	}
 
 	logger.Info("encoded transcript")
@@ -826,7 +879,7 @@ func CreateGenesisState(
 		},
 		AggregateCommitment: commitment,
 		Proof:               proof,
-	}, [][]byte{genesis.Beacon}, peerSeniority
+	}, [][]byte{genesis.Beacon}, map[string]uint64{}
 }
 
 func GetAddressOfCoin(
@@ -1001,14 +1054,15 @@ func (e *TokenExecutionEngine) RunWorker() {
 				)
 				panic(err)
 			}
+
+			txn, err := e.coinStore.NewTransaction()
+			if err != nil {
+				panic(err)
+			}
+
 			for _, output := range app.TokenOutputs.Outputs {
 				switch o := output.Output.(type) {
 				case *protobufs.TokenOutput_Coin:
-					txn, err := e.coinStore.NewTransaction()
-					if err != nil {
-						panic(err)
-					}
-
 					address, err := GetAddressOfCoin(o.Coin, frame.FrameNumber)
 					if err != nil {
 						panic(err)
@@ -1022,15 +1076,7 @@ func (e *TokenExecutionEngine) RunWorker() {
 					if err != nil {
 						panic(err)
 					}
-					if err := txn.Commit(); err != nil {
-						panic(err)
-					}
 				case *protobufs.TokenOutput_DeletedCoin:
-					txn, err := e.coinStore.NewTransaction()
-					if err != nil {
-						panic(err)
-					}
-
 					coin, err := e.coinStore.GetCoinByAddress(o.DeletedCoin.Address)
 					if err != nil {
 						panic(err)
@@ -1043,15 +1089,7 @@ func (e *TokenExecutionEngine) RunWorker() {
 					if err != nil {
 						panic(err)
 					}
-					if err := txn.Commit(); err != nil {
-						panic(err)
-					}
 				case *protobufs.TokenOutput_Proof:
-					txn, err := e.coinStore.NewTransaction()
-					if err != nil {
-						panic(err)
-					}
-
 					address, err := GetAddressOfPreCoinProof(o.Proof)
 					if err != nil {
 						panic(err)
@@ -1065,15 +1103,7 @@ func (e *TokenExecutionEngine) RunWorker() {
 					if err != nil {
 						panic(err)
 					}
-					if err := txn.Commit(); err != nil {
-						panic(err)
-					}
 				case *protobufs.TokenOutput_DeletedProof:
-					txn, err := e.coinStore.NewTransaction()
-					if err != nil {
-						panic(err)
-					}
-
 					address, err := GetAddressOfPreCoinProof(o.DeletedProof)
 					if err != nil {
 						panic(err)
@@ -1086,10 +1116,11 @@ func (e *TokenExecutionEngine) RunWorker() {
 					if err != nil {
 						panic(err)
 					}
-					if err := txn.Commit(); err != nil {
-						panic(err)
-					}
 				}
+			}
+
+			if err := txn.Commit(); err != nil {
+				panic(err)
 			}
 		}
 	}

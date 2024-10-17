@@ -159,14 +159,14 @@ func (e *MasterClockConsensusEngine) handleSelfTestReport(
 func (e *MasterClockConsensusEngine) publishProof(
 	frame *protobufs.ClockFrame,
 ) error {
-	e.logger.Debug(
-		"publishing frame",
-		zap.Uint64("frame_number", frame.FrameNumber),
-	)
-
-	e.masterTimeReel.Insert(frame, false)
-
 	if bytes.Equal(e.pubSub.GetPeerID(), []byte(e.beacon)) {
+		e.logger.Debug(
+			"publishing frame",
+			zap.Uint64("frame_number", frame.FrameNumber),
+		)
+
+		e.masterTimeReel.Insert(frame, false)
+
 		err := e.publishMessage(e.filter, frame)
 		if err != nil {
 			return errors.Wrap(err, "publish proof")
