@@ -5,11 +5,12 @@ import (
 	"errors"
 	"math/big"
 	"sync"
-	"time"
 
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
@@ -53,7 +54,9 @@ func NewMasterTimeReel(
 		panic("frame prover is nil")
 	}
 
-	filter, err := hex.DecodeString(engineConfig.Filter)
+	filter, err := hex.DecodeString(
+		"0000000000000000000000000000000000000000000000000000000000000000",
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -74,32 +77,26 @@ func NewMasterTimeReel(
 
 // Start implements TimeReel.
 func (m *MasterTimeReel) Start() error {
+	m.logger.Debug("starting master time reel")
 	frame, err := m.clockStore.GetLatestMasterClockFrame(m.filter)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		panic(err)
 	}
 
+	m.logger.Debug("fetching genesis frame")
 	genesis, err := m.clockStore.GetMasterClockFrame(m.filter, 0)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		panic(err)
 	}
 
-	for {
-		genesis, err := config.DownloadAndVerifyGenesis()
-		if err != nil {
-			time.Sleep(10 * time.Minute)
-			continue
-		}
-
-		m.engineConfig.GenesisSeed = genesis.GenesisSeedHex
-		break
-	}
-
 	rebuildGenesisFrame := false
-	if genesis != nil && len(m.engineConfig.GenesisSeed) != 74 {
-		m.logger.Warn("rebuilding genesis frame")
+	if genesis != nil && genesis.Difficulty != 1000000 {
+		m.logger.Info("rewinding time reel to genesis")
 
 		err = m.clockStore.ResetMasterClockFrames(m.filter)
+		err = m.clockStore.ResetDataClockFrames(
+			p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3),
+		)
 		if err != nil {
 			panic(err)
 		}
@@ -107,7 +104,8 @@ func (m *MasterTimeReel) Start() error {
 		rebuildGenesisFrame = true
 	}
 
-	if frame == nil || rebuildGenesisFrame {
+	if genesis == nil || rebuildGenesisFrame {
+		m.logger.Info("creating genesis frame")
 		m.head = m.createGenesisFrame()
 	} else {
 		m.head = frame
@@ -158,8 +156,8 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 	}
 
 	difficulty := m.engineConfig.Difficulty
-	if difficulty != 10000000 {
-		difficulty = 10000000
+	if difficulty != 1000000 {
+		difficulty = 1000000
 	}
 
 	frame, err := m.frameProver.CreateMasterGenesisFrame(

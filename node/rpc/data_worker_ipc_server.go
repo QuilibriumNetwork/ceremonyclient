@@ -3,15 +3,20 @@ package rpc
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"os"
 	"runtime"
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/sha3"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
@@ -147,7 +152,7 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 
 	if !found {
 		return nil, errors.Wrap(
-			errors.New("no applicable challenge"),
+			data.ErrNoApplicableChallenge,
 			"calculate challenge proof",
 		)
 	}
@@ -169,13 +174,42 @@ func NewDataWorkerIPCServer(
 	logger *zap.Logger,
 	coreId uint32,
 	prover crypto.FrameProver,
+	config *config.Config,
 	parentProcessId int,
 ) (*DataWorkerIPCServer, error) {
+	peerPrivKey, err := hex.DecodeString(config.P2P.PeerPrivKey)
+	if err != nil {
+		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+	}
+
+	privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
+	if err != nil {
+		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+	}
+
+	pub := privKey.GetPublic()
+
+	pubKey, err := pub.Raw()
+	if err != nil {
+		panic(err)
+	}
+
+	digest := make([]byte, 128)
+	s := sha3.NewShake256()
+	s.Write([]byte(pubKey))
+	_, err = s.Read(digest)
+	if err != nil {
+		panic(err)
+	}
+
 	return &DataWorkerIPCServer{
-		listenAddrGRPC:  listenAddrGRPC,
-		logger:          logger,
-		coreId:          coreId,
-		prover:          prover,
+		listenAddrGRPC: listenAddrGRPC,
+		logger:         logger,
+		coreId:         coreId,
+		prover:         prover,
+		indices: []int{
+			p2p.GetOnesIndices(p2p.GetBloomFilter(digest, 1024, 64))[coreId%64],
+		},
 		parentProcessId: parentProcessId,
 	}, nil
 }

@@ -280,6 +280,9 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 func (e *DataClockConsensusEngine) getAddressFromSignature(
 	sig *protobufs.Ed448Signature,
 ) ([]byte, error) {
+	if sig.PublicKey == nil || sig.PublicKey.KeyValue == nil {
+		return nil, errors.New("invalid data")
+	}
 	addrBI, err := poseidon.HashBytes(sig.PublicKey.KeyValue)
 	if err != nil {
 		return nil, errors.Wrap(err, "get address from signature")
@@ -298,8 +301,22 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverJoin(
 		return errors.Wrap(err, "handle data announce prover join")
 	}
 
+	if announce.PublicKeySignatureEd448 == nil || announce.Filter == nil {
+		return errors.Wrap(
+			errors.New("invalid data"),
+			"handle data announce prover join",
+		)
+	}
+
 	address, err := e.getAddressFromSignature(announce.PublicKeySignatureEd448)
 	if err != nil {
+		return errors.Wrap(err, "handle data announce prover join")
+	}
+
+	msg := []byte("join")
+	msg = binary.BigEndian.AppendUint64(msg, announce.FrameNumber)
+	msg = append(msg, announce.Filter...)
+	if err := announce.GetPublicKeySignatureEd448().Verify(msg); err != nil {
 		return errors.Wrap(err, "handle data announce prover join")
 	}
 
@@ -325,12 +342,28 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverLeave(
 	if err := any.UnmarshalTo(announce); err != nil {
 		return errors.Wrap(err, "handle data announce prover leave")
 	}
+
+	if announce.PublicKeySignatureEd448 == nil || announce.Filter == nil {
+		return errors.Wrap(
+			errors.New("invalid data"),
+			"handle data announce prover leave",
+		)
+	}
+
 	e.proverTrieRequestsMx.Lock()
+
 	if len(announce.Filter) != len(e.filter) {
 		return errors.Wrap(
 			errors.New("filter width mismatch"),
 			"handle data announce prover leave",
 		)
+	}
+
+	msg := []byte("leave")
+	msg = binary.BigEndian.AppendUint64(msg, announce.FrameNumber)
+	msg = append(msg, announce.Filter...)
+	if err := announce.GetPublicKeySignatureEd448().Verify(msg); err != nil {
+		return errors.Wrap(err, "handle data announce prover leave")
 	}
 
 	address, err := e.getAddressFromSignature(announce.PublicKeySignatureEd448)
@@ -353,6 +386,13 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverPause(
 		return errors.Wrap(err, "handle data announce prover pause")
 	}
 
+	if announce.PublicKeySignatureEd448 == nil || announce.Filter == nil {
+		return errors.Wrap(
+			errors.New("invalid data"),
+			"handle data announce prover leave",
+		)
+	}
+
 	e.proverTrieRequestsMx.Lock()
 	if len(announce.Filter) != len(e.filter) {
 		return errors.Wrap(
@@ -361,12 +401,19 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverPause(
 		)
 	}
 
+	msg := []byte("pause")
+	msg = binary.BigEndian.AppendUint64(msg, announce.FrameNumber)
+	msg = append(msg, announce.Filter...)
+	if err := announce.GetPublicKeySignatureEd448().Verify(msg); err != nil {
+		return errors.Wrap(err, "handle data announce prover pause")
+	}
+
 	address, err := e.getAddressFromSignature(announce.PublicKeySignatureEd448)
 	if err != nil {
 		return errors.Wrap(err, "handle data announce prover pause")
 	}
 
-	e.proverTrieLeaveRequests[string(address)] = string(announce.Filter)
+	e.proverTriePauseRequests[string(address)] = string(announce.Filter)
 	e.proverTrieRequestsMx.Unlock()
 	return nil
 }
@@ -379,6 +426,13 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverResume(
 	announce := &protobufs.AnnounceProverResume{}
 	if err := any.UnmarshalTo(announce); err != nil {
 		return errors.Wrap(err, "handle data announce prover resume")
+	}
+
+	if announce.PublicKeySignatureEd448 == nil || announce.Filter == nil {
+		return errors.Wrap(
+			errors.New("invalid data"),
+			"handle data announce prover resume",
+		)
 	}
 
 	e.proverTrieRequestsMx.Lock()
@@ -394,7 +448,14 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverResume(
 		return errors.Wrap(err, "handle data announce prover resume")
 	}
 
-	e.proverTrieLeaveRequests[string(address)] = string(announce.Filter)
+	msg := []byte("resume")
+	msg = binary.BigEndian.AppendUint64(msg, announce.FrameNumber)
+	msg = append(msg, announce.Filter...)
+	if err := announce.GetPublicKeySignatureEd448().Verify(msg); err != nil {
+		return errors.Wrap(err, "handle data announce prover resume")
+	}
+
+	e.proverTrieResumeRequests[string(address)] = string(announce.Filter)
 	e.proverTrieRequestsMx.Unlock()
 	return nil
 }

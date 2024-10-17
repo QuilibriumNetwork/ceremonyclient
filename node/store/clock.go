@@ -764,7 +764,7 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 	}
 
 	frameNumber := binary.BigEndian.Uint64(idxValue)
-	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
+	frame, tries, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, nil, ErrNotFound
@@ -775,29 +775,7 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 
 	closer.Close()
 
-	proverTries := []*tries.RollingFrecencyCritbitTrie{}
-	i := uint16(0)
-	for {
-		proverTrie := &tries.RollingFrecencyCritbitTrie{}
-		trieData, closer, err := p.db.Get(clockProverTrieKey(filter, i, frameNumber))
-		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
-				break
-			}
-
-			return nil, nil, errors.Wrap(err, "get latest data clock frame")
-		}
-
-		if err := proverTrie.Deserialize(trieData); err != nil {
-			closer.Close()
-			return nil, nil, errors.Wrap(err, "get latest data clock frame")
-		}
-		closer.Close()
-		proverTries = append(proverTries, proverTrie)
-		i++
-	}
-
-	return frame, proverTries, nil
+	return frame, tries, nil
 }
 
 // GetStagedDataClockFrame implements ClockStore.

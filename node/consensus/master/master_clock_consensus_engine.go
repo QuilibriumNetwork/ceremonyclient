@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -69,7 +70,7 @@ type MasterClockConsensusEngine struct {
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
 
-var MASTER_CLOCK_RATE = uint32(10000000)
+var MASTER_CLOCK_RATE = uint32(1000000)
 
 func NewMasterClockConsensusEngine(
 	engineConfig *config.EngineConfig,
@@ -167,26 +168,19 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateLoading
 	e.logger.Info("syncing last seen state")
 
-	var genesis *config.SignedGenesisUnlock
-	var err error
-
-	for {
-		genesis, err := config.DownloadAndVerifyGenesis()
-		if err != nil {
-			time.Sleep(10 * time.Minute)
-			continue
-		}
-
-		e.engineConfig.GenesisSeed = genesis.GenesisSeedHex
-		break
-	}
-
-	err = e.masterTimeReel.Start()
+	err := e.masterTimeReel.Start()
 	if err != nil {
 		panic(err)
 	}
 
-	e.beacon, err = peer.IDFromBytes(genesis.Beacon)
+	beaconPubKey, err := pcrypto.UnmarshalEd448PublicKey(
+		config.GetGenesis().Beacon,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	e.beacon, err = peer.IDFromPublicKey(beaconPubKey)
 	if err != nil {
 		panic(err)
 	}
@@ -196,6 +190,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 		panic(err)
 	}
 
+	e.logger.Info("building historic frame cache")
 	e.buildHistoricFrameCache(frame)
 
 	go func() {
