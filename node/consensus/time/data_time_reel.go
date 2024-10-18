@@ -277,71 +277,128 @@ func (d *DataTimeReel) runLoop() {
 	for {
 		select {
 		case frame := <-d.frames:
+			rawFrame, err := d.clockStore.GetStagedDataClockFrame(
+				d.filter,
+				frame.frameNumber,
+				frame.selector.FillBytes(make([]byte, 32)),
+				false,
+			)
+			if err != nil {
+				panic(err)
+			}
+			d.logger.Debug(
+				"processing frame",
+				zap.Uint64("frame_number", rawFrame.FrameNumber),
+				zap.String("output_tag", hex.EncodeToString(rawFrame.Output[:64])),
+				zap.Uint64("head_number", d.head.FrameNumber),
+				zap.String("head_output_tag", hex.EncodeToString(d.head.Output[:64])),
+			)
 			// Most common scenario: in order – new frame is higher number
-			if d.head.FrameNumber < frame.frameNumber {
-				d.logger.Debug(
-					"frame is higher",
-					zap.Uint64("head_frame_number", d.head.FrameNumber),
-					zap.Uint64("frame_number", frame.frameNumber),
-				)
+			if d.head.FrameNumber < rawFrame.FrameNumber {
+				d.logger.Debug("frame is higher")
 
-				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
-					d.filter,
-					frame.frameNumber,
-					frame.selector.FillBytes(make([]byte, 32)),
-					false,
-				)
+				parent := new(big.Int).SetBytes(rawFrame.ParentSelector)
+				selector, err := rawFrame.GetSelector()
 				if err != nil {
 					panic(err)
 				}
 
 				distance, err := d.GetDistance(rawFrame)
 				if err != nil {
-					panic(err)
+					if !errors.Is(err, store.ErrNotFound) {
+						panic(err)
+					}
+
+					d.addPending(selector, parent, frame.frameNumber)
+					d.processPending(d.head, frame)
+					continue
 				}
 
-				// Otherwise set it as the next and process all pending
-				d.setHead(rawFrame, distance)
-			} else if d.head.FrameNumber == frame.frameNumber {
-				// frames are equivalent, no need to act
 				headSelector, err := d.head.GetSelector()
 				if err != nil {
 					panic(err)
 				}
 
-				if headSelector.Cmp(frame.selector) == 0 {
-					d.logger.Debug("equivalent frame")
+				// If the frame has a gap from the head or is not descendent, mark it as
+				// pending:
+				if rawFrame.FrameNumber-d.head.FrameNumber != 1 {
+					d.logger.Debug(
+						"frame has has gap, fork choice",
+						zap.Bool("has_gap", rawFrame.FrameNumber-d.head.FrameNumber != 1),
+						zap.String("parent_selector", parent.Text(16)),
+						zap.String("head_selector", headSelector.Text(16)),
+					)
+
+					d.forkChoice(rawFrame, distance)
+					d.processPending(d.head, frame)
 					continue
 				}
 
-				rawFrame, err := d.clockStore.GetStagedDataClockFrame(
-					d.filter,
-					frame.frameNumber,
-					frame.selector.FillBytes(make([]byte, 32)),
-					false,
-				)
-				if err != nil {
-					panic(err)
+				// Otherwise set it as the next and process all pending
+				d.setHead(rawFrame, distance)
+				d.processPending(d.head, frame)
+			} else if d.head.FrameNumber == rawFrame.FrameNumber {
+				// frames are equivalent, no need to act
+				if bytes.Equal(d.head.Output, rawFrame.Output) {
+					d.logger.Debug("equivalent frame")
+					d.processPending(d.head, frame)
+					continue
 				}
 
 				distance, err := d.GetDistance(rawFrame)
 				if err != nil {
 					panic(err)
 				}
+				d.logger.Debug(
+					"frame is same height",
+					zap.String("head_distance", d.headDistance.Text(16)),
+					zap.String("distance", distance.Text(16)),
+				)
 
 				// Optimization: if competing frames share a parent we can short-circuit
 				// fork choice
-				if new(big.Int).SetBytes(d.head.ParentSelector).Cmp(
-					frame.parentSelector,
-				) == 0 && distance.Cmp(d.headDistance) < 0 {
+				if bytes.Equal(d.head.ParentSelector, rawFrame.ParentSelector) &&
+					distance.Cmp(d.headDistance) < 0 {
 					d.logger.Debug(
 						"frame shares parent, has shorter distance, short circuit",
 					)
+					d.totalDistance.Sub(d.totalDistance, d.headDistance)
 					d.setHead(rawFrame, distance)
+					d.processPending(d.head, frame)
 					continue
 				}
+
+				// Choose fork
+				d.forkChoice(rawFrame, distance)
+				d.processPending(d.head, frame)
 			} else {
 				d.logger.Debug("frame is lower height")
+
+				// tag: dusk – we should have some kind of check here to avoid brutal
+				// thrashing
+				existing, _, err := d.clockStore.GetDataClockFrame(
+					d.filter,
+					rawFrame.FrameNumber,
+					true,
+				)
+				if err != nil {
+					// if this returns an error it's either not found (which shouldn't
+					// happen without corruption) or pebble is borked, either way, panic
+					panic(err)
+				}
+
+				// It's a fork, but it's behind. We need to stash it until it catches
+				// up (or dies off)
+				if !bytes.Equal(existing.Output, rawFrame.Output) {
+					d.logger.Debug("is fork, add pending")
+					parent, selector, err := rawFrame.GetParentAndSelector()
+					if err != nil {
+						panic(err)
+					}
+
+					d.addPending(selector, parent, frame.frameNumber)
+					d.processPending(d.head, frame)
+				}
 			}
 		case <-d.done:
 			return

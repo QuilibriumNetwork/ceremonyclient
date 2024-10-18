@@ -225,7 +225,7 @@ func (e *DataClockConsensusEngine) sync(
 	response, err := client.GetDataFrame(
 		context.TODO(),
 		&protobufs.GetDataFrameRequest{
-			FrameNumber: 0,
+			FrameNumber: currentLatest.FrameNumber + 1,
 		},
 		grpc.MaxCallRecvMsgSize(600*1024*1024),
 	)

@@ -5,10 +5,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"math/bits"
 	"net"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +33,7 @@ import (
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -206,6 +212,8 @@ func NewBlossomSub(
 	)
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
+
+	verifyReachability(p2pConfig)
 
 	discoverPeers(p2pConfig, ctx, logger, h, routingDiscovery)
 
@@ -473,10 +481,19 @@ func initDHT(
 	var kademliaDHT *dht.IpfsDHT
 	var err error
 	if isBootstrapPeer {
-		panic(
-			"this release is for normal peers only, if you are running a " +
-				"bootstrap node, please use v2.0-bootstrap",
-		)
+		if p2pConfig.Network == 0 {
+			panic(
+				"this release is for normal peers only, if you are running a " +
+					"bootstrap node, please use v2.0-bootstrap",
+			)
+		} else {
+			kademliaDHT, err = dht.New(
+				ctx,
+				h,
+				dht.Mode(dht.ModeServer),
+				dht.BootstrapPeers(bootstrappers...),
+			)
+		}
 	} else {
 		kademliaDHT, err = dht.New(
 			ctx,
@@ -520,7 +537,9 @@ func initDHT(
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			reconnect()
+			if len(h.Network().Peers()) == 0 {
+				reconnect()
+			}
 		}
 	}()
 
@@ -675,6 +694,91 @@ func (b *BlossomSub) SignMessage(msg []byte) ([]byte, error) {
 	return sig, errors.Wrap(err, "sign message")
 }
 
+type ReachabilityRequest struct {
+	Port uint16 `json:"port"`
+	Type string `json:"type"`
+}
+
+type ReachabilityResponse struct {
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error"`
+}
+
+func verifyReachability(cfg *config.P2PConfig) bool {
+	a, err := ma.NewMultiaddr(cfg.ListenMultiaddr)
+	if err != nil {
+		return false
+	}
+
+	transport, addr, err := mn.DialArgs(a)
+	if err != nil {
+		return false
+	}
+
+	addrparts := strings.Split(addr, ":")
+	if len(addrparts) != 2 {
+		return false
+	}
+
+	port, err := strconv.ParseUint(addrparts[1], 10, 0)
+	if err != nil {
+		return false
+	}
+
+	if !strings.Contains(transport, "tcp") {
+		transport = "quic"
+	} else {
+		transport = "tcp"
+	}
+
+	req := &ReachabilityRequest{
+		Port: uint16(port),
+		Type: transport,
+	}
+
+	b, err := json.Marshal(req)
+	if err != nil {
+		return false
+	}
+
+	resp, err := http.Post(
+		"https://rpc.quilibrium.com/connectivity-check",
+		"application/json",
+		bytes.NewBuffer(b),
+	)
+	if err != nil {
+		fmt.Println("Reachability check not currently available, skipping test.")
+		return true
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		fmt.Println("Reachability check not currently available, skipping test.")
+		return true
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Reachability check not currently available, skipping test.")
+		return true
+	}
+
+	r := &ReachabilityResponse{}
+	err = json.Unmarshal(bodyBytes, r)
+	if err != nil {
+		fmt.Println("Reachability check not currently available, skipping test.")
+		return true
+	}
+
+	if r.Error != "" {
+		fmt.Println("Reachability check failed: " + r.Error)
+		return false
+	}
+
+	fmt.Println("Node passed reachability check.")
+	return true
+}
+
 func discoverPeers(
 	p2pConfig *config.P2PConfig,
 	ctx context.Context,
@@ -691,6 +795,7 @@ func discoverPeers(
 		)
 		if err != nil {
 			logger.Error("could not find peers", zap.Error(err))
+			return
 		}
 
 		for peer := range peerChan {
@@ -714,6 +819,9 @@ func discoverPeers(
 					"connected to peer",
 					zap.String("peer_id", peer.ID.String()),
 				)
+				if len(h.Network().Peers()) >= 6 {
+					break
+				}
 			}
 		}
 	}
@@ -722,8 +830,8 @@ func discoverPeers(
 
 	go func() {
 		for {
-			time.Sleep(5 * time.Minute)
-			if len(h.Network().Peers()) < 16 {
+			time.Sleep(5 * time.Second)
+			if len(h.Network().Peers()) < 6 {
 				discover()
 			}
 		}

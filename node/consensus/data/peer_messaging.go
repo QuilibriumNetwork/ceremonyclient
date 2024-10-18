@@ -133,7 +133,7 @@ func (e *DataClockConsensusEngine) decompressAndStoreCandidates(
 			delete(e.peerMap, string(peerId))
 		}
 		e.peerMapMx.Unlock()
-		return nil, errors.New("invalid continuity for compressed sync response")
+		return nil, errors.New("invalid continuity for compressed x response")
 	}
 
 	var final *protobufs.ClockFrame

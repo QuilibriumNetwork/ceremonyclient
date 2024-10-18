@@ -332,6 +332,9 @@ func main() {
 	}
 
 	if *core != 0 {
+		runtime.GOMAXPROCS(2)
+		rdebug.SetGCPercent(9999)
+
 		if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
 			nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
 		}

@@ -315,15 +315,25 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 	go func() {
 		thresholdBeforeConfirming := 4
-
+		frame, err := e.dataTimeReel.Head()
+		if err != nil {
+			panic(err)
+		}
 		for {
-			list := &protobufs.DataPeerListAnnounce{
-				PeerList: []*protobufs.DataPeer{},
-			}
-
-			frame, err := e.dataTimeReel.Head()
+			nextFrame, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
+			}
+
+			if frame.FrameNumber >= nextFrame.FrameNumber {
+				time.Sleep(30 * time.Second)
+				continue
+			}
+
+			frame = nextFrame
+
+			list := &protobufs.DataPeerListAnnounce{
+				PeerList: []*protobufs.DataPeer{},
 			}
 
 			e.latestFrameReceived = frame.FrameNumber

@@ -15,18 +15,18 @@ func (e *DataClockConsensusEngine) RegisterExecutor(
 
 	go func() {
 		for {
-			masterFrame, err := e.masterTimeReel.Head()
+			dataFrame, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
 			}
 
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", masterFrame.FrameNumber),
+				zap.Uint64("current_frame", dataFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := masterFrame.FrameNumber
+			newFrame := dataFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"injecting execution engine at frame",
@@ -57,18 +57,18 @@ func (e *DataClockConsensusEngine) UnregisterExecutor(
 
 	go func() {
 		for {
-			masterFrame, err := e.masterTimeReel.Head()
+			dataFrame, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
 			}
 
 			logger.Info(
 				"awaiting frame",
-				zap.Uint64("current_frame", masterFrame.FrameNumber),
+				zap.Uint64("current_frame", dataFrame.FrameNumber),
 				zap.Uint64("target_frame", frame),
 			)
 
-			newFrame := masterFrame.FrameNumber
+			newFrame := dataFrame.FrameNumber
 			if newFrame >= frame {
 				logger.Info(
 					"removing execution engine at frame",
