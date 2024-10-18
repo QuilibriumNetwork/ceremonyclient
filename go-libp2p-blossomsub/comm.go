@@ -3,11 +3,17 @@ package blossomsub
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
+	"net"
 	"time"
 
 	pool "github.com/libp2p/go-buffer-pool"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-varint"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -129,6 +135,76 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 	s, err := p.host.NewStream(p.ctx, pid, p.rt.Protocols()...)
 	if err != nil {
 		log.Debug("opening new stream to peer: ", err, pid)
+
+		select {
+		case p.newPeerError <- pid:
+		case <-ctx.Done():
+		}
+
+		return
+	}
+
+	ma := s.Conn().RemoteMultiaddr()
+	isTCP := false
+	isQUIC := false
+	for _, p := range ma.Protocols() {
+		isTCP = isTCP || p.Code == multiaddr.P_TCP
+		isQUIC = isQUIC || p.Code == multiaddr.P_QUIC_V1
+	}
+
+	_, addr, err := mn.DialArgs(ma)
+	if err != nil {
+		s.Close()
+		log.Debug("peer unreachable: ", pid)
+
+		select {
+		case p.newPeerError <- pid:
+		case <-ctx.Done():
+		}
+
+		return
+	}
+
+	if isTCP {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			s.Close()
+			fmt.Println("peer unreachable: ", err, pid)
+
+			select {
+			case p.newPeerError <- pid:
+			case <-ctx.Done():
+			}
+
+			return
+		}
+		c.Close()
+	} else if isQUIC {
+		c, err := grpc.Dial(
+			addr,
+			grpc.WithTransportCredentials(
+				insecure.NewCredentials(),
+			),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallSendMsgSize(10*1024*1024),
+				grpc.MaxCallRecvMsgSize(10*1024*1024),
+			),
+		)
+		if err != nil {
+			s.Close()
+			log.Debug("peer unreachable: ", err, pid)
+
+			select {
+			case p.newPeerError <- pid:
+			case <-ctx.Done():
+			}
+
+			return
+		}
+		c.Close()
+	} else {
+		s.Close()
+		log.Debug("peer unreachable: ", pid)
 
 		select {
 		case p.newPeerError <- pid:
