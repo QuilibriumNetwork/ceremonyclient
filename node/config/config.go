@@ -63,7 +63,7 @@ var BootstrapPeers = []string{
 	"/ip4/70.36.102.32/udp/8336/quic-v1/p2p/QmYriGRXCUiwFodqSoS4GgEcD7UVyxXPeCgQKmYne3iLSF",
 	"/ip4/204.12.220.2/udp/8336/quic-v1/p2p/QmRw5Tw4p5v2vLPvVSAkQEiRPQGnWk9HM4xiSvgxF82CCw",
 	"/ip4/209.159.149.14/udp/8336/quic-v1/p2p/Qmcq4Lmw45tbodvdRWZ8iGgy3rUcR3dikHTj1fBXP8VJqv",
-	"/dns/bravo-1.qcommander.sh/udp/8336/quic-v1/p2p/QmWFK1gVuhEqZdr8phTo3QbyLwjYmyivx31Zubqt7oR4XB",
+	"/dns/bravo-1.qcommander.sh/udp/8336/quic-v1/p2p/QmURj4qEB9vNdCCKzSMq4ESEgz13nJrqazgMdGi2DBSeeC",
 	"/ip4/109.199.100.108/udp/8336/quic-v1/p2p/Qma9fgugQc17MDu4YRSvnhfhVre6AYZ3nZdW8dSUYbsWvm",
 	"/ip4/47.251.49.193/udp/8336/quic-v1/p2p/QmP6ADPmMCsB8y82oFbrKTrwYWXt1CTMJ3jGNDXRHyYJgR",
 	"/ip4/138.201.203.208/udp/8336/quic-v1/p2p/QmbNhSTd4Y64ZCbV2gAXYR4ZFDdfRBMfrgWsNg99JHxsJo",

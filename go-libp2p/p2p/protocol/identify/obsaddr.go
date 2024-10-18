@@ -19,7 +19,7 @@ import (
 // can be contacted on. The "seen" events expire by default after 40 minutes
 // (OwnObservedAddressTTL * ActivationThreshold). The are cleaned up during
 // the GC rounds set by GCInterval.
-var ActivationThresh = 4
+var ActivationThresh = 1
 
 // observedAddrManagerWorkerChannelSize defines how many addresses can be enqueued
 // for adding to an ObservedAddrManager.
