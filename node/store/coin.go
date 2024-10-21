@@ -480,7 +480,16 @@ func (p *PebbleCoinStore) Migrate(filter []byte) error {
 				panic(err)
 			}
 
-			return nil
+			txn, err := p.NewTransaction()
+			if err != nil {
+				return nil
+			}
+
+			err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x02})
+			if err != nil {
+				panic(err)
+			}
+			return txn.Commit()
 		}
 		return nil
 	}

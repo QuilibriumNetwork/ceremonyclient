@@ -6,6 +6,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -22,6 +23,15 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 		}
 
 		panic(err)
+	}
+
+	for {
+		if e.state < consensus.EngineStateCollecting {
+			e.logger.Debug("waiting for node to finish starting")
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		break
 	}
 
 	addrBI, err := poseidon.HashBytes(e.pubSub.GetPeerID())
