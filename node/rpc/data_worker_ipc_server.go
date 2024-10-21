@@ -64,12 +64,13 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 			}
 
 		inRange:
-			for _, out := range outputs.Outputs {
+			for i, out := range outputs.Outputs {
 				switch e := out.Output.(type) {
 				case *protobufs.TokenOutput_Coin:
 					addr, err := token.GetAddressOfCoin(
 						e.Coin,
 						req.ClockFrame.FrameNumber,
+						uint64(i),
 					)
 					if err != nil {
 						return nil, err

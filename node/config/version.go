@@ -10,11 +10,11 @@ func GetMinimumVersionCutoff() time.Time {
 }
 
 func GetMinimumVersion() []byte {
-	return []byte{0x02, 0x00, 0x00}
+	return []byte{0x02, 0x00, 0x01}
 }
 
 func GetVersion() []byte {
-	return []byte{0x02, 0x00, 0x00}
+	return []byte{0x02, 0x00, 0x01}
 }
 
 func GetVersionString() string {
@@ -36,5 +36,9 @@ func FormatVersion(version []byte) string {
 }
 
 func GetPatchNumber() byte {
-	return 0x08
+	return 0x00
+}
+
+func GetRCNumber() byte {
+	return 0x02
 }

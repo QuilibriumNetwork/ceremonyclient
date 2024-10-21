@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"crypto"
+
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -40,7 +41,6 @@ type DataConsensusEngine interface {
 	GetFrame() *protobufs.ClockFrame
 	GetDifficulty() uint32
 	GetState() EngineState
-	GetFrameChannel() <-chan *protobufs.ClockFrame
 	GetProvingKey(
 		engineConfig *config.EngineConfig,
 	) (crypto.Signer, keys.KeyType, []byte, []byte)

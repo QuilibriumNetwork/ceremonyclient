@@ -273,7 +273,7 @@ func main() {
 
 	if !*dbConsole && *core == 0 {
 		config.PrintLogo()
-		config.PrintVersion()
+		config.PrintVersion(uint8(*network))
 		fmt.Println(" ")
 	}
 
@@ -300,6 +300,8 @@ func main() {
 		fmt.Println(
 			"Node is operating outside of mainnet – be sure you intended to do this.",
 		)
+	} else {
+		panic("do not run this release on mainnet")
 	}
 
 	clearIfTestData(*configDirectory, nodeConfig)

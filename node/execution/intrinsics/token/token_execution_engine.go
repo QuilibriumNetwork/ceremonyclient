@@ -3,27 +3,19 @@ package token
 import (
 	"bytes"
 	"crypto"
-	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	gotime "time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
-	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -54,8 +46,6 @@ type TokenExecutionEngine struct {
 	peerChannels          map[string]*p2p.PublicP2PChannel
 	activeClockFrame      *protobufs.ClockFrame
 	alreadyPublishedShare bool
-	seenMessageMap        map[string]bool
-	seenMessageMx         sync.Mutex
 	intrinsicFilter       []byte
 	frameProver           qcrypto.FrameProver
 	peerSeniority         map[string]uint64
@@ -63,7 +53,7 @@ type TokenExecutionEngine struct {
 
 func NewTokenExecutionEngine(
 	logger *zap.Logger,
-	engineConfig *config.EngineConfig,
+	cfg *config.Config,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
 	frameProver qcrypto.FrameProver,
@@ -80,7 +70,7 @@ func NewTokenExecutionEngine(
 		panic(errors.New("logger is nil"))
 	}
 
-	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
+	seed, err := hex.DecodeString(cfg.Engine.GenesisSeed)
 	if err != nil {
 		panic(err)
 	}
@@ -97,33 +87,70 @@ func NewTokenExecutionEngine(
 	if err != nil && errors.Is(err, store.ErrNotFound) {
 		origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
 			logger,
-			engineConfig,
+			cfg.Engine,
 			nil,
 			inclusionProver,
 			coinStore,
+			uint(cfg.P2P.Network),
 		)
 		genesisCreated = true
 	} else if err != nil {
 		panic(err)
+	} else {
+		err := coinStore.Migrate(intrinsicFilter)
+		if err != nil {
+			panic(err)
+		}
+		_, _, err = clockStore.GetDataClockFrame(intrinsicFilter, 0, false)
+		if err != nil && errors.Is(err, store.ErrNotFound) {
+			origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
+				logger,
+				cfg.Engine,
+				nil,
+				inclusionProver,
+				coinStore,
+				uint(cfg.P2P.Network),
+			)
+			genesisCreated = true
+		}
+	}
+
+	e := &TokenExecutionEngine{
+		logger:                logger,
+		engineConfig:          cfg.Engine,
+		keyManager:            keyManager,
+		clockStore:            clockStore,
+		coinStore:             coinStore,
+		keyStore:              keyStore,
+		pubSub:                pubSub,
+		inclusionProver:       inclusionProver,
+		frameProver:           frameProver,
+		participantMx:         sync.Mutex{},
+		peerChannels:          map[string]*p2p.PublicP2PChannel{},
+		alreadyPublishedShare: false,
+		intrinsicFilter:       intrinsicFilter,
+		peerSeniority:         peerSeniority,
 	}
 
 	dataTimeReel := time.NewDataTimeReel(
 		intrinsicFilter,
 		logger,
 		clockStore,
-		engineConfig,
+		cfg.Engine,
 		frameProver,
+		e.ProcessFrame,
 		origin,
 		inclusionProof,
 		proverKeys,
 	)
 
-	clock := data.NewDataClockConsensusEngine(
-		engineConfig,
+	e.clock = data.NewDataClockConsensusEngine(
+		cfg.Engine,
 		logger,
 		keyManager,
 		clockStore,
 		coinStore,
+		dataProofStore,
 		keyStore,
 		pubSub,
 		frameProver,
@@ -137,26 +164,6 @@ func NewTokenExecutionEngine(
 		peerSeniority,
 	)
 
-	e := &TokenExecutionEngine{
-		logger:                logger,
-		clock:                 clock,
-		engineConfig:          engineConfig,
-		keyManager:            keyManager,
-		clockStore:            clockStore,
-		coinStore:             coinStore,
-		keyStore:              keyStore,
-		pubSub:                pubSub,
-		inclusionProver:       inclusionProver,
-		frameProver:           frameProver,
-		participantMx:         sync.Mutex{},
-		peerChannels:          map[string]*p2p.PublicP2PChannel{},
-		alreadyPublishedShare: false,
-		seenMessageMx:         sync.Mutex{},
-		seenMessageMap:        map[string]bool{},
-		intrinsicFilter:       intrinsicFilter,
-		peerSeniority:         peerSeniority,
-	}
-
 	peerId := e.pubSub.GetPeerID()
 	addr, err := poseidon.HashBytes(peerId)
 	if err != nil {
@@ -166,7 +173,7 @@ func NewTokenExecutionEngine(
 	addrBytes := addr.FillBytes(make([]byte, 32))
 	e.peerIdHash = addrBytes
 	provingKey, _, publicKeyBytes, provingKeyAddress := e.clock.GetProvingKey(
-		engineConfig,
+		cfg.Engine,
 	)
 	e.provingKey = provingKey
 	e.proverPublicKey = publicKeyBytes
@@ -294,6 +301,41 @@ func NewTokenExecutionEngine(
 		}()
 	} else {
 		f, _, err := e.clockStore.GetLatestDataClockFrame(e.intrinsicFilter)
+		fn, err := coinStore.GetLatestFrameProcessed()
+		if err != nil {
+			panic(err)
+		}
+
+		if f.FrameNumber != fn && fn == 0 {
+			txn, err := coinStore.NewTransaction()
+			if err != nil {
+				panic(err)
+			}
+
+			err = coinStore.SetLatestFrameProcessed(txn, f.FrameNumber)
+			if err != nil {
+				txn.Abort()
+				panic(err)
+			}
+
+			if err = txn.Commit(); err != nil {
+				panic(err)
+			}
+		} else if f.FrameNumber-fn == 1 && f.FrameNumber > fn {
+			txn, err := coinStore.NewTransaction()
+			if err != nil {
+				panic(err)
+			}
+			e.logger.Info(
+				"replaying last data frame",
+				zap.Uint64("frame_number", f.FrameNumber),
+			)
+			e.ProcessFrame(txn, f)
+			if err = txn.Commit(); err != nil {
+				panic(err)
+			}
+		}
+
 		if err == nil {
 			msg := []byte("resume")
 			msg = binary.BigEndian.AppendUint64(msg, f.FrameNumber)
@@ -318,73 +360,6 @@ func NewTokenExecutionEngine(
 		}
 	}
 
-	inc, _, _, err := dataProofStore.GetLatestDataTimeProof(pubSub.GetPeerID())
-	if err != nil {
-		go func() {
-			addrBI, err := poseidon.HashBytes(pubSub.GetPeerID())
-			if err != nil {
-				panic(err)
-			}
-
-			addr := addrBI.FillBytes(make([]byte, 32))
-
-			for {
-				_, proofs, err := coinStore.GetPreCoinProofsForOwner(addr)
-				if err == nil {
-					for _, proof := range proofs {
-						if proof.IndexProof != nil && len(proof.IndexProof) != 0 {
-							if proof.Difficulty < inc {
-								_, par, input, output, err := dataProofStore.GetDataTimeProof(
-									pubSub.GetPeerID(),
-									proof.Difficulty-1,
-								)
-								if err == nil {
-									p := []byte{}
-									p = binary.BigEndian.AppendUint32(p, proof.Difficulty-1)
-									p = binary.BigEndian.AppendUint32(p, par)
-									p = binary.BigEndian.AppendUint64(
-										p,
-										uint64(len(input)),
-									)
-									p = append(p, input...)
-									p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
-									p = append(p, output...)
-									proofs := [][]byte{
-										[]byte("pre-dusk"),
-										make([]byte, 32),
-										p,
-									}
-									payload := []byte("mint")
-									for _, i := range proofs {
-										payload = append(payload, i...)
-									}
-									sig, err := e.pubSub.SignMessage(payload)
-									if err != nil {
-										panic(err)
-									}
-									e.publishMessage(e.intrinsicFilter, &protobufs.TokenRequest{
-										Request: &protobufs.TokenRequest_Mint{
-											Mint: &protobufs.MintCoinRequest{
-												Proofs: proofs,
-												Signature: &protobufs.Ed448Signature{
-													PublicKey: &protobufs.Ed448PublicKey{
-														KeyValue: e.pubSub.GetPublicKey(),
-													},
-													Signature: sig,
-												},
-											},
-										},
-									})
-								}
-							}
-						}
-					}
-				}
-				gotime.Sleep(10 * gotime.Second)
-			}
-		}()
-	}
-
 	return e
 }
 
@@ -407,523 +382,6 @@ func (
 	}
 }
 
-var BridgeAddress = "1ac3290d57e064bdb5a57e874b59290226a9f9730d69f1d963600883789d6ee2"
-
-type BridgedPeerJson struct {
-	Amount     string `json:"amount"`
-	Identifier string `json:"identifier"`
-	Variant    string `json:"variant"`
-}
-
-type FirstRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-type SecondRetroJson struct {
-	PeerId      string `json:"peerId"`
-	Reward      string `json:"reward"`
-	JanPresence bool   `json:"janPresence"`
-	FebPresence bool   `json:"febPresence"`
-	MarPresence bool   `json:"marPresence"`
-	AprPresence bool   `json:"aprPresence"`
-	MayPresence bool   `json:"mayPresence"`
-}
-
-type ThirdRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-type FourthRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-//go:embed bridged.json
-var bridgedPeersJsonBinary []byte
-
-//go:embed ceremony_vouchers.json
-var ceremonyVouchersJsonBinary []byte
-
-//go:embed first_retro.json
-var firstRetroJsonBinary []byte
-
-//go:embed second_retro.json
-var secondRetroJsonBinary []byte
-
-//go:embed third_retro.json
-var thirdRetroJsonBinary []byte
-
-//go:embed fourth_retro.json
-var fourthRetroJsonBinary []byte
-
-// Creates a genesis state for the intrinsic
-func CreateGenesisState(
-	logger *zap.Logger,
-	engineConfig *config.EngineConfig,
-	testProverKeys [][]byte,
-	inclusionProver qcrypto.InclusionProver,
-	coinStore store.CoinStore,
-) (
-	[]byte,
-	*qcrypto.InclusionAggregateProof,
-	[][]byte,
-	map[string]uint64,
-) {
-	genesis := config.GetGenesis()
-	if genesis == nil {
-		panic("genesis is nil")
-	}
-
-	seed, err := hex.DecodeString(engineConfig.GenesisSeed)
-	if err != nil {
-		panic(err)
-	}
-
-	logger.Info("creating genesis frame from message:")
-	for i, l := range strings.Split(string(seed), "|") {
-		if i == 0 {
-			logger.Info(l)
-		} else {
-			logger.Info(fmt.Sprintf("Blockstamp ending in 0x%x", l))
-		}
-	}
-
-	difficulty := engineConfig.Difficulty
-	if difficulty != 200000 {
-		difficulty = 200000
-	}
-
-	b := sha3.Sum256(seed)
-	v := vdf.New(difficulty, b)
-
-	v.Execute()
-	o := v.GetOutput()
-	inputMessage := o[:]
-
-	logger.Info("encoding all prior state")
-
-	bridged := []*BridgedPeerJson{}
-	vouchers := []string{}
-	firstRetro := []*FirstRetroJson{}
-	secondRetro := []*SecondRetroJson{}
-	thirdRetro := []*ThirdRetroJson{}
-	fourthRetro := []*FourthRetroJson{}
-
-	err = json.Unmarshal(bridgedPeersJsonBinary, &bridged)
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal(ceremonyVouchersJsonBinary, &vouchers)
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal(firstRetroJsonBinary, &firstRetro)
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal(secondRetroJsonBinary, &secondRetro)
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal(thirdRetroJsonBinary, &thirdRetro)
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal(fourthRetroJsonBinary, &fourthRetro)
-	if err != nil {
-		panic(err)
-	}
-
-	bridgedAddrs := map[string]struct{}{}
-
-	logger.Info("encoding bridged token state")
-	bridgeTotal := decimal.Zero
-	for _, b := range bridged {
-		amt, err := decimal.NewFromString(b.Amount)
-		if err != nil {
-			panic(err)
-		}
-		bridgeTotal = bridgeTotal.Add(amt)
-		bridgedAddrs[b.Identifier] = struct{}{}
-	}
-
-	voucherTotals := map[string]decimal.Decimal{}
-	peerIdTotals := map[string]decimal.Decimal{}
-	peerSeniority := map[string]uint64{}
-	logger.Info("encoding first retro state")
-	for _, f := range firstRetro {
-		if _, ok := bridgedAddrs[f.PeerId]; !ok {
-			peerIdTotals[f.PeerId], err = decimal.NewFromString(f.Reward)
-			if err != nil {
-				panic(err)
-			}
-		}
-
-		// these don't have decimals so we can shortcut
-		max := 157208
-		actual, err := strconv.Atoi(f.Reward)
-		if err != nil {
-			panic(err)
-		}
-
-		peerSeniority[f.PeerId] = uint64(10 * 6 * 60 * 24 * 92 / (max / actual))
-	}
-
-	logger.Info("encoding voucher state")
-	for _, v := range vouchers {
-		if _, ok := bridgedAddrs[v]; !ok {
-			voucherTotals[v] = decimal.NewFromInt(50)
-		}
-	}
-
-	logger.Info("encoding second retro state")
-	for _, f := range secondRetro {
-		if _, ok := bridgedAddrs[f.PeerId]; !ok {
-			existing, ok := peerIdTotals[f.PeerId]
-
-			amount, err := decimal.NewFromString(f.Reward)
-			if err != nil {
-				panic(err)
-			}
-
-			if !ok {
-				peerIdTotals[f.PeerId] = amount
-			} else {
-				peerIdTotals[f.PeerId] = existing.Add(amount)
-			}
-		}
-
-		if _, ok := peerSeniority[f.PeerId]; !ok {
-			peerSeniority[f.PeerId] = 0
-		}
-
-		if f.JanPresence {
-			peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 31)
-		}
-
-		if f.FebPresence {
-			peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 29)
-		}
-
-		if f.MarPresence {
-			peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 31)
-		}
-
-		if f.AprPresence {
-			peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 30)
-		}
-
-		if f.MayPresence {
-			peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 31)
-		}
-	}
-
-	logger.Info("encoding third retro state")
-	for _, f := range thirdRetro {
-		existing, ok := peerIdTotals[f.PeerId]
-
-		amount, err := decimal.NewFromString(f.Reward)
-		if err != nil {
-			panic(err)
-		}
-
-		if !ok {
-			peerIdTotals[f.PeerId] = amount
-		} else {
-			peerIdTotals[f.PeerId] = existing.Add(amount)
-		}
-
-		if _, ok := peerSeniority[f.PeerId]; !ok {
-			peerSeniority[f.PeerId] = 0
-		}
-
-		peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 30)
-	}
-
-	logger.Info("encoding fourth retro state")
-	for _, f := range fourthRetro {
-		existing, ok := peerIdTotals[f.PeerId]
-
-		amount, err := decimal.NewFromString(f.Reward)
-		if err != nil {
-			panic(err)
-		}
-
-		if !ok {
-			peerIdTotals[f.PeerId] = amount
-		} else {
-			peerIdTotals[f.PeerId] = existing.Add(amount)
-		}
-
-		if _, ok := peerSeniority[f.PeerId]; !ok {
-			peerSeniority[f.PeerId] = 0
-		}
-
-		peerSeniority[f.PeerId] = peerSeniority[f.PeerId] + (10 * 6 * 60 * 24 * 31)
-	}
-
-	genesisState := &protobufs.TokenOutputs{
-		Outputs: []*protobufs.TokenOutput{},
-	}
-
-	factor, _ := decimal.NewFromString("8000000000")
-	bridgeAddressHex, err := hex.DecodeString(BridgeAddress)
-	if err != nil {
-		panic(err)
-	}
-
-	totalExecutions := 0
-	logger.Info(
-		"creating execution state",
-		zap.Int(
-			"coin_executions",
-			totalExecutions,
-		),
-	)
-	genesisState.Outputs = append(genesisState.Outputs, &protobufs.TokenOutput{
-		Output: &protobufs.TokenOutput_Coin{
-			Coin: &protobufs.Coin{
-				Amount: bridgeTotal.Mul(factor).BigInt().FillBytes(
-					make([]byte, 32),
-				),
-				Intersection: make([]byte, 1024),
-				Owner: &protobufs.AccountRef{
-					Account: &protobufs.AccountRef_ImplicitAccount{
-						ImplicitAccount: &protobufs.ImplicitAccount{
-							Address: bridgeAddressHex,
-						},
-					},
-				},
-			},
-		},
-	})
-	totalExecutions++
-
-	for peerId, total := range peerIdTotals {
-		if totalExecutions%1000 == 0 {
-			logger.Info(
-				"creating execution state",
-				zap.Int(
-					"coin_executions",
-					totalExecutions,
-				),
-			)
-		}
-		peerBytes, err := base58.Decode(peerId)
-		if err != nil {
-			panic(err)
-		}
-
-		addr, err := poseidon.HashBytes(peerBytes)
-		if err != nil {
-			panic(err)
-		}
-
-		genesisState.Outputs = append(genesisState.Outputs, &protobufs.TokenOutput{
-			Output: &protobufs.TokenOutput_Coin{
-				Coin: &protobufs.Coin{
-					Amount: total.Mul(factor).BigInt().FillBytes(
-						make([]byte, 32),
-					),
-					Intersection: make([]byte, 1024),
-					Owner: &protobufs.AccountRef{
-						Account: &protobufs.AccountRef_ImplicitAccount{
-							ImplicitAccount: &protobufs.ImplicitAccount{
-								Address: addr.FillBytes(make([]byte, 32)),
-							},
-						},
-					},
-				},
-			},
-		})
-		totalExecutions++
-	}
-
-	for voucher, total := range voucherTotals {
-		if totalExecutions%1000 == 0 {
-			logger.Info(
-				"creating execution state",
-				zap.Int(
-					"coin_executions",
-					totalExecutions,
-				),
-			)
-		}
-		keyBytes, err := hex.DecodeString(voucher[2:])
-		if err != nil {
-			panic(err)
-		}
-
-		addr, err := poseidon.HashBytes(keyBytes)
-		if err != nil {
-			panic(err)
-		}
-
-		genesisState.Outputs = append(genesisState.Outputs, &protobufs.TokenOutput{
-			Output: &protobufs.TokenOutput_Coin{
-				Coin: &protobufs.Coin{
-					Amount: total.Mul(factor).BigInt().FillBytes(
-						make([]byte, 32),
-					),
-					Intersection: make([]byte, 1024),
-					Owner: &protobufs.AccountRef{
-						Account: &protobufs.AccountRef_ImplicitAccount{
-							ImplicitAccount: &protobufs.ImplicitAccount{
-								Address: addr.FillBytes(make([]byte, 32)),
-							},
-						},
-					},
-				},
-			},
-		})
-		totalExecutions++
-	}
-
-	logger.Info(
-		"serializing execution state to store, this may take some time...",
-		zap.Int(
-			"coin_executions",
-			totalExecutions,
-		),
-	)
-	txn, err := coinStore.NewTransaction()
-	for _, output := range genesisState.Outputs {
-		if err != nil {
-			panic(err)
-		}
-
-		address, err := GetAddressOfCoin(output.GetCoin(), 0)
-		if err != nil {
-			panic(err)
-		}
-		err = coinStore.PutCoin(
-			txn,
-			0,
-			address,
-			output.GetCoin(),
-		)
-		if err != nil {
-			panic(err)
-		}
-	}
-	if err := txn.Commit(); err != nil {
-		panic(err)
-	}
-
-	logger.Info("encoded transcript")
-
-	outputBytes, err := proto.Marshal(genesisState)
-	if err != nil {
-		panic(err)
-	}
-
-	intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-
-	executionOutput := &protobufs.IntrinsicExecutionOutput{
-		Address: intrinsicFilter,
-		Output:  outputBytes,
-		Proof:   seed,
-	}
-
-	data, err := proto.Marshal(executionOutput)
-	if err != nil {
-		panic(err)
-	}
-
-	logger.Debug("encoded execution output")
-	digest := sha3.NewShake256()
-	_, err = digest.Write(data)
-	if err != nil {
-		panic(err)
-	}
-
-	expand := make([]byte, 1024)
-	_, err = digest.Read(expand)
-	if err != nil {
-		panic(err)
-	}
-
-	commitment, err := inclusionProver.CommitRaw(
-		expand,
-		16,
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	logger.Debug("creating kzg proof")
-	proof, err := inclusionProver.ProveRaw(
-		expand,
-		int(expand[0]%16),
-		16,
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	logger.Info("finalizing execution proof")
-
-	return inputMessage, &qcrypto.InclusionAggregateProof{
-		InclusionCommitments: []*qcrypto.InclusionCommitment{
-			&qcrypto.InclusionCommitment{
-				TypeUrl:    protobufs.IntrinsicExecutionOutputType,
-				Data:       data,
-				Commitment: commitment,
-			},
-		},
-		AggregateCommitment: commitment,
-		Proof:               proof,
-	}, [][]byte{genesis.Beacon}, map[string]uint64{}
-}
-
-func GetAddressOfCoin(
-	coin *protobufs.Coin,
-	frameNumber uint64,
-) ([]byte, error) {
-	eval := []byte{}
-	eval = append(eval, application.TOKEN_ADDRESS...)
-	eval = binary.BigEndian.AppendUint64(eval, frameNumber)
-	eval = append(eval, coin.Amount...)
-	eval = append(eval, coin.Intersection...)
-	eval = binary.BigEndian.AppendUint32(eval, 0)
-	eval = append(eval, coin.Owner.GetImplicitAccount().Address...)
-	addressBI, err := poseidon.HashBytes(eval)
-	if err != nil {
-		return nil, err
-	}
-
-	return addressBI.FillBytes(make([]byte, 32)), nil
-}
-
-func GetAddressOfPreCoinProof(
-	proof *protobufs.PreCoinProof,
-) ([]byte, error) {
-	eval := []byte{}
-	eval = append(eval, application.TOKEN_ADDRESS...)
-	eval = append(eval, proof.Amount...)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Index)
-	eval = append(eval, proof.IndexProof...)
-	eval = append(eval, proof.Commitment...)
-	eval = append(eval, proof.Proof...)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Parallelism)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Difficulty)
-	eval = binary.BigEndian.AppendUint32(eval, 0)
-	eval = append(eval, proof.Owner.GetImplicitAccount().Address...)
-	addressBI, err := poseidon.HashBytes(eval)
-	if err != nil {
-		return nil, err
-	}
-
-	return addressBI.FillBytes(make([]byte, 32)), nil
-}
-
 // Start implements ExecutionEngine
 func (e *TokenExecutionEngine) Start() <-chan error {
 	errChan := make(chan error)
@@ -938,8 +396,6 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 		if err != nil {
 			panic(err)
 		}
-
-		go e.RunWorker()
 
 		errChan <- nil
 	}()
@@ -964,45 +420,18 @@ func (e *TokenExecutionEngine) ProcessMessage(
 	message *protobufs.Message,
 ) ([]*protobufs.Message, error) {
 	if bytes.Equal(address, e.GetSupportedApplications()[0].Address) {
-		e.logger.Debug("processing execution message")
 		any := &anypb.Any{}
 		if err := proto.Unmarshal(message.Payload, any); err != nil {
 			return nil, errors.Wrap(err, "process message")
 		}
 
+		e.logger.Debug(
+			"processing execution message",
+			zap.String("type", any.TypeUrl),
+		)
+
 		switch any.TypeUrl {
-		case protobufs.ClockFrameType:
-			frame := &protobufs.ClockFrame{}
-			if err := any.UnmarshalTo(frame); err != nil {
-				return nil, errors.Wrap(err, "process message")
-			}
-
-			if frame.FrameNumber < e.clock.GetFrame().FrameNumber {
-				return nil, nil
-			}
-
-			if err := e.frameProver.VerifyDataClockFrame(frame); err != nil {
-				return nil, errors.Wrap(err, "process message")
-			}
-
-			if err := e.VerifyExecution(frame); err != nil {
-				return nil, errors.Wrap(err, "process message")
-			}
 		case protobufs.TokenRequestType:
-			hash := sha3.Sum256(any.Value)
-			if any.TypeUrl == protobufs.TokenRequestType {
-				e.seenMessageMx.Lock()
-				ref := string(hash[:])
-				if _, ok := e.seenMessageMap[ref]; !ok {
-					e.seenMessageMap[ref] = true
-				} else {
-					return nil, errors.Wrap(
-						errors.New("message already received"),
-						"process message",
-					)
-				}
-				e.seenMessageMx.Unlock()
-			}
 			if e.clock.IsInProverTrie(e.proverPublicKey) {
 				payload, err := proto.Marshal(any)
 				if err != nil {
@@ -1016,7 +445,7 @@ func (e *TokenExecutionEngine) ProcessMessage(
 
 				msg := &protobufs.Message{
 					Hash:    h.Bytes(),
-					Address: e.provingKeyAddress,
+					Address: application.TOKEN_ADDRESS,
 					Payload: payload,
 				}
 				return []*protobufs.Message{
@@ -1029,102 +458,116 @@ func (e *TokenExecutionEngine) ProcessMessage(
 	return nil, nil
 }
 
-func (e *TokenExecutionEngine) RunWorker() {
-	frameChan := e.clock.GetFrameChannel()
-	for {
-		select {
-		case frame := <-frameChan:
-			e.activeClockFrame = frame
-			e.logger.Info(
-				"evaluating next frame",
-				zap.Uint64(
-					"frame_number",
-					frame.FrameNumber,
-				),
-			)
-			app, err := application.MaterializeApplicationFromFrame(
-				frame,
-				e.clock.GetFrameProverTries(),
-				e.coinStore,
-				e.logger,
+func (e *TokenExecutionEngine) ProcessFrame(
+	txn store.Transaction,
+	frame *protobufs.ClockFrame,
+) error {
+	f, err := e.coinStore.GetLatestFrameProcessed()
+	if err != nil || f == frame.FrameNumber {
+		return errors.Wrap(err, "process frame")
+	}
+
+	e.activeClockFrame = frame
+	e.logger.Info(
+		"evaluating next frame",
+		zap.Uint64(
+			"frame_number",
+			frame.FrameNumber,
+		),
+	)
+	app, err := application.MaterializeApplicationFromFrame(
+		frame,
+		e.clock.GetFrameProverTries(),
+		e.coinStore,
+		e.logger,
+	)
+	if err != nil {
+		e.logger.Error(
+			"error while materializing application from frame",
+			zap.Error(err),
+		)
+		return errors.Wrap(err, "process frame")
+	}
+
+	e.logger.Debug(
+		"app outputs",
+		zap.Int("outputs", len(app.TokenOutputs.Outputs)),
+	)
+
+	for i, output := range app.TokenOutputs.Outputs {
+		switch o := output.Output.(type) {
+		case *protobufs.TokenOutput_Coin:
+			address, err := GetAddressOfCoin(o.Coin, frame.FrameNumber, uint64(i))
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
+			}
+			err = e.coinStore.PutCoin(
+				txn,
+				frame.FrameNumber,
+				address,
+				o.Coin,
 			)
 			if err != nil {
-				e.logger.Error(
-					"error while materializing application from frame",
-					zap.Error(err),
-				)
-				panic(err)
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
 			}
-
-			txn, err := e.coinStore.NewTransaction()
+		case *protobufs.TokenOutput_DeletedCoin:
+			coin, err := e.coinStore.GetCoinByAddress(txn, o.DeletedCoin.Address)
 			if err != nil {
-				panic(err)
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
 			}
-
-			for _, output := range app.TokenOutputs.Outputs {
-				switch o := output.Output.(type) {
-				case *protobufs.TokenOutput_Coin:
-					address, err := GetAddressOfCoin(o.Coin, frame.FrameNumber)
-					if err != nil {
-						panic(err)
-					}
-					err = e.coinStore.PutCoin(
-						txn,
-						frame.FrameNumber,
-						address,
-						o.Coin,
-					)
-					if err != nil {
-						panic(err)
-					}
-				case *protobufs.TokenOutput_DeletedCoin:
-					coin, err := e.coinStore.GetCoinByAddress(o.DeletedCoin.Address)
-					if err != nil {
-						panic(err)
-					}
-					err = e.coinStore.DeleteCoin(
-						txn,
-						o.DeletedCoin.Address,
-						coin,
-					)
-					if err != nil {
-						panic(err)
-					}
-				case *protobufs.TokenOutput_Proof:
-					address, err := GetAddressOfPreCoinProof(o.Proof)
-					if err != nil {
-						panic(err)
-					}
-					err = e.coinStore.PutPreCoinProof(
-						txn,
-						frame.FrameNumber,
-						address,
-						o.Proof,
-					)
-					if err != nil {
-						panic(err)
-					}
-				case *protobufs.TokenOutput_DeletedProof:
-					address, err := GetAddressOfPreCoinProof(o.DeletedProof)
-					if err != nil {
-						panic(err)
-					}
-					err = e.coinStore.DeletePreCoinProof(
-						txn,
-						address,
-						o.DeletedProof,
-					)
-					if err != nil {
-						panic(err)
-					}
-				}
+			err = e.coinStore.DeleteCoin(
+				txn,
+				o.DeletedCoin.Address,
+				coin,
+			)
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
 			}
-
-			if err := txn.Commit(); err != nil {
-				panic(err)
+		case *protobufs.TokenOutput_Proof:
+			address, err := GetAddressOfPreCoinProof(o.Proof)
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
+			}
+			err = e.coinStore.PutPreCoinProof(
+				txn,
+				frame.FrameNumber,
+				address,
+				o.Proof,
+			)
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
+			}
+		case *protobufs.TokenOutput_DeletedProof:
+			address, err := GetAddressOfPreCoinProof(o.DeletedProof)
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
+			}
+			err = e.coinStore.DeletePreCoinProof(
+				txn,
+				address,
+				o.DeletedProof,
+			)
+			if err != nil {
+				txn.Abort()
+				return errors.Wrap(err, "process frame")
 			}
 		}
 	}
+
+	err = e.coinStore.SetLatestFrameProcessed(txn, frame.FrameNumber)
+	if err != nil {
+		txn.Abort()
+		return errors.Wrap(err, "process frame")
+	}
+
+	return nil
 }
 
 func (e *TokenExecutionEngine) publishMessage(

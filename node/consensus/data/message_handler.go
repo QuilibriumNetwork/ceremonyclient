@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -32,15 +33,13 @@ func (e *DataClockConsensusEngine) runMessageHandler() {
 			e.peerMapMx.RUnlock()
 
 			if ok && bytes.Compare(peer.version, config.GetMinimumVersion()) >= 0 &&
-				bytes.Equal(
-					e.frameProverTries[0].FindNearest(e.provingKeyAddress).External.Key,
-					e.provingKeyAddress,
-				) && e.syncingStatus == SyncStatusNotSyncing {
+				e.frameProverTries[0].Contains(e.provingKeyAddress) &&
+				e.syncingStatus == SyncStatusNotSyncing {
 				for name := range e.executionEngines {
 					name := name
 					go func() error {
 						messages, err := e.executionEngines[name].ProcessMessage(
-							msg.Address,
+							application.TOKEN_ADDRESS,
 							msg,
 						)
 						if err != nil {
@@ -63,6 +62,8 @@ func (e *DataClockConsensusEngine) runMessageHandler() {
 								)
 								continue
 							}
+
+							e.logger.Debug(appMsg.TypeUrl)
 
 							switch appMsg.TypeUrl {
 							case protobufs.TokenRequestType:
@@ -91,22 +92,6 @@ func (e *DataClockConsensusEngine) runMessageHandler() {
 
 			go func() {
 				switch any.TypeUrl {
-				case protobufs.ClockFrameType:
-					if !ok || bytes.Compare(
-						peer.version,
-						config.GetMinimumVersion(),
-					) < 0 {
-						e.logger.Debug("received frame from unknown or outdated peer")
-						return
-					}
-					if err := e.handleClockFrameData(
-						message.From,
-						msg.Address,
-						any,
-						false,
-					); err != nil {
-						return
-					}
 				case protobufs.DataPeerListAnnounceType:
 					if err := e.handleDataPeerListAnnounce(
 						message.From,
@@ -293,7 +278,7 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverJoin(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.parentSelector) {
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		announce := &protobufs.AnnounceProverJoin{}
 		if err := any.UnmarshalTo(announce); err != nil {
 			return errors.Wrap(err, "handle data announce prover join")
@@ -337,7 +322,7 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverLeave(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.parentSelector) {
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		announce := &protobufs.AnnounceProverLeave{}
 		if err := any.UnmarshalTo(announce); err != nil {
 			return errors.Wrap(err, "handle data announce prover leave")
@@ -382,7 +367,7 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverPause(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.parentSelector) {
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		announce := &protobufs.AnnounceProverPause{}
 		if err := any.UnmarshalTo(announce); err != nil {
 			return errors.Wrap(err, "handle data announce prover pause")
@@ -426,7 +411,7 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverResume(
 	address []byte,
 	any *anypb.Any,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.parentSelector) {
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		announce := &protobufs.AnnounceProverResume{}
 		if err := any.UnmarshalTo(announce); err != nil {
 			return errors.Wrap(err, "handle data announce prover resume")
@@ -468,7 +453,7 @@ func (e *DataClockConsensusEngine) handleDataAnnounceProverResume(
 func (e *DataClockConsensusEngine) handleTokenRequest(
 	transition *protobufs.TokenRequest,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.parentSelector) {
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		e.stagedTransactionsMx.Lock()
 		if e.stagedTransactions == nil {
 			e.stagedTransactions = &protobufs.TokenRequests{}
@@ -527,86 +512,6 @@ func (e *DataClockConsensusEngine) handleTokenRequest(
 			)
 		}
 		e.stagedTransactionsMx.Unlock()
-	}
-	return nil
-}
-
-func (e *DataClockConsensusEngine) handleClockFrameData(
-	peerID []byte,
-	address []byte,
-	any *anypb.Any,
-	isSync bool,
-) error {
-	frame := &protobufs.ClockFrame{}
-	if err := any.UnmarshalTo(frame); err != nil {
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if e.latestFrameReceived > frame.FrameNumber {
-		return nil
-	}
-
-	addr, err := poseidon.HashBytes(
-		frame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-	)
-	if err != nil {
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	for _, trie := range e.GetFrameProverTries() {
-		if trie.Contains(addr.Bytes()) {
-			e.logger.Info(
-				"prover not in trie at frame, address may be in fork",
-				zap.Binary("address", address),
-				zap.Binary("filter", frame.Filter),
-				zap.Uint64("frame_number", frame.FrameNumber),
-			)
-			return nil
-		}
-	}
-
-	e.logger.Info(
-		"got clock frame",
-		zap.Binary("address", address),
-		zap.Binary("filter", frame.Filter),
-		zap.Uint64("frame_number", frame.FrameNumber),
-		zap.Int("proof_count", len(frame.AggregateProofs)),
-	)
-
-	if err := e.frameProver.VerifyDataClockFrame(frame); err != nil {
-		e.logger.Error("could not verify clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	if err := e.inclusionProver.VerifyFrame(frame); err != nil {
-		e.logger.Error("could not verify clock frame", zap.Error(err))
-		return errors.Wrap(err, "handle clock frame data")
-	}
-
-	e.logger.Info(
-		"clock frame was valid",
-		zap.Binary("address", address),
-		zap.Binary("filter", frame.Filter),
-		zap.Uint64("frame_number", frame.FrameNumber),
-	)
-
-	if e.latestFrameReceived < frame.FrameNumber {
-		e.latestFrameReceived = frame.FrameNumber
-		go func() {
-			select {
-			case e.frameChan <- frame:
-			default:
-			}
-		}()
-	}
-
-	head, err := e.dataTimeReel.Head()
-	if err != nil {
-		panic(err)
-	}
-
-	if frame.FrameNumber > head.FrameNumber {
-		e.dataTimeReel.Insert(frame, e.latestFrameReceived < frame.FrameNumber)
 	}
 	return nil
 }

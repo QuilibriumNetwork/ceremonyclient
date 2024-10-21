@@ -623,6 +623,16 @@ message GetTokensByAccountRequest {
 message TokensByAccountResponse {
   repeated Coin coins = 1;
   repeated uint64 frame_numbers = 2;
+  repeated bytes addresses = 3;
+}
+
+message GetPreCoinProofsByAccountRequest {
+  bytes address = 1;
+}
+
+message PreCoinProofsByAccountResponse {
+  repeated PreCoinProof proofs = 1;
+  repeated uint64 frame_numbers = 2;
 }
 
 service NodeService {
@@ -635,6 +645,7 @@ service NodeService {
   rpc GetPeerManifests(GetPeerManifestsRequest) returns (PeerManifestsResponse);
   rpc SendMessage(TokenRequest) returns (SendMessageResponse);
   rpc GetTokensByAccount(GetTokensByAccountRequest) returns (TokensByAccountResponse);
+  rpc GetPreCoinProofsByAccount(GetPreCoinProofsByAccountRequest) returns (PreCoinProofsByAccountResponse);
 }
 
 service AccountService {

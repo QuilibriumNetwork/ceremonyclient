@@ -133,6 +133,21 @@ var Signatories = []string{
 var unlock *SignedGenesisUnlock
 
 func DownloadAndVerifyGenesis(network uint) (*SignedGenesisUnlock, error) {
+	if network != 0 {
+		unlock = &SignedGenesisUnlock{
+			GenesisSeedHex: "726573697374206d7563682c206f626579206c6974746c657c000000000000000000000001",
+			Beacon: []byte{
+				0x58, 0xef, 0xd9, 0x7e, 0xdd, 0x0e, 0xb6, 0x2f,
+				0x51, 0xc7, 0x5d, 0x00, 0x29, 0x12, 0x45, 0x49,
+				0x2e, 0x2f, 0xee, 0x17, 0x24, 0xf4, 0x76, 0x0b,
+				0xe6, 0x18, 0x82, 0xab, 0xca, 0x7f, 0xc8, 0x3a,
+				0xbd, 0x1a, 0x9e, 0x01, 0x71, 0xb2, 0xe0, 0x8c,
+				0x35, 0xa0, 0x42, 0xd0, 0x91, 0x32, 0xb0, 0x42,
+				0xda, 0xee, 0x71, 0xf5, 0xe3, 0x73, 0x93, 0x4e,
+				0x80,
+			},
+		}
+	}
 	if unlock != nil {
 		return unlock, nil
 	}
@@ -195,7 +210,6 @@ func DownloadAndVerifyGenesis(network uint) (*SignedGenesisUnlock, error) {
 		return nil, errors.New("quorum on signatures not met")
 	}
 
-	fmt.Println("Stasis lock released. Welcome to 2.0.")
 	unlock = checkUnlock
 	return unlock, err
 }
@@ -457,11 +471,14 @@ func PrintLogo() {
 	fmt.Println("████████████████████████████████████████████████████████████████████████████████")
 }
 
-func PrintVersion() {
+func PrintVersion(network uint8) {
 	patch := GetPatchNumber()
 	patchString := ""
 	if patch != 0x00 {
 		patchString = fmt.Sprintf("-p%d", patch)
+	}
+	if network != 0 {
+		patchString = fmt.Sprintf("-b%d", GetRCNumber())
 	}
 	fmt.Println(" ")
 	fmt.Println("                      Quilibrium Node - v" + GetVersionString() + patchString + " – Dusk")

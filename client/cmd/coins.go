@@ -2,13 +2,11 @@ package cmd
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -48,11 +46,10 @@ var coinsCmd = &cobra.Command{
 			amount := new(big.Int).SetBytes(coin.Amount)
 			conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
 			r := new(big.Rat).SetFrac(amount, conversionFactor)
-			addr, err := token.GetAddressOfCoin(coin, resp.FrameNumbers[i])
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println(r.FloatString(12), "QUIL (Coin 0x", hex.EncodeToString(addr), ")")
+			fmt.Println(
+				r.FloatString(12),
+				fmt.Sprintf("QUIL (Coin 0x%x)", resp.Addresses[i]),
+			)
 		}
 	},
 }

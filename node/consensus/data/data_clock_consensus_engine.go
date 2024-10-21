@@ -1,13 +1,11 @@
 package data
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"encoding/binary"
 	"fmt"
 	"math/big"
-	"slices"
 	"sync"
 	"time"
 
@@ -32,7 +30,7 @@ import (
 )
 
 const PEER_INFO_TTL = 60 * 60 * 1000
-const UNCOOPERATIVE_PEER_INFO_TTL = 5 * 60 * 1000
+const UNCOOPERATIVE_PEER_INFO_TTL = 60 * 1000
 
 var ErrNoApplicableChallenge = errors.New("no applicable challenge")
 
@@ -68,6 +66,7 @@ type DataClockConsensusEngine struct {
 	state                       consensus.EngineState
 	clockStore                  store.ClockStore
 	coinStore                   store.CoinStore
+	dataProofStore              store.DataProofStore
 	keyStore                    store.KeyStore
 	pubSub                      p2p.PubSub
 	keyManager                  keys.KeyManager
@@ -149,6 +148,7 @@ func NewDataClockConsensusEngine(
 	keyManager keys.KeyManager,
 	clockStore store.ClockStore,
 	coinStore store.CoinStore,
+	dataProofStore store.DataProofStore,
 	keyStore store.KeyStore,
 	pubSub p2p.PubSub,
 	frameProver qcrypto.FrameProver,
@@ -179,6 +179,10 @@ func NewDataClockConsensusEngine(
 
 	if coinStore == nil {
 		panic(errors.New("coin store is nil"))
+	}
+
+	if dataProofStore == nil {
+		panic(errors.New("data proof store is nil"))
 	}
 
 	if keyStore == nil {
@@ -225,6 +229,7 @@ func NewDataClockConsensusEngine(
 		state:            consensus.EngineStateStopped,
 		clockStore:       clockStore,
 		coinStore:        coinStore,
+		dataProofStore:   dataProofStore,
 		keyStore:         keyStore,
 		keyManager:       keyManager,
 		pubSub:           pubSub,
@@ -325,7 +330,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				panic(err)
 			}
 
-			if frame.FrameNumber >= nextFrame.FrameNumber {
+			if frame.FrameNumber >= nextFrame.FrameNumber || frame.FrameNumber == 0 {
 				time.Sleep(30 * time.Second)
 				continue
 			}
@@ -414,6 +419,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		errChan <- nil
 	}()
 
+	go e.runPreMidnightProofWorker()
+
 	go func() {
 		frame, err := e.dataTimeReel.Head()
 		if err != nil {
@@ -454,7 +461,14 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				continue
 			}
 
-			e.PerformTimeProof(frame, frame.Difficulty, clients)
+			frame = nextFrame
+
+			for i, trie := range e.GetFrameProverTries()[1:] {
+				if trie.Contains(e.provingKeyAddress) {
+					e.logger.Info("creating data shard ring proof", zap.Int("ring", i-1))
+					e.PerformTimeProof(frame, frame.Difficulty, clients)
+				}
+			}
 		}
 	}()
 
@@ -566,284 +580,6 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 	return []byte{}
 }
 
-func (
-	e *DataClockConsensusEngine,
-) GetFrameProverTries() []*tries.RollingFrecencyCritbitTrie {
-	e.frameProverTriesMx.RLock()
-	frameProverTries := make(
-		[]*tries.RollingFrecencyCritbitTrie,
-		len(e.frameProverTries),
-	)
-
-	for i, trie := range e.frameProverTries {
-		newTrie := &tries.RollingFrecencyCritbitTrie{}
-		b, err := trie.Serialize()
-		if err != nil {
-			panic(err)
-		}
-
-		err = newTrie.Deserialize(b)
-		if err != nil {
-			panic(err)
-		}
-		frameProverTries[i] = newTrie
-	}
-
-	e.frameProverTriesMx.RUnlock()
-	return frameProverTries
-}
-
-func (e *DataClockConsensusEngine) runLoop() {
-	dataFrameCh := e.dataTimeReel.NewFrameCh()
-
-	for e.state < consensus.EngineStateStopping {
-		peerCount := e.pubSub.GetNetworkPeersCount()
-		if peerCount < e.minimumPeersRequired {
-			e.logger.Info(
-				"waiting for minimum peers",
-				zap.Int("peer_count", peerCount),
-			)
-			time.Sleep(1 * time.Second)
-		} else {
-			latestFrame, err := e.dataTimeReel.Head()
-			if err != nil {
-				panic(err)
-			}
-			select {
-			case dataFrame := <-dataFrameCh:
-				if latestFrame, err = e.collect(dataFrame); err != nil {
-					e.logger.Error("could not collect", zap.Error(err))
-				}
-
-				dataFrame, err := e.dataTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
-				if latestFrame != nil &&
-					dataFrame.FrameNumber > latestFrame.FrameNumber {
-					latestFrame = dataFrame
-				}
-
-				if e.latestFrameReceived < latestFrame.FrameNumber {
-					e.latestFrameReceived = latestFrame.FrameNumber
-					go func() {
-						select {
-						case e.frameChan <- latestFrame:
-						default:
-						}
-					}()
-				}
-
-				trie := e.GetFrameProverTries()[0]
-				if bytes.Equal(
-					trie.FindNearest(e.provingKeyAddress).External.Key,
-					e.provingKeyAddress,
-				) {
-					var nextFrame *protobufs.ClockFrame
-					if nextFrame, err = e.prove(latestFrame); err != nil {
-						e.logger.Error("could not prove", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-						continue
-					}
-
-					e.proverTrieRequestsMx.Lock()
-					joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
-					leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
-					for _, addr := range e.proverTrieJoinRequests {
-						if _, ok := (*e.peerSeniority)[addr]; !ok {
-							joinAddrs.Push(peerSeniorityItem{
-								addr:      addr,
-								seniority: 0,
-							})
-						} else {
-							joinAddrs.Push((*e.peerSeniority)[addr])
-						}
-					}
-					for _, addr := range e.proverTrieLeaveRequests {
-						if _, ok := (*e.peerSeniority)[addr]; !ok {
-							leaveAddrs.Push(peerSeniorityItem{
-								addr:      addr,
-								seniority: 0,
-							})
-						} else {
-							leaveAddrs.Push((*e.peerSeniority)[addr])
-						}
-					}
-					for _, addr := range e.proverTrieResumeRequests {
-						if _, ok := e.proverTriePauseRequests[addr]; ok {
-							delete(e.proverTriePauseRequests, addr)
-						}
-					}
-
-					joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
-					copy(joinReqs, joinAddrs.All())
-					slices.Reverse(joinReqs)
-					leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
-					copy(leaveReqs, leaveAddrs.All())
-					slices.Reverse(leaveReqs)
-
-					e.proverTrieJoinRequests = make(map[string]string)
-					e.proverTrieLeaveRequests = make(map[string]string)
-					e.proverTrieRequestsMx.Unlock()
-
-					e.frameProverTriesMx.Lock()
-					for _, addr := range joinReqs {
-						rings := len(e.frameProverTries)
-						last := e.frameProverTries[rings-1]
-						set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
-						if len(set) == 8 {
-							e.frameProverTries = append(
-								e.frameProverTries,
-								&tries.RollingFrecencyCritbitTrie{},
-							)
-							last = e.frameProverTries[rings]
-						}
-						last.Add([]byte(addr.addr), nextFrame.FrameNumber)
-					}
-					for _, addr := range leaveReqs {
-						for _, t := range e.frameProverTries {
-							if bytes.Equal(
-								t.FindNearest([]byte(addr.addr)).External.Key,
-								[]byte(addr.addr),
-							) {
-								t.Remove([]byte(addr.addr))
-								break
-							}
-						}
-					}
-					e.frameProverTriesMx.Unlock()
-
-					e.dataTimeReel.Insert(nextFrame, false)
-
-					if err = e.publishProof(nextFrame); err != nil {
-						e.logger.Error("could not publish", zap.Error(err))
-						e.state = consensus.EngineStateCollecting
-					}
-					break
-				}
-			case <-time.After(20 * time.Second):
-				dataFrame, err := e.dataTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
-				if latestFrame, err = e.collect(dataFrame); err != nil {
-					e.logger.Error("could not collect", zap.Error(err))
-					continue
-				}
-
-				if latestFrame == nil ||
-					latestFrame.FrameNumber < dataFrame.FrameNumber {
-					latestFrame, err = e.dataTimeReel.Head()
-					if err != nil {
-						panic(err)
-					}
-				}
-
-				if e.latestFrameReceived < latestFrame.FrameNumber {
-					e.latestFrameReceived = latestFrame.FrameNumber
-					go func() {
-						select {
-						case e.frameChan <- latestFrame:
-						default:
-						}
-					}()
-				}
-
-				for _, trie := range e.GetFrameProverTries() {
-					if bytes.Equal(
-						trie.FindNearest(e.provingKeyAddress).External.Key,
-						e.provingKeyAddress,
-					) {
-						var nextFrame *protobufs.ClockFrame
-						if nextFrame, err = e.prove(latestFrame); err != nil {
-							e.logger.Error("could not prove", zap.Error(err))
-							e.state = consensus.EngineStateCollecting
-							continue
-						}
-
-						e.proverTrieRequestsMx.Lock()
-						joinAddrs := tries.NewMinHeap[peerSeniorityItem]()
-						leaveAddrs := tries.NewMinHeap[peerSeniorityItem]()
-						for _, addr := range e.proverTrieJoinRequests {
-							if _, ok := (*e.peerSeniority)[addr]; !ok {
-								joinAddrs.Push(peerSeniorityItem{
-									addr:      addr,
-									seniority: 0,
-								})
-							} else {
-								joinAddrs.Push((*e.peerSeniority)[addr])
-							}
-						}
-						for _, addr := range e.proverTrieLeaveRequests {
-							if _, ok := (*e.peerSeniority)[addr]; !ok {
-								leaveAddrs.Push(peerSeniorityItem{
-									addr:      addr,
-									seniority: 0,
-								})
-							} else {
-								leaveAddrs.Push((*e.peerSeniority)[addr])
-							}
-						}
-						for _, addr := range e.proverTrieResumeRequests {
-							if _, ok := e.proverTriePauseRequests[addr]; ok {
-								delete(e.proverTriePauseRequests, addr)
-							}
-						}
-
-						joinReqs := make([]peerSeniorityItem, len(joinAddrs.All()))
-						copy(joinReqs, joinAddrs.All())
-						slices.Reverse(joinReqs)
-						leaveReqs := make([]peerSeniorityItem, len(leaveAddrs.All()))
-						copy(leaveReqs, leaveAddrs.All())
-						slices.Reverse(leaveReqs)
-
-						e.proverTrieJoinRequests = make(map[string]string)
-						e.proverTrieLeaveRequests = make(map[string]string)
-						e.proverTrieRequestsMx.Unlock()
-
-						e.frameProverTriesMx.Lock()
-						for _, addr := range joinReqs {
-							rings := len(e.frameProverTries)
-							last := e.frameProverTries[rings-1]
-							set := last.FindNearestAndApproximateNeighbors(make([]byte, 32))
-							if len(set) == 8 {
-								e.frameProverTries = append(
-									e.frameProverTries,
-									&tries.RollingFrecencyCritbitTrie{},
-								)
-								last = e.frameProverTries[rings]
-							}
-							last.Add([]byte(addr.addr), nextFrame.FrameNumber)
-						}
-						for _, addr := range leaveReqs {
-							for _, t := range e.frameProverTries {
-								if bytes.Equal(
-									t.FindNearest([]byte(addr.addr)).External.Key,
-									[]byte(addr.addr),
-								) {
-									t.Remove([]byte(addr.addr))
-									break
-								}
-							}
-						}
-						e.frameProverTriesMx.Unlock()
-
-						e.dataTimeReel.Insert(nextFrame, false)
-
-						if err = e.publishProof(nextFrame); err != nil {
-							e.logger.Error("could not publish", zap.Error(err))
-							e.state = consensus.EngineStateCollecting
-						}
-						break
-					}
-				}
-			}
-		}
-	}
-}
-
 func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.logger.Info("stopping ceremony consensus engine")
 	e.state = consensus.EngineStateStopping
@@ -916,12 +652,6 @@ func (e *DataClockConsensusEngine) GetFrame() *protobufs.ClockFrame {
 
 func (e *DataClockConsensusEngine) GetState() consensus.EngineState {
 	return e.state
-}
-
-func (
-	e *DataClockConsensusEngine,
-) GetFrameChannel() <-chan *protobufs.ClockFrame {
-	return e.frameChan
 }
 
 func (

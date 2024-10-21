@@ -44,7 +44,8 @@ func (e *DataClockConsensusEngine) prove(
 	)
 
 	var validTransactions *protobufs.TokenRequests
-	app, validTransactions, _, err = app.ApplyTransitions(
+	var invalidTransactions *protobufs.TokenRequests
+	app, validTransactions, invalidTransactions, err = app.ApplyTransitions(
 		previousFrame.FrameNumber,
 		e.stagedTransactions,
 		true,
@@ -55,7 +56,13 @@ func (e *DataClockConsensusEngine) prove(
 		return nil, errors.Wrap(err, "prove")
 	}
 
-	defer e.stagedTransactionsMx.Unlock()
+	e.logger.Info(
+		"applied transitions",
+		zap.Int("successful", len(validTransactions.Requests)),
+		zap.Int("failed", len(invalidTransactions.Requests)),
+	)
+	e.stagedTransactions = &protobufs.TokenRequests{}
+	e.stagedTransactionsMx.Unlock()
 
 	outputState, err := app.MaterializeStateFromApplication()
 	if err != nil {
@@ -222,50 +229,76 @@ func (e *DataClockConsensusEngine) sync(
 
 	client := protobufs.NewDataServiceClient(cc)
 
-	response, err := client.GetDataFrame(
-		context.TODO(),
-		&protobufs.GetDataFrameRequest{
-			FrameNumber: currentLatest.FrameNumber + 1,
-		},
-		grpc.MaxCallRecvMsgSize(600*1024*1024),
-	)
-	if err != nil {
-		e.logger.Debug(
-			"could not get frame",
-			zap.Error(err),
+	for {
+		response, err := client.GetDataFrame(
+			context.TODO(),
+			&protobufs.GetDataFrameRequest{
+				FrameNumber: currentLatest.FrameNumber + 1,
+			},
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
+		if err != nil {
+			e.logger.Debug(
+				"could not get frame",
+				zap.Error(err),
+			)
+			e.peerMapMx.Lock()
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+				delete(e.peerMap, string(peerId))
+			}
+			e.peerMapMx.Unlock()
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			return latest, errors.Wrap(err, "sync")
 		}
-		e.peerMapMx.Unlock()
-		if err := cc.Close(); err != nil {
-			e.logger.Error("error while closing connection", zap.Error(err))
+
+		if response == nil {
+			e.logger.Debug("received no response from peer")
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			return latest, nil
 		}
-		return latest, errors.Wrap(err, "sync")
+
+		e.logger.Info(
+			"received new leading frame",
+			zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
+		)
+
+		if !e.IsInProverTrie(
+			response.ClockFrame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+		) {
+			e.peerMapMx.Lock()
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+				delete(e.peerMap, string(peerId))
+			}
+			e.peerMapMx.Unlock()
+		}
+
+		if err := e.frameProver.VerifyDataClockFrame(
+			response.ClockFrame,
+		); err != nil {
+			return nil, errors.Wrap(err, "sync")
+		}
+
+		e.dataTimeReel.Insert(response.ClockFrame, false)
+		currentLatest = response.ClockFrame
+
+		if currentLatest.FrameNumber >= maxFrame {
+			break
+		}
 	}
 
-	if response == nil {
-		e.logger.Debug("received no response from peer")
-		if err := cc.Close(); err != nil {
-			e.logger.Error("error while closing connection", zap.Error(err))
-		}
-		return latest, nil
-	}
-
-	e.logger.Info(
-		"received new leading frame",
-		zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
-	)
 	if err := cc.Close(); err != nil {
 		e.logger.Error("error while closing connection", zap.Error(err))
 	}
 
-	e.dataTimeReel.Insert(response.ClockFrame, false)
-
-	return response.ClockFrame, nil
+	return latest, nil
 }
 
 func (e *DataClockConsensusEngine) collect(
@@ -294,10 +327,6 @@ func (e *DataClockConsensusEngine) collect(
 	}
 
 	e.syncingStatus = SyncStatusNotSyncing
-
-	if latest.FrameNumber < currentFramePublished.FrameNumber {
-		latest = currentFramePublished
-	}
 
 	e.logger.Info(
 		"returning leader frame",

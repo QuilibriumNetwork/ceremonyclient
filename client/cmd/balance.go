@@ -44,7 +44,10 @@ var balanceCmd = &cobra.Command{
 		tokens := new(big.Int).SetBytes(info.OwnedTokens)
 		conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
 		r := new(big.Rat).SetFrac(tokens, conversionFactor)
-		fmt.Println("Total balance:", r.FloatString(12), "QUIL")
+		fmt.Println("Total balance:", r.FloatString(12), fmt.Sprintf(
+			"QUIL (Account 0x%x)",
+			addrBytes,
+		))
 	},
 }
 

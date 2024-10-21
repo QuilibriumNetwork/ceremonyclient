@@ -26,7 +26,6 @@ replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-
 replace github.com/cockroachdb/pebble => ../pebble
 
 require (
-	filippo.io/edwards25519 v1.0.0-rc.1
 	github.com/cockroachdb/pebble v0.0.0-20231210175920-b4d301aeb46a
 	github.com/deiu/rdf2go v0.0.0-20240619132609-81222e324bb9
 	github.com/libp2p/go-libp2p v0.35.4
@@ -42,6 +41,7 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.0.0-rc.1 // indirect
 	github.com/deiu/gon3 v0.0.0-20230411081920-f0f8f879f597 // indirect
 	github.com/libp2p/go-libp2p-routing-helpers v0.7.2 // indirect
 	github.com/linkeddata/gojsonld v0.0.0-20170418210642-4f5db6791326 // indirect
@@ -165,7 +165,7 @@ require (
 	github.com/mr-tron/base58 v1.2.0
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
-	github.com/multiformats/go-multiaddr-dns v0.3.1 // indirect
+	github.com/multiformats/go-multiaddr-dns v0.3.1
 	github.com/multiformats/go-multiaddr-fmt v0.1.0 // indirect
 	github.com/multiformats/go-multibase v0.2.0 // indirect
 	github.com/multiformats/go-multicodec v0.9.0 // indirect
@@ -178,7 +178,7 @@ require (
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/pkg/errors v0.9.1
 	github.com/polydawn/refmt v0.89.0 // indirect
-	github.com/prometheus/client_golang v1.19.1 // indirect
+	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.48.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
