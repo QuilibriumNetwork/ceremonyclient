@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -13,6 +15,8 @@ import (
 )
 
 func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
+	e.logger.Info("checking for pre-2.0 proofs")
+
 	increment, _, _, err := e.dataProofStore.GetLatestDataTimeProof(
 		e.pubSub.GetPeerID(),
 	)
@@ -27,7 +31,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 
 	for {
 		if e.state < consensus.EngineStateCollecting {
-			e.logger.Debug("waiting for node to finish starting")
+			e.logger.Info("waiting for node to finish starting")
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -55,7 +59,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 		e.peerMapMx.RUnlock()
 
 		if len(tries) == 0 || wait {
-			e.logger.Debug("waiting for more peer info to appear")
+			e.logger.Info("waiting for more peer info to appear")
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -82,7 +86,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 
 		if foundPri != -1 {
 			if frame.FrameNumber == frames[foundPri] {
-				e.logger.Debug("waiting for a new frame to appear")
+				e.logger.Info("waiting for a new frame to appear")
 				time.Sleep(10 * time.Second)
 				continue
 			}
@@ -94,7 +98,9 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 		}
 
 		batchCount := 0
-		for i := increment; i >= 0; i-- {
+		// the cast is important, it underflows without:
+		for i := int(increment); i >= 0; i-- {
+			e.logger.Info("iterating proofs", zap.Int("increment", i))
 			_, parallelism, input, output, err := e.dataProofStore.GetDataTimeProof(
 				e.pubSub.GetPeerID(),
 				uint32(i),
@@ -110,11 +116,17 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 
 				proofs = append(proofs, p)
 			} else {
-				panic(err)
+				e.logger.Error(
+					"could not find data time proof for peer and increment, stopping worker",
+					zap.String("peer_id", peer.ID(e.pubSub.GetPeerID()).String()),
+					zap.Int("increment", i),
+				)
 			}
 
 			batchCount++
 			if batchCount == 10 || i == 0 {
+				e.logger.Info("publishing proof batch", zap.Int("increment", i))
+
 				payload := []byte("mint")
 				for _, i := range proofs {
 					payload = append(payload, i...)
