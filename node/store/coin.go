@@ -68,8 +68,8 @@ func NewPebbleCoinStore(
 }
 
 const (
-	COIN             = 0x05
-	PROOF            = 0x06
+	COIN             = 0x07
+	PROOF            = 0x08
 	COIN_BY_ADDRESS  = 0x00
 	COIN_BY_OWNER    = 0x01
 	MIGRATION        = 0x02
@@ -389,7 +389,7 @@ func (p *PebbleCoinStore) SetLatestFrameProcessed(
 }
 
 func (p *PebbleCoinStore) SetMigrationVersion() error {
-	if err := p.db.Set(migrationKey(), []byte{0x02, 0x00, 0x01}); err != nil {
+	if err := p.db.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03}); err != nil {
 		return errors.Wrap(err, "set migration version")
 	}
 
@@ -408,16 +408,16 @@ func (p *PebbleCoinStore) Migrate(filter []byte) error {
 			return nil
 		}
 
-		err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x02})
+		err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03})
 		if err != nil {
 			panic(err)
 		}
 		return txn.Commit()
 	} else {
 		defer closer.Close()
-		if len(status) == 4 && bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x02}) > 0 {
+		if len(status) == 4 && bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x03}) > 0 {
 			panic("database has been migrated to a newer version, do not rollback")
-		} else if len(status) == 3 || bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x02}) < 0 {
+		} else if len(status) == 3 || bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x03}) < 0 {
 			err = p.db.DeleteRange(
 				coinByOwnerKey(
 					bytes.Repeat([]byte{0x00}, 32),
@@ -485,7 +485,7 @@ func (p *PebbleCoinStore) Migrate(filter []byte) error {
 				return nil
 			}
 
-			err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x02})
+			err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03})
 			if err != nil {
 				panic(err)
 			}
