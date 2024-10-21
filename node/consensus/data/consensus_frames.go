@@ -233,7 +233,7 @@ func (e *DataClockConsensusEngine) sync(
 		response, err := client.GetDataFrame(
 			context.TODO(),
 			&protobufs.GetDataFrameRequest{
-				FrameNumber: currentLatest.FrameNumber + 1,
+				FrameNumber: latest.FrameNumber + 1,
 			},
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
@@ -287,9 +287,9 @@ func (e *DataClockConsensusEngine) sync(
 		}
 
 		e.dataTimeReel.Insert(response.ClockFrame, false)
-		currentLatest = response.ClockFrame
+		latest = response.ClockFrame
 
-		if currentLatest.FrameNumber >= maxFrame {
+		if latest.FrameNumber >= maxFrame {
 			break
 		}
 	}
