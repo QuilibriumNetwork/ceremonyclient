@@ -606,7 +606,10 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 
 	d.headDistance = distance
 	go func() {
-		d.newFrameCh <- frame
+		select {
+		case d.newFrameCh <- frame:
+		default:
+		}
 	}()
 }
 
@@ -906,7 +909,10 @@ func (d *DataTimeReel) forkChoice(
 	)
 
 	go func() {
-		d.newFrameCh <- frame
+		select {
+		case d.newFrameCh <- frame:
+		default:
+		}
 	}()
 }
 

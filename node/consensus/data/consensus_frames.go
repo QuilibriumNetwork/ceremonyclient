@@ -302,11 +302,11 @@ func (e *DataClockConsensusEngine) sync(
 }
 
 func (e *DataClockConsensusEngine) collect(
-	currentFramePublished *protobufs.ClockFrame,
+	enqueuedFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
 	e.logger.Info("collecting vdf proofs")
 
-	latest := currentFramePublished
+	latest := enqueuedFrame
 
 	for {
 		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
