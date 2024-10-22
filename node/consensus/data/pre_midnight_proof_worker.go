@@ -101,7 +101,7 @@ outer:
 			},
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
-		if err != nil {
+		if err != nil || status == nil {
 			e.logger.Error(
 				"got error response, waiting...",
 				zap.Error(err),
