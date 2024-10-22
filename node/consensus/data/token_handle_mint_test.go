@@ -588,7 +588,7 @@ func TestHandlePreMidnightMint(t *testing.T) {
 				panic(err)
 			}
 
-			err = d.handleMint(
+			a, err := d.handleMint(
 				&protobufs.MintCoinRequest{
 					Proofs: proofs,
 					Signature: &protobufs.Ed448Signature{
@@ -609,6 +609,7 @@ func TestHandlePreMidnightMint(t *testing.T) {
 			for _, prf := range prfs {
 				if prf.IndexProof != nil {
 					resume, err = GetAddressOfPreCoinProof(prf)
+					assert.ElementsMatch(t, a, resume)
 					assert.NoError(t, err)
 				}
 			}
@@ -622,8 +623,18 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		}
 	}
 
-	app, _, _, err = app.ApplyTransitions(1, d.stagedTransactions, false)
+	assert.Len(t, d.stagedTransactions.Requests, 1)
+	// confirm operation cannot occur twice:
+	d.stagedTransactions.Requests = append(
+		d.stagedTransactions.Requests,
+		d.stagedTransactions.Requests[0],
+	)
+	app, success, fail, err := app.ApplyTransitions(1, d.stagedTransactions, true)
 	assert.NoError(t, err)
+
+	assert.Len(t, success.Requests, 1)
+	assert.Len(t, fail.Requests, 1)
+
 	txn, _ := app.CoinStore.NewTransaction()
 	for i, o := range app.TokenOutputs.Outputs {
 		switch e := o.Output.(type) {
@@ -652,8 +663,12 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		}
 	}
 	err = txn.Commit()
+	// confirm updated app state does fail transition
+	_, _, _, err = app.ApplyTransitions(1, d.stagedTransactions, false)
+	assert.Error(t, err)
 
 	_, _, coin, err := app.CoinStore.GetCoinsForOwner(addr)
+	assert.Len(t, coin, 1)
 	assert.Equal(t, append(make([]byte, 28), 0x27, 0xe9, 0x49, 0x00), coin[0].Amount)
 }
 

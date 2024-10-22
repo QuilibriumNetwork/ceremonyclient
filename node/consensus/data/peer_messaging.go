@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 var ErrNoNewFrames = errors.New("peer reported no frames")
@@ -222,7 +224,7 @@ func (e *DataClockConsensusEngine) handleMint(
 	}
 
 	if len(t.Proofs) >= 3 &&
-		len(t.Proofs) < 104 &&
+		len(t.Proofs) < 204 &&
 		bytes.Equal(
 			t.Proofs[0],
 			[]byte("pre-dusk"),
@@ -230,6 +232,7 @@ func (e *DataClockConsensusEngine) handleMint(
 		head.FrameNumber < 60480) && e.GetFrameProverTries()[0].Contains(
 		e.provingKeyAddress,
 	) {
+		prevInput := []byte{}
 		deletes := []*protobufs.TokenOutput{}
 		if !bytes.Equal(t.Proofs[1], make([]byte, 32)) {
 			pre, err := e.coinStore.GetPreCoinProofByAddress(t.Proofs[1])
@@ -246,13 +249,28 @@ func (e *DataClockConsensusEngine) handleMint(
 				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 			}
 			if pre.Difficulty == 0 {
+				_, pr, err := e.coinStore.GetPreCoinProofsForOwner(t.Proofs[0][32:])
+				if err != nil && !errors.Is(err, store.ErrNotFound) {
+					return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+				}
+
+				for _, p := range pr {
+					if p.IndexProof != nil {
+						continue
+					}
+					if bytes.Equal(p.Amount, pre.Amount) {
+						return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+					}
+				}
 				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			} else {
+				deletes = append(deletes, &protobufs.TokenOutput{
+					Output: &protobufs.TokenOutput_DeletedProof{
+						DeletedProof: pre,
+					},
+				})
 			}
-			deletes = append(deletes, &protobufs.TokenOutput{
-				Output: &protobufs.TokenOutput_DeletedProof{
-					DeletedProof: pre,
-				},
-			})
+			prevInput = pre.Proof[74:]
 		}
 
 		var previousIncrement = uint32(0xFFFFFFFF)
@@ -336,6 +354,12 @@ func (e *DataClockConsensusEngine) handleMint(
 				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 			}
 
+			if len(prevInput) != 0 && !bytes.Equal(prevInput, kzgCommitment) {
+				fmt.Printf("%x\n", prevInput)
+				fmt.Printf("%x\n", kzgCommitment)
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
 			wp := []byte{}
 			wp = append(wp, peerId...)
 			wp = append(wp, input...)
@@ -355,6 +379,7 @@ func (e *DataClockConsensusEngine) handleMint(
 				reward,
 				additional,
 			)
+			prevInput = input
 		}
 
 		if len(deletes) != 0 {
@@ -378,7 +403,7 @@ func (e *DataClockConsensusEngine) handleMint(
 				Index:       index,
 				IndexProof:  indexProof,
 				Commitment:  kzgCommitment,
-				Proof:       append(append([]byte{}, kzgProof...), indexProof...),
+				Proof:       append(append([]byte{}, kzgProof...), prevInput...),
 				Parallelism: parallelism,
 				Difficulty:  previousIncrement,
 				Owner: &protobufs.AccountRef{

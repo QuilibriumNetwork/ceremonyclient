@@ -12,6 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 func (a *TokenApplication) handleMint(
@@ -19,7 +20,7 @@ func (a *TokenApplication) handleMint(
 	lockMap map[string]struct{},
 	t *protobufs.MintCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
-	if t == nil || t.Proofs == nil {
+	if t == nil || t.Proofs == nil || t.Signature == nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
@@ -54,6 +55,7 @@ func (a *TokenApplication) handleMint(
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
+	// todo: set termination frame for this:
 	if len(t.Proofs) == 1 && a.Tries[0].Contains(
 		addr.FillBytes(make([]byte, 32)),
 	) && bytes.Equal(t.Signature.PublicKey.KeyValue, a.Beacon) {
@@ -61,7 +63,40 @@ func (a *TokenApplication) handleMint(
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}
 
+		if _, touched := lockMap[string(t.Proofs[0][32:])]; touched {
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
+		}
+
+		_, pr, err := a.CoinStore.GetPreCoinProofsForOwner(t.Proofs[0][32:])
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
+		}
+
+		for _, p := range pr {
+			if p.IndexProof == nil && bytes.Equal(p.Amount, t.Proofs[0][:32]) {
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
+			}
+		}
+
+		lockMap[string(t.Proofs[0][32:])] = struct{}{}
+
 		outputs := []*protobufs.TokenOutput{
+			&protobufs.TokenOutput{
+				Output: &protobufs.TokenOutput_Proof{
+					Proof: &protobufs.PreCoinProof{
+						Amount: t.Proofs[0][:32],
+						Owner: &protobufs.AccountRef{
+							Account: &protobufs.AccountRef_ImplicitAccount{
+								ImplicitAccount: &protobufs.ImplicitAccount{
+									ImplicitType: 0,
+									Address:      t.Proofs[0][32:],
+								},
+							},
+						},
+						Proof: t.Signature.Signature,
+					},
+				},
+			},
 			&protobufs.TokenOutput{
 				Output: &protobufs.TokenOutput_Coin{
 					Coin: &protobufs.Coin{

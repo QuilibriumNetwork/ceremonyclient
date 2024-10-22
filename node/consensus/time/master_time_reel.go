@@ -99,7 +99,7 @@ func (m *MasterTimeReel) Start() error {
 		rebuildGenesisFrame = true
 	}
 
-	if genesis == nil || rebuildGenesisFrame {
+	if genesis == nil || rebuildGenesisFrame || frame == nil {
 		m.logger.Info("creating genesis frame")
 		m.head = m.createGenesisFrame()
 	} else {

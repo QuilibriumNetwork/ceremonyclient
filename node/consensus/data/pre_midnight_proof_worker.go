@@ -154,7 +154,7 @@ outer:
 			}
 
 			batchCount++
-			if batchCount == 100 || i == 0 {
+			if batchCount == 200 || i == 0 {
 				e.logger.Info("publishing proof batch", zap.Int("increment", i))
 
 				payload := []byte("mint")
@@ -187,8 +187,6 @@ outer:
 					time.Sleep(10 * time.Second)
 					continue outer
 				}
-
-				time.Sleep(10 * time.Second)
 
 				resume = resp.Address
 				batchCount = 0

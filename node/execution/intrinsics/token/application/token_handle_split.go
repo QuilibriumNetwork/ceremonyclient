@@ -19,10 +19,7 @@ func (a *TokenApplication) handleSplit(
 	newCoins := []*protobufs.Coin{}
 	newAmounts := []*big.Int{}
 	payload := []byte{}
-	if t.Signature.PublicKey == nil ||
-		t.Signature.Signature == nil ||
-		t.OfCoin == nil ||
-		t.OfCoin.Address == nil {
+	if t.Signature == nil || t.OfCoin == nil || t.OfCoin.Address == nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 	coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)

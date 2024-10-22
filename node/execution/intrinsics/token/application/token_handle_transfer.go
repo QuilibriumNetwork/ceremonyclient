@@ -17,7 +17,11 @@ func (a *TokenApplication) handleTransfer(
 	t *protobufs.TransferCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
 	payload := []byte("transfer")
-	if t == nil || t.OfCoin == nil || t.OfCoin.Address == nil {
+	if t == nil || t.Signature == nil || t.OfCoin == nil ||
+		t.OfCoin.Address == nil || len(t.OfCoin.Address) != 32 ||
+		t.ToAccount == nil || t.ToAccount.GetImplicitAccount() == nil ||
+		t.ToAccount.GetImplicitAccount().Address == nil ||
+		len(t.ToAccount.GetImplicitAccount().Address) != 32 {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle transfer")
 	}
 
