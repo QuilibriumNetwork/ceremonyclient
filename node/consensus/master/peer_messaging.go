@@ -35,7 +35,7 @@ func (e *MasterClockConsensusEngine) Sync(
 		panic(err)
 	}
 
-	if masterFrame.FrameNumber < from || len(e.historicFrames) == 0 {
+	if masterFrame.FrameNumber < from {
 		e.logger.Debug(
 			"peer asked for undiscovered frame",
 			zap.Uint64("frame_number", request.FramesRequest.FromFrameNumber),
