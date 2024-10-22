@@ -137,23 +137,21 @@ func (e *DataClockConsensusEngine) GetPreMidnightMintStatus(
 			Increment: 0,
 		}, nil
 	} else {
-		for i, pr := range pre {
-			if fr[i] == 0 {
-				addr, err := GetAddressOfPreCoinProof(pr)
+		for _, pr := range pre {
+			addr, err := GetAddressOfPreCoinProof(pr)
+			if err != nil {
 				if err != nil {
-					if err != nil {
-						return nil, errors.Wrap(
-							errors.New("invalid data"),
-							"get pre midnight mint status",
-						)
-					}
+					return nil, errors.Wrap(
+						errors.New("invalid data"),
+						"get pre midnight mint status",
+					)
 				}
-
-				return &protobufs.PreMidnightMintResponse{
-					Address:   addr,
-					Increment: pr.Difficulty,
-				}, nil
 			}
+
+			return &protobufs.PreMidnightMintResponse{
+				Address:   addr,
+				Increment: pr.Difficulty,
+			}, nil
 		}
 	}
 
