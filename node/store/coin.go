@@ -473,25 +473,10 @@ func (p *PebbleCoinStore) internalMigrate(
 	if err != nil {
 		panic(err)
 	}
-	if err := p.db.DeleteRange(
-		clockDataFrameKey(filter, 0),
-		clockDataFrameKey(filter, 200000),
-	); err != nil {
-		panic(err)
-	}
-
 	if err := p.db.Delete(clockDataEarliestIndex(filter)); err != nil {
 		panic(err)
 	}
 	if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
-		panic(err)
-	}
-	if err := p.db.Delete(clockMasterEarliestIndex(
-		make([]byte, 32),
-	)); err != nil {
-		panic(err)
-	}
-	if err := p.db.Delete(clockMasterLatestIndex(make([]byte, 32))); err != nil {
 		panic(err)
 	}
 
