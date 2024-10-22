@@ -97,7 +97,10 @@ func NewTokenExecutionEngine(
 	} else if err != nil {
 		panic(err)
 	} else {
-		err := coinStore.Migrate(intrinsicFilter)
+		err := coinStore.Migrate(
+			intrinsicFilter,
+			config.GetGenesis().GenesisSeedHex,
+		)
 		if err != nil {
 			panic(err)
 		}
@@ -138,7 +141,16 @@ func NewTokenExecutionEngine(
 		clockStore,
 		cfg.Engine,
 		frameProver,
-		e.ProcessFrame,
+		func(txn store.Transaction, frame *protobufs.ClockFrame) error {
+			if err := e.VerifyExecution(frame); err != nil {
+				return err
+			}
+			if err := e.ProcessFrame(txn, frame); err != nil {
+				return err
+			}
+
+			return nil
+		},
 		origin,
 		inclusionProof,
 		proverKeys,
@@ -251,44 +263,6 @@ func NewTokenExecutionEngine(
 						Signature: ksigs[i],
 					},
 				)
-			}
-
-			inc, _, _, err := dataProofStore.GetLatestDataTimeProof(
-				e.pubSub.GetPeerID(),
-			)
-			_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
-				e.pubSub.GetPeerID(),
-				inc,
-			)
-			if err == nil {
-				proof := []byte{}
-				proof = binary.BigEndian.AppendUint32(proof, inc)
-				proof = binary.BigEndian.AppendUint32(proof, parallelism)
-				proof = binary.BigEndian.AppendUint64(proof, uint64(len(input)))
-				proof = append(proof, input...)
-				proof = binary.BigEndian.AppendUint64(proof, uint64(len(output)))
-				proof = append(proof, output...)
-				announce.Announce.InitialProof = &protobufs.MintCoinRequest{}
-				announce.Announce.InitialProof.Proofs = [][]byte{
-					[]byte("pre-dusk"),
-					make([]byte, 32),
-					proof,
-				}
-				payload := []byte("mint")
-				for _, p := range announce.Announce.InitialProof.Proofs {
-					payload = append(payload, p...)
-				}
-				sig, err := e.pubSub.SignMessage(payload)
-				if err != nil {
-					panic(err)
-				}
-
-				announce.Announce.InitialProof.Signature = &protobufs.Ed448Signature{
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: e.pubSub.GetPublicKey(),
-					},
-					Signature: sig,
-				}
 			}
 
 			req := &protobufs.TokenRequest{
@@ -476,6 +450,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 		),
 	)
 	app, err := application.MaterializeApplicationFromFrame(
+		e.provingKey,
 		frame,
 		e.clock.GetFrameProverTries(),
 		e.coinStore,
@@ -611,10 +586,6 @@ func (e *TokenExecutionEngine) publishMessage(
 func (e *TokenExecutionEngine) VerifyExecution(
 	frame *protobufs.ClockFrame,
 ) error {
-	if e.clock.GetFrame().FrameNumber != frame.FrameNumber-1 {
-		return nil
-	}
-
 	if len(frame.AggregateProofs) > 0 {
 		for _, proofs := range frame.AggregateProofs {
 			for _, inclusion := range proofs.InclusionCommitments {
@@ -624,19 +595,18 @@ func (e *TokenExecutionEngine) VerifyExecution(
 						return errors.Wrap(err, "verify execution")
 					}
 
-					parent, err := e.clockStore.GetStagedDataClockFrame(
+					parent, tries, err := e.clockStore.GetDataClockFrame(
 						append(
 							p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3),
 						),
 						frame.FrameNumber-1,
-						frame.ParentSelector,
 						false,
 					)
 					if err != nil && !errors.Is(err, store.ErrNotFound) {
 						return errors.Wrap(err, "verify execution")
 					}
 
-					if parent == nil {
+					if parent == nil && frame.FrameNumber != 0 {
 						return errors.Wrap(
 							errors.New("missing parent frame"),
 							"verify execution",
@@ -644,8 +614,9 @@ func (e *TokenExecutionEngine) VerifyExecution(
 					}
 
 					a, err := application.MaterializeApplicationFromFrame(
+						e.provingKey,
 						parent,
-						e.clock.GetFrameProverTries(),
+						tries,
 						e.coinStore,
 						e.logger,
 					)
@@ -653,14 +624,19 @@ func (e *TokenExecutionEngine) VerifyExecution(
 						return errors.Wrap(err, "verify execution")
 					}
 
-					a, _, _, err = a.ApplyTransitions(frame.FrameNumber, transition, false)
+					a, _, _, err = a.ApplyTransitions(
+						frame.FrameNumber,
+						transition,
+						false,
+					)
 					if err != nil {
 						return errors.Wrap(err, "verify execution")
 					}
 
 					a2, err := application.MaterializeApplicationFromFrame(
+						e.provingKey,
 						frame,
-						e.clock.GetFrameProverTries(),
+						tries,
 						e.coinStore,
 						e.logger,
 					)
@@ -670,7 +646,7 @@ func (e *TokenExecutionEngine) VerifyExecution(
 
 					if len(a.TokenOutputs.Outputs) != len(a2.TokenOutputs.Outputs) {
 						return errors.Wrap(
-							application.ErrInvalidStateTransition,
+							errors.New("mismatched outputs"),
 							"verify execution",
 						)
 					}
@@ -678,23 +654,9 @@ func (e *TokenExecutionEngine) VerifyExecution(
 					for i := range a.TokenOutputs.Outputs {
 						o1 := a.TokenOutputs.Outputs[i]
 						o2 := a2.TokenOutputs.Outputs[i]
-						b1, err := proto.Marshal(o1)
-						if err != nil {
+						if !proto.Equal(o1, o2) {
 							return errors.Wrap(
-								application.ErrInvalidStateTransition,
-								"verify execution",
-							)
-						}
-						b2, err := proto.Marshal(o2)
-						if err != nil {
-							return errors.Wrap(
-								application.ErrInvalidStateTransition,
-								"verify execution",
-							)
-						}
-						if !bytes.Equal(b1, b2) {
-							return errors.Wrap(
-								application.ErrInvalidStateTransition,
+								errors.New("mismatched messages"),
 								"verify execution",
 							)
 						}

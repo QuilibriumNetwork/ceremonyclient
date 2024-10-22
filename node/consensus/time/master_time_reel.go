@@ -9,8 +9,6 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
@@ -90,13 +88,10 @@ func (m *MasterTimeReel) Start() error {
 	}
 
 	rebuildGenesisFrame := false
-	if genesis != nil && genesis.Difficulty != 1000000 {
+	if genesis != nil && genesis.Difficulty != 100000 {
 		m.logger.Info("rewinding time reel to genesis")
 
 		err = m.clockStore.ResetMasterClockFrames(m.filter)
-		err = m.clockStore.ResetDataClockFrames(
-			p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3),
-		)
 		if err != nil {
 			panic(err)
 		}
@@ -156,8 +151,8 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 	}
 
 	difficulty := m.engineConfig.Difficulty
-	if difficulty != 1000000 {
-		difficulty = 1000000
+	if difficulty != 100000 {
+		difficulty = 100000
 	}
 
 	frame, err := m.frameProver.CreateMasterGenesisFrame(

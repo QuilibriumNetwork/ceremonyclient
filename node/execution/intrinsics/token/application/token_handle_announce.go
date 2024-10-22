@@ -1,6 +1,7 @@
 package application
 
 import (
+	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -16,38 +17,30 @@ func (a *TokenApplication) handleAnnounce(
 	payload := []byte{}
 
 	if t == nil || t.PublicKeySignaturesEd448 == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle announce")
 	}
 	for i, p := range t.PublicKeySignaturesEd448 {
 		if p.PublicKey == nil || p.Signature == nil ||
 			p.PublicKey.KeyValue == nil {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle announce")
 		}
 		if i == 0 {
 			primary = p
 		} else {
 			payload = append(payload, p.PublicKey.KeyValue...)
 			if err := p.Verify(primary.PublicKey.KeyValue); err != nil {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle announce")
 			}
 		}
 	}
 	if primary == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle announce")
 	}
 	if err := primary.Verify(payload); err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle announce")
 	}
 
 	outputs := []*protobufs.TokenOutput{}
-
-	if t.InitialProof != nil {
-		o, err := a.handleMint(currentFrameNumber, lockMap, t.InitialProof)
-		if err != nil {
-			return nil, ErrInvalidStateTransition
-		}
-		outputs = append(outputs, o...)
-	}
 
 	return outputs, nil
 }

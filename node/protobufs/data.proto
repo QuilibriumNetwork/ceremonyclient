@@ -7,6 +7,7 @@ option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 import "channel.proto";
 import "clock.proto";
 import "keys.proto";
+import "node.proto";
 
 message DataPeerListAnnounce {
   repeated DataPeer peer_list = 1;
@@ -78,11 +79,22 @@ message DataFrameResponse {
   bytes proof = 2;
 }
 
+message PreMidnightMintResponse {
+  bytes address = 1;
+  uint32 increment = 2;
+}
+
+message PreMidnightMintStatusRequest {
+  bytes owner = 1;
+}
+
 service DataService {
   rpc GetCompressedSyncFrames (quilibrium.node.clock.pb.ClockFramesRequest) returns (stream DataCompressedSync);
   rpc NegotiateCompressedSyncFrames (stream DataCompressedSyncRequestMessage) returns (stream DataCompressedSyncResponseMessage);
   rpc GetPublicChannel (stream quilibrium.node.channel.pb.P2PChannelEnvelope) returns (stream quilibrium.node.channel.pb.P2PChannelEnvelope);
   rpc GetDataFrame (GetDataFrameRequest) returns (DataFrameResponse);
+  rpc HandlePreMidnightMint (quilibrium.node.node.pb.MintCoinRequest) returns (PreMidnightMintResponse);
+  rpc GetPreMidnightMintStatus (PreMidnightMintStatusRequest) returns (PreMidnightMintResponse);
 }
 
 message ChallengeProofRequest {

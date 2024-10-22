@@ -1,19 +1,75 @@
-package application
+package data
 
 import (
+	"context"
+	gocrypto "crypto"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
+	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/anypb"
+	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
+	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/keys"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
+
+type pubsub struct {
+	privkey ed448.PrivateKey
+	pubkey  []byte
+}
+
+func (pubsub) GetBitmaskPeers() map[string][]string                                    { return nil }
+func (pubsub) Publish(address []byte, data []byte) error                               { return nil }
+func (pubsub) PublishToBitmask(bitmask []byte, data []byte) error                      { return nil }
+func (pubsub) Subscribe(bitmask []byte, handler func(message *pb.Message) error) error { return nil }
+func (pubsub) Unsubscribe(bitmask []byte, raw bool)                                    {}
+func (pubsub) GetPeerID() []byte                                                       { return nil }
+func (pubsub) GetPeerstoreCount() int                                                  { return 0 }
+func (pubsub) GetNetworkPeersCount() int                                               { return 0 }
+func (pubsub) GetRandomPeer(bitmask []byte) ([]byte, error)                            { return nil, nil }
+func (pubsub) GetMultiaddrOfPeerStream(ctx context.Context, peerId []byte) <-chan multiaddr.Multiaddr {
+	return nil
+}
+func (pubsub) GetMultiaddrOfPeer(peerId []byte) string { return "" }
+func (pubsub) StartDirectChannelListener(
+	key []byte,
+	purpose string,
+	server *grpc.Server,
+) error {
+	return nil
+}
+func (pubsub) GetDirectChannel(peerId []byte, purpose string) (*grpc.ClientConn, error) {
+	return nil, nil
+}
+func (pubsub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
+	return nil
+}
+func (p pubsub) SignMessage(msg []byte) ([]byte, error) {
+	return p.privkey.Sign(rand.Reader, msg, gocrypto.Hash(0))
+}
+func (p pubsub) GetPublicKey() []byte                  { return p.pubkey }
+func (pubsub) GetPeerScore(peerId []byte) int64        { return 0 }
+func (pubsub) SetPeerScore(peerId []byte, score int64) {}
 
 type outputs struct {
 	difficulty  uint32
@@ -24,12 +80,76 @@ type outputs struct {
 
 func TestHandlePreMidnightMint(t *testing.T) {
 	log, _ := zap.NewDevelopment()
-	app := &TokenApplication{
+	bpub, bprivKey, _ := ed448.GenerateKey(rand.Reader)
+	app := &application.TokenApplication{
+		Beacon:     bpub,
 		CoinStore:  store.NewPebbleCoinStore(store.NewInMemKVDB(), log),
 		Logger:     log,
 		Difficulty: 200000,
+		Tries: []*tries.RollingFrecencyCritbitTrie{
+			&tries.RollingFrecencyCritbitTrie{},
+		},
 	}
 
+	clockstore := store.NewPebbleClockStore(store.NewInMemKVDB(), log)
+	dataproofstore := store.NewPebbleDataProofStore(store.NewInMemKVDB(), log)
+	keystore := store.NewPebbleKeyStore(store.NewInMemKVDB(), log)
+	d := &DataClockConsensusEngine{
+		difficulty:       200000,
+		logger:           log,
+		state:            consensus.EngineStateStopped,
+		clockStore:       clockstore,
+		coinStore:        app.CoinStore,
+		dataProofStore:   dataproofstore,
+		keyStore:         keystore,
+		keyManager:       keys.NewInMemoryKeyManager(),
+		pubSub:           nil,
+		frameChan:        make(chan *protobufs.ClockFrame),
+		executionEngines: map[string]execution.ExecutionEngine{},
+		dependencyMap:    make(map[string]*anypb.Any),
+		parentSelector: []byte{
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		},
+		currentReceivingSyncPeers: 0,
+		lastFrameReceivedAt:       time.Time{},
+		frameProverTries:          []*tries.RollingFrecencyCritbitTrie{},
+		inclusionProver:           qcrypto.NewKZGInclusionProver(log),
+		syncingStatus:             SyncStatusNotSyncing,
+		peerMap:                   map[string]*peerInfo{},
+		uncooperativePeersMap:     map[string]*peerInfo{},
+		minimumPeersRequired:      0,
+		report:                    nil,
+		frameProver:               qcrypto.NewWesolowskiFrameProver(log),
+		masterTimeReel:            nil,
+		dataTimeReel:              &qtime.DataTimeReel{},
+		peerInfoManager:           nil,
+		peerSeniority:             newFromMap(map[string]uint64{}),
+		messageProcessorCh:        make(chan *pb.Message),
+		engineConfig:              nil,
+		preMidnightMint:           map[string]struct{}{},
+	}
+
+	d.dataTimeReel.SetHead(&protobufs.ClockFrame{
+		FrameNumber: 0,
+	})
+
+	d.pubSub = pubsub{
+		privkey: bprivKey,
+		pubkey:  bpub,
+	}
+	d.filter = p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
+	d.input = nil
+	d.provingKey = bprivKey
+	d.provingKeyType = keys.KeyTypeEd448
+	d.provingKeyBytes = bpub
+	d.frameProverTries = app.Tries
+	baddr, _ := poseidon.HashBytes(bpub)
+	d.provingKeyAddress = baddr.FillBytes(make([]byte, 32))
+
+	app.Tries[0].Add(baddr.FillBytes(make([]byte, 32)), 0)
 	resume := make([]byte, 32)
 	proofs := [][]byte{
 		[]byte("pre-dusk"),
@@ -429,7 +549,12 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		t.FailNow()
 	}
 
-	addrBI, err := poseidon.HashBytes(pubkey)
+	peerId, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		t.FailNow()
+	}
+
+	addrBI, err := poseidon.HashBytes([]byte(peerId))
 	if err != nil {
 		t.FailNow()
 	}
@@ -438,7 +563,6 @@ func TestHandlePreMidnightMint(t *testing.T) {
 
 	batchCount := 0
 	for i := len(outputs) - 1; i >= 0; i-- {
-		fmt.Println(i)
 		parallelism, inputhex, outputhex := outputs[i].parallelism, outputs[i].input, outputs[i].output
 		input, _ := hex.DecodeString(inputhex)
 		output, _ := hex.DecodeString(outputhex)
@@ -451,7 +575,6 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		p = append(p, output...)
 
 		proofs = append(proofs, p)
-		fmt.Printf("%x\n", p)
 
 		batchCount++
 		if batchCount == 10 || i == 0 {
@@ -465,7 +588,7 @@ func TestHandlePreMidnightMint(t *testing.T) {
 				panic(err)
 			}
 
-			outputs, err := app.handleMint(0, map[string]struct{}{},
+			err = d.handleMint(
 				&protobufs.MintCoinRequest{
 					Proofs: proofs,
 					Signature: &protobufs.Ed448Signature{
@@ -478,37 +601,19 @@ func TestHandlePreMidnightMint(t *testing.T) {
 			)
 
 			assert.NoError(t, err)
-			txn, _ := app.CoinStore.NewTransaction()
-			for i, o := range outputs {
-				switch e := o.Output.(type) {
-				case *protobufs.TokenOutput_Coin:
-					a, err := GetAddressOfCoin(e.Coin, 1, uint64(i))
-					assert.NoError(t, err)
-					err = app.CoinStore.PutCoin(txn, 1, a, e.Coin)
-					assert.NoError(t, err)
-				case *protobufs.TokenOutput_DeletedCoin:
-					c, err := app.CoinStore.GetCoinByAddress(txn, e.DeletedCoin.Address)
-					assert.NoError(t, err)
-					err = app.CoinStore.DeleteCoin(txn, e.DeletedCoin.Address, c)
-					assert.NoError(t, err)
-				case *protobufs.TokenOutput_Proof:
-					a, err := GetAddressOfPreCoinProof(e.Proof)
-					assert.NoError(t, err)
-					err = app.CoinStore.PutPreCoinProof(txn, 1, a, e.Proof)
-					resume = a
-					assert.NoError(t, err)
-				case *protobufs.TokenOutput_DeletedProof:
-					a, err := GetAddressOfPreCoinProof(e.DeletedProof)
-					assert.NoError(t, err)
-					c, err := app.CoinStore.GetPreCoinProofByAddress(a)
-					assert.NoError(t, err)
-					err = app.CoinStore.DeletePreCoinProof(txn, a, c)
+
+			fmt.Printf("check %x\n", addr)
+			fr, prfs, err := app.CoinStore.GetPreCoinProofsForOwner(addr)
+			assert.Len(t, prfs, 1)
+			assert.Len(t, fr, 1)
+			for _, prf := range prfs {
+				if prf.IndexProof != nil {
+					resume, err = GetAddressOfPreCoinProof(prf)
 					assert.NoError(t, err)
 				}
 			}
-			err = txn.Commit()
 			assert.NoError(t, err)
-			assert.NotEqual(t, resume, append(make([]byte, 28), 0x27, 0xe9, 0x49, 0x00))
+			assert.NotEqual(t, resume, make([]byte, 32))
 			batchCount = 0
 			proofs = [][]byte{
 				[]byte("pre-dusk"),
@@ -517,8 +622,39 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		}
 	}
 
+	app, _, _, err = app.ApplyTransitions(1, d.stagedTransactions, false)
+	assert.NoError(t, err)
+	txn, _ := app.CoinStore.NewTransaction()
+	for i, o := range app.TokenOutputs.Outputs {
+		switch e := o.Output.(type) {
+		case *protobufs.TokenOutput_Coin:
+			a, err := GetAddressOfCoin(e.Coin, 1, uint64(i))
+			assert.NoError(t, err)
+			err = app.CoinStore.PutCoin(txn, 1, a, e.Coin)
+			assert.NoError(t, err)
+		case *protobufs.TokenOutput_DeletedCoin:
+			c, err := app.CoinStore.GetCoinByAddress(txn, e.DeletedCoin.Address)
+			assert.NoError(t, err)
+			err = app.CoinStore.DeleteCoin(txn, e.DeletedCoin.Address, c)
+			assert.NoError(t, err)
+		case *protobufs.TokenOutput_Proof:
+			a, err := GetAddressOfPreCoinProof(e.Proof)
+			assert.NoError(t, err)
+			err = app.CoinStore.PutPreCoinProof(txn, 1, a, e.Proof)
+			assert.NoError(t, err)
+		case *protobufs.TokenOutput_DeletedProof:
+			a, err := GetAddressOfPreCoinProof(e.DeletedProof)
+			assert.NoError(t, err)
+			c, err := app.CoinStore.GetPreCoinProofByAddress(a)
+			assert.NoError(t, err)
+			err = app.CoinStore.DeletePreCoinProof(txn, a, c)
+			assert.NoError(t, err)
+		}
+	}
+	err = txn.Commit()
+
 	_, _, coin, err := app.CoinStore.GetCoinsForOwner(addr)
-	assert.Equal(t, make([]byte, 32), coin[0].Amount)
+	assert.Equal(t, append(make([]byte, 28), 0x27, 0xe9, 0x49, 0x00), coin[0].Amount)
 }
 
 func GetAddressOfCoin(
@@ -527,7 +663,7 @@ func GetAddressOfCoin(
 	seqno uint64,
 ) ([]byte, error) {
 	eval := []byte{}
-	eval = append(eval, TOKEN_ADDRESS...)
+	eval = append(eval, application.TOKEN_ADDRESS...)
 	eval = binary.BigEndian.AppendUint64(eval, frameNumber)
 	if frameNumber != 0 {
 		eval = binary.BigEndian.AppendUint64(eval, seqno)
@@ -536,28 +672,6 @@ func GetAddressOfCoin(
 	eval = append(eval, coin.Intersection...)
 	eval = binary.BigEndian.AppendUint32(eval, 0)
 	eval = append(eval, coin.Owner.GetImplicitAccount().Address...)
-	addressBI, err := poseidon.HashBytes(eval)
-	if err != nil {
-		return nil, err
-	}
-
-	return addressBI.FillBytes(make([]byte, 32)), nil
-}
-
-func GetAddressOfPreCoinProof(
-	proof *protobufs.PreCoinProof,
-) ([]byte, error) {
-	eval := []byte{}
-	eval = append(eval, TOKEN_ADDRESS...)
-	eval = append(eval, proof.Amount...)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Index)
-	eval = append(eval, proof.IndexProof...)
-	eval = append(eval, proof.Commitment...)
-	eval = append(eval, proof.Proof...)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Parallelism)
-	eval = binary.BigEndian.AppendUint32(eval, proof.Difficulty)
-	eval = binary.BigEndian.AppendUint32(eval, 0)
-	eval = append(eval, proof.Owner.GetImplicitAccount().Address...)
 	addressBI, err := poseidon.HashBytes(eval)
 	if err != nil {
 		return nil, err

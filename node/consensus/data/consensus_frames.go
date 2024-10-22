@@ -23,6 +23,7 @@ func (e *DataClockConsensusEngine) prove(
 	e.stagedTransactionsMx.Lock()
 	executionOutput := &protobufs.IntrinsicExecutionOutput{}
 	app, err := application.MaterializeApplicationFromFrame(
+		e.provingKey,
 		previousFrame,
 		e.frameProverTries,
 		e.coinStore,
@@ -263,6 +264,23 @@ func (e *DataClockConsensusEngine) sync(
 			return latest, nil
 		}
 
+		if response.ClockFrame == nil ||
+			response.ClockFrame.FrameNumber != latest.FrameNumber+1 ||
+			response.ClockFrame.Timestamp < latest.Timestamp {
+			e.logger.Debug("received invalid response from peer")
+			e.peerMapMx.Lock()
+			if _, ok := e.peerMap[string(peerId)]; ok {
+				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+				delete(e.peerMap, string(peerId))
+			}
+			e.peerMapMx.Unlock()
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+			return latest, nil
+		}
+
 		e.logger.Info(
 			"received new leading frame",
 			zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
@@ -286,7 +304,7 @@ func (e *DataClockConsensusEngine) sync(
 			return nil, errors.Wrap(err, "sync")
 		}
 
-		e.dataTimeReel.Insert(response.ClockFrame, false)
+		e.dataTimeReel.Insert(response.ClockFrame, true)
 		latest = response.ClockFrame
 
 		if latest.FrameNumber >= maxFrame {
@@ -316,6 +334,9 @@ func (e *DataClockConsensusEngine) collect(
 				e.logger.Info("no peers available for sync, waiting")
 				time.Sleep(5 * time.Second)
 			} else if maxFrame > latest.FrameNumber {
+				if maxFrame-latest.FrameNumber > 100 {
+					maxFrame = latest.FrameNumber + 100
+				}
 				latest, err = e.sync(latest, maxFrame, peerId)
 				if err == nil {
 					break

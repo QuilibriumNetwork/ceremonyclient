@@ -7,6 +7,7 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -22,50 +23,55 @@ func (a *TokenApplication) handleSplit(
 		t.Signature.Signature == nil ||
 		t.OfCoin == nil ||
 		t.OfCoin.Address == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 	coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	if _, touched := lockMap[string(t.OfCoin.Address)]; touched {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	payload = append(payload, []byte("split")...)
 	payload = append(payload, t.OfCoin.Address...)
+
+	if len(t.Amounts) > 100 {
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
+	}
+
 	for _, a := range t.Amounts {
 		if len(a) > 32 {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 		}
 		payload = append(payload, a...)
 	}
 
 	if err := t.Signature.Verify(payload); err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	addr, err := poseidon.HashBytes(t.Signature.PublicKey.KeyValue)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	pk, err := pcrypto.UnmarshalEd448PublicKey(
 		t.Signature.PublicKey.KeyValue,
 	)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	peerId, err := peer.IDFromPublicKey(pk)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	altAddr, err := poseidon.HashBytes([]byte(peerId))
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	if !bytes.Equal(
@@ -75,7 +81,7 @@ func (a *TokenApplication) handleSplit(
 		coin.Owner.GetImplicitAccount().Address,
 		altAddr.FillBytes(make([]byte, 32)),
 	) {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	original := new(big.Int).SetBytes(coin.Amount)
@@ -84,7 +90,7 @@ func (a *TokenApplication) handleSplit(
 	for _, amount := range amounts {
 		amountBI := new(big.Int).SetBytes(amount)
 		if amountBI.Cmp(original) >= 0 {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 		}
 
 		newAmounts = append(newAmounts, amountBI)
@@ -96,7 +102,7 @@ func (a *TokenApplication) handleSplit(
 		})
 	}
 	if original.Cmp(total) != 0 {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	outputs := []*protobufs.TokenOutput{}

@@ -1,9 +1,12 @@
 package application
 
 import (
+	"crypto"
+
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
@@ -20,6 +23,7 @@ var TOKEN_ADDRESS = []byte{
 }
 
 type TokenApplication struct {
+	Beacon       []byte
 	TokenOutputs *protobufs.TokenOutputs
 	Tries        []*tries.RollingFrecencyCritbitTrie
 	CoinStore    store.CoinStore
@@ -67,6 +71,7 @@ func GetOutputsFromClockFrame(
 }
 
 func MaterializeApplicationFromFrame(
+	privKey crypto.Signer,
 	frame *protobufs.ClockFrame,
 	tries []*tries.RollingFrecencyCritbitTrie,
 	store store.CoinStore,
@@ -77,7 +82,10 @@ func MaterializeApplicationFromFrame(
 		return nil, errors.Wrap(err, "materialize application from frame")
 	}
 
+	genesis := config.GetGenesis()
+
 	return &TokenApplication{
+		Beacon:       genesis.Beacon,
 		TokenOutputs: tokenOutputs,
 		Tries:        tries,
 		CoinStore:    store,
@@ -109,7 +117,7 @@ func (a *TokenApplication) ApplyTransitions(
 			if err != nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						ErrInvalidStateTransition,
+						err,
 						"apply transitions",
 					)
 				}
@@ -129,7 +137,7 @@ func (a *TokenApplication) ApplyTransitions(
 			if err != nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						ErrInvalidStateTransition,
+						err,
 						"apply transitions",
 					)
 				}
@@ -149,7 +157,7 @@ func (a *TokenApplication) ApplyTransitions(
 			if err != nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						ErrInvalidStateTransition,
+						err,
 						"apply transitions",
 					)
 				}
@@ -169,7 +177,7 @@ func (a *TokenApplication) ApplyTransitions(
 			if err != nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						ErrInvalidStateTransition,
+						err,
 						"apply transitions",
 					)
 				}
@@ -189,7 +197,7 @@ func (a *TokenApplication) ApplyTransitions(
 			if err != nil {
 				if !skipFailures {
 					return nil, nil, nil, errors.Wrap(
-						ErrInvalidStateTransition,
+						err,
 						"apply transitions",
 					)
 				}
@@ -210,18 +218,6 @@ func (a *TokenApplication) ApplyTransitions(
 	a.TokenOutputs = outputs
 
 	return a, finalizedTransitions, failedTransitions, nil
-}
-
-func nearestApplicablePowerOfTwo(number uint64) uint64 {
-	power := uint64(128)
-	if number > 2048 {
-		power = 65536
-	} else if number > 1024 {
-		power = 2048
-	} else if number > 128 {
-		power = 1024
-	}
-	return power
 }
 
 func (a *TokenApplication) MaterializeStateFromApplication() (

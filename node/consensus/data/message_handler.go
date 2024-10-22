@@ -494,10 +494,12 @@ func (e *DataClockConsensusEngine) handleTokenRequest(
 				case *protobufs.TokenRequest_Mint:
 				checkmint:
 					for i := range t.Mint.Proofs {
-						for j := range r.Mint.Proofs {
-							if bytes.Equal(t.Mint.Proofs[i], r.Mint.Proofs[j]) {
-								found = true
-								break checkmint
+						if len(r.Mint.Proofs) < 2 {
+							for j := range r.Mint.Proofs {
+								if bytes.Equal(t.Mint.Proofs[i], r.Mint.Proofs[j]) {
+									found = true
+									break checkmint
+								}
 							}
 						}
 					}
@@ -514,4 +516,16 @@ func (e *DataClockConsensusEngine) handleTokenRequest(
 		e.stagedTransactionsMx.Unlock()
 	}
 	return nil
+}
+
+func nearestApplicablePowerOfTwo(number uint64) uint64 {
+	power := uint64(128)
+	if number > 2048 {
+		power = 65536
+	} else if number > 1024 {
+		power = 2048
+	} else if number > 128 {
+		power = 1024
+	}
+	return power
 }

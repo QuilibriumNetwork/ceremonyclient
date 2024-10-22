@@ -143,6 +143,14 @@ func (d *DataTimeReel) Start() error {
 	return nil
 }
 
+func (d *DataTimeReel) SetHead(frame *protobufs.ClockFrame) {
+	if d.running == true {
+		panic("internal test function should never be called outside of tests")
+	}
+
+	d.head = frame
+}
+
 func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 	return d.head, nil
 }
@@ -177,7 +185,7 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
 
 	d.storePending(selector, parent, distance, frame)
 
-	if !isSync {
+	if isSync {
 		go func() {
 			d.frames <- &pendingFrame{
 				selector:       selector,

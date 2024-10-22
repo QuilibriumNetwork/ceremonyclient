@@ -80,6 +80,8 @@ type DataClockConsensusEngine struct {
 	lastFrameReceivedAt         time.Time
 	latestFrameReceived         uint64
 	frameProverTries            []*tries.RollingFrecencyCritbitTrie
+	preMidnightMintMx           sync.Mutex
+	preMidnightMint             map[string]struct{}
 	frameProverTriesMx          sync.RWMutex
 	dependencyMap               map[string]*anypb.Any
 	pendingCommits              chan *anypb.Any
@@ -220,7 +222,7 @@ func NewDataClockConsensusEngine(
 
 	difficulty := engineConfig.Difficulty
 	if difficulty == 0 {
-		difficulty = 200000
+		difficulty = 100000
 	}
 
 	e := &DataClockConsensusEngine{
@@ -258,6 +260,7 @@ func NewDataClockConsensusEngine(
 		peerSeniority:             newFromMap(peerSeniority),
 		messageProcessorCh:        make(chan *pb.Message),
 		engineConfig:              engineConfig,
+		preMidnightMint:           map[string]struct{}{},
 	}
 
 	logger.Info("constructing consensus engine")

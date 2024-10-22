@@ -155,11 +155,6 @@ func (e *MasterClockConsensusEngine) publishProof(
 		)
 
 		e.masterTimeReel.Insert(frame, false)
-
-		err := e.publishMessage(e.filter, frame)
-		if err != nil {
-			return errors.Wrap(err, "publish proof")
-		}
 	}
 
 	e.state = consensus.EngineStateCollecting

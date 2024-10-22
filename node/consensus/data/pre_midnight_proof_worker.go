@@ -1,13 +1,18 @@
 package data
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -45,6 +50,18 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 
 	addr := addrBI.FillBytes(make([]byte, 32))
 
+	genesis := config.GetGenesis()
+	pub, err := crypto.UnmarshalEd448PublicKey(genesis.Beacon)
+	if err != nil {
+		panic(err)
+	}
+
+	peerId, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		panic(errors.Wrap(err, "error getting peer id"))
+	}
+
+outer:
 	for {
 		frame, err := e.dataTimeReel.Head()
 		tries := e.GetFrameProverTries()
@@ -64,37 +81,49 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 			continue
 		}
 
-		frames, prfs, err := e.coinStore.GetPreCoinProofsForOwner(addr)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			panic(err)
+		cc, err := e.pubSub.GetDirectChannel([]byte(peerId), "")
+		if err != nil {
+			e.logger.Info(
+				"could not establish direct channel, waiting...",
+				zap.Error(err),
+			)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		defer cc.Close()
+
+		client := protobufs.NewDataServiceClient(cc)
+
+		status, err := client.GetPreMidnightMintStatus(
+			context.Background(),
+			&protobufs.PreMidnightMintStatusRequest{
+				Owner: addr,
+			},
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
+		)
+		if err != nil {
+			e.logger.Error(
+				"got error response, waiting...",
+				zap.Error(err),
+			)
+			time.Sleep(10 * time.Second)
+			continue
 		}
 
-		resume := make([]byte, 32)
-
-		foundPri := -1
-		for pri, pr := range prfs {
-			if pr.IndexProof != nil {
-				resume, err = GetAddressOfPreCoinProof(pr)
-				if err != nil {
-					panic(err)
-				}
-				increment = pr.Difficulty - 1
-				foundPri = pri
-				break
-			}
-		}
-
-		if foundPri != -1 {
-			if frame.FrameNumber == frames[foundPri] {
-				e.logger.Info("waiting for a new frame to appear")
-				time.Sleep(10 * time.Second)
-				continue
-			}
-		}
+		resume := status.Address
 
 		proofs := [][]byte{
 			[]byte("pre-dusk"),
 			resume,
+		}
+
+		if status.Increment != 0 {
+			increment = status.Increment - 1
+		}
+
+		if status.Increment == 0 && !bytes.Equal(status.Address, make([]byte, 32)) {
+			e.logger.Info("already completed pre-midnight mint")
+			return
 		}
 
 		batchCount := 0
@@ -121,10 +150,11 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 					zap.String("peer_id", peer.ID(e.pubSub.GetPeerID()).String()),
 					zap.Int("increment", i),
 				)
+				return
 			}
 
 			batchCount++
-			if batchCount == 10 || i == 0 {
+			if batchCount == 100 || i == 0 {
 				e.logger.Info("publishing proof batch", zap.Int("increment", i))
 
 				payload := []byte("mint")
@@ -136,36 +166,31 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 					panic(err)
 				}
 
-				e.publishMessage(
-					e.filter,
-					&protobufs.TokenRequest{
-						Request: &protobufs.TokenRequest_Mint{
-							Mint: &protobufs.MintCoinRequest{
-								Proofs: proofs,
-								Signature: &protobufs.Ed448Signature{
-									PublicKey: &protobufs.Ed448PublicKey{
-										KeyValue: e.pubSub.GetPublicKey(),
-									},
-									Signature: sig,
-								},
+				resp, err := client.HandlePreMidnightMint(
+					context.Background(),
+					&protobufs.MintCoinRequest{
+						Proofs: proofs,
+						Signature: &protobufs.Ed448Signature{
+							PublicKey: &protobufs.Ed448PublicKey{
+								KeyValue: e.pubSub.GetPublicKey(),
 							},
+							Signature: sig,
 						},
 					},
 				)
 
-				time.Sleep(20 * time.Second)
-
-				_, prfs, err := e.coinStore.GetPreCoinProofsForOwner(addr)
 				if err != nil {
-					for _, pr := range prfs {
-						if pr.IndexProof != nil {
-							resume, err = GetAddressOfPreCoinProof(pr)
-							if err != nil {
-								panic(err)
-							}
-						}
-					}
+					e.logger.Error(
+						"got error response, waiting...",
+						zap.Error(err),
+					)
+					time.Sleep(10 * time.Second)
+					continue outer
 				}
+
+				time.Sleep(10 * time.Second)
+
+				resume = resp.Address
 				batchCount = 0
 				proofs = [][]byte{
 					[]byte("pre-dusk"),

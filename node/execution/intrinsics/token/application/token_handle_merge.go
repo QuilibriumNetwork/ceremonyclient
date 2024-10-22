@@ -7,6 +7,7 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -20,21 +21,21 @@ func (a *TokenApplication) handleMerge(
 	newIntersection := make([]byte, 1024)
 	payload := []byte("merge")
 	if t == nil || t.Coins == nil || t.Signature == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 	addresses := [][]byte{}
 	for _, c := range t.Coins {
 		if c.Address == nil {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}
 
 		if _, touched := lockMap[string(c.Address)]; touched {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}
 
 		for _, addr := range addresses {
 			if bytes.Equal(addr, c.Address) {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 			}
 		}
 
@@ -43,31 +44,31 @@ func (a *TokenApplication) handleMerge(
 	}
 	if t.Signature.PublicKey == nil ||
 		t.Signature.Signature == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 	if err := t.Signature.Verify(payload); err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 
 	addr, err := poseidon.HashBytes(t.Signature.PublicKey.KeyValue)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 	pk, err := pcrypto.UnmarshalEd448PublicKey(
 		t.Signature.PublicKey.KeyValue,
 	)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 
 	peerId, err := peer.IDFromPublicKey(pk)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 
 	altAddr, err := poseidon.HashBytes([]byte(peerId))
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 
 	owner := &protobufs.AccountRef{}
@@ -75,7 +76,7 @@ func (a *TokenApplication) handleMerge(
 	for _, c := range t.Coins {
 		coin, err := a.CoinStore.GetCoinByAddress(nil, c.Address)
 		if err != nil {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}
 
 		if !bytes.Equal(
@@ -85,7 +86,7 @@ func (a *TokenApplication) handleMerge(
 			coin.Owner.GetImplicitAccount().Address,
 			altAddr.FillBytes(make([]byte, 32)),
 		) {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}
 
 		newTotal.Add(newTotal, new(big.Int).SetBytes(coin.Amount))

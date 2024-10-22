@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
 
 	"github.com/cockroachdb/pebble"
@@ -46,8 +47,7 @@ type CoinStore interface {
 	) error
 	GetLatestFrameProcessed() (uint64, error)
 	SetLatestFrameProcessed(txn Transaction, frameNumber uint64) error
-	SetMigrationVersion() error
-	Migrate(filter []byte) error
+	Migrate(filter []byte, genesisSeedHex string) error
 }
 
 var _ CoinStore = (*PebbleCoinStore)(nil)
@@ -73,6 +73,7 @@ const (
 	COIN_BY_ADDRESS  = 0x00
 	COIN_BY_OWNER    = 0x01
 	MIGRATION        = 0x02
+	GENESIS          = 0xFE
 	LATEST_EXECUTION = 0xFF
 )
 
@@ -108,6 +109,10 @@ func proofByOwnerKey(owner []byte, address []byte) []byte {
 
 func migrationKey() []byte {
 	return []byte{COIN, MIGRATION}
+}
+
+func genesisSeedKey() []byte {
+	return []byte{COIN, GENESIS}
 }
 
 func (p *PebbleCoinStore) NewTransaction() (Transaction, error) {
@@ -388,15 +393,119 @@ func (p *PebbleCoinStore) SetLatestFrameProcessed(
 	return nil
 }
 
-func (p *PebbleCoinStore) SetMigrationVersion() error {
-	if err := p.db.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03}); err != nil {
-		return errors.Wrap(err, "set migration version")
+func (p *PebbleCoinStore) internalMigrate(
+	filter []byte,
+	genesisSeed []byte,
+) error {
+	p.logger.Warn("incompatible state change detected, performing migration")
+	err := p.db.DeleteRange(
+		coinByOwnerKey(
+			bytes.Repeat([]byte{0x00}, 32),
+			bytes.Repeat([]byte{0x00}, 32),
+		),
+		coinByOwnerKey(
+			bytes.Repeat([]byte{0xff}, 32),
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	err = p.db.DeleteRange(
+		coinKey(
+			bytes.Repeat([]byte{0x00}, 32),
+		),
+		coinKey(
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	err = p.db.DeleteRange(
+		proofByOwnerKey(
+			bytes.Repeat([]byte{0x00}, 32),
+			bytes.Repeat([]byte{0x00}, 32),
+		),
+		proofByOwnerKey(
+			bytes.Repeat([]byte{0xff}, 32),
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	err = p.db.DeleteRange(
+		proofKey(
+			bytes.Repeat([]byte{0x00}, 32),
+		),
+		proofKey(
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	if err := p.db.DeleteRange(
+		clockDataFrameKey(filter, 0),
+		clockDataFrameKey(filter, 200000),
+	); err != nil {
+		panic(err)
 	}
 
-	return nil
+	if err := p.db.Delete(clockDataEarliestIndex(filter)); err != nil {
+		panic(err)
+	}
+	if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
+		panic(err)
+	}
+	if err := p.db.Delete(clockMasterEarliestIndex(
+		make([]byte, 32),
+	)); err != nil {
+		panic(err)
+	}
+	if err := p.db.Delete(clockMasterLatestIndex(make([]byte, 32))); err != nil {
+		panic(err)
+	}
+
+	txn, err := p.NewTransaction()
+	if err != nil {
+		return nil
+	}
+
+	err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
+	if err != nil {
+		panic(err)
+	}
+
+	err = txn.Set(genesisSeedKey(), genesisSeed)
+	if err != nil {
+		panic(err)
+	}
+
+	return txn.Commit()
 }
 
-func (p *PebbleCoinStore) Migrate(filter []byte) error {
+func (p *PebbleCoinStore) Migrate(filter []byte, genesisSeedHex string) error {
+	seed, err := hex.DecodeString(genesisSeedHex)
+	if err != nil {
+		return errors.Wrap(err, "migrate")
+	}
+
+	compare, closer, err := p.db.Get(genesisSeedKey())
+	if err != nil {
+		if !errors.Is(err, pebble.ErrNotFound) {
+			return errors.Wrap(err, "migrate")
+		}
+		return p.internalMigrate(filter, seed)
+	}
+
+	if !bytes.Equal(compare, seed) {
+		return p.internalMigrate(filter, seed)
+	}
+
+	closer.Close()
+
 	status, closer, err := p.db.Get(migrationKey())
 	if err != nil {
 		if !errors.Is(err, pebble.ErrNotFound) {
@@ -408,88 +517,17 @@ func (p *PebbleCoinStore) Migrate(filter []byte) error {
 			return nil
 		}
 
-		err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03})
+		err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
 		if err != nil {
 			panic(err)
 		}
 		return txn.Commit()
 	} else {
 		defer closer.Close()
-		if len(status) == 4 && bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x03}) > 0 {
+		if len(status) == 4 && bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x04}) > 0 {
 			panic("database has been migrated to a newer version, do not rollback")
-		} else if len(status) == 3 || bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x03}) < 0 {
-			err = p.db.DeleteRange(
-				coinByOwnerKey(
-					bytes.Repeat([]byte{0x00}, 32),
-					bytes.Repeat([]byte{0x00}, 32),
-				),
-				coinByOwnerKey(
-					bytes.Repeat([]byte{0xff}, 32),
-					bytes.Repeat([]byte{0xff}, 32),
-				),
-			)
-			if err != nil {
-				panic(err)
-			}
-			err = p.db.DeleteRange(
-				coinKey(
-					bytes.Repeat([]byte{0x00}, 32),
-				),
-				coinKey(
-					bytes.Repeat([]byte{0xff}, 32),
-				),
-			)
-			if err != nil {
-				panic(err)
-			}
-			err = p.db.DeleteRange(
-				proofByOwnerKey(
-					bytes.Repeat([]byte{0x00}, 32),
-					bytes.Repeat([]byte{0x00}, 32),
-				),
-				proofByOwnerKey(
-					bytes.Repeat([]byte{0xff}, 32),
-					bytes.Repeat([]byte{0xff}, 32),
-				),
-			)
-			if err != nil {
-				panic(err)
-			}
-			err = p.db.DeleteRange(
-				proofKey(
-					bytes.Repeat([]byte{0x00}, 32),
-				),
-				proofKey(
-					bytes.Repeat([]byte{0xff}, 32),
-				),
-			)
-			if err != nil {
-				panic(err)
-			}
-			if err := p.db.DeleteRange(
-				clockDataFrameKey(filter, 0),
-				clockDataFrameKey(filter, 200000),
-			); err != nil {
-				panic(err)
-			}
-
-			if err := p.db.Delete(clockDataEarliestIndex(filter)); err != nil {
-				panic(err)
-			}
-			if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
-				panic(err)
-			}
-
-			txn, err := p.NewTransaction()
-			if err != nil {
-				return nil
-			}
-
-			err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x03})
-			if err != nil {
-				panic(err)
-			}
-			return txn.Commit()
+		} else if len(status) == 3 || bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x04}) < 0 {
+			return p.internalMigrate(filter, seed)
 		}
 		return nil
 	}

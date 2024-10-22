@@ -23,6 +23,8 @@ const (
 	DataService_NegotiateCompressedSyncFrames_FullMethodName = "/quilibrium.node.data.pb.DataService/NegotiateCompressedSyncFrames"
 	DataService_GetPublicChannel_FullMethodName              = "/quilibrium.node.data.pb.DataService/GetPublicChannel"
 	DataService_GetDataFrame_FullMethodName                  = "/quilibrium.node.data.pb.DataService/GetDataFrame"
+	DataService_HandlePreMidnightMint_FullMethodName         = "/quilibrium.node.data.pb.DataService/HandlePreMidnightMint"
+	DataService_GetPreMidnightMintStatus_FullMethodName      = "/quilibrium.node.data.pb.DataService/GetPreMidnightMintStatus"
 )
 
 // DataServiceClient is the client API for DataService service.
@@ -33,6 +35,8 @@ type DataServiceClient interface {
 	NegotiateCompressedSyncFrames(ctx context.Context, opts ...grpc.CallOption) (DataService_NegotiateCompressedSyncFramesClient, error)
 	GetPublicChannel(ctx context.Context, opts ...grpc.CallOption) (DataService_GetPublicChannelClient, error)
 	GetDataFrame(ctx context.Context, in *GetDataFrameRequest, opts ...grpc.CallOption) (*DataFrameResponse, error)
+	HandlePreMidnightMint(ctx context.Context, in *MintCoinRequest, opts ...grpc.CallOption) (*PreMidnightMintResponse, error)
+	GetPreMidnightMintStatus(ctx context.Context, in *PreMidnightMintStatusRequest, opts ...grpc.CallOption) (*PreMidnightMintResponse, error)
 }
 
 type dataServiceClient struct {
@@ -146,6 +150,24 @@ func (c *dataServiceClient) GetDataFrame(ctx context.Context, in *GetDataFrameRe
 	return out, nil
 }
 
+func (c *dataServiceClient) HandlePreMidnightMint(ctx context.Context, in *MintCoinRequest, opts ...grpc.CallOption) (*PreMidnightMintResponse, error) {
+	out := new(PreMidnightMintResponse)
+	err := c.cc.Invoke(ctx, DataService_HandlePreMidnightMint_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataServiceClient) GetPreMidnightMintStatus(ctx context.Context, in *PreMidnightMintStatusRequest, opts ...grpc.CallOption) (*PreMidnightMintResponse, error) {
+	out := new(PreMidnightMintResponse)
+	err := c.cc.Invoke(ctx, DataService_GetPreMidnightMintStatus_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DataServiceServer is the server API for DataService service.
 // All implementations must embed UnimplementedDataServiceServer
 // for forward compatibility
@@ -154,6 +176,8 @@ type DataServiceServer interface {
 	NegotiateCompressedSyncFrames(DataService_NegotiateCompressedSyncFramesServer) error
 	GetPublicChannel(DataService_GetPublicChannelServer) error
 	GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error)
+	HandlePreMidnightMint(context.Context, *MintCoinRequest) (*PreMidnightMintResponse, error)
+	GetPreMidnightMintStatus(context.Context, *PreMidnightMintStatusRequest) (*PreMidnightMintResponse, error)
 	mustEmbedUnimplementedDataServiceServer()
 }
 
@@ -172,6 +196,12 @@ func (UnimplementedDataServiceServer) GetPublicChannel(DataService_GetPublicChan
 }
 func (UnimplementedDataServiceServer) GetDataFrame(context.Context, *GetDataFrameRequest) (*DataFrameResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetDataFrame not implemented")
+}
+func (UnimplementedDataServiceServer) HandlePreMidnightMint(context.Context, *MintCoinRequest) (*PreMidnightMintResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method HandlePreMidnightMint not implemented")
+}
+func (UnimplementedDataServiceServer) GetPreMidnightMintStatus(context.Context, *PreMidnightMintStatusRequest) (*PreMidnightMintResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPreMidnightMintStatus not implemented")
 }
 func (UnimplementedDataServiceServer) mustEmbedUnimplementedDataServiceServer() {}
 
@@ -277,6 +307,42 @@ func _DataService_GetDataFrame_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DataService_HandlePreMidnightMint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MintCoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataServiceServer).HandlePreMidnightMint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataService_HandlePreMidnightMint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataServiceServer).HandlePreMidnightMint(ctx, req.(*MintCoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataService_GetPreMidnightMintStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreMidnightMintStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataServiceServer).GetPreMidnightMintStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataService_GetPreMidnightMintStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataServiceServer).GetPreMidnightMintStatus(ctx, req.(*PreMidnightMintStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DataService_ServiceDesc is the grpc.ServiceDesc for DataService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -287,6 +353,14 @@ var DataService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetDataFrame",
 			Handler:    _DataService_GetDataFrame_Handler,
+		},
+		{
+			MethodName: "HandlePreMidnightMint",
+			Handler:    _DataService_HandlePreMidnightMint_Handler,
+		},
+		{
+			MethodName: "GetPreMidnightMintStatus",
+			Handler:    _DataService_GetPreMidnightMintStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

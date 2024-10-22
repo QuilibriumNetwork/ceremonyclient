@@ -8,7 +8,7 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"golang.org/x/crypto/sha3"
+	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -20,7 +20,7 @@ func (a *TokenApplication) handleMint(
 	t *protobufs.MintCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
 	if t == nil || t.Proofs == nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
 	payload := []byte("mint")
@@ -28,217 +28,62 @@ func (a *TokenApplication) handleMint(
 		payload = append(payload, p...)
 	}
 	if err := t.Signature.Verify(payload); err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 	pk, err := pcrypto.UnmarshalEd448PublicKey(
 		t.Signature.PublicKey.KeyValue,
 	)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
 	peerId, err := peer.IDFromPublicKey(pk)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
 	addr, err := poseidon.HashBytes(
 		t.Signature.PublicKey.KeyValue,
 	)
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
 	altAddr, err := poseidon.HashBytes([]byte(peerId))
 	if err != nil {
-		return nil, ErrInvalidStateTransition
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 	}
 
-	if _, touched := lockMap[string(t.Signature.PublicKey.KeyValue)]; touched {
-		return nil, ErrInvalidStateTransition
-	}
-
-	if len(t.Proofs) >= 3 &&
-		len(t.Proofs) < 14 &&
-		bytes.Equal(
-			t.Proofs[0],
-			[]byte("pre-dusk"),
-		) && (!bytes.Equal(t.Proofs[1], make([]byte, 32)) ||
-		currentFrameNumber < 60480) {
-		deletes := []*protobufs.TokenOutput{}
-		outputs := []*protobufs.TokenOutput{}
-		if !bytes.Equal(t.Proofs[1], make([]byte, 32)) {
-			pre, err := a.CoinStore.GetPreCoinProofByAddress(t.Proofs[1])
-			if err != nil {
-				return nil, ErrInvalidStateTransition
-			}
-			if !bytes.Equal(
-				pre.Owner.GetImplicitAccount().Address,
-				addr.FillBytes(make([]byte, 32)),
-			) && !bytes.Equal(
-				pre.Owner.GetImplicitAccount().Address,
-				altAddr.FillBytes(make([]byte, 32)),
-			) {
-				return nil, ErrInvalidStateTransition
-			}
-
-			deletes = append(deletes, &protobufs.TokenOutput{
-				Output: &protobufs.TokenOutput_DeletedProof{
-					DeletedProof: pre,
-				},
-			})
+	if len(t.Proofs) == 1 && a.Tries[0].Contains(
+		addr.FillBytes(make([]byte, 32)),
+	) && bytes.Equal(t.Signature.PublicKey.KeyValue, a.Beacon) {
+		if len(t.Proofs[0]) != 64 {
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}
 
-		var previousIncrement = uint32(0xFFFFFFFF)
-		reward := new(big.Int)
-		var index uint32
-		var indexProof []byte
-		var parallelism uint32
-		var kzgCommitment []byte
-		var kzgProof []byte
-		for pi, data := range t.Proofs[2:] {
-			if len(data) < 28 {
-				return nil, ErrInvalidStateTransition
-			}
-
-			increment := binary.BigEndian.Uint32(data[:4])
-			parallelism = binary.BigEndian.Uint32(data[4:8])
-			inputLen := binary.BigEndian.Uint64(data[8:16])
-
-			if len(deletes) != 0 && pi == 0 {
-				if deletes[0].GetDeletedProof().Difficulty-1 != increment {
-					return nil, ErrInvalidStateTransition
-				}
-			} else if pi == 0 && bytes.Equal(t.Proofs[1], make([]byte, 32)) {
-				frames, _, err := a.CoinStore.GetPreCoinProofsForOwner(
-					addr.FillBytes(make([]byte, 32)),
-				)
-				if err != nil || len(frames) != 0 {
-					return nil, ErrInvalidStateTransition
-				}
-			} else if pi != 0 {
-				if increment != previousIncrement-1 {
-					return nil, ErrInvalidStateTransition
-				}
-			}
-			previousIncrement = increment
-
-			if uint64(len(data[16:])) < inputLen+8 {
-				return nil, ErrInvalidStateTransition
-			}
-
-			input := make([]byte, inputLen)
-			copy(input[:], data[16:16+inputLen])
-
-			outputLen := binary.BigEndian.Uint64(data[16+inputLen : 16+inputLen+8])
-
-			if uint64(len(data[16+inputLen+8:])) < outputLen {
-				return nil, ErrInvalidStateTransition
-			}
-
-			output := make([]byte, outputLen)
-			copy(output[:], data[16+inputLen+8:])
-			dataProver := crypto.NewKZGInclusionProver(a.Logger)
-			wesoProver := crypto.NewWesolowskiFrameProver(a.Logger)
-			index = binary.BigEndian.Uint32(output[:4])
-			indexProof = output[4:520]
-			kzgCommitment = output[520:594]
-			kzgProof = output[594:668]
-			ip := sha3.Sum512(indexProof)
-
-			v, err := dataProver.VerifyRaw(
-				ip[:],
-				kzgCommitment,
-				int(index),
-				kzgProof,
-				nearestApplicablePowerOfTwo(uint64(parallelism)),
-			)
-			if err != nil {
-				return nil, ErrInvalidStateTransition
-			}
-
-			if !v {
-				return nil, ErrInvalidStateTransition
-			}
-
-			wp := []byte{}
-			wp = append(wp, peerId...)
-			wp = append(wp, input...)
-			v = wesoProver.VerifyPreDuskChallengeProof(
-				wp,
-				increment,
-				index,
-				indexProof,
-			)
-			if !v {
-				return nil, ErrInvalidStateTransition
-			}
-
-			pomwBasis := big.NewInt(1200000)
-			additional := new(big.Int).Mul(pomwBasis, big.NewInt(int64(parallelism)))
-			reward.Add(
-				reward,
-				additional,
-			)
-		}
-
-		if len(deletes) != 0 {
-			reward.Add(
-				reward,
-				new(big.Int).SetBytes(deletes[0].GetDeletedProof().Amount),
-			)
-		}
-
-		if previousIncrement == uint32(0xffffffff) {
-			return nil, ErrInvalidStateTransition
-		}
-
-		if previousIncrement != 0 {
-			add := &protobufs.PreCoinProof{
-				Amount:      reward.FillBytes(make([]byte, 32)),
-				Index:       index,
-				IndexProof:  indexProof,
-				Commitment:  kzgCommitment,
-				Proof:       append(append([]byte{}, kzgProof...), indexProof...),
-				Parallelism: parallelism,
-				Difficulty:  previousIncrement,
-				Owner: &protobufs.AccountRef{
-					Account: &protobufs.AccountRef_ImplicitAccount{
-						ImplicitAccount: &protobufs.ImplicitAccount{
-							ImplicitType: 0,
-							Address:      addr.FillBytes(make([]byte, 32)),
-						},
-					},
-				},
-			}
-			outputs = append(outputs, &protobufs.TokenOutput{
-				Output: &protobufs.TokenOutput_Proof{
-					Proof: add,
-				},
-			})
-		} else {
-			add := &protobufs.Coin{
-				Amount:       reward.FillBytes(make([]byte, 32)),
-				Intersection: make([]byte, 1024),
-				Owner: &protobufs.AccountRef{
-					Account: &protobufs.AccountRef_ImplicitAccount{
-						ImplicitAccount: &protobufs.ImplicitAccount{
-							ImplicitType: 0,
-							Address:      addr.FillBytes(make([]byte, 32)),
-						},
-					},
-				},
-			}
-			outputs = append(outputs, &protobufs.TokenOutput{
+		outputs := []*protobufs.TokenOutput{
+			&protobufs.TokenOutput{
 				Output: &protobufs.TokenOutput_Coin{
-					Coin: add,
+					Coin: &protobufs.Coin{
+						Amount:       t.Proofs[0][:32],
+						Intersection: make([]byte, 1024),
+						Owner: &protobufs.AccountRef{
+							Account: &protobufs.AccountRef_ImplicitAccount{
+								ImplicitAccount: &protobufs.ImplicitAccount{
+									ImplicitType: 0,
+									Address:      t.Proofs[0][32:],
+								},
+							},
+						},
+					},
 				},
-			})
+			},
 		}
-		outputs = append(outputs, deletes...)
-		lockMap[string(t.Signature.PublicKey.KeyValue)] = struct{}{}
 		return outputs, nil
-	} else {
+	} else if len(t.Proofs) != 3 && currentFrameNumber > 60480 {
+		if _, touched := lockMap[string(t.Signature.PublicKey.KeyValue)]; touched {
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
+		}
 		ring := -1
 		addrBytes := addr.FillBytes(make([]byte, 32))
 		for i, t := range a.Tries {
@@ -248,16 +93,16 @@ func (a *TokenApplication) handleMint(
 			}
 		}
 		if ring == -1 {
-			return nil, ErrInvalidStateTransition
+			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}
 		outputs := []*protobufs.TokenOutput{}
 		for _, p := range t.Proofs {
 			if len(p) < 516+len(peerId)+8+32 {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 			}
 
 			if !bytes.Equal(p[516:len(peerId)], []byte(peerId)) {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 			}
 
 			wesoProver := crypto.NewWesolowskiFrameProver(a.Logger)
@@ -266,11 +111,11 @@ func (a *TokenApplication) handleMint(
 				p[516+len(peerId) : 516+len(peerId)+8],
 			)
 			if frameNumber > currentFrameNumber {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 			}
 
 			frames, proofs, err := a.CoinStore.GetPreCoinProofsForOwner(
-				addr.FillBytes(make([]byte, 32)),
+				altAddr.FillBytes(make([]byte, 32)),
 			)
 			if err == nil {
 				none := true
@@ -284,19 +129,19 @@ func (a *TokenApplication) handleMint(
 				if !none {
 					for _, pr := range proofs {
 						if bytes.Equal(pr.Proof, p) {
-							return nil, ErrInvalidStateTransition
+							return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 						}
 					}
 				}
 			}
 
 			if !wesoProver.VerifyChallengeProof(p[516:], a.Difficulty, p[:516]) {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 			}
 
 			scale := len(p2p.GetOnesIndices(p[516+len(peerId)+8 : 32]))
 			if scale == 0 {
-				return nil, ErrInvalidStateTransition
+				return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 			}
 
 			ringFactor := big.NewInt(2)
@@ -346,4 +191,6 @@ func (a *TokenApplication) handleMint(
 		lockMap[string(t.Signature.PublicKey.KeyValue)] = struct{}{}
 		return outputs, nil
 	}
+
+	return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 }

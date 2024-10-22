@@ -89,10 +89,6 @@ func CreateGenesisState(
 	[][]byte,
 	map[string]uint64,
 ) {
-	if err := coinStore.SetMigrationVersion(); err != nil {
-		panic(err)
-	}
-
 	genesis := config.GetGenesis()
 	if genesis == nil {
 		panic("genesis is nil")
