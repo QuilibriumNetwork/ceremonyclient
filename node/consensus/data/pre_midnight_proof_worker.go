@@ -196,6 +196,11 @@ outer:
 					[]byte("pre-dusk"),
 					resume,
 				}
+
+				if i == 0 {
+					e.logger.Info("pre-midnight proofs submitted, returning")
+					return
+				}
 			}
 		}
 	}

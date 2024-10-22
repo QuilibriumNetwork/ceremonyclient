@@ -47,6 +47,7 @@ type CoinStore interface {
 	) error
 	GetLatestFrameProcessed() (uint64, error)
 	SetLatestFrameProcessed(txn Transaction, frameNumber uint64) error
+	SetMigrationVersion(genesisSeedHex string) error
 	Migrate(filter []byte, genesisSeedHex string) error
 }
 
@@ -391,6 +392,32 @@ func (p *PebbleCoinStore) SetLatestFrameProcessed(
 	}
 
 	return nil
+}
+
+func (p *PebbleCoinStore) SetMigrationVersion(
+	genesisSeedHex string,
+) error {
+	seed, err := hex.DecodeString(genesisSeedHex)
+	if err != nil {
+		return errors.Wrap(err, "migrate")
+	}
+
+	txn, err := p.NewTransaction()
+	if err != nil {
+		return nil
+	}
+
+	err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
+	if err != nil {
+		panic(err)
+	}
+
+	err = txn.Set(genesisSeedKey(), seed)
+	if err != nil {
+		panic(err)
+	}
+
+	return txn.Commit()
 }
 
 func (p *PebbleCoinStore) internalMigrate(

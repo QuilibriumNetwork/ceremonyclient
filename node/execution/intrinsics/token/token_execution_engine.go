@@ -93,6 +93,11 @@ func NewTokenExecutionEngine(
 			coinStore,
 			uint(cfg.P2P.Network),
 		)
+		if err := coinStore.SetMigrationVersion(
+			config.GetGenesis().GenesisSeedHex,
+		); err != nil {
+			panic(err)
+		}
 		genesisCreated = true
 	} else if err != nil {
 		panic(err)

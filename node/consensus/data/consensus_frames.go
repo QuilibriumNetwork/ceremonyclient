@@ -30,7 +30,6 @@ func (e *DataClockConsensusEngine) prove(
 		e.logger,
 	)
 	if err != nil {
-		e.stagedTransactions = &protobufs.TokenRequests{}
 		e.stagedTransactionsMx.Unlock()
 		return nil, errors.Wrap(err, "prove")
 	}
