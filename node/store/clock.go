@@ -1027,24 +1027,6 @@ func (p *PebbleClockStore) Compact(
 	}
 
 	if !cleared {
-		// If this node has been around since the early days, this is going to free
-		// up a lot of cruft.
-		if err := p.db.DeleteRange(
-			clockDataCandidateFrameKey(
-				make([]byte, 32),
-				0,
-				make([]byte, 32),
-				make([]byte, 32),
-			),
-			clockDataCandidateFrameKey(
-				bytes.Repeat([]byte{0xff}, 32),
-				1000000,
-				bytes.Repeat([]byte{0xff}, 32),
-				bytes.Repeat([]byte{0xff}, 32),
-			),
-		); err != nil {
-			return errors.Wrap(err, "compact")
-		}
 		if err := p.db.Compact(
 			clockDataCandidateFrameKey(
 				make([]byte, 32),

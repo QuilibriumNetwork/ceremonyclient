@@ -34,17 +34,6 @@ func (e *MasterClockConsensusEngine) handleMessage(message *pb.Message) error {
 		return errors.Wrap(err, "handle message")
 	}
 
-	switch any.TypeUrl {
-	case protobufs.ClockFrameType:
-		if err := e.handleClockFrameData(
-			message.From,
-			any,
-		); err != nil {
-			return errors.Wrap(err, "handle message")
-		}
-		return nil
-	}
-
 	return errors.Wrap(errors.New("invalid message"), "handle message")
 }
 
@@ -166,11 +155,6 @@ func (e *MasterClockConsensusEngine) publishProof(
 		)
 
 		e.masterTimeReel.Insert(frame, false)
-
-		err := e.publishMessage(e.filter, frame)
-		if err != nil {
-			return errors.Wrap(err, "publish proof")
-		}
 	}
 
 	e.state = consensus.EngineStateCollecting

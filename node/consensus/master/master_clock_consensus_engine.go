@@ -51,9 +51,7 @@ type MasterClockConsensusEngine struct {
 	syncingTarget    []byte
 	engineMx         sync.Mutex
 	seenFramesMx     sync.Mutex
-	historicFramesMx sync.Mutex
 	seenFrames       []*protobufs.ClockFrame
-	historicFrames   []*protobufs.ClockFrame
 
 	clockStore                  store.ClockStore
 	masterTimeReel              *qtime.MasterTimeReel
@@ -70,7 +68,7 @@ type MasterClockConsensusEngine struct {
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
 
-var MASTER_CLOCK_RATE = uint32(1000000)
+var MASTER_CLOCK_RATE = uint32(160000)
 
 func NewMasterClockConsensusEngine(
 	engineConfig *config.EngineConfig,
@@ -184,14 +182,6 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	if err != nil {
 		panic(err)
 	}
-
-	frame, err := e.masterTimeReel.Head()
-	if err != nil {
-		panic(err)
-	}
-
-	e.logger.Info("building historic frame cache")
-	e.buildHistoricFrameCache(frame)
 
 	go func() {
 		for {
@@ -358,43 +348,6 @@ func (
 	e *MasterClockConsensusEngine,
 ) GetFrameChannel() <-chan *protobufs.ClockFrame {
 	return e.frameChan
-}
-
-func (e *MasterClockConsensusEngine) buildHistoricFrameCache(
-	latestFrame *protobufs.ClockFrame,
-) {
-	e.historicFrames = []*protobufs.ClockFrame{}
-
-	if latestFrame.FrameNumber != 0 {
-		min := uint64(0)
-		if latestFrame.FrameNumber-255 > min && latestFrame.FrameNumber > 255 {
-			min = latestFrame.FrameNumber - 255
-		}
-
-		iter, err := e.clockStore.RangeMasterClockFrames(
-			e.filter,
-			min,
-			latestFrame.FrameNumber-1,
-		)
-		if err != nil {
-			panic(err)
-		}
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			frame, err := iter.Value()
-			if err != nil {
-				panic(err)
-			}
-
-			e.historicFrames = append(e.historicFrames, frame)
-		}
-
-		if err = iter.Close(); err != nil {
-			panic(err)
-		}
-	}
-
-	e.historicFrames = append(e.historicFrames, latestFrame)
 }
 
 func (e *MasterClockConsensusEngine) addPeerManifestReport(

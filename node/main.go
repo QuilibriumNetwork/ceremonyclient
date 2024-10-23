@@ -273,7 +273,7 @@ func main() {
 
 	if !*dbConsole && *core == 0 {
 		config.PrintLogo()
-		config.PrintVersion()
+		config.PrintVersion(uint8(*network))
 		fmt.Println(" ")
 	}
 

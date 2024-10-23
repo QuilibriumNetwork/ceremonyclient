@@ -48,7 +48,7 @@ var splitCmd = &cobra.Command{
 				fmt.Println("invalid amount")
 				os.Exit(1)
 			}
-			amount.Mul(decimal.NewFromBigInt(conversionFactor, 0))
+			amount = amount.Mul(decimal.NewFromBigInt(conversionFactor, 0))
 			amountBytes := amount.BigInt().FillBytes(make([]byte, 32))
 			amounts = append(amounts, amountBytes)
 			payload = append(payload, amountBytes...)

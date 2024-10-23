@@ -3,14 +3,19 @@ package data
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"math/big"
 	"time"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -53,28 +58,8 @@ func (e *DataClockConsensusEngine) GetDataFrame(
 		return nil, errors.Wrap(err, "get data frame")
 	}
 
-	idx, err := e.frameProver.GenerateWeakRecursiveProofIndex(frame)
-	if err != nil {
-		return nil, errors.Wrap(err, "get data frame")
-	}
-
-	indexFrame, _, err := e.clockStore.GetDataClockFrame(e.filter, idx, false)
-	if err != nil {
-		return &protobufs.DataFrameResponse{
-			ClockFrame: frame,
-		}, nil
-	}
-
-	proof := e.frameProver.FetchRecursiveProof(indexFrame)
-
-	e.logger.Debug(
-		"sending frame response",
-		zap.Uint64("frame_number", frame.FrameNumber),
-	)
-
 	return &protobufs.DataFrameResponse{
 		ClockFrame: frame,
-		Proof:      proof,
 	}, nil
 }
 
@@ -110,196 +95,455 @@ func (e *DataClockConsensusEngine) GetCompressedSyncFrames(
 	return nil
 }
 
-func (e *DataClockConsensusEngine) decompressAndStoreCandidates(
-	peerId []byte,
-	syncMsg *protobufs.DataCompressedSync,
-) (*protobufs.ClockFrame, error) {
-	if len(syncMsg.TruncatedClockFrames) == 0 {
-		return nil, ErrNoNewFrames
+func (e *DataClockConsensusEngine) HandlePreMidnightMint(
+	ctx context.Context,
+	t *protobufs.MintCoinRequest,
+) (*protobufs.PreMidnightMintResponse, error) {
+	addr, err := e.handleMint(t)
+	if err != nil {
+		return nil, err
 	}
+
+	return &protobufs.PreMidnightMintResponse{Address: addr}, nil
+}
+
+func (e *DataClockConsensusEngine) GetPreMidnightMintStatus(
+	ctx context.Context,
+	t *protobufs.PreMidnightMintStatusRequest,
+) (*protobufs.PreMidnightMintResponse, error) {
+	if !e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+		return nil, errors.Wrap(
+			errors.New("wrong destination"),
+			"get pre midnight mint status",
+		)
+	}
+
+	if len(t.Owner) != 32 {
+		return nil, errors.Wrap(
+			errors.New("invalid data"),
+			"get pre midnight mint status",
+		)
+	}
+	fr, pre, err := e.coinStore.GetPreCoinProofsForOwner(t.Owner)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.New("invalid data"),
+			"get pre midnight mint status",
+		)
+	}
+
+	if len(fr) == 0 {
+		return &protobufs.PreMidnightMintResponse{
+			Address:   make([]byte, 32),
+			Increment: 0,
+		}, nil
+	} else {
+		for _, pr := range pre {
+			addr, err := GetAddressOfPreCoinProof(pr)
+			if err != nil {
+				if err != nil {
+					return nil, errors.Wrap(
+						errors.New("invalid data"),
+						"get pre midnight mint status",
+					)
+				}
+			}
+
+			return &protobufs.PreMidnightMintResponse{
+				Address:   addr,
+				Increment: pr.Difficulty,
+			}, nil
+		}
+	}
+
+	return &protobufs.PreMidnightMintResponse{
+		Address:   make([]byte, 32),
+		Increment: 0,
+	}, nil
+}
+
+func (e *DataClockConsensusEngine) handleMint(
+	t *protobufs.MintCoinRequest,
+) ([]byte, error) {
+	if !e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+		return nil, errors.Wrap(errors.New("wrong destination"), "handle mint")
+	}
+
+	returnAddr := []byte{}
+	e.preMidnightMintMx.Lock()
+	if _, active := e.preMidnightMint[string(
+		t.Signature.PublicKey.KeyValue,
+	)]; active {
+		return nil, errors.Wrap(errors.New("busy"), "handle mint")
+	}
+	e.preMidnightMint[string(
+		t.Signature.PublicKey.KeyValue,
+	)] = struct{}{}
+	e.preMidnightMintMx.Unlock()
+
+	defer func() {
+		e.preMidnightMintMx.Lock()
+		delete(e.preMidnightMint, string(
+			t.Signature.PublicKey.KeyValue,
+		))
+		e.preMidnightMintMx.Unlock()
+	}()
 
 	head, err := e.dataTimeReel.Head()
 	if err != nil {
-		panic(err)
+		return nil, errors.Wrap(errors.New("busy"), "handle mint")
 	}
 
-	if len(syncMsg.TruncatedClockFrames) < int(
-		syncMsg.ToFrameNumber-syncMsg.FromFrameNumber+1,
+	if t == nil || t.Proofs == nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+
+	payload := []byte("mint")
+	for _, p := range t.Proofs {
+		payload = append(payload, p...)
+	}
+	if err := t.Signature.Verify(payload); err != nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+	pk, err := pcrypto.UnmarshalEd448PublicKey(
+		t.Signature.PublicKey.KeyValue,
+	)
+	if err != nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+
+	peerId, err := peer.IDFromPublicKey(pk)
+	if err != nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+
+	altAddr, err := poseidon.HashBytes([]byte(peerId))
+	if err != nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+
+	if len(t.Proofs) >= 3 &&
+		len(t.Proofs) < 204 &&
+		bytes.Equal(
+			t.Proofs[0],
+			[]byte("pre-dusk"),
+		) && (!bytes.Equal(t.Proofs[1], make([]byte, 32)) ||
+		head.FrameNumber < 60480) && e.GetFrameProverTries()[0].Contains(
+		e.provingKeyAddress,
 	) {
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
-		return nil, errors.New("invalid continuity for compressed x response")
-	}
-
-	var final *protobufs.ClockFrame
-	for _, frame := range syncMsg.TruncatedClockFrames {
-		frame := frame
-		commits := (len(frame.Input) - 516) / 74
-		e.logger.Info(
-			"processing frame",
-			zap.Uint64("frame_number", frame.FrameNumber),
-			zap.Int("aggregate_commits", commits),
-		)
-		for j := 0; j < commits; j++ {
-			e.logger.Debug(
-				"processing commit",
-				zap.Uint64("frame_number", frame.FrameNumber),
-				zap.Int("commit_index", j),
-			)
-			commit := frame.Input[516+(j*74) : 516+((j+1)*74)]
-			var aggregateProof *protobufs.InclusionProofsMap
-			for _, a := range syncMsg.Proofs {
-				a := a
-				if bytes.Equal(a.FrameCommit, commit) {
-					e.logger.Info(
-						"found matching proof",
-						zap.Uint64("frame_number", frame.FrameNumber),
-						zap.Int("commit_index", j),
-					)
-					aggregateProof = a
-					break
-				}
-			}
-			if aggregateProof == nil {
-				e.logger.Error(
-					"could not find matching proof",
-					zap.Uint64("frame_number", frame.FrameNumber),
-					zap.Int("commit_index", j),
-					zap.Binary("proof", aggregateProof.Proof),
-				)
+		prevInput := []byte{}
+		prevErrorMetric := uint32(0)
+		highestIncrement := uint32(0)
+		deletes := []*protobufs.TokenOutput{}
+		if !bytes.Equal(t.Proofs[1], make([]byte, 32)) {
+			pre, err := e.coinStore.GetPreCoinProofByAddress(t.Proofs[1])
+			if err != nil {
 				return nil, errors.Wrap(
-					store.ErrInvalidData,
-					"decompress and store candidates",
+					application.ErrInvalidStateTransition,
+					"handle mint",
 				)
 			}
-			inc := &protobufs.InclusionAggregateProof{
-				Filter:               e.filter,
-				FrameNumber:          frame.FrameNumber,
-				InclusionCommitments: []*protobufs.InclusionCommitment{},
-				Proof:                aggregateProof.Proof,
+			if !bytes.Equal(
+				pre.Owner.GetImplicitAccount().Address,
+				altAddr.FillBytes(make([]byte, 32)),
+			) {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 			}
-
-			for k, c := range aggregateProof.Commitments {
-				k := k
-				c := c
-				e.logger.Debug(
-					"adding inclusion commitment",
-					zap.Uint64("frame_number", frame.FrameNumber),
-					zap.Int("commit_index", j),
-					zap.Int("inclusion_commit_index", k),
-					zap.String("type_url", c.TypeUrl),
-				)
-				incCommit := &protobufs.InclusionCommitment{
-					Filter:      e.filter,
-					FrameNumber: frame.FrameNumber,
-					Position:    uint32(k),
-					TypeUrl:     c.TypeUrl,
-					Data:        []byte{},
-					Commitment:  c.Commitment,
+			if pre.Difficulty == 0 {
+				_, pr, err := e.coinStore.GetPreCoinProofsForOwner(t.Proofs[0][32:])
+				if err != nil && !errors.Is(err, store.ErrNotFound) {
+					return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 				}
-				var output *protobufs.IntrinsicExecutionOutput
-				if c.TypeUrl == protobufs.IntrinsicExecutionOutputType {
-					output = &protobufs.IntrinsicExecutionOutput{}
-				}
-				for l, h := range c.SegmentHashes {
-					l := l
-					h := h
 
-					for _, s := range syncMsg.Segments {
-						s := s
-
-						if bytes.Equal(s.Hash, h) {
-							if output != nil {
-								if l == 0 {
-									e.logger.Debug(
-										"found first half of matching segment data",
-										zap.Uint64("frame_number", frame.FrameNumber),
-										zap.Int("commit_index", j),
-										zap.Int("inclusion_commit_index", k),
-										zap.String("type_url", c.TypeUrl),
-									)
-									output.Address = s.Data[:32]
-									output.Output = s.Data[32:]
-								} else {
-									e.logger.Debug(
-										"found second half of matching segment data",
-										zap.Uint64("frame_number", frame.FrameNumber),
-										zap.Int("commit_index", j),
-										zap.Int("inclusion_commit_index", k),
-										zap.String("type_url", c.TypeUrl),
-									)
-									output.Proof = s.Data
-									b, err := proto.Marshal(output)
-									if err != nil {
-										return nil, errors.Wrap(
-											err,
-											"decompress and store candidates",
-										)
-									}
-									incCommit.Data = b
-									break
-								}
-							} else {
-								e.logger.Debug(
-									"found matching segment data",
-									zap.Uint64("frame_number", frame.FrameNumber),
-									zap.Int("commit_index", j),
-									zap.Int("inclusion_commit_index", k),
-									zap.String("type_url", c.TypeUrl),
-								)
-								incCommit.Data = append(incCommit.Data, s.Data...)
-								break
-							}
-						}
+				for _, p := range pr {
+					if p.IndexProof != nil {
+						continue
+					}
+					if bytes.Equal(p.Amount, pre.Amount) {
+						return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 					}
 				}
-				inc.InclusionCommitments = append(
-					inc.InclusionCommitments,
-					incCommit,
-				)
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			} else {
+				deletes = append(deletes, &protobufs.TokenOutput{
+					Output: &protobufs.TokenOutput_DeletedProof{
+						DeletedProof: pre,
+					},
+				})
+			}
+			prevInput = pre.Proof[74:148]
+			prevErrorMetric = binary.BigEndian.Uint32(pre.Proof[148:152])
+			highestIncrement = binary.BigEndian.Uint32(pre.Proof[152:156])
+		}
+
+		var previousIncrement = uint32(0xFFFFFFFF)
+		reward := new(big.Int)
+		var index uint32
+		var indexProof []byte
+		var parallelism uint32
+		var kzgCommitment []byte
+		var kzgProof []byte
+		for pi, data := range t.Proofs[2:] {
+			if len(data) < 28 {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 			}
 
-			frame.AggregateProofs = append(
-				frame.AggregateProofs,
-				inc,
+			increment := binary.BigEndian.Uint32(data[:4])
+			parallelism = binary.BigEndian.Uint32(data[4:8])
+			inputLen := binary.BigEndian.Uint64(data[8:16])
+
+			if len(deletes) != 0 && pi == 0 {
+				if deletes[0].GetDeletedProof().Difficulty-1 != increment {
+					return nil, errors.Wrap(
+						application.ErrInvalidStateTransition,
+						"handle mint",
+					)
+				}
+			} else if pi == 0 && bytes.Equal(t.Proofs[1], make([]byte, 32)) {
+				frames, _, err := e.coinStore.GetPreCoinProofsForOwner(
+					altAddr.FillBytes(make([]byte, 32)),
+				)
+				if err != nil || len(frames) != 0 {
+					return nil, errors.Wrap(
+						application.ErrInvalidStateTransition,
+						"handle mint",
+					)
+				}
+			} else if pi != 0 {
+				if increment != previousIncrement-1 {
+					return nil, errors.Wrap(
+						application.ErrInvalidStateTransition,
+						"handle mint",
+					)
+				}
+			}
+			previousIncrement = increment
+
+			if uint64(len(data[16:])) < inputLen+8 {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
+			input := make([]byte, inputLen)
+			copy(input[:], data[16:16+inputLen])
+
+			outputLen := binary.BigEndian.Uint64(data[16+inputLen : 16+inputLen+8])
+
+			if uint64(len(data[16+inputLen+8:])) < outputLen {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
+			output := make([]byte, outputLen)
+			copy(output[:], data[16+inputLen+8:])
+			dataProver := crypto.NewKZGInclusionProver(e.logger)
+			wesoProver := crypto.NewWesolowskiFrameProver(e.logger)
+			index = binary.BigEndian.Uint32(output[:4])
+			indexProof = output[4:520]
+			kzgCommitment = output[520:594]
+			kzgProof = output[594:668]
+			ip := sha3.Sum512(indexProof)
+
+			v, err := dataProver.VerifyRaw(
+				ip[:],
+				kzgCommitment,
+				int(index),
+				kzgProof,
+				nearestApplicablePowerOfTwo(uint64(parallelism)),
+			)
+			if err != nil {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
+			if !v {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
+			if len(prevInput) != 0 && !bytes.Equal(prevInput, kzgCommitment) {
+				heuristic := uint64(highestIncrement) -
+					(uint64(highestIncrement) * uint64(999) / uint64(1000))
+				if highestIncrement != 0 && uint64(prevErrorMetric) > heuristic {
+					return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+				} else {
+					prevErrorMetric++
+				}
+			}
+
+			wp := []byte{}
+			wp = append(wp, peerId...)
+			wp = append(wp, input...)
+			v = wesoProver.VerifyPreDuskChallengeProof(
+				wp,
+				increment,
+				index,
+				indexProof,
+			)
+			if !v {
+				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+			}
+
+			pomwBasis := big.NewInt(1200000)
+			additional := new(big.Int).Mul(pomwBasis, big.NewInt(int64(parallelism)))
+			reward.Add(
+				reward,
+				additional,
+			)
+			prevInput = input
+		}
+
+		if len(deletes) != 0 {
+			reward.Add(
+				reward,
+				new(big.Int).SetBytes(deletes[0].GetDeletedProof().Amount),
 			)
 		}
 
-		f, err := proto.Marshal(frame)
+		if previousIncrement == uint32(0xffffffff) {
+			return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+		}
+
+		if previousIncrement > highestIncrement {
+			highestIncrement = previousIncrement
+		}
+
+		txn, err := e.coinStore.NewTransaction()
 		if err != nil {
-			return nil, errors.Wrap(err, "decompress and store candidates")
+			return nil, errors.Wrap(err, "handle mint")
+		}
+		if previousIncrement != 0 {
+			add := &protobufs.PreCoinProof{
+				Amount:     reward.FillBytes(make([]byte, 32)),
+				Index:      index,
+				IndexProof: indexProof,
+				Commitment: kzgCommitment,
+				Proof: binary.BigEndian.AppendUint32(
+					binary.BigEndian.AppendUint32(
+						append(
+							append([]byte{}, kzgProof...),
+							prevInput...,
+						),
+						prevErrorMetric,
+					),
+					highestIncrement,
+				),
+				Parallelism: parallelism,
+				Difficulty:  previousIncrement,
+				Owner: &protobufs.AccountRef{
+					Account: &protobufs.AccountRef_ImplicitAccount{
+						ImplicitAccount: &protobufs.ImplicitAccount{
+							ImplicitType: 0,
+							Address:      altAddr.FillBytes(make([]byte, 32)),
+						},
+					},
+				},
+			}
+			proofAddr, err := GetAddressOfPreCoinProof(add)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+			returnAddr = proofAddr
+			err = e.coinStore.PutPreCoinProof(
+				txn,
+				head.FrameNumber,
+				proofAddr,
+				add,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+		} else {
+			proof := &protobufs.PreCoinProof{
+				Amount:     reward.FillBytes(make([]byte, 32)),
+				Index:      index,
+				IndexProof: indexProof,
+				Commitment: kzgCommitment,
+				Proof: binary.BigEndian.AppendUint32(
+					binary.BigEndian.AppendUint32(
+						append(
+							append([]byte{}, kzgProof...),
+							prevInput...,
+						),
+						prevErrorMetric,
+					),
+					highestIncrement,
+				),
+				Parallelism: parallelism,
+				Difficulty:  previousIncrement,
+				Owner: &protobufs.AccountRef{
+					Account: &protobufs.AccountRef_ImplicitAccount{
+						ImplicitAccount: &protobufs.ImplicitAccount{
+							ImplicitType: 0,
+							Address:      altAddr.FillBytes(make([]byte, 32)),
+						},
+					},
+				},
+			}
+			proofAddr, err := GetAddressOfPreCoinProof(proof)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+			returnAddr = proofAddr
+			err = e.coinStore.PutPreCoinProof(
+				txn,
+				head.FrameNumber,
+				proofAddr,
+				proof,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+
+			mint := []byte{}
+			mint = append(mint, reward.FillBytes(make([]byte, 32))...)
+			mint = append(mint, altAddr.FillBytes(make([]byte, 32))...)
+			sig := []byte("mint")
+			sig = append(sig, mint...)
+			out, err := e.pubSub.SignMessage(sig)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+			e.stagedTransactionsMx.Lock()
+			if e.stagedTransactions == nil {
+				e.stagedTransactions = &protobufs.TokenRequests{}
+			}
+			e.stagedTransactions.Requests = append(e.stagedTransactions.Requests,
+				&protobufs.TokenRequest{
+					Request: &protobufs.TokenRequest_Mint{
+						Mint: &protobufs.MintCoinRequest{
+							Proofs: [][]byte{mint},
+							Signature: &protobufs.Ed448Signature{
+								Signature: out,
+								PublicKey: &protobufs.Ed448PublicKey{
+									KeyValue: e.provingKeyBytes,
+								},
+							},
+						},
+					},
+				})
+			e.stagedTransactionsMx.Unlock()
 		}
 
-		any := &anypb.Any{
-			TypeUrl: protobufs.ClockFrameType,
-			Value:   f,
+		if len(deletes) == 1 {
+			a, err := GetAddressOfPreCoinProof(deletes[0].GetDeletedProof())
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
+			e.coinStore.DeletePreCoinProof(
+				txn,
+				a,
+				deletes[0].GetDeletedProof(),
+			)
 		}
-		if err = e.handleClockFrameData(
-			e.syncingTarget,
-			p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3),
-			any,
-			// We'll tell the time reel to process it (isSync = false) if we're caught
-			// up beyond the head and frame number is divisible by 100 (limited to
-			// avoid thrash):
-			head.FrameNumber > frame.FrameNumber || frame.FrameNumber%100 != 0,
-		); err != nil {
-			return nil, errors.Wrap(err, "decompress and store candidates")
+		if err := txn.Commit(); err != nil {
+			txn.Abort()
+			return nil, errors.Wrap(err, "handle mint")
 		}
-
-		final = frame
 	}
-
-	e.logger.Info(
-		"decompressed and stored sync for range",
-		zap.Uint64("from", syncMsg.FromFrameNumber),
-		zap.Uint64("to", syncMsg.ToFrameNumber),
-	)
-	return final, nil
+	return returnAddr, nil
 }
 
 type svr struct {

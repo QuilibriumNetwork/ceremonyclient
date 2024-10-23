@@ -30,6 +30,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -181,6 +182,13 @@ func NewBlossomSub(
 			panic(err)
 		}
 
+		opts = append(
+			opts,
+			libp2p.SwarmOpts(
+				swarm.WithIPv6BlackHoleConfig(false, 0, 0),
+				swarm.WithUDPBlackHoleConfig(false, 0, 0),
+			),
+		)
 		opts = append(opts, libp2p.ConnectionManager(cm))
 		opts = append(opts, libp2p.ResourceManager(rm))
 	}
@@ -772,6 +780,16 @@ func verifyReachability(cfg *config.P2PConfig) bool {
 
 	if r.Error != "" {
 		fmt.Println("Reachability check failed: " + r.Error)
+		if transport == "quic" {
+			fmt.Println("WARNING!")
+			fmt.Println("WARNING!")
+			fmt.Println("WARNING!")
+			fmt.Println("You failed reachability with QUIC enabled. Consider switching to TCP")
+			fmt.Println("WARNING!")
+			fmt.Println("WARNING!")
+			fmt.Println("WARNING!")
+			time.Sleep(5 * time.Second)
+		}
 		return false
 	}
 
@@ -799,6 +817,10 @@ func discoverPeers(
 		}
 
 		for peer := range peerChan {
+			if len(h.Network().Peers()) >= 6 {
+				break
+			}
+
 			peer := peer
 			if peer.ID == h.ID() ||
 				h.Network().Connectedness(peer.ID) == network.Connected ||
@@ -819,9 +841,6 @@ func discoverPeers(
 					"connected to peer",
 					zap.String("peer_id", peer.ID.String()),
 				)
-				if len(h.Network().Peers()) >= 6 {
-					break
-				}
 			}
 		}
 	}

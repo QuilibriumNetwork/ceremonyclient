@@ -26,6 +26,7 @@ type Node struct {
 	pubSub         p2p.PubSub
 	execEngines    map[string]execution.ExecutionEngine
 	engine         consensus.ConsensusEngine
+	pebble         store.KVDB
 }
 
 type DHTNode struct {
@@ -51,6 +52,7 @@ func newNode(
 	pubSub p2p.PubSub,
 	tokenExecutionEngine *token.TokenExecutionEngine,
 	engine consensus.ConsensusEngine,
+	pebble store.KVDB,
 ) (*Node, error) {
 	if engine == nil {
 		return nil, errors.New("engine must not be nil")
@@ -70,6 +72,7 @@ func newNode(
 		pubSub,
 		execEngines,
 		engine,
+		pebble,
 	}, nil
 }
 
@@ -169,6 +172,8 @@ func (n *Node) Stop() {
 	if err != nil {
 		panic(err)
 	}
+
+	n.pebble.Close()
 }
 
 func (n *Node) GetLogger() *zap.Logger {

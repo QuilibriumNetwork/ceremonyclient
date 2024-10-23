@@ -174,15 +174,16 @@ var ValidationService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	NodeService_GetFrames_FullMethodName          = "/quilibrium.node.node.pb.NodeService/GetFrames"
-	NodeService_GetFrameInfo_FullMethodName       = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
-	NodeService_GetPeerInfo_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
-	NodeService_GetNodeInfo_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
-	NodeService_GetNetworkInfo_FullMethodName     = "/quilibrium.node.node.pb.NodeService/GetNetworkInfo"
-	NodeService_GetTokenInfo_FullMethodName       = "/quilibrium.node.node.pb.NodeService/GetTokenInfo"
-	NodeService_GetPeerManifests_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetPeerManifests"
-	NodeService_SendMessage_FullMethodName        = "/quilibrium.node.node.pb.NodeService/SendMessage"
-	NodeService_GetTokensByAccount_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetTokensByAccount"
+	NodeService_GetFrames_FullMethodName                 = "/quilibrium.node.node.pb.NodeService/GetFrames"
+	NodeService_GetFrameInfo_FullMethodName              = "/quilibrium.node.node.pb.NodeService/GetFrameInfo"
+	NodeService_GetPeerInfo_FullMethodName               = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
+	NodeService_GetNodeInfo_FullMethodName               = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
+	NodeService_GetNetworkInfo_FullMethodName            = "/quilibrium.node.node.pb.NodeService/GetNetworkInfo"
+	NodeService_GetTokenInfo_FullMethodName              = "/quilibrium.node.node.pb.NodeService/GetTokenInfo"
+	NodeService_GetPeerManifests_FullMethodName          = "/quilibrium.node.node.pb.NodeService/GetPeerManifests"
+	NodeService_SendMessage_FullMethodName               = "/quilibrium.node.node.pb.NodeService/SendMessage"
+	NodeService_GetTokensByAccount_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetTokensByAccount"
+	NodeService_GetPreCoinProofsByAccount_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetPreCoinProofsByAccount"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -198,6 +199,7 @@ type NodeServiceClient interface {
 	GetPeerManifests(ctx context.Context, in *GetPeerManifestsRequest, opts ...grpc.CallOption) (*PeerManifestsResponse, error)
 	SendMessage(ctx context.Context, in *TokenRequest, opts ...grpc.CallOption) (*SendMessageResponse, error)
 	GetTokensByAccount(ctx context.Context, in *GetTokensByAccountRequest, opts ...grpc.CallOption) (*TokensByAccountResponse, error)
+	GetPreCoinProofsByAccount(ctx context.Context, in *GetPreCoinProofsByAccountRequest, opts ...grpc.CallOption) (*PreCoinProofsByAccountResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -289,6 +291,15 @@ func (c *nodeServiceClient) GetTokensByAccount(ctx context.Context, in *GetToken
 	return out, nil
 }
 
+func (c *nodeServiceClient) GetPreCoinProofsByAccount(ctx context.Context, in *GetPreCoinProofsByAccountRequest, opts ...grpc.CallOption) (*PreCoinProofsByAccountResponse, error) {
+	out := new(PreCoinProofsByAccountResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetPreCoinProofsByAccount_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -302,6 +313,7 @@ type NodeServiceServer interface {
 	GetPeerManifests(context.Context, *GetPeerManifestsRequest) (*PeerManifestsResponse, error)
 	SendMessage(context.Context, *TokenRequest) (*SendMessageResponse, error)
 	GetTokensByAccount(context.Context, *GetTokensByAccountRequest) (*TokensByAccountResponse, error)
+	GetPreCoinProofsByAccount(context.Context, *GetPreCoinProofsByAccountRequest) (*PreCoinProofsByAccountResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -335,6 +347,9 @@ func (UnimplementedNodeServiceServer) SendMessage(context.Context, *TokenRequest
 }
 func (UnimplementedNodeServiceServer) GetTokensByAccount(context.Context, *GetTokensByAccountRequest) (*TokensByAccountResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTokensByAccount not implemented")
+}
+func (UnimplementedNodeServiceServer) GetPreCoinProofsByAccount(context.Context, *GetPreCoinProofsByAccountRequest) (*PreCoinProofsByAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPreCoinProofsByAccount not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -511,6 +526,24 @@ func _NodeService_GetTokensByAccount_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_GetPreCoinProofsByAccount_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPreCoinProofsByAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetPreCoinProofsByAccount(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetPreCoinProofsByAccount_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetPreCoinProofsByAccount(ctx, req.(*GetPreCoinProofsByAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -553,6 +586,10 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTokensByAccount",
 			Handler:    _NodeService_GetTokensByAccount_Handler,
+		},
+		{
+			MethodName: "GetPreCoinProofsByAccount",
+			Handler:    _NodeService_GetPreCoinProofsByAccount_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

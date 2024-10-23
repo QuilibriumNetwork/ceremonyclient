@@ -246,7 +246,9 @@ func (r *RPCServer) GetTokensByAccount(
 	ctx context.Context,
 	req *protobufs.GetTokensByAccountRequest,
 ) (*protobufs.TokensByAccountResponse, error) {
-	frameNumbers, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
+	frameNumbers, addresses, coins, err := r.coinStore.GetCoinsForOwner(
+		req.Address,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +256,7 @@ func (r *RPCServer) GetTokensByAccount(
 	return &protobufs.TokensByAccountResponse{
 		Coins:        coins,
 		FrameNumbers: frameNumbers,
+		Addresses:    addresses,
 	}, nil
 }
 
@@ -263,7 +266,7 @@ func (r *RPCServer) GetTokenInfo(
 ) (*protobufs.TokenInfoResponse, error) {
 	// 1 QUIL = 0x1DCD65000 units
 	if req.Address != nil {
-		_, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
+		_, _, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
 		if err != nil {
 			return nil, errors.New("no coins found for address")
 		}
@@ -298,12 +301,12 @@ func (r *RPCServer) GetTokenInfo(
 		addrBytes := addr.FillBytes(make([]byte, 32))
 		peerAddrBytes := peerAddr.FillBytes(make([]byte, 32))
 
-		_, coins, err := r.coinStore.GetCoinsForOwner(addrBytes)
+		_, _, coins, err := r.coinStore.GetCoinsForOwner(addrBytes)
 		if err != nil {
 			panic(err)
 		}
 
-		_, otherCoins, err := r.coinStore.GetCoinsForOwner(peerAddrBytes)
+		_, _, otherCoins, err := r.coinStore.GetCoinsForOwner(peerAddrBytes)
 		if err != nil {
 			panic(err)
 		}

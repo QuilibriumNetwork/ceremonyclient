@@ -35,7 +35,7 @@ func (p *PebbleDB) Delete(key []byte) error {
 
 func (p *PebbleDB) NewBatch() Transaction {
 	return &PebbleTransaction{
-		b: p.db.NewBatch(),
+		b: p.db.NewIndexedBatch(),
 	}
 }
 

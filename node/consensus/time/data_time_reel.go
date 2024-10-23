@@ -39,6 +39,7 @@ type DataTimeReel struct {
 	logger       *zap.Logger
 	clockStore   store.ClockStore
 	frameProver  crypto.FrameProver
+	exec         func(txn store.Transaction, frame *protobufs.ClockFrame) error
 
 	origin                []byte
 	initialInclusionProof *crypto.InclusionAggregateProof
@@ -62,6 +63,7 @@ func NewDataTimeReel(
 	clockStore store.ClockStore,
 	engineConfig *config.EngineConfig,
 	frameProver crypto.FrameProver,
+	exec func(txn store.Transaction, frame *protobufs.ClockFrame) error,
 	origin []byte,
 	initialInclusionProof *crypto.InclusionAggregateProof,
 	initialProverKeys [][]byte,
@@ -82,6 +84,10 @@ func NewDataTimeReel(
 		panic("engine config is nil")
 	}
 
+	if exec == nil {
+		panic("execution function is nil")
+	}
+
 	if frameProver == nil {
 		panic("frame prover is nil")
 	}
@@ -98,6 +104,7 @@ func NewDataTimeReel(
 		engineConfig:          engineConfig,
 		clockStore:            clockStore,
 		frameProver:           frameProver,
+		exec:                  exec,
 		origin:                origin,
 		initialInclusionProof: initialInclusionProof,
 		initialProverKeys:     initialProverKeys,
@@ -136,6 +143,14 @@ func (d *DataTimeReel) Start() error {
 	return nil
 }
 
+func (d *DataTimeReel) SetHead(frame *protobufs.ClockFrame) {
+	if d.running == true {
+		panic("internal test function should never be called outside of tests")
+	}
+
+	d.head = frame
+}
+
 func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 	return d.head, nil
 }
@@ -170,7 +185,7 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
 
 	d.storePending(selector, parent, distance, frame)
 
-	if !isSync {
+	if isSync {
 		go func() {
 			d.frames <- &pendingFrame{
 				selector:       selector,
@@ -329,7 +344,6 @@ func (d *DataTimeReel) runLoop() {
 						zap.String("head_selector", headSelector.Text(16)),
 					)
 
-					d.forkChoice(rawFrame, distance)
 					d.processPending(d.head, frame)
 					continue
 				}
@@ -374,8 +388,6 @@ func (d *DataTimeReel) runLoop() {
 			} else {
 				d.logger.Debug("frame is lower height")
 
-				// tag: dusk – we should have some kind of check here to avoid brutal
-				// thrashing
 				existing, _, err := d.clockStore.GetDataClockFrame(
 					d.filter,
 					rawFrame.FrameNumber,
@@ -588,6 +600,11 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 	); err != nil {
 		panic(err)
 	}
+	if err = d.exec(txn, frame); err != nil {
+		d.logger.Debug("invalid frame execution, unwinding", zap.Error(err))
+		txn.Abort()
+		return
+	}
 
 	if err = txn.Commit(); err != nil {
 		panic(err)
@@ -597,7 +614,10 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) {
 
 	d.headDistance = distance
 	go func() {
-		d.newFrameCh <- frame
+		select {
+		case d.newFrameCh <- frame:
+		default:
+		}
 	}()
 }
 
@@ -897,7 +917,10 @@ func (d *DataTimeReel) forkChoice(
 	)
 
 	go func() {
-		d.newFrameCh <- frame
+		select {
+		case d.newFrameCh <- frame:
+		default:
+		}
 	}()
 }
 
