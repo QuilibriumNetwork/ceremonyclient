@@ -109,7 +109,7 @@ func NewTokenExecutionEngine(
 		if err != nil {
 			panic(err)
 		}
-		_, _, err = clockStore.GetDataClockFrame(intrinsicFilter, 0, false)
+		_, err = clockStore.GetEarliestDataClockFrame(intrinsicFilter)
 		if err != nil && errors.Is(err, store.ErrNotFound) {
 			origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
 				logger,
