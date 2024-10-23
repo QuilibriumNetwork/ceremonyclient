@@ -81,7 +81,7 @@ outer:
 			continue
 		}
 
-		cc, err := e.pubSub.GetDirectChannel([]byte(peerId), "")
+		cc, err := e.pubSub.GetDirectChannel([]byte(peerId), "worker")
 		if err != nil {
 			e.logger.Info(
 				"could not establish direct channel, waiting...",
@@ -90,7 +90,6 @@ outer:
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		defer cc.Close()
 
 		client := protobufs.NewDataServiceClient(cc)
 
@@ -107,6 +106,7 @@ outer:
 				zap.Error(err),
 			)
 			time.Sleep(10 * time.Second)
+			cc.Close()
 			continue
 		}
 
@@ -123,6 +123,7 @@ outer:
 
 		if status.Increment == 0 && !bytes.Equal(status.Address, make([]byte, 32)) {
 			e.logger.Info("already completed pre-midnight mint")
+			cc.Close()
 			return
 		}
 
@@ -150,6 +151,7 @@ outer:
 					zap.String("peer_id", peer.ID(e.pubSub.GetPeerID()).String()),
 					zap.Int("increment", i),
 				)
+				cc.Close()
 				return
 			}
 
@@ -163,6 +165,7 @@ outer:
 				}
 				sig, err := e.pubSub.SignMessage(payload)
 				if err != nil {
+					cc.Close()
 					panic(err)
 				}
 
@@ -185,6 +188,7 @@ outer:
 						zap.Error(err),
 					)
 					time.Sleep(10 * time.Second)
+					cc.Close()
 					continue outer
 				}
 
@@ -197,10 +201,12 @@ outer:
 
 				if i == 0 {
 					e.logger.Info("pre-midnight proofs submitted, returning")
+					cc.Close()
 					return
 				}
 			}
 		}
+		cc.Close()
 	}
 }
 

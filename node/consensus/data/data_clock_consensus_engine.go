@@ -317,6 +317,16 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		); err != nil {
 			panic(err)
 		}
+
+		if e.dataTimeReel.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+			if err := e.pubSub.StartDirectChannelListener(
+				e.pubSub.GetPeerID(),
+				"worker",
+				server,
+			); err != nil {
+				panic(err)
+			}
+		}
 	}()
 
 	e.state = consensus.EngineStateCollecting
