@@ -205,7 +205,7 @@ func DownloadAndVerifyGenesis(network uint) (*SignedGenesisUnlock, error) {
 		count++
 	}
 
-	if count < len(Signatories)/2+len(Signatories)%2 {
+	if count < ((len(Signatories)-4)/2)+((len(Signatories)-4)%2) {
 		fmt.Printf("Quorum on signatures not met")
 		return nil, errors.New("quorum on signatures not met")
 	}
