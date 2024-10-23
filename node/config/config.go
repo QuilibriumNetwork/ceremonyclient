@@ -135,7 +135,7 @@ var unlock *SignedGenesisUnlock
 func DownloadAndVerifyGenesis(network uint) (*SignedGenesisUnlock, error) {
 	if network != 0 {
 		unlock = &SignedGenesisUnlock{
-			GenesisSeedHex: "726573697374206d7563682c206f626579206c6974746c657c000000000000000000000003",
+			GenesisSeedHex: "726573697374206d7563682c206f626579206c6974746c657c000000000000000000000004",
 			Beacon: []byte{
 				0x58, 0xef, 0xd9, 0x7e, 0xdd, 0x0e, 0xb6, 0x2f,
 				0x51, 0xc7, 0x5d, 0x00, 0x29, 0x12, 0x45, 0x49,
