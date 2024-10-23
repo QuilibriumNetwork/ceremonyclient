@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"math/big"
 	"time"
 
@@ -233,6 +232,8 @@ func (e *DataClockConsensusEngine) handleMint(
 		e.provingKeyAddress,
 	) {
 		prevInput := []byte{}
+		prevErrorMetric := uint32(0)
+		highestIncrement := uint32(0)
 		deletes := []*protobufs.TokenOutput{}
 		if !bytes.Equal(t.Proofs[1], make([]byte, 32)) {
 			pre, err := e.coinStore.GetPreCoinProofByAddress(t.Proofs[1])
@@ -270,7 +271,9 @@ func (e *DataClockConsensusEngine) handleMint(
 					},
 				})
 			}
-			prevInput = pre.Proof[74:]
+			prevInput = pre.Proof[74:148]
+			prevErrorMetric = binary.BigEndian.Uint32(pre.Proof[148:152])
+			highestIncrement = binary.BigEndian.Uint32(pre.Proof[152:156])
 		}
 
 		var previousIncrement = uint32(0xFFFFFFFF)
@@ -355,9 +358,13 @@ func (e *DataClockConsensusEngine) handleMint(
 			}
 
 			if len(prevInput) != 0 && !bytes.Equal(prevInput, kzgCommitment) {
-				fmt.Printf("%x\n", prevInput)
-				fmt.Printf("%x\n", kzgCommitment)
-				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+				heuristic := uint64(highestIncrement) -
+					(uint64(highestIncrement) * uint64(999) / uint64(1000))
+				if highestIncrement != 0 && uint64(prevErrorMetric) > heuristic {
+					return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+				} else {
+					prevErrorMetric++
+				}
 			}
 
 			wp := []byte{}
@@ -393,17 +400,30 @@ func (e *DataClockConsensusEngine) handleMint(
 			return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 		}
 
+		if previousIncrement > highestIncrement {
+			highestIncrement = previousIncrement
+		}
+
 		txn, err := e.coinStore.NewTransaction()
 		if err != nil {
 			return nil, errors.Wrap(err, "handle mint")
 		}
 		if previousIncrement != 0 {
 			add := &protobufs.PreCoinProof{
-				Amount:      reward.FillBytes(make([]byte, 32)),
-				Index:       index,
-				IndexProof:  indexProof,
-				Commitment:  kzgCommitment,
-				Proof:       append(append([]byte{}, kzgProof...), prevInput...),
+				Amount:     reward.FillBytes(make([]byte, 32)),
+				Index:      index,
+				IndexProof: indexProof,
+				Commitment: kzgCommitment,
+				Proof: binary.BigEndian.AppendUint32(
+					binary.BigEndian.AppendUint32(
+						append(
+							append([]byte{}, kzgProof...),
+							prevInput...,
+						),
+						prevErrorMetric,
+					),
+					highestIncrement,
+				),
 				Parallelism: parallelism,
 				Difficulty:  previousIncrement,
 				Owner: &protobufs.AccountRef{
@@ -433,11 +453,20 @@ func (e *DataClockConsensusEngine) handleMint(
 			}
 		} else {
 			proof := &protobufs.PreCoinProof{
-				Amount:      reward.FillBytes(make([]byte, 32)),
-				Index:       index,
-				IndexProof:  indexProof,
-				Commitment:  kzgCommitment,
-				Proof:       append(append([]byte{}, kzgProof...), indexProof...),
+				Amount:     reward.FillBytes(make([]byte, 32)),
+				Index:      index,
+				IndexProof: indexProof,
+				Commitment: kzgCommitment,
+				Proof: binary.BigEndian.AppendUint32(
+					binary.BigEndian.AppendUint32(
+						append(
+							append([]byte{}, kzgProof...),
+							prevInput...,
+						),
+						prevErrorMetric,
+					),
+					highestIncrement,
+				),
 				Parallelism: parallelism,
 				Difficulty:  previousIncrement,
 				Owner: &protobufs.AccountRef{
