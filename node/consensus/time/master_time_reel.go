@@ -88,7 +88,7 @@ func (m *MasterTimeReel) Start() error {
 	}
 
 	rebuildGenesisFrame := false
-	if genesis != nil && genesis.Difficulty != 100000 {
+	if genesis != nil && genesis.Difficulty != 160000 {
 		m.logger.Info("rewinding time reel to genesis")
 
 		err = m.clockStore.ResetMasterClockFrames(m.filter)
@@ -151,8 +151,8 @@ func (m *MasterTimeReel) createGenesisFrame() *protobufs.ClockFrame {
 	}
 
 	difficulty := m.engineConfig.Difficulty
-	if difficulty != 100000 {
-		difficulty = 100000
+	if difficulty != 160000 {
+		difficulty = 160000
 	}
 
 	frame, err := m.frameProver.CreateMasterGenesisFrame(

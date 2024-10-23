@@ -222,7 +222,7 @@ func NewDataClockConsensusEngine(
 
 	difficulty := engineConfig.Difficulty
 	if difficulty == 0 {
-		difficulty = 100000
+		difficulty = 160000
 	}
 
 	e := &DataClockConsensusEngine{
@@ -317,8 +317,16 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		); err != nil {
 			panic(err)
 		}
+	}()
 
+	go func() {
 		if e.dataTimeReel.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+			server := grpc.NewServer(
+				grpc.MaxSendMsgSize(600*1024*1024),
+				grpc.MaxRecvMsgSize(600*1024*1024),
+			)
+			protobufs.RegisterDataServiceServer(server, e)
+
 			if err := e.pubSub.StartDirectChannelListener(
 				e.pubSub.GetPeerID(),
 				"worker",

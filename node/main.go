@@ -300,8 +300,6 @@ func main() {
 		fmt.Println(
 			"Node is operating outside of mainnet – be sure you intended to do this.",
 		)
-	} else {
-		panic("do not run this release on mainnet")
 	}
 
 	clearIfTestData(*configDirectory, nodeConfig)

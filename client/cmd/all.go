@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -90,20 +91,25 @@ var allCmd = &cobra.Command{
 			}
 		}
 
+		if increment == 0 && !bytes.Equal(resume, make([]byte, 32)) {
+			fmt.Println("already completed pre-midnight mint")
+			return
+		}
+
 		proofs := [][]byte{
 			[]byte("pre-dusk"),
 			resume,
 		}
 
 		batchCount := 0
-		for i := increment; i >= 0; i-- {
+		for i := int(increment); i >= 0; i-- {
 			_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
 				[]byte(peerId),
 				uint32(i),
 			)
 			if err == nil {
 				p := []byte{}
-				p = binary.BigEndian.AppendUint32(p, i)
+				p = binary.BigEndian.AppendUint32(p, uint32(i))
 				p = binary.BigEndian.AppendUint32(p, parallelism)
 				p = binary.BigEndian.AppendUint64(p, uint64(len(input)))
 				p = append(p, input...)
@@ -112,11 +118,13 @@ var allCmd = &cobra.Command{
 
 				proofs = append(proofs, p)
 			} else {
+				fmt.Println("could not find data time proof for peer and increment, stopping at increment", i)
 				panic(err)
 			}
 
 			batchCount++
-			if batchCount == 10 || i == 0 {
+			if batchCount == 200 || i == 0 {
+				fmt.Println("publishing proof batch, increment", i)
 				payload := []byte("mint")
 				for _, i := range proofs {
 					payload = append(payload, i...)
@@ -146,28 +154,40 @@ var allCmd = &cobra.Command{
 					panic(err)
 				}
 
-				gotime.Sleep(20 * gotime.Second)
-
-				resp, err := client.GetPreCoinProofsByAccount(
-					context.Background(),
-					&protobufs.GetPreCoinProofsByAccountRequest{
-						Address: addr.FillBytes(make([]byte, 32)),
-					},
-				)
-				if err != nil {
-					for _, pr := range resp.Proofs {
-						if pr.IndexProof != nil {
-							resume, err = token.GetAddressOfPreCoinProof(pr)
-							if err != nil {
-								panic(err)
+			waitForConf:
+				for {
+					gotime.Sleep(20 * gotime.Second)
+					resp, err := client.GetPreCoinProofsByAccount(
+						context.Background(),
+						&protobufs.GetPreCoinProofsByAccountRequest{
+							Address: addr.FillBytes(make([]byte, 32)),
+						},
+					)
+					if err != nil {
+						for _, pr := range resp.Proofs {
+							if pr.IndexProof != nil {
+								newResume, err := token.GetAddressOfPreCoinProof(pr)
+								if err != nil {
+									panic(err)
+								}
+								if bytes.Equal(newResume, resume) {
+									fmt.Println("waiting for confirmation...")
+									continue waitForConf
+								}
 							}
 						}
 					}
+					break
 				}
 				batchCount = 0
 				proofs = [][]byte{
 					[]byte("pre-dusk"),
 					resume,
+				}
+
+				if i == 0 {
+					fmt.Println("all proofs submitted, returning")
+					return
 				}
 			}
 		}

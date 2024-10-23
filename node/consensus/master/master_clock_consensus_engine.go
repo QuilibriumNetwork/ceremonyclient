@@ -68,7 +68,7 @@ type MasterClockConsensusEngine struct {
 
 var _ consensus.ConsensusEngine = (*MasterClockConsensusEngine)(nil)
 
-var MASTER_CLOCK_RATE = uint32(100000)
+var MASTER_CLOCK_RATE = uint32(160000)
 
 func NewMasterClockConsensusEngine(
 	engineConfig *config.EngineConfig,

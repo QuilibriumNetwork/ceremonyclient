@@ -130,7 +130,6 @@ outer:
 		batchCount := 0
 		// the cast is important, it underflows without:
 		for i := int(increment); i >= 0; i-- {
-			e.logger.Info("iterating proofs", zap.Int("increment", i))
 			_, parallelism, input, output, err := e.dataProofStore.GetDataTimeProof(
 				e.pubSub.GetPeerID(),
 				uint32(i),
