@@ -215,7 +215,16 @@ func NewBlossomSub(
 	blossomOpts := []blossomsub.Option{}
 
 	if isBootstrapPeer {
+		peerInfo, err := peer.AddrInfoFromString("/ip4/185.209.178.191/udp/8336/quic-v1/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ")
+		if err != nil {
+			panic(err)
+		}
 		blossomOpts = append(blossomOpts, blossomsub.WithValidateQueueSize(1024))
+		blossomOpts = append(blossomOpts, blossomsub.WithDirectPeers(
+			[]peer.AddrInfo{
+				*peerInfo,
+			},
+		))
 	}
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
