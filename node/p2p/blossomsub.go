@@ -228,6 +228,23 @@ func NewBlossomSub(
 		blossomsub.WithStrictSignatureVerification(true),
 	}
 
+	if len(p2pConfig.DirectPeers) > 0 {
+		logger.Info("Found direct peers in config")
+		directPeers := []peer.AddrInfo{}
+		for _, peerAddr := range p2pConfig.DirectPeers {
+			peerinfo, err := peer.AddrInfoFromString(peerAddr)
+			if err != nil {
+				panic(err)
+			}
+			logger.Info("Adding direct peer", zap.String("peer", peerinfo.ID.String()))
+			directPeers = append(directPeers, *peerinfo)
+		}
+
+		if len(directPeers) > 0 {
+			blossomOpts = append(blossomOpts, blossomsub.WithDirectPeers(directPeers))
+		}
+	}
+
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
