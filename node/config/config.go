@@ -70,6 +70,7 @@ var BootstrapPeers = []string{
 	"/ip4/148.251.9.90/udp/8336/quic-v1/p2p/QmRpKmQ1W83s6moBFpG6D6nrttkqdQSbdCJpvfxDVGcs38",
 	"/ip4/15.235.211.121/udp/8336/quic-v1/p2p/QmZHNLUSAFCkTwHiEE3vWay3wsus5fWYsNLFTFU6tPCmNR",
 	"/ip4/63.141.228.58/udp/8336/quic-v1/p2p/QmezARggdWKa1sw3LqE3LfZwVvtuCpXpK8WVo8EEdfakJV",
+	"/ip4/185.209.178.191/udp/8336/quic-v1/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ",
 	// purged peers (keep your node online to return to this list)
 	// "/ip4/204.186.74.47/udp/8317/quic-v1/p2p/Qmd233pLUDvcDW3ama27usfbG1HxKNh1V9dmWVW1SXp1pd",
 	// "/ip4/186.233.184.181/udp/8336/quic-v1/p2p/QmW6QDvKuYqJYYMP5tMZSp12X3nexywK28tZNgqtqNpEDL",
