@@ -466,6 +466,29 @@ pub(crate) async fn start(
         }));
     }
 
+    // Feed the coverage halt detector the CURRENT grid's sub-shards with their REAL
+    // committed data sizes + Active prover counts. Without this the detector falls back
+    // to the registry summaries with `size = u64::MAX`, which defeats the "no data →
+    // don't halt" skip: STALE off-grid ANCESTOR filters (left behind as the grid splits
+    // deeper, with zero provers and zero data) then trip a PERMANENT `u64::MAX` halt,
+    // wedging `any_halted()` true and gating every leave/swap network-wide. The
+    // inventory enumerates only the live grid (`range_app_shards`) with real sizes, so a
+    // zero-data husk is skipped while a data-bearing shard nobody has joined still halts.
+    {
+        let crdt_inv = crdt.clone();
+        let shards_inv = shards_store.clone();
+        let reg_inv = prover_registry.clone()
+            as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
+        coverage_monitor.set_shard_inventory_provider(std::sync::Arc::new(move |frame: u64| {
+            quil_engine::coverage::build_shard_inventory(
+                crdt_inv.clone(),
+                shards_inv.clone(),
+                reg_inv.as_ref(),
+                frame,
+            )
+        }));
+    }
+
     // Lazy cell holding the prover-message transport. The transport
     // itself is constructed later (it depends on the archive pool and
     // mtls seed which are resolved further down), but worker_manager

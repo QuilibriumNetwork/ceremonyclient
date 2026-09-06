@@ -403,7 +403,7 @@ pub struct ShardCoverageEntry {
 /// therefore can't observe zero-prover shards (the gap that
 /// motivated this hook).
 pub type ShardInventoryProvider =
-    Arc<dyn Fn() -> Vec<ShardCoverageEntry> + Send + Sync>;
+    Arc<dyn Fn(u64) -> Vec<ShardCoverageEntry> + Send + Sync>;
 
 pub struct CoverageMonitor {
     prover_registry: Arc<dyn ProverRegistry>,
@@ -425,7 +425,7 @@ pub struct CoverageMonitor {
     /// allocated-only registry summary, which lets the monitor see
     /// zero-prover-but-non-zero-size shards (the address-creation
     /// failure mode).
-    shard_inventory_provider: Option<ShardInventoryProvider>,
+    shard_inventory_provider: std::sync::RwLock<Option<ShardInventoryProvider>>,
     /// Optional EMPTY-SPLIT GUARD (`UNIFIED_APP_TREE_DESIGN` §6.1): given a shard
     /// `(filter, factor)`, returns the leaf count of each of the `factor` proposed
     /// children under the unified app tree. A split is only proposed when ≥2 of
@@ -568,7 +568,7 @@ impl CoverageMonitor {
             prover_only_mode,
             last_checked_frame: AtomicU64::new(0),
             emitted_halted: Mutex::new(std::collections::HashSet::new()),
-            shard_inventory_provider: None,
+            shard_inventory_provider: std::sync::RwLock::new(None),
             split_feasibility: std::sync::RwLock::new(None),
             split_proposer: std::sync::RwLock::new(None),
             unified_provider: std::sync::RwLock::new(None),
@@ -636,8 +636,8 @@ impl CoverageMonitor {
     /// registry's per-filter active counts. Archive nodes can wire
     /// a closure that pulls sizes directly from the local hypergraph
     /// CRDT and counts from the registry.
-    pub fn set_shard_inventory_provider(&mut self, provider: ShardInventoryProvider) {
-        self.shard_inventory_provider = Some(provider);
+    pub fn set_shard_inventory_provider(&self, provider: ShardInventoryProvider) {
+        *self.shard_inventory_provider.write().unwrap() = Some(provider);
     }
 
     /// Seed the per-shard streak map from each prover's
@@ -692,8 +692,13 @@ impl CoverageMonitor {
         // When the provider is installed, we use it for the
         // detection sweep. When absent, we fall back to summaries
         // only (legacy behavior).
-        let inventory: Vec<ShardCoverageEntry> = match &self.shard_inventory_provider {
-            Some(provider) => provider(),
+        let inventory: Vec<ShardCoverageEntry> = match self
+            .shard_inventory_provider
+            .read()
+            .unwrap()
+            .as_ref()
+        {
+            Some(provider) => provider(frame_number),
             None => summaries
                 .iter()
                 .map(|s| ShardCoverageEntry {
@@ -1829,7 +1834,7 @@ mod tests {
             Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> =
             dist.clone();
-        let mut monitor = CoverageMonitor::new(
+        let monitor = CoverageMonitor::new(
             registry,
             dist_arc,
             CoverageThresholds::mainnet(),
@@ -2112,7 +2117,7 @@ mod tests {
     fn inventory_provider_surfaces_zero_prover_data_shard() {
         let target_filter: Vec<u8> = vec![0xAB; 32];
         let target_for_provider = target_filter.clone();
-        let provider: ShardInventoryProvider = Arc::new(move || {
+        let provider: ShardInventoryProvider = Arc::new(move |_frame: u64| {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 1024, // 1 KB of data on this shard
@@ -2148,7 +2153,7 @@ mod tests {
     fn inventory_provider_skips_zero_size_shards() {
         let target_filter: Vec<u8> = vec![0xCD; 32];
         let target_for_provider = target_filter.clone();
-        let provider: ShardInventoryProvider = Arc::new(move || {
+        let provider: ShardInventoryProvider = Arc::new(move |_frame: u64| {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 0, // no data — must skip
@@ -2185,7 +2190,7 @@ mod tests {
     /// `propose_merge_rebalance` takes its inventory as a parameter, so no
     /// inventory provider is needed.
     fn build_merge_monitor() -> (CoverageMonitor, Arc<CapturingDistributor>) {
-        build_monitor_with_inventory(Arc::new(Vec::new))
+        build_monitor_with_inventory(Arc::new(|_frame: u64| Vec::new()))
     }
 
     fn entry(filter: Vec<u8>, size: u64, active: u64) -> ShardCoverageEntry {
