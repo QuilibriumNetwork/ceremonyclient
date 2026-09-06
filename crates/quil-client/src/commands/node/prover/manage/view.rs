@@ -1147,10 +1147,10 @@ mod tests {
                 9,  // "Size_[MB]"
                 8,  // "10076371", wider than "Shards"
                 3,  // "Mat"
-                5,  // "Lag"
+                3,  // "Lag"
                 7,  // "joining", wider than "State"
                 12, // "Reward_[Q/f]"
-                6,  // "Worker"
+                8,  // "^|Worker", including the active sort indicator
                 7,  // "joining", wider than "Status"
                 4,  // "Mode"
                 11, // "Next_Action", wider than "confirmed"
@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn fixed_sizing_reproduces_the_historical_layout() {
         let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 8, 14, 7, 12, 4, 30, 16]);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 6, 8, 14, 9, 12, 4, 30, 16]);
         assert_eq!(fw, 12);
         assert_eq!(w.iter().sum::<usize>() + 14, 170);
         // 30 columns of Next Action for a 9-column value in the fixed layout.
