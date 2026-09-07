@@ -49,15 +49,15 @@ async fn fetch_changed_blobs(
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
     phase: u32,
-    // Version to REQUEST from the peer (the peer's tree version the diff
-    // addressed — MVCC-pins the served blob so it matches the committed leaf).
+    // Version to request from the peer (the tree version the diff addressed),
+    // which pins each served blob to the authenticated leaf commitment.
     source_version: u64,
-    // Version to SAVE at locally (the version our forest tree was applied at in
-    // `sync_shard_phase_from`) — keeps the blob keyspace consistent with the tree.
-    apply_version: u64,
+    // The local tree version is selected after all blobs are ready; successful
+    // full-tree sync persists them with the tree in one transaction.
     changed: Vec<([u8; 32], Vec<u8>)>,
-) -> Result<()> {
-    let Some(shard) = app_shard_key(shard_id) else { return Ok(()) };
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let Some(shard) = app_shard_key(shard_id) else { return Ok(Vec::new()); };
+    let mut fetched = Vec::new();
     let shard_key_bytes: Vec<u8> = shard.l1.iter().copied().chain(shard.l2).collect();
     for (kh, leaf_value) in changed {
         // Per-vertex-subtree raw-key model: the changed `key_hash` IS the
@@ -114,10 +114,9 @@ async fn fetch_changed_blobs(
                 hex::encode(&vertex_id)
             )));
         }
-        crdt.save_synced_blob(&shard, phase as usize, &vertex_id, &blob, apply_version)
-            .map_err(|e| QuilError::Internal(format!("save_synced_blob: {e}")))?;
+        fetched.push((vertex_id, blob));
     }
-    Ok(())
+    Ok(fetched)
 }
 
 /// Sync ONE forest tree's phase from a peer: diff + apply the commitment, then
@@ -152,16 +151,22 @@ pub async fn sync_one_phase(
     let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
     let c = crdt.clone();
     let sid = shard_id.to_vec();
-    // The forest-write lock is taken INSIDE `sync_shard_phase_from`, around the
-    // apply only — the diff runs lock-free so it can't starve the materializer.
-    let (root, apply_version, changed) = tokio::task::spawn_blocking(move || {
-        c.sync_shard_phase_from(&remote, source_version, &sid, phase as usize)
+    let prepared = tokio::task::spawn_blocking(move || {
+        c.prepare_shard_phase_sync(&remote, source_version, &sid, phase as usize)
+    })
+    .await
+    .map_err(|e| QuilError::Internal(format!("sync task join: {e}")))?
+    .map_err(|e| QuilError::Internal(format!("sync prepare: {e}")))?;
+    let changed = prepared.changed_leaves();
+    let blobs = fetch_changed_blobs(client, crdt, shard_id, phase, source_version, changed).await?;
+    let blob_shard = app_shard_key(shard_id);
+    let c = crdt.clone();
+    let (root, _) = tokio::task::spawn_blocking(move || {
+        c.apply_prepared_shard_phase_sync(prepared, blob_shard.as_ref(), &blobs)
     })
     .await
     .map_err(|e| QuilError::Internal(format!("sync task join: {e}")))?
     .map_err(|e| QuilError::Internal(format!("sync apply: {e}")))?;
-    fetch_changed_blobs(client, crdt, shard_id, phase, source_version, apply_version, changed)
-        .await?;
     Ok(root)
 }
 
@@ -185,8 +190,8 @@ pub async fn sync_subtree_one_phase(
     let remote = RemoteTreeReader::new(client.clone(), handle.clone(), app.to_vec(), phase);
     let c = crdt.clone();
     let app_v = app.to_vec();
-    let (root, apply_version, changed) = tokio::task::spawn_blocking(move || {
-        c.sync_shard_subtree_phase_from(
+    let prepared = tokio::task::spawn_blocking(move || {
+        c.prepare_shard_subtree_phase_sync(
             &remote,
             source_version,
             &app_v,
@@ -197,8 +202,17 @@ pub async fn sync_subtree_one_phase(
     })
     .await
     .map_err(|e| QuilError::Internal(format!("subtree sync task join: {e}")))?
+    .map_err(|e| QuilError::Internal(format!("subtree sync prepare: {e}")))?;
+    let changed = prepared.changed_leaves();
+    let blobs = fetch_changed_blobs(client, crdt, app, phase, source_version, changed).await?;
+    let blob_shard = app_shard_key(app);
+    let c = crdt.clone();
+    let (root, _) = tokio::task::spawn_blocking(move || {
+        c.apply_prepared_shard_subtree_phase_sync(prepared, blob_shard.as_ref(), &blobs)
+    })
+    .await
+    .map_err(|e| QuilError::Internal(format!("subtree sync task join: {e}")))?
     .map_err(|e| QuilError::Internal(format!("subtree sync apply: {e}")))?;
-    fetch_changed_blobs(client, crdt, app, phase, source_version, apply_version, changed).await?;
     Ok(root)
 }
 

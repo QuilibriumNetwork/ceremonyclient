@@ -115,6 +115,120 @@ fn empty_follower_converges_to_leader_prover_root() {
     );
 }
 
+/// A failed blob transfer must not install a matching tree with unreadable
+/// state. Once all blobs are available, tree and blob state become visible
+/// together.
+#[test]
+fn prepared_sync_waits_for_blobs_before_installing_tree() {
+    let leader = fresh_crdt();
+    seed_and_commit(&leader, 1, 1);
+    let follower = fresh_crdt();
+    let shard_id = GLOBAL_APP.to_vec();
+    let (source_version, leader_root) = leader
+        .serve_forest_head(&shard_id, 0)
+        .expect("leader phase head");
+    let reader = InProcTreeReader {
+        source: leader.clone(),
+        shard_id: shard_id.clone(),
+        phase: 0,
+    };
+    let prepared = follower
+        .prepare_shard_phase_sync(&reader, source_version, &shard_id, 0)
+        .expect("prepare sync");
+    assert!(!prepared.is_empty());
+    assert_ne!(
+        follower.compute_shard_root("vertex", "adds", &global_prover_shard()),
+        leader_root,
+        "no tree is installed before the blob transfer succeeds",
+    );
+
+    let blobs = prepared
+        .changed_leaves()
+        .into_iter()
+        .map(|(data, _)| {
+            let mut id = GLOBAL_APP.to_vec();
+            id.extend_from_slice(&data);
+            let blob = leader
+                .peek_synced_blob(&global_prover_shard(), 0, &id)
+                .expect("leader blob");
+            (id, blob)
+        })
+        .collect::<Vec<_>>();
+    follower
+        .apply_prepared_shard_phase_sync(
+            prepared,
+            Some(&global_prover_shard()),
+            &blobs,
+        )
+        .expect("atomic tree-and-blob install");
+    assert_eq!(
+        follower.compute_shard_root("vertex", "adds", &global_prover_shard()),
+        leader_root,
+    );
+}
+
+/// The unified subtree path must have the same ordering guarantee as whole-tree
+/// sync: a failed blob transfer cannot advance the subtree commitment.
+#[test]
+fn prepared_subtree_sync_waits_for_blobs_before_installing_tree() {
+    use quil_types::store::ShardKey;
+
+    let app = *b"quil-app-address-0123456789abcd!";
+    let shard = ShardKey { l1: [0u8; 3], l2: app };
+    let vertex = Location { app_address: app, data_address: [0x00u8; 32] };
+    let leader = fresh_crdt();
+    leader.set_shard_partition(app, 1);
+    leader.set_unified_tree(true);
+    leader.add_vertex(&vertex, b"subtree-data").unwrap();
+    leader.commit(1).unwrap();
+    let leader_root = leader.compute_shard_root("vertex", "adds", &shard);
+    let pinned = <[u8; 32]>::try_from(leader_root.as_slice()).unwrap();
+
+    let follower = fresh_crdt();
+    follower.set_shard_partition(app, 1);
+    follower.set_unified_tree(true);
+    let bit_path = follower.canonical_bits_for_prefix(&app, &[0u32]);
+    let shard_id = app.to_vec();
+    let (source_version, _) = leader
+        .serve_forest_head(&shard_id, 0)
+        .expect("leader phase head");
+    let reader = InProcTreeReader { source: leader.clone(), shard_id, phase: 0 };
+    let prepared = follower
+        .prepare_shard_subtree_phase_sync(
+            &reader,
+            source_version,
+            &app,
+            0,
+            &bit_path,
+            Some(pinned),
+        )
+        .expect("prepare subtree sync");
+    assert!(!prepared.is_empty());
+    assert!(
+        !follower.lookup_vertex(&vertex),
+        "tree and blob state stay absent until blob transfer succeeds",
+    );
+
+    let blobs = prepared
+        .changed_leaves()
+        .into_iter()
+        .map(|(data, _)| {
+            let mut id = app.to_vec();
+            id.extend_from_slice(&data);
+            let blob = leader.peek_synced_blob(&shard, 0, &id).expect("leader blob");
+            (id, blob)
+        })
+        .collect::<Vec<_>>();
+    let (subtree_root, _) = follower
+        .apply_prepared_shard_subtree_phase_sync(prepared, Some(&shard), &blobs)
+        .expect("atomic subtree tree-and-blob install");
+    assert!(follower.lookup_vertex(&vertex), "blob is readable after install");
+    assert_eq!(
+        subtree_root,
+        leader.sub_shard_commitment("vertex", "adds", &shard, &[0u32]).as_slice(),
+    );
+}
+
 /// A follower that is STALE (holds an older subset) converges after sync — the
 /// Merkle diff carries only the missing/changed leaves and reaches the leader root.
 #[test]
