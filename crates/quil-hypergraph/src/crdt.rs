@@ -49,6 +49,59 @@ const PHASE_STR: [(&str, &str); 4] = [
     ("hyperedge", "removes"),
 ];
 
+/// A lock-free forest diff prepared for an atomic sync install.
+///
+/// Remote blobs bound to the changed leaves must be fetched and verified before
+/// the preparation is applied, so a transport failure cannot install a root
+/// whose readable blob state is incomplete.
+pub struct PreparedShardPhaseSync {
+    shard_id: Vec<u8>,
+    phase_idx: usize,
+    target_version: Option<u64>,
+    leaves: Vec<(quil_forest::KeyHash, Vec<u8>)>,
+}
+
+impl PreparedShardPhaseSync {
+    pub fn changed_leaves(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        self.leaves
+            .iter()
+            .map(|(key, value)| (key.0, value.clone()))
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+}
+
+/// A lock-free authenticated subtree diff prepared for an atomic sync install.
+///
+/// This is the unified-app counterpart of [`PreparedShardPhaseSync`]. Its
+/// source subtree root is authenticated against the pinned app root before
+/// blobs are fetched, and the local subtree is checked after the joint commit.
+pub struct PreparedShardSubtreeSync {
+    app: Vec<u8>,
+    phase_idx: usize,
+    target_version: Option<u64>,
+    bit_path: Vec<bool>,
+    pinned_app_root: Option<[u8; 32]>,
+    source_subtree_root: [u8; 32],
+    leaves: Vec<(quil_forest::KeyHash, Vec<u8>)>,
+}
+
+impl PreparedShardSubtreeSync {
+    pub fn changed_leaves(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        self.leaves
+            .iter()
+            .map(|(key, value)| (key.0, value.clone()))
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+}
+
 /// Expand a UNIFORM 64-way split `depth` into its complete prefix set: depth 0 ⇒
 /// `[[]]` (single shard); depth 1 ⇒ `{[0]..[63]}` (QUIL); etc. Used by the
 /// convenience [`HypergraphCrdt::set_shard_partition`].
@@ -2037,11 +2090,10 @@ impl HypergraphCrdt {
         Some((v, root))
     }
 
-    /// Forest-sync CLIENT: pull one shard/phase tree from a remote `source` (at
-    /// `source_version`) via the efficient Merkle diff and apply the differing
-    /// leaves into this CRDT's forest at a fresh, COORDINATED version (so it
-    /// doesn't collide with live `commit_inner` versions). Returns the new root
-    /// for the caller to verify against the trusted target.
+    /// Forest-sync CLIENT: prepare one shard/phase Merkle diff from a remote
+    /// `source` at `source_version`, without mutating local state. The caller
+    /// fetches the changed blobs and uses the companion apply method to persist
+    /// both at a fresh coordinated version.
     ///
     /// The diff walk (remote reads) runs LOCK-FREE — it takes neither
     /// `forest_write_lock` nor `commit_lock`. JMT reads are version-exact, so the
@@ -2052,6 +2104,103 @@ impl HypergraphCrdt {
     /// apply: if a commit advanced this phase in between, the diff's leaves are
     /// stale and the apply is aborted for the caller to retry — so an expensive
     /// full-tree diff can never block the global-frame materializer.
+    ///
+    /// Prepare an authenticated phase diff without mutating local state.
+    pub fn prepare_shard_phase_sync<S: quil_forest::TreeReader>(
+        &self,
+        source: &S,
+        source_version: u64,
+        shard_id: &[u8],
+        phase_idx: usize,
+    ) -> Result<PreparedShardPhaseSync> {
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        let (target_version, leaves) = {
+            let forest = self.forest.read().unwrap();
+            let target_version = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
+            let target = forest.shard_phase_reader(shard_id, PHASES[phase_idx]);
+            let leaves = quil_forest::diff_leaves(
+                source,
+                source_version,
+                &target,
+                target_version.unwrap_or(0),
+            )
+            .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?;
+            (target_version, leaves)
+        };
+        Ok(PreparedShardPhaseSync {
+            shard_id: shard_id.to_vec(),
+            phase_idx,
+            target_version,
+            leaves,
+        })
+    }
+
+    /// Commit a prepared diff only after its remote blobs have been fetched
+    /// and validated. A materializer advance invalidates the preparation.
+    pub fn apply_prepared_shard_phase_sync(
+        &self,
+        prepared: PreparedShardPhaseSync,
+        blob_shard: Option<&ShardKey>,
+        blobs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<([u8; 32], u64)> {
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let current = self.resolve_phase_version_with(
+            &forest,
+            &prepared.shard_id,
+            prepared.phase_idx,
+        );
+        if current != prepared.target_version {
+            return Err(QuilError::Internal(format!(
+                "sync phase {} advanced {:?}→{:?} during blob fetch — retry",
+                prepared.phase_idx, prepared.target_version, current,
+            )));
+        }
+        let version = current.map(|v| v + 1).unwrap_or(0);
+        let (root, puts) = forest
+            .apply_synced_shard_phase(
+                &prepared.shard_id,
+                PHASES[prepared.phase_idx],
+                version,
+                prepared.leaves,
+            )
+            .map_err(|e| QuilError::Internal(format!("apply synced shard: {e}")))?;
+        let txn = self.store.new_transaction(false)?;
+        for (key, value) in puts {
+            txn.set(&key, &value)?;
+        }
+        if let Some((key, value)) = forest.head_version_put(
+            &prepared.shard_id,
+            PHASES[prepared.phase_idx],
+            version,
+        ) {
+            txn.set(&key, &value)?;
+        }
+        if let Some(shard) = blob_shard {
+            let (set, phase) = PHASE_STR[prepared.phase_idx];
+            for (id, blob) in blobs {
+                self.store.save_vertex_underlying_versioned(
+                    txn.as_ref(),
+                    set,
+                    phase,
+                    shard,
+                    id,
+                    blob,
+                    version,
+                )?;
+            }
+        }
+        txn.commit()?;
+        self.phase_versions
+            .write()
+            .unwrap()
+            .insert((prepared.shard_id, prepared.phase_idx), version);
+        Ok((root, version))
+    }
+
     pub fn sync_shard_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -2123,16 +2272,130 @@ impl HypergraphCrdt {
         Ok((root, ver, changed))
     }
 
-    /// UNIFIED shard-prover subtree-range sync: pull ONLY the leaves under
-    /// `bit_path` (this prover's shard prefix) from `source`'s app tree and apply
-    /// them to the LOCAL app tree (keyed by `app`), returning the local SUBTREE
-    /// root — the shard commitment. `pinned_app_root` is the trusted header app
-    /// root for the phase; the descent to the prefix is authenticated against it
-    /// (so a peer can't serve a fake subtree), and the applied local subtree root
-    /// is verified to equal the authenticated source subtree root. A shard prover
-    /// thus stores only its subtree yet holds a commitment that composes to the
-    /// global app root — never pulling the whole app. Empty `bit_path` ==
-    /// [`sync_shard_phase_from`] over the whole app tree.
+    /// Prepare an authenticated unified-app subtree diff without mutating local
+    /// state. Call [`apply_prepared_shard_subtree_phase_sync`](Self::apply_prepared_shard_subtree_phase_sync)
+    /// only after every changed leaf's blob has been fetched and verified.
+    pub fn prepare_shard_subtree_phase_sync<S: quil_forest::TreeReader>(
+        &self,
+        source: &S,
+        source_version: u64,
+        app: &[u8],
+        phase_idx: usize,
+        bit_path: &[bool],
+        pinned_app_root: Option<[u8; 32]>,
+    ) -> Result<PreparedShardSubtreeSync> {
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        let (target_version, leaves, source_subtree_root) = {
+            let forest = self.forest.read().unwrap();
+            let target_version = self.resolve_phase_version_with(&forest, app, phase_idx);
+            let target = forest.shard_phase_reader(app, PHASES[phase_idx]);
+            let (leaves, source_subtree_root) = quil_forest::diff_leaves_under_prefix(
+                source,
+                source_version,
+                &target,
+                target_version.unwrap_or(0),
+                bit_path,
+                pinned_app_root,
+            )
+            .map_err(|e| QuilError::Internal(format!("diff_leaves_under_prefix: {e}")))?;
+            (target_version, leaves, source_subtree_root)
+        };
+        Ok(PreparedShardSubtreeSync {
+            app: app.to_vec(),
+            phase_idx,
+            target_version,
+            bit_path: bit_path.to_vec(),
+            pinned_app_root,
+            source_subtree_root,
+            leaves,
+        })
+    }
+
+    /// Commit a prepared unified-app subtree diff and its verified blobs in one
+    /// transaction. A materializer advance invalidates the preparation.
+    pub fn apply_prepared_shard_subtree_phase_sync(
+        &self,
+        prepared: PreparedShardSubtreeSync,
+        blob_shard: Option<&ShardKey>,
+        blobs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<([u8; 32], u64)> {
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let current = self.resolve_phase_version_with(&forest, &prepared.app, prepared.phase_idx);
+        if current != prepared.target_version {
+            return Err(QuilError::Internal(format!(
+                "sync subtree phase {} advanced {:?}→{:?} during blob fetch — retry",
+                prepared.phase_idx, prepared.target_version, current,
+            )));
+        }
+        if prepared.is_empty() {
+            let version = current.unwrap_or(0);
+            let local = forest
+                .app_subtree_root(&prepared.app, PHASES[prepared.phase_idx], version, &prepared.bit_path)
+                .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
+            if prepared.pinned_app_root.is_some() && local != prepared.source_subtree_root {
+                return Err(QuilError::Internal(
+                    "local subtree root != authenticated source subtree root (no-op path)".into(),
+                ));
+            }
+            return Ok((local, version));
+        }
+        let version = current.map(|v| v + 1).unwrap_or(0);
+        let (_full_root, puts) = forest
+            .apply_synced_shard_phase(
+                &prepared.app,
+                PHASES[prepared.phase_idx],
+                version,
+                prepared.leaves,
+            )
+            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
+        let txn = self.store.new_transaction(false)?;
+        for (key, value) in puts {
+            txn.set(&key, &value)?;
+        }
+        if let Some((key, value)) = forest.head_version_put(
+            &prepared.app,
+            PHASES[prepared.phase_idx],
+            version,
+        ) {
+            txn.set(&key, &value)?;
+        }
+        if let Some(shard) = blob_shard {
+            let (set, phase) = PHASE_STR[prepared.phase_idx];
+            for (id, blob) in blobs {
+                self.store.save_vertex_underlying_versioned(
+                    txn.as_ref(),
+                    set,
+                    phase,
+                    shard,
+                    id,
+                    blob,
+                    version,
+                )?;
+            }
+        }
+        txn.commit()?;
+        self.phase_versions
+            .write()
+            .unwrap()
+            .insert((prepared.app.clone(), prepared.phase_idx), version);
+        let local = forest
+            .app_subtree_root(&prepared.app, PHASES[prepared.phase_idx], version, &prepared.bit_path)
+            .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
+        if prepared.pinned_app_root.is_some() && local != prepared.source_subtree_root {
+            return Err(QuilError::Internal(
+                "post-sync local subtree root != authenticated source subtree root".into(),
+            ));
+        }
+        Ok((local, version))
+    }
+
+    /// UNIFIED shard-prover subtree-range sync. This compatibility helper
+    /// applies immediately; network callers should prepare, fetch blobs, then
+    /// call [`apply_prepared_shard_subtree_phase_sync`](Self::apply_prepared_shard_subtree_phase_sync).
     pub fn sync_shard_subtree_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -2142,80 +2405,18 @@ impl HypergraphCrdt {
         bit_path: &[bool],
         pinned_app_root: Option<[u8; 32]>,
     ) -> Result<([u8; 32], u64, Vec<([u8; 32], Vec<u8>)>)> {
-        if phase_idx >= 4 {
-            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
-        }
-        // Lock-free subtree diff + authenticated source subtree root.
-        let (v_t_opt, leaves, src_subtree_root) = {
-            let forest = self.forest.read().unwrap();
-            let v_t_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
-            let target = forest.shard_phase_reader(app, PHASES[phase_idx]);
-            let (leaves, src_root) = quil_forest::diff_leaves_under_prefix(
-                source,
-                source_version,
-                &target,
-                v_t_opt.unwrap_or(0),
-                bit_path,
-                pinned_app_root,
-            )
-            .map_err(|e| QuilError::Internal(format!("diff_leaves_under_prefix: {e}")))?;
-            (v_t_opt, leaves, src_root)
-        };
-        let changed: Vec<([u8; 32], Vec<u8>)> =
-            leaves.iter().map(|(k, v)| (k.0, v.clone())).collect();
-
-        // Nothing to pull — already synced. Return the current local subtree root
-        // without bumping the tree version.
-        if changed.is_empty() {
-            let forest = self.forest.read().unwrap();
-            let ver = v_t_opt.unwrap_or(0);
-            let local = forest
-                .app_subtree_root(app, PHASES[phase_idx], ver, bit_path)
-                .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
-            if pinned_app_root.is_some() && local != src_subtree_root {
-                return Err(QuilError::Internal(
-                    "local subtree root != authenticated source subtree root (no-op path)".into(),
-                ));
-            }
-            return Ok((local, ver, changed));
-        }
-
-        let _forest_guard = self.forest_write_lock.lock().unwrap();
-        let _guard = self.commit_lock.lock().unwrap();
-        let forest = self.forest.read().unwrap();
-        let cur_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
-        if cur_opt != v_t_opt {
-            return Err(QuilError::Internal(format!(
-                "sync subtree phase {phase_idx} advanced {v_t_opt:?}→{cur_opt:?} during diff — retry"
-            )));
-        }
-        let ver = cur_opt.map(|v| v + 1).unwrap_or(0);
-        let (_full_root, puts) = forest
-            .apply_synced_shard_phase(app, PHASES[phase_idx], ver, leaves)
-            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
-        let txn = self.store.new_transaction(false)?;
-        for (k, v) in puts {
-            txn.set(&k, &v)?;
-        }
-        if let Some((hk, hv)) = forest.head_version_put(app, PHASES[phase_idx], ver) {
-            txn.set(&hk, &hv)?;
-        }
-        txn.commit()?;
-        self.phase_versions.write().unwrap().insert((app.to_vec(), phase_idx), ver);
-
-        // The freshly-applied local subtree root MUST equal the authenticated
-        // source subtree root — this is what binds the pulled leaves to the
-        // trusted header (the pin authenticated the source subtree; this ties our
-        // reconstruction to it).
-        let local = forest
-            .app_subtree_root(app, PHASES[phase_idx], ver, bit_path)
-            .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
-        if pinned_app_root.is_some() && local != src_subtree_root {
-            return Err(QuilError::Internal(
-                "post-sync local subtree root != authenticated source subtree root".into(),
-            ));
-        }
-        Ok((local, ver, changed))
+        let prepared = self.prepare_shard_subtree_phase_sync(
+            source,
+            source_version,
+            app,
+            phase_idx,
+            bit_path,
+            pinned_app_root,
+        )?;
+        let changed = prepared.changed_leaves();
+        let (root, version) =
+            self.apply_prepared_shard_subtree_phase_sync(prepared, None, &[])?;
+        Ok((root, version, changed))
     }
 
     /// The canonical bit-path of one shard `prefix` within an app's COMPLETE
