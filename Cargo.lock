@@ -2219,7 +2219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.100",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5801,6 +5801,7 @@ dependencies = [
  "rand 0.8.5",
  "ratatui",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6991,7 +6992,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
