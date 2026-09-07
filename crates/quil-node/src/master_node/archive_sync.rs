@@ -471,6 +471,18 @@ fn state_jump_min_gap() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(1_000)
 }
+
+/// Bound one archive's prover-tree pull so another peer can be tried when an
+/// archive accepts the request but never completes it.
+const STATE_JUMP_PEER_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn state_jump_peer_sync_with_timeout<T>(
+    timeout: std::time::Duration,
+    operation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::time::timeout(timeout, operation).await.ok()
+}
+
 /// Backoff between state-jump retry passes when the node IS far behind but no peer
 /// completed a jump this pass (empty/failing pool at boot, transient peer errors).
 /// Short enough to catch up quickly once a usable archive appears; long enough not
@@ -630,18 +642,29 @@ async fn run_state_jump(
         // `prover_root_at(N-1)`, so `G == target - 1` — and the cursor is pinned
         // there so startup RE-MATERIALIZES frame `target` forward from the
         // authenticated pre-state (rather than skipping it, which would fork).
-        let prover_pinned_frame = match crate::forest_sync::sync_single_shard_verified(
-            &addr, &seed, crdt.clone(), &[0xffu8; 32], &anchor,
+        let prover_pinned_frame = match state_jump_peer_sync_with_timeout(
+            STATE_JUMP_PEER_SYNC_TIMEOUT,
+            crate::forest_sync::sync_single_shard_verified(
+                &addr, &seed, crdt.clone(), &[0xffu8; 32], &anchor,
+            ),
         )
-        .await
-        {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                warn!(%addr, target, "state-jump: peer cannot serve the authenticated prover-tree anchor version — trying another peer");
+        .await {
+            None => {
+                warn!(
+                    %addr,
+                    target,
+                    timeout_secs = STATE_JUMP_PEER_SYNC_TIMEOUT.as_secs(),
+                    "state-jump: prover tree sync timed out; trying another peer"
+                );
                 continue;
             }
-            Err(e) => {
-                warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
+            Some(Ok(Some(g))) => g,
+            Some(Ok(None)) => {
+                warn!(%addr, target, "state-jump: peer cannot serve authenticated prover-tree anchor; trying another peer");
+                continue;
+            }
+            Some(Err(e)) => {
+                warn!(%addr, error = %e, "state-jump: prover tree sync failed; trying another peer");
                 continue;
             }
         };
@@ -2900,5 +2923,30 @@ mod validation_tests {
             requests: Vec::new(),
         };
         assert!(!archive_frame_is_valid(&frame, &addrs, &verifier()));
+    }
+}
+
+#[cfg(test)]
+mod state_jump_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn state_jump_peer_deadline_rotates_hung_operation() {
+        assert_eq!(
+            state_jump_peer_sync_with_timeout(
+                std::time::Duration::from_millis(1),
+                std::future::pending::<u64>(),
+            )
+            .await,
+            None,
+        );
+        assert_eq!(
+            state_jump_peer_sync_with_timeout(
+                std::time::Duration::from_secs(1),
+                async { 796_258u64 },
+            )
+            .await,
+            Some(796_258),
+        );
     }
 }
