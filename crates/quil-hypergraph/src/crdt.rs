@@ -249,6 +249,30 @@ pub struct HypergraphCrdt {
     /// flipped at the flag-day frame AFTER the one-time consolidation (§9), since
     /// a split app's existing data lives in the per-prefix trees until then.
     unified_tree: AtomicBool,
+    /// Per-`(shard_id, phase_idx)` leaf-blob audit bookkeeping, so the syncer
+    /// can skip re-sweeping a tree it has already swept. Process-scoped on
+    /// purpose: it is a cost bound, never a correctness claim, and a restart
+    /// re-verifies from disk.
+    blob_audit_state: RwLock<std::collections::HashMap<(Vec<u8>, usize), BlobAuditState>>,
+}
+
+/// Cost-bounding state for one tree's leaf-blob audit. See
+/// [`HypergraphCrdt::missing_vertex_blobs`].
+#[derive(Default)]
+struct BlobAuditState {
+    /// A full audit-and-repair pass has run for this tree in this process, so
+    /// there is nothing left to TRY — every leaf it reported was either filled
+    /// or recorded in `unfillable`. Deliberately not conditioned on the pass
+    /// having filled everything: a permanently unfillable leaf would otherwise
+    /// keep an O(leaves) sweep plus one RPC per gap running on every sync tick
+    /// forever.
+    done: bool,
+    /// Leaves no peer could serve, keyed by the leaf's `key_hash` and holding
+    /// the exact leaf value the fetch was verified against. Storing the VALUE
+    /// rather than just the key is what lets a leaf come back into scope once
+    /// the tree moves it on: a leaf that is stale because our tree has not
+    /// converged is skipped only while it carries that same stale value.
+    unfillable: std::collections::HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// READ-ONLY snapshot of where an app's forest leaves actually live — the
@@ -268,6 +292,21 @@ pub struct AppForestStats {
     pub legacy_nonempty: Vec<(u32, u64)>,
     /// Sum of VertexAdds leaves across ALL 64 legacy per-prefix trees.
     pub legacy_total_vertex_adds: u64,
+}
+
+/// The blob-keyspace [`ShardKey`] for a forest `shard_id`, whose first 32 bytes
+/// are the app address `l2` (the app itself for a single-shard app, or
+/// `app ‖ prefix` for a split sub-shard — the blobs of every sub-shard share the
+/// app's key). `None` when `shard_id` is too short to carry an address. Mirrors
+/// `quil_node::forest_sync::app_shard_key`, which derives the same key on the
+/// sync side; both must agree or a repaired blob lands where no reader looks.
+fn blob_shard_key(shard_id: &[u8]) -> Option<ShardKey> {
+    if shard_id.len() < 32 {
+        return None;
+    }
+    let mut l2 = [0u8; 32];
+    l2.copy_from_slice(&shard_id[..32]);
+    Some(ShardKey { l1: crate::addressing::get_bloom_filter_indices(&l2, 256, 3), l2 })
 }
 
 impl HypergraphCrdt {
@@ -356,6 +395,7 @@ impl HypergraphCrdt {
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: std::sync::Mutex::new(()),
             unified_tree: AtomicBool::new(false),
+            blob_audit_state: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2105,6 +2145,230 @@ impl HypergraphCrdt {
     /// stale and the apply is aborted for the caller to retry — so an expensive
     /// full-tree diff can never block the global-frame materializer.
     ///
+    /// AUDIT: the leaves of `(shard_id, phase_idx)` whose readable vertex blob
+    /// is missing or does not hash to the committed leaf value, as
+    /// `(key_hash, leaf_value)` — the exact shape
+    /// [`PreparedShardPhaseSync::changed_leaves`] produces, so a caller can feed
+    /// the result straight into the ordinary blob-fetch path.
+    ///
+    /// The forest tree and the readable blob keyspace are two separate stores,
+    /// and only the tree is diffed by sync. A sync that installed the tree but
+    /// failed partway through its blob fetch (the pre-atomic
+    /// [`sync_shard_phase_from`](Self::sync_shard_phase_from) path committed the
+    /// tree FIRST and fetched blobs after) leaves leaves with no data. That state
+    /// is self-perpetuating: the root now matches the peer's, so every later sync
+    /// short-circuits and never re-fetches. Only leaves a later frame happens to
+    /// rewrite recover. This is what finds the rest.
+    ///
+    /// Cost is one sequential sweep of the tree's value column plus one point
+    /// read per leaf, so callers should run it once per tree rather than per
+    /// tick — see [`blob_audit_pending`](Self::blob_audit_pending).
+    pub fn missing_vertex_blobs(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        let Some(shard) = blob_shard_key(shard_id) else {
+            return Ok(Vec::new());
+        };
+        let leaves: Vec<([u8; 32], Vec<u8>)> = {
+            let forest = self.forest.read().unwrap();
+            let Some(version) = self.resolve_phase_version_with(&forest, shard_id, phase_idx)
+            else {
+                // Never committed here — no leaves, nothing to audit.
+                return Ok(Vec::new());
+            };
+            let mut leaves = Vec::new();
+            forest
+                .for_each_shard_phase_leaf(shard_id, PHASES[phase_idx], version, |kh, v| {
+                    leaves.push((kh, v))
+                })
+                .map_err(|e| QuilError::Internal(format!("leaf sweep: {e}")))?;
+            leaves
+        };
+        // The commitment of the EMPTY blob. A leaf carrying it commits to no
+        // data at all — a removes-phase tombstone (whose leaf keeps the removed
+        // vertex's SIZE but whose blob is empty by construction, see
+        // `stage_sized_tombstone`), or the empty add-side placeholder a remove
+        // stages for a never-added id. There is nothing for a peer to serve for
+        // those, so they are never gaps; auditing them would report every
+        // tombstone forever and no repair could ever clear it.
+        let empty_commitment = quil_tries::vertex_leaf_value(&[])
+            .map_err(|e| QuilError::Internal(format!("vertex_leaf_value: {e}")))?;
+        let mut missing = Vec::new();
+        for (key_hash, leaf_value) in leaves {
+            if leaf_value.len() >= 32 && leaf_value[..32] == empty_commitment[..32] {
+                continue;
+            }
+            // Per-vertex-subtree raw-key model: the leaf's `key_hash` IS the
+            // vertex's 32-byte DATA address, so the blob id is `app ‖ key_hash`.
+            let mut vertex_id = shard.l2.to_vec();
+            vertex_id.extend_from_slice(&key_hash);
+            // Same acceptance test the sync path applies to a served blob: the
+            // stored bytes must hash to the committed `commitment ‖ size`. This
+            // also catches a STALE blob and the EMPTY placeholder standing where
+            // real data belongs — both read as "no data" to every caller.
+            let ok = self
+                .read_blob(&shard, phase_idx, &vertex_id)
+                .and_then(|b| quil_tries::vertex_leaf_value(&b).ok())
+                .map(|recomputed| recomputed == leaf_value)
+                .unwrap_or(false);
+            if !ok {
+                missing.push((key_hash, leaf_value));
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The gaps [`missing_vertex_blobs`](Self::missing_vertex_blobs) reports,
+    /// MINUS the ones a peer has already refused to serve at this exact leaf
+    /// value ([`mark_blob_unfillable`](Self::mark_blob_unfillable)).
+    ///
+    /// This is what a repair pass should iterate. The raw audit is the honest
+    /// answer to "which leaves have no readable data"; this is the answer to
+    /// "which of those is it still worth spending an RPC on". A leaf whose value
+    /// has since changed is dropped from the skip list and offered again, so the
+    /// skip lasts exactly as long as the condition that caused it.
+    pub fn pending_blob_repairs(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+        let missing = self.missing_vertex_blobs(shard_id, phase_idx)?;
+        if missing.is_empty() {
+            return Ok(missing);
+        }
+        let key = (shard_id.to_vec(), phase_idx);
+        let mut state = self.blob_audit_state.write().unwrap();
+        let Some(entry) = state.get_mut(&key) else {
+            return Ok(missing);
+        };
+        if entry.unfillable.is_empty() {
+            return Ok(missing);
+        }
+        let mut out = Vec::with_capacity(missing.len());
+        for (key_hash, leaf_value) in missing {
+            match entry.unfillable.get(&key_hash) {
+                // Same leaf, same failure — do not pay for it again.
+                Some(v) if v == &leaf_value => {}
+                // The leaf moved; the old verdict no longer applies.
+                Some(_) => {
+                    entry.unfillable.remove(&key_hash);
+                    out.push((key_hash, leaf_value));
+                }
+                None => out.push((key_hash, leaf_value)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `(shard_id, phase_idx)` still needs a leaf-blob audit-and-repair
+    /// pass in this process. Cleared by
+    /// [`mark_blob_audit_done`](Self::mark_blob_audit_done).
+    pub fn blob_audit_pending(&self, shard_id: &[u8], phase_idx: usize) -> bool {
+        !self
+            .blob_audit_state
+            .read()
+            .unwrap()
+            .get(&(shard_id.to_vec(), phase_idx))
+            .is_some_and(|s| s.done)
+    }
+
+    /// Record that `(shard_id, phase_idx)` has been swept and every gap the
+    /// sweep reported was either filled or marked unfillable, so the syncer
+    /// stops paying for it.
+    ///
+    /// Callers MUST only call this after a pass that CONSIDERED every gap — a
+    /// pass cut short by a per-tick budget must leave the tree pending so the
+    /// remainder is picked up on the next tick.
+    pub fn mark_blob_audit_done(&self, shard_id: &[u8], phase_idx: usize) {
+        self.blob_audit_state
+            .write()
+            .unwrap()
+            .entry((shard_id.to_vec(), phase_idx))
+            .or_default()
+            .done = true;
+    }
+
+    /// Record that no peer could serve the blob for `key_hash` while its leaf
+    /// carries `leaf_value`, so
+    /// [`pending_blob_repairs`](Self::pending_blob_repairs) stops offering it.
+    ///
+    /// The common cause is not a missing blob at all but a STALE LEAF: this
+    /// node's tree has not converged, so it commits to a revision the peer no
+    /// longer holds, and the commitment binding correctly rejects the current
+    /// one. Nothing here can fix that — tree convergence will, and when it does
+    /// the leaf value changes and the entry stops matching.
+    pub fn mark_blob_unfillable(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        key_hash: [u8; 32],
+        leaf_value: Vec<u8>,
+    ) {
+        self.blob_audit_state
+            .write()
+            .unwrap()
+            .entry((shard_id.to_vec(), phase_idx))
+            .or_default()
+            .unfillable
+            .insert(key_hash, leaf_value);
+    }
+
+    /// REPAIR: store already-verified vertex blobs for `(shard_id, phase_idx)`
+    /// WITHOUT touching the tree — the counterpart to
+    /// [`missing_vertex_blobs`](Self::missing_vertex_blobs). The leaves are
+    /// already committed and already authenticated; only their data was lost, so
+    /// there is no diff to apply and no version to advance.
+    ///
+    /// Blobs are written at the phase's CURRENT version, which is where reads
+    /// (a reverse seek for the greatest version `<= target`) will find them. If
+    /// the materializer concurrently commits a newer version of the same vertex
+    /// it lands ABOVE this write and shadows it, so no lock beyond the write
+    /// transaction is needed.
+    ///
+    /// The caller is responsible for having verified each blob against its
+    /// committed `commitment ‖ size`; this method does not re-derive it.
+    pub fn install_vertex_blobs(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        blobs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<u64> {
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        let Some(shard) = blob_shard_key(shard_id) else {
+            return Err(QuilError::InvalidArgument("shard_id shorter than 32 bytes".into()));
+        };
+        if blobs.is_empty() {
+            return Ok(0);
+        }
+        let version = {
+            let forest = self.forest.read().unwrap();
+            self.resolve_phase_version_with(&forest, shard_id, phase_idx)
+                .unwrap_or(0)
+        };
+        let (set, phase) = PHASE_STR[phase_idx];
+        let txn = self.store.new_transaction(false)?;
+        for (id, blob) in blobs {
+            self.store.save_vertex_underlying_versioned(
+                txn.as_ref(),
+                set,
+                phase,
+                &shard,
+                id,
+                blob,
+                version,
+            )?;
+        }
+        txn.commit()?;
+        Ok(version)
+    }
+
     /// Prepare an authenticated phase diff without mutating local state.
     pub fn prepare_shard_phase_sync<S: quil_forest::TreeReader>(
         &self,
