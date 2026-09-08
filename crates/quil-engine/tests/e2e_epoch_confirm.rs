@@ -1051,6 +1051,7 @@ async fn tier2_composite_end_to_end() {
                     EquivocationDetected { .. } => "EquivocationDetected",
                     Halted { .. } => "Halted",
                     AncestorSyncRequested { .. } => "AncestorSyncRequested",
+                    ShardDataBootstrapRequested { .. } => "ShardDataBootstrapRequested",
                     ParentSealed { .. } => "ParentSealed",
                     CwOut { .. } => "CwOut",
                 };
