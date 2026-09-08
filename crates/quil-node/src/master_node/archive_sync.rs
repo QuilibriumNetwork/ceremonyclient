@@ -472,6 +472,14 @@ fn state_jump_min_gap() -> u64 {
         .unwrap_or(1_000)
 }
 
+/// State-jump eligibility is based on materialized state, not the newest
+/// stored clock frame. Gossip may persist a validated global frame before the
+/// corresponding prover tree has been acquired; treating that frame as local
+/// recovery progress would release the startup barrier with an empty registry.
+fn state_jump_local_head(clock_store: &quil_store::RocksClockStore) -> u64 {
+    clock_store.get_global_materialized_cursor().unwrap_or(0)
+}
+
 /// Bound one archive's prover-tree pull so another peer can be tried when an
 /// archive accepts the request but never completes it.
 const STATE_JUMP_PEER_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -546,7 +554,7 @@ async fn run_state_jump(
         if cancel.is_cancelled() {
             return None;
         }
-        let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
+        let local_head = state_jump_local_head(clock_store.as_ref());
         // Archive ceiling (see STATE_JUMP_MAX_FRAME): once an archive is current-era
         // it must verify, not blind-trust a peer. Non-archives have no ceiling —
         // whether they jump is decided per-peer purely by the gap to that peer's
@@ -2930,6 +2938,7 @@ mod validation_tests {
 mod state_jump_timeout_tests {
     use super::*;
 
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
     #[tokio::test]
     async fn state_jump_peer_deadline_rotates_hung_operation() {
         assert_eq!(
@@ -2948,5 +2957,28 @@ mod state_jump_timeout_tests {
             .await,
             Some(796_258),
         );
+    }
+    #[test]
+    fn gossip_clock_head_does_not_end_state_jump_before_materialization() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = quil_store::RocksClockStore::new(db.inner());
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 796_664,
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+        store.put_global_frame(&frame, None).unwrap();
+
+        assert_eq!(store.get_latest_frame_number(), Some(796_664));
+        assert_eq!(
+            state_jump_local_head(&store),
+            0,
+            "a gossip-persisted frame is not a synced prover-tree checkpoint",
+        );
+
+        store.put_global_materialized_cursor(796_663).unwrap();
+        assert_eq!(state_jump_local_head(&store), 796_663);
     }
 }
