@@ -79,6 +79,25 @@ impl MemTreeStore {
         self.stale.write().unwrap().clear();
         self.sizes.write().unwrap().clear();
     }
+
+    /// In-memory analogue of [`RocksTreeStore::for_each_live_leaf`]. Emission
+    /// order is unspecified (a `HashMap` sweep); the audit that consumes it is
+    /// order-independent.
+    pub fn for_each_live_leaf<F>(&self, version: Version, mut callback: F) -> Result<usize>
+    where
+        F: FnMut([u8; 32], Vec<u8>),
+    {
+        let mut count = 0usize;
+        for (key_hash, hist) in self.values.read().unwrap().iter() {
+            // Same newest-write-`<= version` rule as `get_value_option`; a
+            // tombstone (`None`) means the key is not live at `version`.
+            if let Some((_, Some(v))) = hist.iter().rev().find(|(ver, _)| *ver <= version) {
+                callback(key_hash.0, v.clone());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl TreeReader for MemTreeStore {
@@ -351,6 +370,69 @@ impl RocksTreeStore {
         let mut it = self.db.raw_iterator_opt(ro);
         it.seek(&lo);
         (it, hi)
+    }
+
+    /// Stream every LIVE leaf of this tree as of `version` — `(key_hash, value)`
+    /// for the newest write `<= version` that is not a tombstone. Returns the
+    /// number emitted.
+    ///
+    /// Value keys are `prefix ++ 'v' ++ key_hash(32) ++ version_be(8)`, so all
+    /// writes of one key are CONTIGUOUS and ascending by version. That lets this
+    /// decide each key during a single sequential sweep with O(1) memory —
+    /// unlike [`seed_size_index_batched`]'s pass 1, which must hold the whole
+    /// map because it joins the value column against the node column.
+    ///
+    /// This is the tree half of the leaf-blob audit: the caller pairs each
+    /// emitted leaf value (`commitment ‖ size`) against the readable blob
+    /// keyspace to find leaves whose data was never stored locally.
+    pub fn for_each_live_leaf<F>(&self, version: Version, mut callback: F) -> Result<usize>
+    where
+        F: FnMut([u8; 32], Vec<u8>),
+    {
+        let khs = self.prefix.len() + 1;
+        let (mut it, hi) = self.seq_iter(TAG_VALUE);
+        let mut count = 0usize;
+        // The key currently being swept and the newest non-tombstone value seen
+        // for it at `<= version` (`None` ⇒ its newest such write was a delete).
+        let mut cur_kh: Option<[u8; 32]> = None;
+        let mut cur_val: Option<Vec<u8>> = None;
+        while it.valid() {
+            let (k, v) = match (it.key(), it.value()) {
+                (Some(k), Some(v)) if k < hi.as_slice() => (k, v),
+                _ => break,
+            };
+            if k.len() != khs + 40 {
+                it.next();
+                continue;
+            }
+            let mut kh = [0u8; 32];
+            kh.copy_from_slice(&k[khs..khs + 32]);
+            let ver = u64::from_be_bytes(k[khs + 32..khs + 40].try_into().unwrap());
+            // Payload: 0x01 ++ value, or 0x00 tombstone.
+            let payload = if ver <= version && v.first() == Some(&0x01) {
+                Some(v[1..].to_vec())
+            } else {
+                None
+            };
+            let ver_in_range = ver <= version;
+            if cur_kh != Some(kh) {
+                if let (Some(prev), Some(val)) = (cur_kh, cur_val.take()) {
+                    callback(prev, val);
+                    count += 1;
+                }
+                cur_kh = Some(kh);
+                cur_val = None;
+            }
+            if ver_in_range {
+                cur_val = payload;
+            }
+            it.next();
+        }
+        if let (Some(prev), Some(val)) = (cur_kh, cur_val) {
+            callback(prev, val);
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// One-time backfill of the `TAG_SIZE` Merkle-sum index over the whole tree at

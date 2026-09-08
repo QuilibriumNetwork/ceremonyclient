@@ -42,6 +42,18 @@ impl TreeStore {
             }
         }
     }
+
+    /// Every live leaf `(key_hash, value)` of this tree at `version` — see
+    /// [`RocksTreeStore::for_each_live_leaf`].
+    pub fn for_each_live_leaf<F>(&self, version: Version, callback: F) -> Result<usize>
+    where
+        F: FnMut([u8; 32], Vec<u8>),
+    {
+        match self {
+            TreeStore::Rocks(s) => s.for_each_live_leaf(version, callback),
+            TreeStore::Mem(s) => s.for_each_live_leaf(version, callback),
+        }
+    }
 }
 
 impl TreeReader for TreeStore {
@@ -695,6 +707,24 @@ impl Forest {
         self.store(&TreeId::shard_phase(shard_id, phase))
     }
 
+    /// Every live leaf `(key_hash, leaf_value)` of one shard/phase tree at
+    /// `version`. The leaf-blob audit's tree side: the CRDT pairs each emitted
+    /// `commitment ‖ size` with the readable blob keyspace to find leaves this
+    /// node committed but never stored data for.
+    pub fn for_each_shard_phase_leaf<F>(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: Version,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut([u8; 32], Vec<u8>),
+    {
+        self.store(&TreeId::shard_phase(shard_id, phase))
+            .for_each_live_leaf(version, callback)
+    }
+
     /// SERVER side of forest sync: serve one JMT node of a shard/phase tree.
     /// `node_key` is `borsh(NodeKey)` (as the diff client requests it); returns
     /// `borsh(Node)`, or `None` if the node is absent. Pure proxy over the store —
@@ -1283,6 +1313,127 @@ impl Forest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `f` against both backends, so the streaming RocksDB sweep and the
+    /// map-based in-memory one are held to the same contract.
+    fn for_each_backend(f: impl Fn(Forest)) {
+        f(Forest::in_memory());
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(rocksdb::DB::open(&opts, dir.path()).unwrap());
+        f(Forest::with_namespace(db, b"\xF7".to_vec()));
+    }
+
+    fn sorted_leaves(forest: &Forest, shard: &[u8], version: u64) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut out = Vec::new();
+        forest
+            .for_each_shard_phase_leaf(shard, Phase::VertexAdds, version, |kh, v| out.push((kh, v)))
+            .unwrap();
+        out.sort();
+        out
+    }
+
+    /// The leaf-blob audit reads the tree through `for_each_shard_phase_leaf`,
+    /// so it must see EXACTLY the tree as of the version asked for: every live
+    /// key once, at its newest write `<= version`. A sweep that leaked a
+    /// superseded value would make the audit compare a blob against a stale
+    /// commitment and report a healthy vertex as a gap.
+    #[test]
+    fn live_leaf_sweep_is_version_exact_and_deduplicated() {
+        for_each_backend(|forest| {
+            let shard = b"shard-id-0123456789abcdef012345!".to_vec();
+            let key = |i: u8| {
+                let mut k = vec![0u8; 32];
+                k[0] = i;
+                k
+            };
+            // v0: two leaves. v1: one rewritten, one added.
+            forest
+                .commit_shard_phase_raw(
+                    &shard,
+                    Phase::VertexAdds,
+                    0,
+                    vec![(key(1), vec![0xA1]), (key(2), vec![0xA2])],
+                )
+                .unwrap();
+            forest
+                .commit_shard_phase_raw(
+                    &shard,
+                    Phase::VertexAdds,
+                    1,
+                    vec![(key(1), vec![0xB1]), (key(3), vec![0xB3])],
+                )
+                .unwrap();
+
+            let at0 = sorted_leaves(&forest, &shard, 0);
+            assert_eq!(at0.len(), 2, "v0 has exactly the two leaves committed then");
+            let mut want0 = vec![
+                (crate::shard_path_key_hash(&key(1)).0, vec![0xA1]),
+                (crate::shard_path_key_hash(&key(2)).0, vec![0xA2]),
+            ];
+            want0.sort();
+            assert_eq!(at0, want0);
+
+            let at1 = sorted_leaves(&forest, &shard, 1);
+            assert_eq!(at1.len(), 3, "each key emitted ONCE, not once per version");
+            let mut want1 = vec![
+                (crate::shard_path_key_hash(&key(1)).0, vec![0xB1]),
+                (crate::shard_path_key_hash(&key(2)).0, vec![0xA2]),
+                (crate::shard_path_key_hash(&key(3)).0, vec![0xB3]),
+            ];
+            want1.sort();
+            assert_eq!(at1, want1, "the newest write <= version wins per key");
+
+            // A version above the head still reads the head state.
+            assert_eq!(sorted_leaves(&forest, &shard, u64::MAX), at1);
+            // A tree that was never committed sweeps empty rather than erroring.
+            assert!(sorted_leaves(&forest, b"never-committed-shard-id-0123456", 0).is_empty());
+        });
+    }
+
+    /// A deleted key must not be emitted: the audit would otherwise try to
+    /// repair a leaf that no longer exists and could never mark the tree clean.
+    #[test]
+    fn live_leaf_sweep_omits_tombstoned_keys() {
+        for_each_backend(|forest| {
+            let shard = b"shard-id-tombstone-0123456789ab!".to_vec();
+            let key = |i: u8| {
+                let mut k = vec![0u8; 32];
+                k[0] = i;
+                k
+            };
+            forest
+                .commit_shard_phase_raw(
+                    &shard,
+                    Phase::VertexAdds,
+                    0,
+                    vec![(key(1), vec![0xA1]), (key(2), vec![0xA2])],
+                )
+                .unwrap();
+            // Delete key 1 at v1 (a `None` value — the JMT tombstone the raw
+            // commit helper has no spelling for).
+            {
+                let store = forest.store(&TreeId::shard_phase(&shard, Phase::VertexAdds));
+                let tree = Sha256Jmt::new(&store);
+                let (_root, batch) = tree
+                    .put_value_set(vec![(crate::shard_path_key_hash(&key(1)), None)], 1)
+                    .unwrap();
+                store.apply_update(&batch).unwrap();
+            }
+
+            assert_eq!(
+                sorted_leaves(&forest, &shard, 1),
+                vec![(crate::shard_path_key_hash(&key(2)).0, vec![0xA2])],
+                "the tombstoned key is gone at v1",
+            );
+            assert_eq!(
+                sorted_leaves(&forest, &shard, 0).len(),
+                2,
+                "history below the tombstone still reads both leaves",
+            );
+        });
+    }
 
     /// Phase-2 unified tree: `app_subtree_root` reads per-shard commitments as
     /// in-place subtrees of the ONE app tree — nibble-aligned, non-nibble-aligned
