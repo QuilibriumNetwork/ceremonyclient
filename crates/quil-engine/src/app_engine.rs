@@ -171,6 +171,15 @@ pub enum AppEngineEvent {
         filter: Vec<u8>,
         missing_frames: Vec<u64>,
     },
+    /// Engine requests a PROACTIVE bootstrap of the covered shard's committed
+    /// DATA into its own CRDT — emitted on becoming bound (Joining) with no local
+    /// data, so the member is staged BEFORE it must produce/attest at Active
+    /// (rather than waiting for a consensus catch-up trigger that never fires
+    /// while it produces on empty state). Handled identically to the
+    /// [`Self::AncestorSyncRequested`] bootstrap by the worker's shard syncer.
+    ShardDataBootstrapRequested {
+        filter: Vec<u8>,
+    },
     /// A certified parent was sealed (state committed via materializer).
     ParentSealed {
         filter: Vec<u8>,
@@ -1353,6 +1362,13 @@ pub struct AppConsensusEngine {
     /// pre-state) rather than signing blind — closing the frame-number-jump
     /// bypass of audit #3. A lagging voter catches up via shard sync, then votes.
     shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the CW proposer/verifier: whether this member has staged the
+    /// covered sub-shard's committed data into its own CRDT. Gates propose/vote
+    /// (see [`crate::cw_app_seams::AppSeamProposer`]) so a joining member neither
+    /// produces attestation-less frames nor forks the shard on empty state. Set
+    /// true when the join-time data bootstrap converges, or immediately when the
+    /// data is already present (archive / restart / shared-state).
+    data_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared with the leader provider: requests this node collected for
     /// frames it proposed (proto `MessageBundle`s), keyed by frame
     /// number. Read at finalization to self-materialize + assemble the
@@ -1496,6 +1512,7 @@ impl AppConsensusEngine {
             pending_seal_rank: None,
             last_materialized_frame: 0,
             shard_mat_frame: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             finalized_requests_roots: HashMap::new(),
@@ -2031,11 +2048,16 @@ impl AppConsensusEngine {
                         }
                         Some(AppEngineMessage::ShardSyncCompleted { synced_to_frame }) => {
                             self.reconcile_with_sync(synced_to_frame).await;
+                            // Covered data is now staged — un-gate propose/vote.
+                            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Some(AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor }) => {
                             if !self.install_archive_bootstrap(anchor, predecessor).await {
                                 continue;
                             }
+                            // Covered data is now staged — un-gate propose/vote. The
+                            // cw_handle is rebuilt below and reads this same flag.
+                            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                             if let Some(old) = self.cw_handle.take() {
                                 old.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -2258,6 +2280,25 @@ impl AppConsensusEngine {
             h.update(m);
         }
         h.finalize().into()
+    }
+
+    /// Whether this member's OWN CRDT holds the covered sub-shard's committed data,
+    /// read from the FOREST via the exact `partition_shard_leaves` path
+    /// `build_vote_openings` uses (NOT the write-time size bucket, which a synced
+    /// tree doesn't populate). A shared-state / test engine has no separate own CRDT
+    /// (`hypergraph` None) and is treated as staged. An empty covered subtree yields
+    /// no leaves → `false` here; the caller's stickiness + bootstrap-convergence path
+    /// handles the genuinely-empty shard.
+    fn covered_data_staged(&self) -> bool {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return true;
+        };
+        let (app, sub_prefix) = crate::app_shard_metadata::split_coverage_filter(&self.filter);
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+        let mut shard_key = Vec::with_capacity(3 + app.len());
+        shard_key.extend_from_slice(&l1);
+        shard_key.extend_from_slice(app);
+        !crate::app_shard_metadata::partition_shard_leaves(hg, &shard_key, &sub_prefix).is_empty()
     }
 
     fn start_consensus_cw(
@@ -2546,6 +2587,32 @@ impl AppConsensusEngine {
                 }
                 _ => None,
             };
+        // Stage-gate: the CW proposer/verifier are gated on `data_ready` until this
+        // member holds the covered sub-shard's committed DATA in its own CRDT.
+        // Without it, `build_vote_openings` yields no storage openings → the frame
+        // carries no attestation → the global proof-of-storage gate zeroes the shard
+        // reward (and producing on empty state forks the shard + churns the CW
+        // re-seed). Re-evaluated on each committee (re)build. The check reads the
+        // FOREST (`covered_data_staged` → the same `partition_shard_leaves` source
+        // `build_vote_openings` uses), NOT the write-time size bucket — a synced tree
+        // populates the forest but not that bucket. `data_ready` is STICKY: once set
+        // (forest has data, or a bootstrap converged — the latter covers a genuinely
+        // EMPTY shard, which has nothing to stage yet must still produce), a later
+        // rebuild never flips it back off. If not yet staged, kick off a PROACTIVE
+        // data bootstrap now (while Joining) so we're ready before Active.
+        if self.covered_data_staged() {
+            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if !self.data_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                "app-shard: covered data not staged — gating propose/vote and requesting proactive data bootstrap"
+            );
+            let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested {
+                filter: self.filter.clone(),
+            });
+        }
+
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -2563,6 +2630,7 @@ impl AppConsensusEngine {
             transport,
             cw_app_storage_dir,
             requests_root_check,
+            self.data_ready.clone(),
         );
         Ok(handle)
     }

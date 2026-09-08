@@ -135,6 +135,31 @@ pub fn prover_join_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Ve
     multi_filter_signing_message(filters, frame_number)
 }
 
+/// Build the signing message for ProverLeave.
+///
+/// Unlike Confirm/Reject/Join (which sign the raw concatenation of the
+/// filters), Leave signs a LENGTH-DELIMITED framing:
+/// `filters.len()(u32 BE) || for each f { f.len()(u32 BE) || f } || frame_number(u64 BE)`.
+///
+/// This must byte-match the signer (`provers::actions::build_leave_bundle`).
+/// The verifier previously reused `multi_filter_signing_message` (raw concat),
+/// which never matched the signed bytes — so every leave failed signature
+/// verification (mass `op=ProverLeave` mempool drops, leaves never accepted,
+/// coverage stuck unable to shed workers). Keep this in lockstep with the
+/// builder.
+pub fn prover_leave_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Vec<u8> {
+    let total: usize =
+        4 + filters.iter().map(|f| 4 + f.len()).sum::<usize>() + 8;
+    let mut msg = Vec::with_capacity(total);
+    msg.extend_from_slice(&(filters.len() as u32).to_be_bytes());
+    for f in filters {
+        msg.extend_from_slice(&(f.len() as u32).to_be_bytes());
+        msg.extend_from_slice(f);
+    }
+    msg.extend_from_slice(&frame_number.to_be_bytes());
+    msg
+}
+
 // =====================================================================
 // Tests
 // =====================================================================

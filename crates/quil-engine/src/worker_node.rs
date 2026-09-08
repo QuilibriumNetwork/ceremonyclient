@@ -559,7 +559,8 @@ impl WorkerOnlyNode {
                                     // subtree from the archive, pinning to the
                                     // vertex-adds root of the latest finalized
                                     // header we hold.
-                                    AncestorSyncRequested { filter, .. } => {
+                                    AncestorSyncRequested { filter, .. }
+                                    | ShardDataBootstrapRequested { filter } => {
                                         if let Some(syncer) = sync_for_pump.clone() {
                                             // Dedup: skip if a sync for this
                                             // filter is already running.

@@ -163,6 +163,15 @@ pub struct AppSeamProposer {
     block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
     /// Body-root cross-check (audit Finding #2); see [`AppRequestsRootCheck`].
     requests_root_check: Option<AppRequestsRootCheck>,
+    /// Whether this member has staged the covered sub-shard's committed data into
+    /// its own CRDT. A member covers its shard's DATA before it can honestly
+    /// produce/attest: without the leaves, `build_vote_openings` yields no storage
+    /// openings, so the frame carries no attestation and the global proof-of-storage
+    /// gate zeroes the shard reward. Until staged, we DON'T propose (skip our leader
+    /// turn) and abstain-by-signing on verify (never nullify) so the shard's already-
+    /// staged Active members keep producing. Set true once the join-time / bootstrap
+    /// data sync converges (see `AppEngineEvent::ShardDataBootstrapRequested`).
+    data_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppSeamProposer {
@@ -172,6 +181,7 @@ impl AppSeamProposer {
         assemble: AppFrameAssembler,
         filter: Vec<u8>,
         requests_root_check: Option<AppRequestsRootCheck>,
+        data_ready: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             leader_provider,
@@ -180,6 +190,7 @@ impl AppSeamProposer {
             filter,
             block_meta: Arc::new(Mutex::new(HashMap::new())),
             requests_root_check,
+            data_ready,
         }
     }
 
@@ -192,6 +203,13 @@ impl AppSeamProposer {
 
 impl GlobalProposer for AppSeamProposer {
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
+        // Don't take our leader turn until the covered shard's data is staged —
+        // proposing on empty state produces a frame with no storage attestation
+        // (reward withheld) and forks the shard's real state. Skipping lets the
+        // view rotate to a staged member.
+        if !self.data_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
         let prior_frame_number = self
             .block_meta
@@ -219,6 +237,12 @@ impl GlobalProposer for AppSeamProposer {
     }
 
     fn verify(&self, _view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        // Until our covered shard's data is staged we can't validate a proposed
+        // frame's state — abstain by SIGNING (return true), never nullify, so the
+        // staged members' proposals still reach quorum while we finish staging.
+        if !self.data_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         let Some(bytes) = bytes else {
             tracing::warn!("cw app verify: block not delivered (nullify)");
             return false;
@@ -445,6 +469,9 @@ pub fn activate_app_consensus_cw(
     // Body-root cross-check for the verify path (audit Finding #2); see
     // [`AppRequestsRootCheck`]. `None` skips it (tests / no-exec).
     requests_root_check: Option<AppRequestsRootCheck>,
+    // Gates propose/verify until the covered shard's data is staged (see
+    // `AppSeamProposer::data_ready`).
+    data_ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> AppConsensusCwHandle {
     let proposer = Arc::new(AppSeamProposer::new(
         leader_provider,
@@ -452,6 +479,7 @@ pub fn activate_app_consensus_cw(
         assemble,
         filter,
         requests_root_check,
+        data_ready,
     ));
     // Seed the genesis parent so the first proposal resolves its frame number.
     proposer.note_frame(genesis_digest, genesis_frame_number);

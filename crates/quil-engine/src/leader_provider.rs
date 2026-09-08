@@ -593,6 +593,19 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let global_addr = [0xFFu8; 32];
                 let mut valid: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
+                // Categorized drop breakdown: `"<msg_type> :: <reason>" -> count`,
+                // logged with the summary below. The per-message reason is otherwise
+                // debug-only, hiding WHICH message types + reasons dominate the drops
+                // (e.g. below-quorum shard-frame certs vs benign duplicate re-confirms).
+                let mut drop_reasons: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                let msg_type = |raw: &[u8]| -> String {
+                    if raw.len() >= 4 {
+                        format!("0x{:08x}", u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                    } else {
+                        "short".to_string()
+                    }
+                };
                 // First pass: hold in-lockstep shard proofs for tip coalescing
                 // (below); validate non-shard messages inline.
                 let mut in_lockstep_shard: Vec<Vec<u8>> = Vec::new();
@@ -609,6 +622,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         ) {
                             in_lockstep_shard.push(raw);
                         } else {
+                            *drop_reasons
+                                .entry(format!("{} :: out-of-lockstep-shard-frame", msg_type(&raw)))
+                                .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
                                 "dropping out-of-lockstep shard frame proof from global mempool",
@@ -620,6 +636,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match validator.validate_message(frame_number, &global_addr, &raw) {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
+                            // Normalize the reason (digit runs → '#') so per-epoch /
+                            // per-frame variants group into one bucket.
+                            let reason: String = e
+                                .to_string()
+                                .chars()
+                                .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                                .take(90)
+                                .collect();
+                            *drop_reasons
+                                .entry(format!("{} :: {}", msg_type(&raw), reason))
+                                .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
@@ -640,6 +667,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
                 let coalesced = superseded.len();
                 valid.extend(tips);
+                for s in &superseded {
+                    *drop_reasons
+                        .entry(format!("{} :: coalesced-superseded-shard-tip", msg_type(s)))
+                        .or_insert(0) += 1;
+                }
                 invalid.extend(superseded);
                 if coalesced > 0 {
                     tracing::info!(
@@ -649,9 +681,21 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     );
                 }
                 if !invalid.is_empty() {
+                    // Sorted, human-readable breakdown of WHY messages were dropped —
+                    // turns the opaque `removed=N` count into per-type/reason buckets
+                    // so a persistent stall (e.g. legitimate confirms being dropped)
+                    // is visible without debug logging.
+                    let mut breakdown: Vec<(String, usize)> = drop_reasons.into_iter().collect();
+                    breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+                    let by_reason = breakdown
+                        .iter()
+                        .map(|(k, n)| format!("{n}× {k}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
+                        by_reason = %by_reason,
                         "dropped protocol-invalid messages from global mempool",
                     );
                     self.message_collector.remove(&invalid);

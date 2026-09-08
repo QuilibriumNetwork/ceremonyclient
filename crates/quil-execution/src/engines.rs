@@ -286,17 +286,25 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                     alloc_tree.as_ref(),
                 )? {
                     true => Ok(()),
-                    false => Err(QuilError::InvalidArgument(
-                        "global: signature verification failed".into(),
-                    )),
+                    false => Err(QuilError::InvalidArgument(format!(
+                        "global: signature verification failed (op={}, prover_tree={}, alloc_tree={})",
+                        crate::global_engine::peek_global_message_kind(inner_bytes)
+                            .map(|k| format!("{k:?}"))
+                            .unwrap_or_else(|_| "unknown".into()),
+                        prover_tree.is_some(),
+                        alloc_tree.is_some(),
+                    ))),
                 }
             } else if let Some(ref intrinsic) = self.intrinsic {
                 // Intrinsic present but no state — structural only
                 match intrinsic.validate(frame_number, inner_bytes, None, None)? {
                     true => Ok(()),
-                    false => Err(QuilError::InvalidArgument(
-                        "global: signature verification failed".into(),
-                    )),
+                    false => Err(QuilError::InvalidArgument(format!(
+                        "global: signature verification failed (op={}, no-state)",
+                        crate::global_engine::peek_global_message_kind(inner_bytes)
+                            .map(|k| format!("{k:?}"))
+                            .unwrap_or_else(|_| "unknown".into()),
+                    ))),
                 }
             } else {
                 crate::global_engine::peek_global_message_kind(inner_bytes)?;

@@ -534,6 +534,52 @@ mod tests {
     }
 
     #[test]
+    fn leave_signature_verifies_under_domain() {
+        // Regression: the leave signer (`build_leave_bundle`) uses a
+        // LENGTH-DELIMITED message, but `verify_prover_leave` had reused the
+        // raw-concat `multi_filter_signing_message`, so EVERY leave failed
+        // signature verification (mass `op=ProverLeave` mempool drops; leaves
+        // never accepted; coverage stuck). This asserts the signed bytes match
+        // the verifier's `prover_leave_signing_message`. Use >1 filter of
+        // differing lengths so a raw-concat reconstruction cannot coincide.
+        let (signer, pk) = bls_keypair();
+        let filters = vec![vec![0x08u8; 32], vec![0x09u8; 40], vec![0x0au8; 8]];
+        let frame_number = 777u64;
+        let address = vec![0x42u8; 32];
+
+        let bytes =
+            build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let inner = decode_single_inner(&bytes);
+        let leave = ProverLeave::from_canonical_bytes(&inner).unwrap();
+        let sig = leave.public_key_signature_bls48581.unwrap();
+
+        // The verifier's message builder must reproduce the signed bytes.
+        let msg = quil_execution::global_intrinsic::prover_verify::prover_leave_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        let domain =
+            quil_execution::global_intrinsic::prover_verify::prover_leave_domain().unwrap();
+
+        let bls = FalconKeyConstructor;
+        assert!(
+            bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain),
+            "leave signature must verify against prover_leave_signing_message"
+        );
+
+        // And it must NOT verify against the old raw-concat form (guards
+        // against silently reverting the verifier to multi_filter).
+        let wrong = quil_execution::global_intrinsic::prover_verify::multi_filter_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        assert!(
+            !bls.verify_signature_raw(&pk, &sig.signature, &wrong, &domain),
+            "raw-concat form must not verify a length-delimited leave signature"
+        );
+    }
+
+    #[test]
     fn merge_helpers_signs_bls_pubkey_with_ed448() {
         let seed = [0x42u8; 57];
         let bls_pubkey = vec![0xCDu8; 585];

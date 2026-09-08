@@ -691,8 +691,17 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
-                                                                crate::app_engine::AppEngineEvent::AncestorSyncRequested { filter, .. } => {
-                                                                    // Step-4 app-shard catch-up. The engine hit a
+                                                                crate::app_engine::AppEngineEvent::AncestorSyncRequested { filter, .. }
+                                                                | crate::app_engine::AppEngineEvent::ShardDataBootstrapRequested { filter } => {
+                                                                    // Step-4 app-shard catch-up OR a proactive join-time
+                                                                    // data bootstrap (ShardDataBootstrapRequested): both
+                                                                    // stage the covered shard's data via the same syncer —
+                                                                    // catch-up path pins to the shard clock head; a fresh
+                                                                    // joiner (no clock frame) takes the archive-anchor
+                                                                    // bootstrap branch below. Convergence loops back
+                                                                    // ShardSyncCompleted / ShardBootstrapCompleted, which
+                                                                    // un-gates the engine's propose/vote.
+                                                                    // The engine hit a
                                                                     // frame gap gossip can't fill (deeply behind).
                                                                     // Pull the shard's forest subtree from an archive
                                                                     // (pinned to the latest finalized header's

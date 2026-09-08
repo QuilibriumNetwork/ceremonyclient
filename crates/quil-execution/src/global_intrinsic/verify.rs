@@ -212,7 +212,7 @@ pub fn verify_prover_leave(
         QuilError::InvalidArgument("verify prover leave: missing signature".into())
     })?;
 
-    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let message = prover_verify::prover_leave_signing_message(&op.filters, op.frame_number);
     let domain = prover_verify::prover_leave_domain()?;
 
     key_manager.validate_signature(
