@@ -916,6 +916,11 @@ impl AppShardHarness {
                         E::AncestorSyncRequested { .. } => {
                             events_log.lock().push("AncestorSyncRequested".into());
                         }
+                        E::ShardDataBootstrapRequested { .. } => {
+                            events_log
+                                .lock()
+                                .push("ShardDataBootstrapRequested".into());
+                        }
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
                         }

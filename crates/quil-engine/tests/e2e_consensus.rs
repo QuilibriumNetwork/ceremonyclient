@@ -1879,6 +1879,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                     EquivocationDetected { .. } => "EquivocationDetected",
                     Halted { .. } => "Halted",
                     AncestorSyncRequested { .. } => "AncestorSyncRequested",
+                    ShardDataBootstrapRequested { .. } => "ShardDataBootstrapRequested",
                     ParentSealed { .. } => "ParentSealed",
                     CwOut { .. } => "CwOut",
                 };
