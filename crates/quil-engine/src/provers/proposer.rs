@@ -625,13 +625,14 @@ pub fn decide_joins(
 /// Returns up to 3 filter candidates for ProverLeave.
 ///
 /// `free_workers` is the count of currently-free auto-managed workers.
-/// It bounds the halt-risk swap: if `halt_risk_count > free_workers`,
-/// the deficit is the number of healthy non-halt-risk allocations we
-/// are willing to shed *this cycle* to free slots for the waiting
-/// halt-risk shards. When `free_workers` already covers the deficit,
-/// the swap doesn't fire — the next `plan_and_allocate` will fill the
-/// free slots with halt-risk shards (because of the join-side
-/// priority bucket) without us martyring healthy allocations.
+/// It bounds the halt-risk swap. A swap needs at least one currently
+/// bindable worker; a leaving allocation remains bound until its leave
+/// completes, so proposing a leave with no free workers cannot make a
+/// replacement possible in the current cycle. With a bindable worker,
+/// any `halt_risk_count` beyond `free_workers` is the number of healthy
+/// non-halt-risk allocations we are willing to shed. When free workers
+/// already cover demand, the next `plan_and_allocate` will fill them
+/// with halt-risk shards without martyring healthy allocations.
 ///
 /// Port of Go's `PlanLeaves` at `proposer.go:558-646`.
 pub fn plan_leaves(
@@ -679,7 +680,15 @@ pub fn plan_leaves(
     let halt_risk_count = unallocated_shards.iter()
         .filter(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         .count();
-    let halt_risk_deficit = halt_risk_count.saturating_sub(free_workers);
+    // A leave does not release its worker until the network confirms it.
+    // With no idle worker, a swap cannot bind a replacement and only
+    // creates lifecycle churn. Wait for an already-pending leave to
+    // complete instead.
+    let halt_risk_deficit = if free_workers == 0 {
+        0
+    } else {
+        halt_risk_count.saturating_sub(free_workers)
+    };
 
     let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
 
@@ -1695,15 +1704,12 @@ mod tests {
             "shard at threshold+1 must be protected — leaving would push it into halt-risk");
     }
 
-    /// Halt-risk swap: with halt-risk shards waiting in the unallocated
-    /// pool AND no free workers to cover them, the node sheds one healthy
-    /// allocation per halt-risk-deficit shard. `free_workers=0`,
-    /// `halt_risk_count=1` → deficit 1 → exactly one swap pick (worst-
-    /// scoring healthy). NOTE: the caller must only run leave proposals
-    /// when coverage data is current (not in prover-only mode); this test
-    /// exercises the pure pick logic.
+    /// A halt-risk swap cannot start without an idle worker: the worker
+    /// running a proposed leave remains bound until the leave is confirmed,
+    /// so shedding a healthy allocation at zero capacity cannot make room
+    /// for the waiting halt-risk shard.
     #[test]
-    fn plan_leaves_swap_fires_when_halt_risk_demand_exceeds_free_workers() {
+    fn plan_leaves_swap_does_not_fire_without_a_bindable_worker() {
         let allocated = vec![
             make_shard(vec![0xA1], 100_000, 0, 1),
             make_shard(vec![0xA2], 100_000, 0, 1),
@@ -1723,8 +1729,8 @@ mod tests {
             0,
             &std::collections::HashSet::<Vec<u8>>::new(),
         );
-        assert_eq!(filters.len(), 1,
-            "deficit = halt_risk(1) - free_workers(0) = 1 → exactly one swap pick; \
+        assert!(filters.is_empty(),
+            "zero free workers cannot bind a replacement, so no swap leave is proposed; \
              got {filters:?}");
     }
 
