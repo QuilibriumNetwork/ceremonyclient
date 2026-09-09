@@ -405,9 +405,9 @@ impl GlobalIntrinsic {
                     if !sig_ok {
                         return Ok(false);
                     }
-                    // Same timing window as confirm. ProverReject
-                    // applies to a single filter (the `op.filter`
-                    // field, not `filters[]`).
+                    // Same timing window as confirm. The legacy `filter`
+                    // wire field is reserved; a reject applies to every
+                    // filter in `filters[]`, just like ProverConfirm.
                     if let Some(hg) = self.hypergraph.as_ref() {
                         let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
                         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
@@ -416,13 +416,15 @@ impl GlobalIntrinsic {
                             .ok_or_else(|| QuilError::InvalidArgument(
                                 "ProverReject: prover vertex missing PublicKey".into(),
                             ))?;
-                        let alloc_addr =
-                            super::materialize::allocation_address(&pubkey, &op.filter)?;
-                        if let Some(blob) = hg_state.get(domain, &alloc_addr, &va_disc)? {
-                            if !blob.is_empty() {
-                                let alloc_tree =
-                                    crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-                                verify::validate_confirm_timing(frame_number, &alloc_tree)?;
+                        for filter in &op.filters {
+                            let alloc_addr =
+                                super::materialize::allocation_address(&pubkey, filter)?;
+                            if let Some(blob) = hg_state.get(domain, &alloc_addr, &va_disc)? {
+                                if !blob.is_empty() {
+                                    let alloc_tree =
+                                        crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                                    verify::validate_confirm_timing(frame_number, &alloc_tree)?;
+                                }
                             }
                         }
                     }
@@ -1016,17 +1018,22 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_REJECT => {
                 let op = ProverReject::from_canonical_bytes(input)?;
-                self.invoke_filter_op(
-                    frame_number,
-                    &op.filter,
-                    &op.public_key_signature_bls48581,
-                    state,
-                    &va_disc,
-                    |prover_tree, _alloc_tree| verify::verify_prover_reject(
-                        &op, prover_tree, self.key_manager.as_ref(),
-                    ),
-                    |alloc_tree, fn_| materialize::materialize_prover_reject(alloc_tree, fn_),
-                )
+                // `filter` is a reserved legacy wire field. Mutate every
+                // allocation named by the signed `filters[]` batch.
+                for filter in &op.filters {
+                    self.invoke_filter_op(
+                        frame_number,
+                        filter,
+                        &op.public_key_signature_bls48581,
+                        state,
+                        &va_disc,
+                        |prover_tree, _alloc_tree| verify::verify_prover_reject(
+                            &op, prover_tree, self.key_manager.as_ref(),
+                        ),
+                        |alloc_tree, fn_| materialize::materialize_prover_reject(alloc_tree, fn_),
+                    )?;
+                }
+                Ok(())
             }
             TYPE_PROVER_JOIN => {
                 let op = ProverJoin::from_canonical_bytes(input)?;
@@ -3725,9 +3732,10 @@ mod tests {
         use crate::global_intrinsic::materialize::{
             allocation_address, build_prover_allocation_hyperedge_blob,
             create_allocation_vertex_tree, create_prover_vertex_tree,
-            prover_address_from_pubkey, STATUS_KICKED,
+            prover_address_from_pubkey, STATUS_ACTIVE, STATUS_JOINING, STATUS_KICKED,
+            STATUS_LEAVING,
         };
-        use crate::global_intrinsic::prover_ops::ProverKick;
+        use crate::global_intrinsic::prover_ops::{ProverKick, ProverReject};
         use crate::global_intrinsic::prover_join::ProverJoin as ProverJoinOp;
         use crate::global_intrinsic::sig_with_pop::SignatureWithPop;
         use crate::global_intrinsic::seniority_merge::SeniorityMerge as SeniorityMergeTarget;
@@ -3781,6 +3789,68 @@ mod tests {
             let bytes = read_field(&tree, cls, "KickFrameNumber")?;
             if bytes.len() != 8 { return None; }
             Some(u64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+
+        #[test]
+        fn reject_batch_updates_joining_and_leaving_allocations() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let pubkey = vec![0xABu8; 897];
+            let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
+            let prover_tree = create_prover_vertex_tree(&pubkey, 100).unwrap();
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &prover_addr,
+                &va_disc,
+                1,
+                vertex_tree_to_blob(&prover_tree),
+            ).unwrap();
+
+            let filters = vec![vec![0x31u8; 32], vec![0x32u8; 32]];
+            let expected_statuses = [STATUS_KICKED, STATUS_ACTIVE];
+            let mut addresses = Vec::new();
+            for (filter, status) in filters.iter().zip([STATUS_JOINING, STATUS_LEAVING]) {
+                let address = allocation_address(&pubkey, filter).unwrap();
+                let mut allocation =
+                    create_allocation_vertex_tree(&prover_addr, filter, 1).unwrap();
+                write_field(
+                    &mut allocation,
+                    "allocation:ProverAllocation",
+                    "Status",
+                    &[status],
+                ).unwrap();
+                state.set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &address,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&allocation),
+                ).unwrap();
+                addresses.push(address);
+            }
+
+            let op = ProverReject {
+                // Canonical encoding reserves this field; filters[] is the
+                // signed batch of target allocations.
+                filter: vec![],
+                frame_number: 777,
+                public_key_signature_bls48581: Some(AddressedSignature {
+                    signature: vec![0x55u8; AddressedSignature::SIG_LEN_SINGLE],
+                    address: prover_addr.to_vec(),
+                }),
+                filters,
+            };
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            gi.invoke_step(777, &op.to_canonical_bytes().unwrap(), &state).unwrap();
+
+            for (address, expected_status) in addresses.into_iter().zip(expected_statuses) {
+                assert_eq!(
+                    read_status(&state, &address, "allocation:ProverAllocation"),
+                    Some(expected_status),
+                    "each filter in a reject batch must take its status-specific reject transition",
+                );
+            }
         }
 
         // -------------------------------------------------------------
