@@ -382,6 +382,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if m.join_picker_active {
         return handle_join_picker_key(m, ev);
     }
+    if m.show_help {
+        return handle_help_key(m, ev);
+    }
     if m.filter_edit_active {
         return handle_filter_edit_key(m, ev);
     }
@@ -397,6 +400,31 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     handle_normal_key(m, ev)
 }
 
+/// Help is a full screen of its own, so while it is up the cursor keys page
+/// through it rather than moving a table nobody can see.
+fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
+    if is_quit(&ev) {
+        return vec![Cmd::Quit];
+    }
+    // One line is the pinned title; the rest is what a page covers.
+    let page = (m.height as usize).saturating_sub(1).max(1);
+    let max = m.help_lines.saturating_sub(page);
+    match ev.code {
+        KeyCode::Char('h') | KeyCode::Esc => {
+            m.show_help = false;
+            m.help_offset = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => m.help_offset = m.help_offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => m.help_offset = (m.help_offset + 1).min(max),
+        KeyCode::PageUp => m.help_offset = m.help_offset.saturating_sub(page),
+        KeyCode::PageDown => m.help_offset = (m.help_offset + page).min(max),
+        KeyCode::Home => m.help_offset = 0,
+        KeyCode::End => m.help_offset = max,
+        _ => {}
+    }
+    vec![]
+}
+
 fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if is_quit(&ev) {
         return vec![Cmd::Quit];
@@ -404,7 +432,8 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let c = ch(&ev);
     match ev.code {
         KeyCode::Char('h') => {
-            m.show_help = !m.show_help;
+            m.show_help = true;
+            m.help_offset = 0;
             return vec![];
         }
         KeyCode::Char('C') => {
@@ -416,6 +445,10 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 ColumnSizing::Dynamic => ColumnSizing::Fixed,
                 ColumnSizing::Fixed => ColumnSizing::Dynamic,
             };
+            return vec![];
+        }
+        KeyCode::Char('e') => {
+            m.threshold_unit = m.threshold_unit.toggled();
             return vec![];
         }
         KeyCode::Tab => {
