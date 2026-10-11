@@ -4121,10 +4121,9 @@ impl AppConsensusEngine {
             // accepting it on state-root equality.
             if let Some(manager) = self.execution_engine.clone() {
                 let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(global)?;
-                for (source, checkpoint) in crate::app_handoff::effective_origins(&view, session)?.origins {
-                    if source.filter != session.filter || self.last_materialized_frame != checkpoint.frame {
-                        continue;
-                    }
+                for (source, checkpoint) in crate::app_handoff::predecessor_history_sources(
+                    &view, session, self.last_materialized_frame,
+                )? {
                     match crate::app_history_recovery::recover(
                         &source, manager.clone(), self.clock_store.clone(), self.frame_validator(),
                         self.delivery_frame_source.as_ref(), checkpoint.frame,

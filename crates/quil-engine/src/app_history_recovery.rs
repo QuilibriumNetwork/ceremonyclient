@@ -103,20 +103,37 @@ impl Progress {
     }
 
     fn validate(&self, session: &Session, cursor: u64) -> Result<()> {
-        if self.version != 1
-            || self.session != session.id()?
-            || self.done < session.base_frame
-            || self.done > self.next
-            || self.next > self.target
-            || self.target > cursor
-            || self.carry > CARRY_WINDOW_FRAMES
-            || self.reports.len() > MAX_REPORT_STATES
-            || self.last_report.len() > shard_accumulator::MAX_REPORT_BYTES
-            || self.implied.as_ref().is_some_and(|(low, report)| {
-                *low < self.done || *low >= self.next || report.len() > shard_accumulator::MAX_REPORT_BYTES
-            })
-        {
-            return Err(unavailable("invalid recovery progress"));
+        let reason = if self.version != 1 {
+            Some("unsupported version")
+        } else if self.session != session.id()? {
+            Some("session mismatch")
+        } else if self.done < session.base_frame {
+            Some("audited prefix precedes session base")
+        } else if self.done > self.next {
+            Some("audited prefix exceeds next frame")
+        } else if self.next > self.target {
+            Some("next frame exceeds target")
+        } else if self.target > cursor {
+            Some("target exceeds cursor")
+        } else if self.carry > CARRY_WINDOW_FRAMES {
+            Some("carry exceeds window")
+        } else if self.reports.len() > MAX_REPORT_STATES {
+            Some("too many report states")
+        } else if self.last_report.len() > shard_accumulator::MAX_REPORT_BYTES {
+            Some("last report exceeds byte limit")
+        } else if self.implied.as_ref().is_some_and(|(low, _)| *low < self.done || *low >= self.next) {
+            Some("implied report range is outside the remaining audit")
+        } else if self.implied.as_ref().is_some_and(|(_, report)| report.len() > shard_accumulator::MAX_REPORT_BYTES) {
+            Some("implied report exceeds byte limit")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(unavailable(format!(
+                "invalid recovery progress: {reason} (version={}, base={}, done={}, next={}, target={}, cursor={}, carry={}, report_states={}, last_report_bytes={})",
+                self.version, session.base_frame, self.done, self.next, self.target, cursor,
+                self.carry, self.reports.len(), self.last_report.len(),
+            )));
         }
         if let Some((_, report)) = self.implied.as_ref().filter(|(_, report)| !report.is_empty()) {
             shard_accumulator::ShardReport::decode(report)?;
@@ -1186,6 +1203,36 @@ mod tests {
                 "frame {n}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_a_saved_audit_past_the_cursor_without_writes() {
+        let directory = Directory::new();
+        let session = session();
+        let (_, _, manager) = open(&directory.0);
+        let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
+        let progress_key = encoding::app_history_recovery_key(&session.filter, &session.id().unwrap());
+        let mut saved = progress(&session);
+        saved.done = 95;
+        saved.next = 95;
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let mut records = tip(&session, 94);
+        records.push((progress_key.clone(), encoded.clone()));
+        manager.crdt().commit_with_frame_cursor_and_records(94, &cursor_key, &records).unwrap();
+        let headers = VerifiedFixture {
+            frames: BTreeMap::new(), fail_at: Mutex::new(None), reads: Mutex::new(vec![]),
+        };
+        let error = recover_with_headers(&session, manager.clone(), &headers, 94).await.unwrap_err();
+        assert!(error.to_string().contains("target exceeds cursor"), "{error}");
+        assert!(error.to_string().contains("target=95, cursor=94"), "{error}");
+        let snapshot = manager.crdt().capture_committed_shard(&session.filter).unwrap();
+        assert_eq!(snapshot.records.read_record(&progress_key).unwrap(), Some(encoded));
+        assert_eq!(snapshot.records.read_record(&cursor_key).unwrap(), Some(94u64.to_be_bytes().to_vec()));
+        assert!(headers.reads.lock().unwrap().is_empty());
+        // The same audited prefix is valid when the committed cursor reaches it.
+        manager.crdt().commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95)).unwrap();
+        assert!(recover_with_headers(&session, manager.clone(), &headers, 95).await.unwrap());
+        assert!(headers.reads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
