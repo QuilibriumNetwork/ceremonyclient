@@ -2095,6 +2095,13 @@ pub struct AppConsensusEngine {
     /// finalizes; past `PRE_STATE_MISMATCH_BOOTSTRAP` it inherits the range
     /// from an archive, as the session path does for a merged shard.
     pre_state_mismatches: Arc<std::sync::atomic::AtomicU64>,
+    /// Seals of the running session's close this member verified, `(equal
+    /// to its own checkpoint, differing only in state roots)`, since the last
+    /// frame it materialized. At a session base no data frame is proposed,
+    /// so `pre_state_mismatches` never counts; a member that refuses seals
+    /// and never sees its own roots proposed by another leader holds state
+    /// no one shares, and inherits its range like a pre-state mismatch.
+    seal_roots: Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
     /// `(materialized frame at the last check, last self-heal bootstrap)`.
     pre_state_heal: (u64, Option<std::time::Instant>),
     /// Shared with the leader provider: requests this node collected for
@@ -2312,6 +2319,7 @@ impl AppConsensusEngine {
             data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inherit_pending: std::sync::atomic::AtomicBool::new(false),
             pre_state_mismatches: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            seal_roots: Arc::default(),
             pre_state_heal: (0, None),
             frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3712,8 +3720,12 @@ impl AppConsensusEngine {
                 return;
             }
         };
-        info!(core_id = self.core_id, filter = hex::encode(&self.filter),
-            session = hex::encode(submission.0), "app committee session sealed; submitting closing certificate");
+        let (checkpoint, view) = quil_cw_consensus::handoff::Seal::decode(seal)
+            .map_or((0, 0), |seal| (seal.checkpoint.frame, seal.view));
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), session = hex::encode(submission.0),
+            generation = session.generation, checkpoint, view,
+            "app committee session sealed; submitting closing certificate");
+        self.execution.sealed(session.generation, checkpoint, view);
         self.publish_seal(&submission.1);
         self.sealed_session = Some(submission);
         self.seal_published_at = Some(std::time::Instant::now());
@@ -3740,10 +3752,18 @@ impl AppConsensusEngine {
                         drain_headers = drained.attached, drain = drained.reason,
                         "closing certificate waits for GLOBAL to execute the session through its checkpoint");
                 }
+                if drained.reason == "too_many" {
+                    warn!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                        global_executed = drained.executed, checkpoint = drained.checkpoint,
+                        "GLOBAL lacks more session frames than one submission carries and partial drains are \
+                         not active: it will fence the session at its executed frame");
+                }
+                self.execution.seal_submitted(drained.executed, drained.reason, drained.attached);
                 publish(drained.bytes);
             }
             Some(Err(error)) => {
                 warn!(core_id = self.core_id, error = %error, "seal drain headers unavailable; submitting the seal alone");
+                self.execution.seal_submitted(0, "unavailable", 0);
                 publish(base.to_vec());
             }
             None => publish(base.to_vec()),
@@ -3806,6 +3826,15 @@ impl AppConsensusEngine {
             self.adopt_registered_session(&global).await;
             return;
         };
+        // A seal belongs to the session it closes. Once a successor runs, the
+        // predecessor's seal was recorded or the session fenced; checked
+        // against the running session it never looked recorded, and a member
+        // republished its predecessor's seal every minute for good.
+        if self.sealed_session.as_ref().is_some_and(|(id, _)| session.id().ok() != Some(*id)) {
+            self.sealed_session = None;
+            self.seal_published_at = None;
+            self.execution.clear_seal();
+        }
         // Every member of the closing committee submits the seal; a copy
         // already in flight needs no repeat until it has had time to land.
         // Resubmissions are spaced a minute apart, staggered per member, so a
@@ -3819,10 +3848,14 @@ impl AppConsensusEngine {
             let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(&global);
             let recorded = view.and_then(|view|
                 quil_execution::global_intrinsic::handoff::schedule::seal_submitted(&view, &session));
-            if matches!(recorded, Ok(false)) {
-                let submission = submission.clone();
-                self.publish_seal(&submission);
-                self.seal_published_at = Some(std::time::Instant::now());
+            match recorded {
+                Ok(false) => {
+                    let submission = submission.clone();
+                    self.publish_seal(&submission);
+                    self.seal_published_at = Some(std::time::Instant::now());
+                }
+                Ok(true) => self.execution.seal_recorded(),
+                Err(_) => {}
             }
         }
         match crate::app_handoff::still_current(&global, &session) {
@@ -3983,26 +4016,33 @@ impl AppConsensusEngine {
     /// inherits it up front, `app_handoff::merged_from`); they refuse each
     /// other's proposals and the merged shard never finalizes a frame. Rate
     /// limited; the bootstrap re-gates proposing and voting until installed.
+    /// At a session base the evidence is the seals instead (`seal_roots`).
     fn heal_disagreeing_pre_state(&mut self) {
         use std::sync::atomic::Ordering;
         let (seen, last) = self.pre_state_heal;
         if self.last_materialized_frame != seen {
             self.pre_state_heal = (self.last_materialized_frame, last);
             self.pre_state_mismatches.store(0, Ordering::Release);
+            self.seal_roots.0.store(0, Ordering::Release);
+            self.seal_roots.1.store(0, Ordering::Release);
             return;
         }
         let mismatches = self.pre_state_mismatches.load(Ordering::Acquire);
-        if mismatches < PRE_STATE_MISMATCH_BOOTSTRAP
-            || self.inherit_pending.load(Ordering::Acquire)
+        let (agreed, differed) = (self.seal_roots.0.load(Ordering::Acquire), self.seal_roots.1.load(Ordering::Acquire));
+        let Some(reason) = disagreeing_state(mismatches, agreed, differed) else { return };
+        if self.inherit_pending.load(Ordering::Acquire)
             || last.is_some_and(|at| at.elapsed() < PRE_STATE_HEAL_INTERVAL)
         {
             return;
         }
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), mismatches,
-            materialized = self.last_materialized_frame,
-            "proposals keep failing this member's pre-state and no frame materializes: inheriting the shard's range from an archive");
+            seal_roots_agreed = agreed, seal_roots_differed = differed,
+            materialized = self.last_materialized_frame, reason,
+            "this member's state matches no one else's and no frame materializes: inheriting the shard's range from an archive");
         self.pre_state_heal = (seen, Some(std::time::Instant::now()));
         self.pre_state_mismatches.store(0, Ordering::Release);
+        self.seal_roots.0.store(0, Ordering::Release);
+        self.seal_roots.1.store(0, Ordering::Release);
         self.inherit_pending.store(true, Ordering::Release);
         self.data_ready.store(false, Ordering::Release);
         let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested { filter: self.filter.clone() });
@@ -4568,11 +4608,19 @@ impl AppConsensusEngine {
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
                     read_parent: source.reader(),
+                    read_tip: source.tip_reader(),
                     read_private_parent,
                     on_sealed: Arc::new(move |seal, cert| {
                         msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert }).is_ok()
                     }),
                     liveness,
+                    checkpoint_votes: Some({
+                        let seal_roots = self.seal_roots.clone();
+                        Arc::new(move |agreed: bool| {
+                            let counter = if agreed { &seal_roots.0 } else { &seal_roots.1 };
+                            counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        })
+                    }),
                 })
             }
             None => None,
@@ -6591,6 +6639,23 @@ const PRE_STATE_MISMATCH_BOOTSTRAP: u64 = 6;
 /// At most one such self-heal per this interval.
 const PRE_STATE_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Why this member's state looks like no one else's, given, since the last
+/// frame it materialized, the proposals whose pre-state it did not reproduce
+/// and the seals it verified that `agreed` with its state roots or
+/// `differed` in them alone. A refused seal is evidence only when no other
+/// leader's seal shared this member's roots: on a shard whose committee splits
+/// over its state, the larger side keeps its data and the members that each
+/// hold a state of their own re-install theirs.
+fn disagreeing_state(mismatches: u64, agreed: u64, differed: u64) -> Option<&'static str> {
+    if mismatches >= PRE_STATE_MISMATCH_BOOTSTRAP {
+        Some("proposals fail its pre-state")
+    } else if differed >= PRE_STATE_MISMATCH_BOOTSTRAP && agreed == 0 {
+        Some("no other leader's seal shares its state roots")
+    } else {
+        None
+    }
+}
+
 /// The application's shards that can take submissions: filters under the
 /// application with Active provers, less any whose strict bit-path
 /// descendant has them too (a split-away parent the registry still lists).
@@ -7375,6 +7440,17 @@ pub(crate) fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member re-installs its shard when proposals fail its pre-state, or,
+    /// at a session base, when the seals it refuses are all it sees: the
+    /// larger side of a committee split over its state keeps its data.
+    #[test]
+    fn a_member_whose_state_no_one_shares_reinstalls_it() {
+        assert_eq!(disagreeing_state(5, 0, 5), None);
+        assert!(disagreeing_state(PRE_STATE_MISMATCH_BOOTSTRAP, 9, 0).is_some());
+        assert_eq!(disagreeing_state(0, 0, PRE_STATE_MISMATCH_BOOTSTRAP), Some("no other leader's seal shares its state roots"));
+        assert_eq!(disagreeing_state(0, 1, 40), None, "another leader proposed this member's roots");
+    }
 
     /// Resolver messages carry the members they are addressed to; votes,
     /// certificates and blocks go to the whole topic.

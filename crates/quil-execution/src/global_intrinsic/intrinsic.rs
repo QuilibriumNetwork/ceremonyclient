@@ -83,6 +83,15 @@ pub struct GlobalIntrinsic {
 
 }
 
+/// What a seal submission's drain headers do ([`GlobalIntrinsic::seal_drain`]).
+struct SealDrain {
+    /// The sealed source's executed tip after them.
+    executed: Option<quil_cw_consensus::handoff::Checkpoint>,
+    /// They reach the sealed checkpoint, or there are none: the seal applies.
+    /// Otherwise a partial drain, which leaves the seal for later.
+    complete: bool,
+}
+
 /// Where a committee session pass spent its time, logged when it is slow.
 struct SessionPassTiming {
     frame: u64,
@@ -1246,11 +1255,18 @@ impl GlobalIntrinsic {
                 self.invoke_frame_header(frame_number, &op, state, &va_disc)
             }
             super::handoff::TYPE_COMMITTEE_HANDOFF => {
-                // The drain and the seal it enables apply together or not at all.
+                // The drain and the seal it enables apply together or not at
+                // all. A partial drain applies with a valid closing
+                // certificate, and leaves the seal for a later submission.
                 let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
                 let savepoint = state.changeset_len();
-                let applied = self.seal_drain(frame_number, &sealed, state, true)
-                    .and_then(|_| super::handoff::apply_submission(state, frame_number, &sealed.submission));
+                let applied = self.seal_drain(frame_number, &sealed, state, true).and_then(|drain| {
+                    if drain.complete {
+                        super::handoff::apply_submission(state, frame_number, &sealed.submission).map(|_| ())
+                    } else {
+                        super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission).map(|_| ())
+                    }
+                });
                 if let Err(error) = applied {
                     state.rollback_to(savepoint);
                     return Err(error);
@@ -2230,30 +2246,32 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
-    /// The sealed source's executed tip once a seal submission's drain
-    /// headers are executed (`execute`) or would be (validation, which writes
-    /// nothing), after checking each one (#699; `handoff::SealSubmission`).
-    /// The recorded tip when it carries none.
+    /// What a seal submission's drain headers do once executed (`execute`)
+    /// or would do (validation, which writes nothing), after checking each one
+    /// (#699; `handoff::SealSubmission`): the sealed source's executed tip
+    /// after them, and whether they reach the sealed checkpoint. The recorded
+    /// tip, complete, when it carries none.
     ///
     /// Drain headers are the source's frames from the one after GLOBAL's
-    /// executed tip through the sealed checkpoint, consecutive; ones GLOBAL
-    /// already executed are passed over. Executing one records the tip and
-    /// its outflows (settlements, accumulator report, relayed spends) as
-    /// `invoke_frame_header` does, with no reward: the frames GLOBAL rewards
-    /// are the ones it packed in their window.
+    /// executed tip, consecutive, through the sealed checkpoint, or, as a
+    /// partial drain, exactly `MAX_DRAIN_HEADERS` of them ending below it;
+    /// ones GLOBAL already executed are passed over. Executing one records the
+    /// tip and its outflows (settlements, accumulator report, relayed spends)
+    /// as `invoke_frame_header` does, with no reward: the frames GLOBAL
+    /// rewards are the ones it packed in their window.
     fn seal_drain(
         &self,
         frame_number: u64,
         sealed: &super::handoff::SealSubmission,
         state: &HypergraphState,
         execute: bool,
-    ) -> Result<Option<quil_cw_consensus::handoff::Checkpoint>> {
+    ) -> Result<SealDrain> {
         use super::handoff;
         let invalid = |message: &str| QuilError::InvalidArgument(format!("seal drain: {message}"));
         let id = sealed.submission.seal.session;
         let recorded = handoff::session_tip(state, &id)?;
         if sealed.drain.is_empty() {
-            return Ok(recorded);
+            return Ok(SealDrain { executed: recorded, complete: true });
         }
         if frame_number < handoff::seal_drain_frame() {
             return Err(invalid("drain headers are not active"));
@@ -2306,20 +2324,32 @@ impl GlobalIntrinsic {
             next = next.saturating_add(1);
             drained += 1;
         }
-        if last != Some(sealed.submission.seal.checkpoint.frame) {
-            return Err(invalid("headers do not end at the sealed checkpoint"));
-        }
+        let checkpoint = sealed.submission.seal.checkpoint.frame;
+        let complete = match last {
+            Some(last) if last == checkpoint => true,
+            Some(last) if last > checkpoint => return Err(invalid("headers run past the sealed checkpoint")),
+            _ if frame_number < handoff::seal_recovery_frame() => {
+                return Err(invalid("headers do not end at the sealed checkpoint"));
+            }
+            _ if sealed.drain.len() != handoff::MAX_DRAIN_HEADERS => {
+                return Err(invalid("a partial drain carries exactly the most headers a submission may"));
+            }
+            _ if drained == 0 => return Err(invalid("a partial drain's headers are already executed")),
+            _ => false,
+        };
         if execute && drained > 0 {
             tracing::info!(
                 frame = frame_number,
                 filter = %hex::encode(&session.filter),
                 session = %hex::encode(id),
                 drained,
-                through = sealed.submission.seal.checkpoint.frame,
+                through = last,
+                checkpoint,
+                complete,
                 "committee handoff: executed a seal's drain headers",
             );
         }
-        Ok(executed)
+        Ok(SealDrain { executed, complete })
     }
 
     /// Check a committee-handoff seal submission, its drain headers included,
@@ -2330,8 +2360,12 @@ impl GlobalIntrinsic {
         sealed: &super::handoff::SealSubmission,
         state: &HypergraphState,
     ) -> Result<()> {
-        let executed = self.seal_drain(frame_number, sealed, state, false)?;
-        super::handoff::verify_submission_at(state, frame_number, &sealed.submission, executed)?;
+        let drain = self.seal_drain(frame_number, sealed, state, false)?;
+        if drain.complete {
+            super::handoff::verify_submission_at(state, frame_number, &sealed.submission, drain.executed)?;
+        } else {
+            super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
+        }
         Ok(())
     }
 
@@ -3769,8 +3803,8 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
-    /// The committee-handoff flag day ([`LegacyHistory::Discard`], owner
-    /// decision 2026-10-05), in the first session pass from activation:
+    /// The committee-handoff flag day ([`LegacyHistory::Discard`], decided
+    /// 2026-10-05), in the first session pass from activation:
     ///
     /// 1. Every live allocation without a ring key records one
     ///    (`prover_rings::preexisting`: its join-confirm cohort and its

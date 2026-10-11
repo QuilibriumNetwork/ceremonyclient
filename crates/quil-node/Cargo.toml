@@ -100,6 +100,7 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_mall
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
+quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 toml = "0.9"
 tempfile = "3"
 flate2 = "1"

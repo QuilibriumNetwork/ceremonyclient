@@ -282,18 +282,18 @@ pub enum LegacyHistory {
 }
 
 /// Mainnet's committee-handoff activation: the GLOBAL frame whose maintenance
-/// pass authorizes the first sessions, an epoch boundary (1197 × 720). Owner
-/// decision 2026-10-05: a flag day that discards legacy app history.
+/// pass authorizes the first sessions, an epoch boundary (1197 × 720).
+/// Decided 2026-10-05: a flag day that discards legacy app history.
 pub const MAINNET_COMMITTEE_HANDOFF_FRAME: u64 = 861_840;
 
 /// Mainnet's first frame of epoch-boundary membership successors (epoch
-/// 1198). Owner decision 2026-10-06: after activation, every eligible-set
+/// 1198). Decided 2026-10-06: after activation, every eligible-set
 /// change re-sealed every shard its prover sat on, every 8 frames, so no
 /// first session produced a frame.
 pub const MAINNET_MEMBERSHIP_BOUNDARY_FRAME: u64 = 862_560;
 
 /// Mainnet's first frame of epoch-boundary first sessions (epoch 1200).
-/// Owner decision 2026-10-06: with membership frozen mid-epoch, a pass still
+/// Decided 2026-10-06: with membership frozen mid-epoch, a pass still
 /// scanned the whole prover shard every 8 frames only to learn whether a
 /// shard without a session had gained members.
 pub const MAINNET_FIRST_SESSION_BOUNDARY_FRAME: u64 = 864_000;

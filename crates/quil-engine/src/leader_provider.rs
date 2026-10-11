@@ -1171,10 +1171,11 @@ fn handoff_only_submissions(
 
 /// `collected` with at most one bundle per committee-handoff seal (request,
 /// source session); other bundles pass unchanged, in collection order. Of a
-/// seal's copies the one carrying the most drain headers rides (they all end
-/// at its checkpoint, and GLOBAL passes over headers it already executed), so
-/// a copy without the headers GLOBAL lacks cannot crowd out one that brings
-/// them (#699); ties go to the earliest. Also returns the handoff-only bundles
+/// seal's copies the one whose drain reaches furthest rides, then the one
+/// carrying the most headers (GLOBAL passes over headers it already executed),
+/// so a copy without the headers GLOBAL lacks cannot crowd out one that brings
+/// them (#699), nor a partial drain a member sent from an older view of
+/// GLOBAL the next part; ties go to the earliest. Also returns the handoff-only bundles
 /// whose every seal `view` shows settled (`handoff::submission_settled`),
 /// which leave the mempool. Other copies are held back but stay in the
 /// mempool until settled.
@@ -1183,9 +1184,18 @@ pub(crate) fn reduce_handoff_bundles(
     view: Option<&quil_execution::global_intrinsic::handoff::CommittedView>,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     type Key = ([u8; 32], [u8; 32]);
+    // How far a copy's drain reaches (its last header's frame), then how many
+    // headers it carries.
+    type Reach = (u64, usize);
+    let reach = |sealed: &quil_execution::global_intrinsic::handoff::SealSubmission| -> Reach {
+        let last = sealed.drain.last()
+            .and_then(|bytes| quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(bytes).ok())
+            .map_or(0, |header| header.frame_number);
+        (last, sealed.drain.len())
+    };
     let mut settled = Vec::new();
-    // (bundle, its seals and their drain lengths), unsettled handoff-only ones.
-    let mut candidates: Vec<(Vec<u8>, Option<Vec<(Key, usize)>>)> = Vec::with_capacity(collected.len());
+    // (bundle, its seals and their drains' reach), unsettled handoff-only ones.
+    let mut candidates: Vec<(Vec<u8>, Option<Vec<(Key, Reach)>>)> = Vec::with_capacity(collected.len());
     for raw in collected {
         let Some(submissions) = handoff_only_submissions(&raw) else {
             candidates.push((raw, None));
@@ -1201,12 +1211,12 @@ pub(crate) fn reduce_handoff_bundles(
             continue;
         }
         let keys = submissions.iter()
-            .map(|sealed| ((sealed.submission.seal.request, sealed.submission.seal.session), sealed.drain.len()))
+            .map(|sealed| ((sealed.submission.seal.request, sealed.submission.seal.session), reach(sealed)))
             .collect();
         candidates.push((raw, Some(keys)));
     }
-    // The bundle each seal rides in: the first with the longest drain.
-    let mut best: std::collections::HashMap<Key, (usize, usize)> = std::collections::HashMap::new();
+    // The bundle each seal rides in: the first whose drain reaches furthest.
+    let mut best: std::collections::HashMap<Key, (usize, Reach)> = std::collections::HashMap::new();
     for (index, (_, keys)) in candidates.iter().enumerate() {
         for (key, drain) in keys.iter().flatten() {
             let entry = best.entry(*key).or_insert((index, *drain));
@@ -1281,7 +1291,24 @@ mod tests {
         };
         let collected = vec![bundle(1, 10), drained(1, 11, 1), other.clone(), drained(1, 12, 2), bundle(2, 13), drained(1, 14, 2)];
         let (kept, _) = reduce_handoff_bundles(collected, None);
-        assert_eq!(kept, vec![other, drained(1, 12, 2), bundle(2, 13)], "the longest drain, the earliest of equals");
+        assert_eq!(kept, vec![other.clone(), drained(1, 12, 2), bundle(2, 13)], "the longest drain, the earliest of equals");
+
+        // Partial drains, each eight headers from the tip its sender saw: the
+        // one reaching furthest rides, a copy from an older view stays back.
+        let partial = |timestamp: i64, from: u64| {
+            let raw = bundle(1, timestamp);
+            let mut decoded = CanonicalMessageBundle::from_canonical_bytes(&raw).unwrap();
+            let request = decoded.requests[0].as_mut().unwrap();
+            let submission = CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
+            let drain = (from..from + 8).map(|frame_number| quil_execution::global_intrinsic::frame_header::FrameHeader {
+                frame_number, ..Default::default()
+            }.to_canonical_bytes().unwrap()).collect();
+            request.inner_bytes = quil_execution::global_intrinsic::handoff::SealSubmission { submission, drain }
+                .to_canonical_bytes().unwrap();
+            decoded.to_canonical_bytes().unwrap()
+        };
+        let collected = vec![partial(20, 2), partial(21, 4), drained(1, 22, 2), partial(23, 3)];
+        assert_eq!(reduce_handoff_bundles(collected, None).0, vec![partial(21, 4)]);
     }
 
     use super::*;

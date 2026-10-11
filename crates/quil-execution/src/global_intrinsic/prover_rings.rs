@@ -1,4 +1,4 @@
-//! Reward rings ordered by seniority (owner decision 2026-10-05).
+//! Reward rings ordered by seniority (decided 2026-10-05).
 //!
 //! A shard's members rank by cohort, then seniority, then address, and a
 //! member's ring is `rank / RING_GROUP_SIZE`:

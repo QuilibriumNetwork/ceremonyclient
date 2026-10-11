@@ -1,5 +1,5 @@
 //! Display local worker observations without inferring health from allocation.
-use quil_types::proto::node::{ShardRecovery, WorkerExecution};
+use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis() as u64
@@ -25,6 +25,28 @@ pub fn detail(s: Option<&WorkerExecution>) -> String {
         if s.last_advance_unix_ms == 0 { "unobserved".into() } else { format!("{} ago", age(s.last_advance_unix_ms)) },
         age(s.observed_unix_ms))
         + &s.recovery.as_ref().map(|r| format!("; {}", recovery(r))).unwrap_or_default()
+        + &s.seal.as_ref().map(|seal| format!("; {}", sealed(seal))).unwrap_or_default()
+}
+/// The session's finalized terminal seal and how far GLOBAL has taken it: a
+/// sealed worker produces no frames while it waits for its successor.
+pub fn sealed(s: &SessionSeal) -> String {
+    let mut text = format!("Seal: generation {} at frame {} (view {}), finalized {} ago",
+        s.generation, s.checkpoint, s.view, age(s.finalized_unix_ms));
+    if s.recorded_unix_ms > 0 {
+        return text + &format!(", recorded by GLOBAL {} ago", age(s.recorded_unix_ms));
+    }
+    if s.submissions == 0 {
+        return text + ", not submitted yet";
+    }
+    text += &format!(", submitted {} times (last {} ago), GLOBAL executed through {}", s.submissions,
+        age(s.last_submitted_unix_ms), s.global_executed);
+    text += &match s.drain.as_str() {
+        "attached" | "partial" => format!(", drain {} ({} frames)", s.drain, s.drain_headers),
+        "too_many" => ", drain too_many (more missing than one submission carries; GLOBAL fences the session)".into(),
+        "" => String::new(),
+        other => format!(", drain {other}"),
+    };
+    text
 }
 /// Archive recovery, which runs in any execution state: a worker can be
 /// downloading its shard while running or blocked at height 0.
@@ -71,5 +93,11 @@ mod tests {
         let text = recovery(&r);
         assert!(text.contains("from 192.0.2.1:8340") && text.contains("attempt 4 (3 failed in a row)"), "{text}");
         assert!(text.contains("waited 31s for a permit") && text.contains("262144 leaves installed in it"), "{text}");
+        let seal = SessionSeal { generation: 1, checkpoint: 575, view: 2671, global_executed: 566, drain: "partial".into(),
+            drain_headers: 8, finalized_unix_ms: 1, last_submitted_unix_ms: 2, submissions: 3, ..Default::default() };
+        let text = detail(Some(&WorkerExecution { seal: Some(seal.clone()), ..s.clone() }));
+        assert!(text.contains("Seal: generation 1 at frame 575") && text.contains("GLOBAL executed through 566"), "{text}");
+        assert!(text.contains("drain partial (8 frames)"), "{text}");
+        assert!(sealed(&SessionSeal { recorded_unix_ms: 3, ..seal }).contains("recorded by GLOBAL"));
     }
 }

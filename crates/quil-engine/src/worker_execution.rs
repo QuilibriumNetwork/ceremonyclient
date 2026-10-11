@@ -1,6 +1,6 @@
 //! Local engine observations, with no allocation or reward inference.
 use std::sync::{Arc, Mutex};
-use quil_types::proto::node::{ShardRecovery, WorkerExecution};
+use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 
 use crate::prover_tree_syncer::ShardRecoveryProgress;
 
@@ -46,6 +46,45 @@ impl SharedWorkerExecution {
     }
 
     pub fn observe(&self) { self.0.lock().unwrap().observed_unix_ms = now_ms(); }
+
+    /// This member saw its session's terminal seal finalized.
+    pub fn sealed(&self, generation: u64, checkpoint: u64, view: u64) {
+        let mut s = self.0.lock().unwrap();
+        let now = now_ms();
+        s.seal = Some(SessionSeal { generation, checkpoint, view, finalized_unix_ms: now, ..Default::default() });
+        s.observed_unix_ms = now;
+    }
+
+    /// The seal was submitted, carrying `drain` (`app_handoff::DrainedSeal::reason`).
+    pub fn seal_submitted(&self, global_executed: u64, drain: &str, drain_headers: usize) {
+        let mut s = self.0.lock().unwrap();
+        let now = now_ms();
+        if let Some(seal) = s.seal.as_mut() {
+            seal.global_executed = global_executed;
+            seal.drain = drain.into();
+            seal.drain_headers = drain_headers as u32;
+            seal.last_submitted_unix_ms = now;
+            seal.submissions += 1;
+        }
+        s.observed_unix_ms = now;
+    }
+
+    /// A successor session runs: the last seal is history.
+    pub fn clear_seal(&self) {
+        let mut s = self.0.lock().unwrap();
+        s.seal = None;
+        s.observed_unix_ms = now_ms();
+    }
+
+    /// GLOBAL recorded the seal, in this node's view of it.
+    pub fn seal_recorded(&self) {
+        let mut s = self.0.lock().unwrap();
+        let now = now_ms();
+        if let Some(seal) = s.seal.as_mut().filter(|seal| seal.recorded_unix_ms == 0) {
+            seal.recorded_unix_ms = now;
+        }
+        s.observed_unix_ms = now;
+    }
 
     fn recovery(&self, update: impl FnOnce(&mut ShardRecovery, u64)) {
         let mut s = self.0.lock().unwrap();

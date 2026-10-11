@@ -283,6 +283,138 @@ fn closing_keeps_inflight_data_valid_but_read_failure_and_seal_descendants_absta
     assert!(!proposer.verify_with_context(ctx, seal_digest, Some(seal_bytes)));
 }
 
+/// A seal notarized without a finalization stays the parent of every later
+/// view; nothing could extend it, so every view was nullified until GLOBAL
+/// fenced the session. Its re-seal (same request, session and checkpoint, at
+/// its own view, `checkpoint.view` naming the seal's view) extends it and is
+/// the only proposal voters accept there; a re-seal extends a re-seal alike.
+#[test]
+fn a_notarized_seal_is_extended_only_by_its_re_seal() {
+    let (session, _) = session();
+    let mut tip = genesis(&session);
+    tip.checkpoint.frame += 3;
+    tip.checkpoint.view = 11;
+    tip.checkpoint.digest = [9; 32];
+    tip.closing_request = Some([8; 32]);
+    let state = Arc::new(Mutex::new(Some(tip.clone())));
+    let store = BlockStore::new();
+    let liveness = Arc::new(Liveness::default());
+    let proposer = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state.clone()))
+        .unwrap()
+        .with_seal_parents(store.clone(), reader(state.clone()))
+        .with_liveness(Some(liveness.clone()));
+    let ctx = context(&session, &tip, 13);
+    let (seal_digest, seal_bytes) = proposer.propose_with_context(ctx).unwrap();
+    let seal = Seal::decode(&seal_bytes).unwrap();
+    // Notarized at view 13: every member that voted for it holds its body.
+    store.seal(seal_digest, seal_bytes);
+    let above = ProposalContext { view: 20, parent_view: 13, parent: seal_digest, ..ctx };
+    let (digest, bytes) = proposer.propose_with_context(above).unwrap();
+    let reseal = Seal::decode(&bytes).unwrap();
+    assert_eq!(reseal, Seal { view: 20, checkpoint: Checkpoint { view: 13, ..tip.checkpoint.clone() }, ..seal.clone() });
+    assert_eq!(digest.0, reseal.digest());
+    assert!(proposer.verify_with_context(above, digest, Some(bytes.clone())));
+
+    // A re-seal that was itself only notarized is extended the same way.
+    store.seal(digest, bytes.clone());
+    let next = ProposalContext { view: 24, parent_view: 20, parent: digest, ..ctx };
+    let (next_digest, next_bytes) = proposer.propose_with_context(next).unwrap();
+    assert_eq!(Seal::decode(&next_bytes).unwrap().checkpoint, Checkpoint { view: 20, ..tip.checkpoint.clone() });
+    assert!(proposer.verify_with_context(next, next_digest, Some(next_bytes.clone())));
+
+    // A member that never held the seal's body (it did not vote for it)
+    // recognises the seal of its own tip by its certified digest; a re-seal
+    // above a re-seal it holds no body of, it cannot.
+    let other = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state.clone()))
+        .unwrap()
+        .with_seal_parents(BlockStore::new(), reader(state.clone()));
+    assert!(other.verify_with_context(above, digest, Some(bytes.clone())));
+    assert_eq!(other.propose_with_context(above), Some((digest, bytes.clone())));
+    assert!(!other.verify_with_context(next, next_digest, Some(next_bytes)));
+
+    // Data never continues a seal; nor does a re-seal naming anything else.
+    let (data_digest, data_bytes) = DataProposer.propose(above.view, above.parent).unwrap();
+    assert!(!proposer.verify_with_context(above, data_digest, Some(data_bytes)));
+    liveness.settle(Step::Verify, above.view, false);
+    for field in 0..9 {
+        let mut changed = reseal.clone();
+        match field {
+            0 => changed.request[0] ^= 1,
+            1 => changed.view += 1,
+            2 => changed.checkpoint.view = tip.checkpoint.view,
+            3 => changed.checkpoint.frame += 1,
+            4 => changed.checkpoint.digest[0] ^= 1,
+            5 => changed.checkpoint.state_roots[1][0] ^= 1,
+            6 => changed.checkpoint.history_root[0] ^= 1,
+            7 => changed.session[0] ^= 1,
+            _ => changed = seal.clone(),
+        }
+        assert!(!proposer.verify_with_context(above, Digest(changed.digest()), Some(changed.encode())), "field {field}");
+    }
+    assert!(!proposer.verify_with_context(ProposalContext { parent_view: 12, ..above }, digest, Some(bytes.clone())));
+    liveness.settle(Step::Verify, above.view, false);
+    let refused = liveness.decisions().refused;
+    assert!(refused.contains_key("data frame above a terminal seal"), "{refused:?}");
+    assert!(refused.contains_key("seal parent differs from the authorized checkpoint"), "{refused:?}");
+
+    // A member without the seal's body, or whose tip is not the sealed
+    // checkpoint, or which no longer sees the request, neither proposes nor
+    // accepts one.
+    let blind = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state.clone())).unwrap();
+    assert!(blind.propose_with_context(above).is_none());
+    assert!(!blind.verify_with_context(above, digest, Some(bytes.clone())));
+    state.lock().unwrap().as_mut().unwrap().checkpoint.history_root[0] ^= 1;
+    assert!(proposer.propose_with_context(above).is_none());
+    assert!(!proposer.verify_with_context(above, digest, Some(bytes.clone())));
+    *state.lock().unwrap() = Some(AuthorizedParent { closing_request: None, ..tip.clone() });
+    assert!(!proposer.verify_with_context(above, digest, Some(bytes.clone())));
+    *state.lock().unwrap() = Some(AuthorizedParent { closing_request: Some([7; 32]), ..tip.clone() });
+    assert!(!proposer.verify_with_context(above, digest, Some(bytes)));
+
+    // A seal at the session base names the genesis at view zero; its re-seal
+    // names the genesis at that seal's view, and GLOBAL accepts it from its
+    // seal recovery frame. Members that never held the base seal recognise it.
+    let base = AuthorizedParent { closing_request: Some([8; 32]), ..genesis(&session) };
+    *state.lock().unwrap() = Some(base.clone());
+    let (base_digest, base_bytes) = proposer.propose_with_context(context(&session, &base, 3)).unwrap();
+    store.seal(base_digest, base_bytes);
+    let above_base = ProposalContext { view: 6, parent_view: 3, parent: base_digest, ..ctx };
+    let (reseal_digest, reseal_bytes) = proposer.propose_with_context(above_base).unwrap();
+    let base_reseal = Seal::decode(&reseal_bytes).unwrap();
+    assert_eq!(base_reseal.checkpoint, Checkpoint { view: 3, ..base.checkpoint.clone() });
+    assert!(other.verify_with_context(above_base, reseal_digest, Some(reseal_bytes)));
+    assert!(base_reseal.validate(&session, &[8; 32]).is_err());
+    assert!(base_reseal.validate_with(&session, &[8; 32], true).is_ok());
+}
+
+/// At a session base a member sees only seals: each one it verifies says
+/// whether it shares the member's state roots. Seals differing in anything
+/// else, or closing another request, say nothing about its state.
+#[test]
+fn verified_seals_report_whether_they_share_this_members_state_roots() {
+    let (session, _) = session();
+    let tip = AuthorizedParent { closing_request: Some([8; 32]), ..genesis(&session) };
+    let state = Arc::new(Mutex::new(Some(tip.clone())));
+    let votes = Arc::new(Mutex::new(Vec::new()));
+    let record = votes.clone();
+    let proposer = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state.clone()))
+        .unwrap()
+        .with_checkpoint_votes(Some(Arc::new(move |agreed| record.lock().unwrap().push(agreed))));
+    let ctx = context(&session, &tip, 4);
+    let seal = Seal { request: [8; 32], session: session.id().unwrap(), view: 4, checkpoint: tip.checkpoint.clone() };
+    let verify = |seal: &Seal| proposer.verify_with_context(ctx, Digest(seal.digest()), Some(seal.encode()));
+    assert!(verify(&seal));
+    let mut other_roots = seal.clone();
+    other_roots.checkpoint.state_roots[2][0] ^= 1;
+    assert!(!verify(&other_roots));
+    let mut other_history = seal.clone();
+    other_history.checkpoint.history_root[0] ^= 1;
+    assert!(!verify(&other_history));
+    let other_request = Seal { request: [7; 32], ..other_roots.clone() };
+    assert!(!verify(&other_request));
+    assert_eq!(*votes.lock().unwrap(), vec![true, false]);
+}
+
 #[test]
 fn unauthorized_genesis_and_malformed_seals_cannot_be_proposed_or_voted() {
     let (session, _) = session();

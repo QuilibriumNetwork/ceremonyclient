@@ -91,9 +91,16 @@ pub struct SessionHost {
     /// Authorizes a selected parent that is notarized but not yet
     /// materialized, from its private execution (see `AppParentExecutor`).
     pub read_private_parent: Option<ParentReader>,
+    /// The authorized checkpoint at the materialized tip, whatever the
+    /// selection: what a re-seal of a notarized seal is checked against
+    /// (`HandoffProposer::with_seal_parents`).
+    pub read_tip: ParentReader,
     pub on_sealed: AppSealedSink,
     /// Records the session's votes and certificates for operators.
     pub liveness: Arc<quil_cw_consensus::adapters::Liveness>,
+    /// Told whether each seal this member verifies shares its state roots
+    /// (`HandoffProposer::with_checkpoint_votes`).
+    pub checkpoint_votes: Option<quil_cw_consensus::handoff::automaton::CheckpointVotes>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -1602,6 +1609,8 @@ pub fn activate_app_consensus_cw(
                     proposer.clone() as Arc<dyn GlobalProposer>, host.session, host.read_parent,
                 )?
                 .with_private_reader(host.read_private_parent)
+                .with_seal_parents(store.clone(), host.read_tip)
+                .with_checkpoint_votes(host.checkpoint_votes)
                 .with_liveness(Some(host.liveness)),
                 bodies: sealed_bodies.clone(),
             }),

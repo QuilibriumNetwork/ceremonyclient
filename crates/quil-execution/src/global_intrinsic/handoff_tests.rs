@@ -1352,6 +1352,94 @@ fn a_seal_below_or_beside_the_executed_tip_is_refused() {
     assert!(super::apply_submission(&state, 3, &seal).unwrap());
 }
 
+/// A seal notarized without a finalization is extended by a re-seal (the app
+/// automaton's `with_seal_parents`): the same checkpoint frame, digest, roots
+/// and history, at a later view, with `checkpoint.view` naming the notarized
+/// seal's view. GLOBAL accepts its finalization as it does any seal's, and
+/// authorizes the successor from the same frame.
+#[test]
+fn a_re_seal_of_a_notarized_seal_closes_the_source_at_the_same_frame() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5d; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let notarized = submission(&request, 0, &keys, 6).seal;
+    let source = &request.sources[0];
+    let reseal = Seal {
+        view: 14,
+        checkpoint: Checkpoint { view: notarized.view, ..notarized.checkpoint.clone() },
+        ..notarized.clone()
+    };
+    // Certified as a child of the data frame instead of the seal: refused.
+    let misbound = CertificateSubmission {
+        seal: reseal.clone(),
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.checkpoint.view, reseal.digest()),
+    };
+    record_session_tip(&state, 3, &reseal.session, &notarized.checkpoint).unwrap();
+    assert!(super::verify_submission(&state, 3, &misbound).is_err());
+    let finalized = CertificateSubmission {
+        seal: reseal.clone(),
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.view, reseal.digest()),
+    };
+    assert!(super::apply_submission(&state, 3, &finalized).unwrap());
+    let successor = head(&state, &filter).unwrap().unwrap();
+    assert_eq!((successor.generation, successor.base_frame), (2, 6));
+    assert_eq!(closed_checkpoint(&state, &reseal.session).unwrap().unwrap(), reseal.checkpoint);
+}
+
+/// A session asked to close before its first frame seals at its base; when
+/// that seal is notarized but never finalized, its re-seal names the genesis
+/// at the notarized seal's view. GLOBAL refuses it before the seal recovery
+/// frame, as an older build does, and accepts it from that frame.
+#[test]
+fn a_re_seal_at_the_base_is_accepted_from_the_seal_recovery_frame() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5e; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let source = &request.sources[0];
+    let reseal = Seal {
+        request: request.id().unwrap(),
+        session: source.id().unwrap(),
+        view: 7,
+        checkpoint: Checkpoint {
+            frame: source.base_frame,
+            view: 3,
+            digest: source.genesis,
+            state_roots: [[0x40; 32]; 4],
+            history_root: [0x44; 32],
+        },
+    };
+    let submission = CertificateSubmission {
+        certificate: sign_certificate(source, &keys, 7, 3, reseal.digest()),
+        seal: reseal,
+    };
+    set_seal_recovery_frame_for_thread(Some(5));
+    let before = super::verify_submission(&state, 4, &submission).unwrap_err();
+    assert!(before.to_string().contains("invalid source finalization certificate"), "{before}");
+    assert!(super::apply_submission(&state, 5, &submission).unwrap());
+    set_seal_recovery_frame_for_thread(None);
+    let successor = head(&state, &filter).unwrap().unwrap();
+    assert_eq!((successor.generation, successor.base_frame), (2, 0));
+}
+
+/// Partial drains and base re-seals are GLOBAL consensus: mainnet starts at
+/// a fixed epoch boundary whatever the environment says; other networks only
+/// when set.
+#[test]
+fn seal_recovery_activates_at_the_mainnet_frame_or_the_testnet_setting() {
+    assert_eq!(seal_recovery_frame_for(0, None), 875_520);
+    assert_eq!(seal_recovery_frame_for(0, Some("7")), 875_520);
+    assert_eq!(875_520 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(seal_recovery_frame_for(1, Some("7")), 7);
+    assert_eq!(seal_recovery_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(seal_recovery_frame_for(1, None), u64::MAX);
+}
+
 fn fence_timeout() -> u64 {
     schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames()
 }

@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, age, recovery};
+use super::super::local_execution::{local_execution_state, age, recovery, sealed};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -791,6 +791,7 @@ fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
     if local_warning(a) { text += " | Warning: no materialized frames"; }
     if let Some(r) = execution.recovery.as_ref() { text += &format!(" | {}", recovery(r)); }
+    if let Some(seal) = execution.seal.as_ref() { text += &format!(" | {}", sealed(seal)); }
     let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
     Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
 }

@@ -3,8 +3,10 @@
 //! A seal is a consensus payload in the OLD session. A quorum certificate for
 //! an out-of-band statement about a local head is not a substitute. The app
 //! automaton must check the selected parent and materialized roots before voting,
-//! and refuse descendants of a seal. Global execution authorizes the successor
-//! only after every source session in its transition has supplied such a seal.
+//! and refuse descendants of a seal other than a re-seal of the same checkpoint
+//! (`automaton::HandoffProposer::with_seal_parents`). Global execution
+//! authorizes the successor only after every source session in its transition
+//! has supplied such a seal.
 
 use commonware_cryptography::{sha256::Sha256, Hasher as _};
 use quil_types::error::{QuilError, Result};
@@ -128,6 +130,11 @@ impl Session {
 /// State AFTER materializing the last data frame. Header pre-state roots alone
 /// do not establish this checkpoint. Outgoing history must be durably available
 /// and authenticated by `history_root` before a successor is allowed to vote.
+///
+/// In a seal, `view` is the view of the seal's consensus parent: the data
+/// frame's own, or, for a re-seal, the view of the notarized seal it extends
+/// (`verify_seal` binds the certified parent view to it). `frame`, `digest`
+/// and the roots always name the data frame (at the base, the genesis).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub frame: u64,
@@ -201,6 +208,14 @@ impl Seal {
     }
 
     pub fn validate(&self, session: &Session, request: &[u8; 32]) -> Result<()> {
+        self.validate_with(session, request, false)
+    }
+
+    /// [`Self::validate`], also accepting, when `base_reseal`, a re-seal of a
+    /// seal at the session base: the genesis at the view of the notarized
+    /// seal it extends (`automaton::HandoffProposer::with_seal_parents`).
+    /// Generation zero's base is a certified legacy frame no seal names.
+    pub fn validate_with(&self, session: &Session, request: &[u8; 32], base_reseal: bool) -> Result<()> {
         if self.session != session.id()? || &self.request != request {
             return Err(invalid("seal belongs to another request or session"));
         }
@@ -208,7 +223,8 @@ impl Seal {
             return Err(invalid("seal regresses its checkpoint"));
         }
         if self.checkpoint.frame == session.base_frame {
-            if self.checkpoint.view != 0 || self.checkpoint.digest != session.genesis {
+            let reseal = base_reseal && session.generation != 0;
+            if (self.checkpoint.view != 0 && !reseal) || self.checkpoint.digest != session.genesis {
                 return Err(invalid("seal changes the authorized genesis"));
             }
         } else if self.checkpoint.view == 0 {
@@ -226,10 +242,24 @@ pub fn verify_seal(
     seal: &Seal,
     certificate: &[u8],
 ) -> Option<VerifiedFinalization> {
+    verify_seal_with(session, request, seal, certificate, false)
+}
+
+/// [`verify_seal`], also accepting a re-seal of a seal at the session base
+/// when `base_reseal` ([`Seal::validate_with`]). GLOBAL passes it from its
+/// seal recovery frame; a member authenticating its own finalized seal
+/// always does.
+pub fn verify_seal_with(
+    session: &Session,
+    request: &[u8; 32],
+    seal: &Seal,
+    certificate: &[u8],
+    base_reseal: bool,
+) -> Option<VerifiedFinalization> {
     if certificate.len() > MAX_RECORD_BYTES {
         return None;
     }
-    seal.validate(session, request).ok()?;
+    seal.validate_with(session, request, base_reseal).ok()?;
     let verified = verify_finalization_details(
         certificate,
         &session.members,
@@ -454,6 +484,40 @@ mod tests {
             &certificate[..certificate.len() - 1]
         )
         .is_none());
+    }
+
+    /// A re-seal (`automaton::HandoffProposer::with_seal_parents`) names the
+    /// notarized seal it extends as `checkpoint.view`: its finalization, whose
+    /// certified parent is that seal's view, verifies exactly as a seal's; the
+    /// data frame's view no longer matches its parent.
+    #[test]
+    fn a_re_seal_verifies_against_the_seal_it_extends() {
+        let keys = keys();
+        let session = session(&keys);
+        let request = [5; 32];
+        let data = Checkpoint { frame: 19, view: 40, digest: [6; 32], state_roots: [[7; 32]; 4], history_root: [8; 32] };
+        let reseal = Seal { request, session: session.id().unwrap(), view: 61, checkpoint: Checkpoint { view: 44, ..data.clone() } };
+        let certificate = certify(&keys, &session, &reseal, 7, 61, 44);
+        assert!(verify_seal(&session, &request, &reseal, &certificate).is_some());
+        let as_data_child = Seal { checkpoint: data, ..reseal.clone() };
+        assert!(verify_seal(&session, &request, &as_data_child, &certify(&keys, &session, &as_data_child, 7, 61, 44)).is_none());
+        // A re-seal of a seal at the base names the genesis at that seal's
+        // view: refused unless base re-seals are accepted, and then only at
+        // the genesis itself.
+        let base = Checkpoint { frame: session.base_frame, view: 44, digest: session.genesis, ..reseal.checkpoint.clone() };
+        let at_base = Seal { checkpoint: base, ..reseal };
+        let certificate = certify(&keys, &session, &at_base, 7, 61, 44);
+        assert!(verify_seal(&session, &request, &at_base, &certificate).is_none());
+        assert!(verify_seal_with(&session, &request, &at_base, &certificate, true).is_some());
+        let mut not_genesis = at_base.clone();
+        not_genesis.checkpoint.digest[0] ^= 1;
+        let certificate = certify(&keys, &session, &not_genesis, 7, 61, 44);
+        assert!(verify_seal_with(&session, &request, &not_genesis, &certificate, true).is_none());
+        let mut legacy = session.clone();
+        legacy.generation = 0;
+        let at_legacy_base = Seal { session: legacy.id().unwrap(), ..at_base };
+        let certificate = certify(&keys, &legacy, &at_legacy_base, 0, 61, 44);
+        assert!(verify_seal_with(&legacy, &request, &at_legacy_base, &certificate, true).is_none());
     }
 
     #[test]

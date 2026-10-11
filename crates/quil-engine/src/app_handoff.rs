@@ -204,9 +204,20 @@ impl ParentSource {
     }
 
     pub fn reader(self: &Arc<Self>) -> ParentReader {
+        self.reader_of(true)
+    }
+
+    /// The authorized checkpoint at the local materialized tip, whatever the
+    /// selected parent: a re-seal's voters compare the notarized seal they
+    /// extend against it (`HandoffProposer::with_seal_parents`).
+    pub fn tip_reader(self: &Arc<Self>) -> ParentReader {
+        self.reader_of(false)
+    }
+
+    fn reader_of(self: &Arc<Self>, selected: bool) -> ParentReader {
         let source = self.clone();
         Arc::new(move |context| {
-            source.read(context).inspect_err(|error| {
+            source.authorized(context, selected).inspect_err(|error| {
                 // Expected while this member catches up to the selected parent;
                 // persistent repetition means its state or history is incomplete.
                 // This is the only trace of why a member abstains, so surface it
@@ -261,7 +272,14 @@ impl ParentSource {
         Ok(root)
     }
 
+    #[cfg(test)]
     fn read(&self, context: ProposalContext) -> Result<AuthorizedParent> {
+        self.authorized(context, true)
+    }
+
+    /// The authorized checkpoint at the local materialized tip; when
+    /// `selected`, only if it is the selected parent.
+    fn authorized(&self, context: ProposalContext, selected: bool) -> Result<AuthorizedParent> {
         self.check_staged()?;
         let view = CommittedView::capture(&self.global)?;
         let head = handoff::head(&view, &self.session.filter)?
@@ -303,7 +321,7 @@ impl ParentSource {
             }
             (header.rank, quil_crypto::poseidon::hash_bytes_to_32(&header.output)?)
         };
-        if digest != context.parent.0 || view_number != context.parent_view {
+        if selected && (digest != context.parent.0 || view_number != context.parent_view) {
             return Err(unavailable(format!(
                 "selected parent (view {}, {}) is not the local materialized tip (frame {cursor}, view {view_number}, {})",
                 context.parent_view, hex::encode(&context.parent.0[..4]), hex::encode(&digest[..4]),
@@ -449,9 +467,12 @@ pub struct DrainedSeal {
     pub executed: u64,
     pub checkpoint: u64,
     pub attached: usize,
-    /// Why the drain is what it is: `attached`, `executed` (GLOBAL has the
-    /// checkpoint), `inactive` (before the drain frame) or `too_many` (more
-    /// missing than one submission carries; the fence closes the session).
+    /// Why the drain is what it is: `attached`, `partial` (the next
+    /// [`MAX_DRAIN_HEADERS`](quil_execution::global_intrinsic::handoff::MAX_DRAIN_HEADERS)
+    /// of more missing; a later submission brings the rest and the seal),
+    /// `executed` (GLOBAL has the checkpoint), `inactive` (before the drain
+    /// frame) or `too_many` (more missing than one submission carries, before
+    /// the partial drain frame; the fence closes the session).
     pub reason: &'static str,
 }
 
@@ -460,9 +481,10 @@ pub struct DrainedSeal {
 /// through the sealed checkpoint (`handoff::SealSubmission`). GLOBAL accepts a
 /// seal only once it has executed its checkpoint frame, and a sealed session's
 /// last headers can miss their lockstep window for good. None are attached
-/// when GLOBAL has executed the checkpoint, before the drain frame, or when
-/// more are missing than one submission carries (the fence closes such a
-/// session).
+/// when GLOBAL has executed the checkpoint or before the drain frame. When
+/// more are missing than one submission carries, the next ones are (a partial
+/// drain), from the partial drain frame; before it none are, and the fence
+/// closes such a session.
 pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: &[u8]) -> Result<DrainedSeal> {
     use quil_execution::global_intrinsic::handoff::{self as h, SealSubmission, MAX_DRAIN_HEADERS};
     let submission = CertificateSubmission::from_canonical_bytes(base)?;
@@ -479,10 +501,12 @@ pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: 
     if view.frame().saturating_add(1) < h::seal_drain_frame() {
         return Ok(plain("inactive"));
     }
-    if checkpoint - executed > MAX_DRAIN_HEADERS as u64 {
+    let partial = checkpoint - executed > MAX_DRAIN_HEADERS as u64;
+    if partial && view.frame().saturating_add(1) < h::seal_recovery_frame() {
         return Ok(plain("too_many"));
     }
-    let drain = (executed + 1..=checkpoint)
+    let through = if partial { executed + MAX_DRAIN_HEADERS as u64 } else { checkpoint };
+    let drain = (executed + 1..=through)
         .map(|number| canonical_header(&clock.get_shard_clock_frame(&session.filter, number, false)?))
         .collect::<Result<Vec<_>>>()?;
     let attached = drain.len();
@@ -491,7 +515,7 @@ pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: 
         executed,
         checkpoint,
         attached,
-        reason: "attached",
+        reason: if partial { "partial" } else { "attached" },
     })
 }
 
