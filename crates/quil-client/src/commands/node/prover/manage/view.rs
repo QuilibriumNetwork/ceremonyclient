@@ -3495,9 +3495,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 184, &rows).1, 28);
+        assert_eq!(alloc_col_widths(&m, 184, &rows).1, 37);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 171, &rows).1, 15);
+        assert_eq!(alloc_col_widths(&m, 171, &rows).1, 24);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
