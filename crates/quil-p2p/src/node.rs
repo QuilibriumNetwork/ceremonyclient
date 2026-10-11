@@ -978,12 +978,13 @@ impl P2PNode {
                                         message, ..
                                     } => {
                                         // Moved, not copied: the event owns the message.
-                                        let _ = msg_tx.try_send(ReceivedMessage {
+                                        let result = msg_tx.try_send(ReceivedMessage {
                                             bitmask: message.bitmask,
                                             data: message.data,
                                             from: message.from,
                                             direct: false,
                                         });
+                                        direct_stats.note_gossip_receive(&result);
                                     }
                                     BlossomSubEvent::Subscribed { peer_id, bitmask } => {
                                         debug!(%peer_id, bitmask = hex::encode(&bitmask), "peer subscribed");
