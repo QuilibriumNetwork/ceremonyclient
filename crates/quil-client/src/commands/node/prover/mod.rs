@@ -223,6 +223,14 @@ pub(crate) fn format_storage(bytes: u64) -> String {
 /// upper bound in the column's own unit, it right-aligns on the same decimal
 /// column as every other cell, and it sorts and filters as the byte value it
 /// really is — only the rendering changes.
+/// Decimal GB, with small nonzero amounts distinct from an empty shard.
+pub(crate) fn format_gb(v: &BigInt) -> String {
+    if v.sign() != Sign::Plus { return "0.0".into(); }
+    let tenths = (v * BigInt::from(10) + BigInt::from(500_000_000u64)) / BigInt::from(1_000_000_000u64);
+    if tenths == BigInt::from(0) { return "<0.1".into(); }
+    format!("{}.{}", &tenths / 10, &tenths % 10)
+}
+
 pub(crate) fn format_mb(v: &BigInt) -> String {
     let mb = v.to_string().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0);
     if v.sign() == Sign::Plus && mb < 0.05 {
@@ -235,22 +243,14 @@ pub(crate) fn format_mb(v: &BigInt) -> String {
 /// `framesPerDay` — frames in 24h at a 10s target frame time.
 const FRAMES_PER_DAY: u64 = 24 * 60 * 60 / 10; // 8640
 
-/// `formatQUILDaily` (per-frame reward → estimated 24h total), rounded to
-/// whole QUIL. Reward units are 1 QUIL = 10^8, and at a fraction of a cent
-/// per QUIL the eight decimals of a raw amount carry no decision value; the
-/// spread that does matter between shards survives rounding. A non-zero
-/// amount below the rounding threshold prints `<1` so it stays
-/// distinguishable from nothing at all.
+/// Per-frame reward as QUIL/day, rounded to one decimal. Preserve tiny
+/// positive rewards as `<0.1` instead of presenting them as zero.
 pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
     let raw = per_frame * BigInt::from(FRAMES_PER_DAY);
-    if raw.sign() != Sign::Plus {
-        return "0".to_string();
-    }
-    let whole = (raw + BigInt::from(50_000_000u64)) / BigInt::from(100_000_000u64);
-    if whole.sign() != Sign::Plus {
-        return "<1".to_string();
-    }
-    whole.to_string()
+    if raw.sign() != Sign::Plus { return "0.0".to_string(); }
+    let tenths = (raw + BigInt::from(5_000_000u64)) / BigInt::from(10_000_000u64);
+    if tenths.sign() != Sign::Plus { return "<0.1".to_string(); }
+    format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
 #[cfg(test)]
@@ -262,6 +262,14 @@ mod tests {
         assert_eq!(format_storage(512), "512 B");
         assert_eq!(format_storage(1536), "1.5 KB");
         assert_eq!(format_storage(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn format_gb_uses_decimal_units_and_retains_small_shards() {
+        for (bytes, expected) in [(0, "0.0"), (2048, "<0.1"), (49_999_999, "<0.1"),
+            (50_000_000, "0.1"), (1_000_000_000, "1.0"), (1_673_583_448, "1.7")] {
+            assert_eq!(format_gb(&BigInt::from(bytes)), expected);
+        }
     }
 
     #[test]
@@ -279,18 +287,18 @@ mod tests {
     fn format_quil_daily_round_separates_a_trickle_from_nothing() {
         // `per_frame` is scaled by FRAMES_PER_DAY, so 1 unit/frame is
         // 8640 units/day = 0.0000864 QUIL/day — a trickle, but not zero.
-        assert_eq!(format_quil_daily_round(&BigInt::from(0)), "0");
-        assert_eq!(format_quil_daily_round(&BigInt::from(1u64)), "<1");
-        // Exactly 0.5 QUIL/day rounds up; anything under it reads `<1`.
+        assert_eq!(format_quil_daily_round(&BigInt::from(0)), "0.0");
+        assert_eq!(format_quil_daily_round(&BigInt::from(1u64)), "<0.1");
+        // Values immediately around 0.5 QUIL/day share the same tenth.
         let half = BigInt::from(50_000_000u64 / FRAMES_PER_DAY); // 5787 -> 0.4999…
-        assert_eq!(format_quil_daily_round(&half), "<1");
-        assert_eq!(format_quil_daily_round(&(half + BigInt::from(1))), "1");
+        assert_eq!(format_quil_daily_round(&half), "0.5");
+        assert_eq!(format_quil_daily_round(&(half + BigInt::from(1))), "0.5");
         // The reported total: 269.91550080 QUIL/day.
-        assert_eq!(format_quil_daily_round(&BigInt::from(3_124_022u64)), "270");
+        assert_eq!(format_quil_daily_round(&BigInt::from(3_124_022u64)), "269.9");
         // Per-shard rates observed on a live node collapse to a handful of
         // tiers, and the ~15x spread that drives a join decision survives.
-        assert_eq!(format_quil_daily_round(&BigInt::from(4_498u64)), "<1");
-        assert_eq!(format_quil_daily_round(&BigInt::from(67_900u64)), "6");
-        assert_eq!(format_quil_daily_round(&BigInt::from(268_000u64)), "23");
+        assert_eq!(format_quil_daily_round(&BigInt::from(4_498u64)), "0.4");
+        assert_eq!(format_quil_daily_round(&BigInt::from(67_900u64)), "5.9");
+        assert_eq!(format_quil_daily_round(&BigInt::from(268_000u64)), "23.2");
     }
 }

@@ -909,6 +909,9 @@ pub struct ShardDetail {
 
 /// Provides shard-level info.
 pub trait ShardInfoProvider: Send + Sync {
+    /// Local lifecycle scoring strategy, unavailable on older providers.
+    fn allocation_scoring_strategy(&self) -> &'static str { "" }
+
     /// One committed GLOBAL cursor per filter, from a single snapshot.
     /// Missing coverage/session data stays unavailable; zero is a real cursor.
     fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {

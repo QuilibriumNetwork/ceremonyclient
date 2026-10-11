@@ -403,6 +403,8 @@ message GetShardInfoResponse {
   bytes pomw_basis = 3;
   bytes world_state_bytes = 4;
   uint64 frame_number = 5;
+  // Local lifecycle scoring strategy; empty on older servers.
+  string allocation_scoring_strategy = 6;
 }
 
 // Advisory budget for one standalone QUIL operation, not a reservation or a

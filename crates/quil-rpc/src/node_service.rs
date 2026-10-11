@@ -1310,6 +1310,7 @@ impl NodeService for NodeRpcServer {
             pomw_basis: basis.to_signed_bytes_be(),
             world_state_bytes: world_bytes.to_signed_bytes_be(),
             frame_number,
+            allocation_scoring_strategy: provider.allocation_scoring_strategy().into(),
         }))
     }
 
@@ -1904,6 +1905,7 @@ mod shard_world_size_tests {
         fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> quil_types::error::Result<Vec<Option<node::GlobalAppFrameHead>>> {
             Ok(filters.iter().map(|f| if f == &[1] { Some(node::GlobalAppFrameHead { frame: 0, global_frame: 12, generation: 2 }) } else { None }).collect())
         }
+        fn allocation_scoring_strategy(&self) -> &'static str { "reward-greedy" }
         fn get_shard_info(&self, include_all: bool)
             -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
             let count = if include_all { 2 } else { 1 };
@@ -1923,6 +1925,7 @@ mod shard_world_size_tests {
                 include_all,
             })).await.unwrap().into_inner();
             assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
+            assert_eq!(response.allocation_scoring_strategy, "reward-greedy");
             assert_eq!(response.shards[0].ring_known, Some(true));
             let response = <node::GetShardInfoResponse as prost::Message>::decode(prost::Message::encode_to_vec(&response).as_slice()).unwrap();
             assert_eq!(response.shards[0].global_head.as_ref().map(|head| (head.frame, head.global_frame, head.generation)), Some((0, 12, 2)));

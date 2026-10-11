@@ -1719,6 +1719,7 @@ pub(crate) fn spawn_all(
     node_rpc_builder = node_rpc_builder.with_workers_view(workers_view.clone());
 
     struct LocalShardInfoProvider {
+        allocation_scoring_strategy: &'static str,
         registry: Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -1738,6 +1739,8 @@ pub(crate) fn spawn_all(
         sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     }
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
+        fn allocation_scoring_strategy(&self) -> &'static str { self.allocation_scoring_strategy }
+
         fn get_global_app_heads(&self, filters: &[Vec<u8>])
             -> quil_types::error::Result<Vec<Option<quil_types::proto::node::GlobalAppFrameHead>>> {
             committed_global_app_heads(&self.crdt, filters)
@@ -1988,6 +1991,9 @@ pub(crate) fn spawn_all(
     }
 
     node_rpc_builder = node_rpc_builder.with_shard_info_provider(Arc::new(LocalShardInfoProvider {
+        allocation_scoring_strategy: if config.engine.reward_strategy == "reward-greedy" {
+            "reward-greedy"
+        } else { "data-greedy" },
         sizes: committed_shard_sizes.clone(),
         registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
