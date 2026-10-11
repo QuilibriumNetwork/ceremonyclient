@@ -511,6 +511,27 @@ const MAX_FETCHED_HISTORY_BYTES: usize = 256 << 20;
 /// Records written per commit when installing verified history.
 const MAX_INSTALL_BATCH_BYTES: usize = 8 << 20;
 
+/// Same-filter predecessors whose certified outgoing history must be audited
+/// before this member can start the successor at its local checkpoint.
+/// Fences supply no certified history root; their checkpoint is verified by
+/// [`successor_state_matches`] instead of delaying startup for a history audit.
+pub fn predecessor_history_sources(
+    view: &CommittedView,
+    session: &Session,
+    cursor: u64,
+) -> Result<Vec<(Session, Checkpoint)>> {
+    let mut sources = Vec::new();
+    for (source, checkpoint) in effective_origins(view, session)?.origins {
+        if source.filter == session.filter
+            && checkpoint.frame == cursor
+            && !handoff::is_fenced(view, &source.id()?)?
+        {
+            sources.push((source, checkpoint));
+        }
+    }
+    Ok(sources)
+}
+
 /// Install a same-filter predecessor's outgoing history this member cannot
 /// re-derive locally (it joined through an archive-anchored jump, or its
 /// records differ), fetched from an archive and accepted only if its chain
@@ -1041,6 +1062,12 @@ mod successor_tests {
         commit(&global, &state, 4);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!((successor.generation, successor.base_frame), (2, 3));
+        let view = CommittedView::capture(&global).unwrap();
+        let sources = predecessor_history_sources(&view, &successor, 3).unwrap();
+        assert_eq!(sources.len(), 1, "a sealed predecessor still requires its history");
+        assert_eq!(sources[0].0.id().unwrap(), source.id().unwrap());
+        assert!(predecessor_history_sources(&view, &successor, 2).unwrap().is_empty(),
+            "state below the checkpoint must be recovered first");
 
         let error = successor_state_matches(&global, &shard, &clock, &successor).unwrap_err();
         assert!(matches!(error, QuilError::ExecutionUnavailable(_)), "no acceptance on roots alone: {error}");
@@ -1294,6 +1321,9 @@ mod successor_tests {
         assert!(schedule::activated(&CommittedView::capture(&global).unwrap(), &request.id().unwrap()).unwrap());
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!(successor.base_frame, 3);
+        assert!(predecessor_history_sources(
+            &CommittedView::capture(&global).unwrap(), &successor, 3,
+        ).unwrap().is_empty(), "a fenced predecessor has no certified history to audit");
 
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
         let at_fence = crdt();
