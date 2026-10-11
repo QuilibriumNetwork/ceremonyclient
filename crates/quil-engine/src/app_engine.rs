@@ -3501,6 +3501,8 @@ impl AppConsensusEngine {
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                                             "shard commonware-simplex consensus running after transport readiness");
                                     }
+                                    Err(e) if expected_admission_wait(&e) => info!(core_id = self.core_id,
+                                        "app worker preparing; awaiting allocation activation"),
                                     Err(e) => warn!(core_id = self.core_id, error = %e,
                                         "failed to start shard simplex after transport readiness — will retry"),
                                 }
@@ -3548,6 +3550,7 @@ impl AppConsensusEngine {
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
+                        self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
                             "app consensus host died; rebuilding it");
                         if let Some(dead) = self.cw_handle.take() {
@@ -3569,7 +3572,9 @@ impl AppConsensusEngine {
                             Err(e) => {
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
-                                if quil_types::consensus::committee_handoff_policy().is_some() {
+                                if expected_admission_wait(&e) {
+                                    debug!(core_id = self.core_id, "app worker awaiting allocation activation");
+                                } else if quil_types::consensus::committee_handoff_policy().is_some() {
                                     info!(core_id = self.core_id, error = %e, "cw retry: app consensus not startable yet");
                                 } else {
                                     debug!(
@@ -3636,6 +3641,9 @@ impl AppConsensusEngine {
                             }
                         }
                     }
+                    if self.cw_handle.as_ref().is_some_and(|host| !host.is_dead()) {
+                        self.observe_consensus_phase();
+                    }
                 }
 
                 // Shutdown
@@ -3666,6 +3674,7 @@ impl AppConsensusEngine {
                 warn!(core_id = self.core_id, error = %e, "app consensus host stopped with an error");
             }
         }
+        self.execution.state("stopped", "engine exited");
     }
 
     /// Stop the engine.
@@ -3729,6 +3738,7 @@ impl AppConsensusEngine {
         self.publish_seal(&submission.1);
         self.sealed_session = Some(submission);
         self.seal_published_at = Some(std::time::Instant::now());
+        self.execution.state("handoff", "awaiting successor");
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "sealed app consensus host stopped with an error");
@@ -3869,6 +3879,7 @@ impl AppConsensusEngine {
                     }
                 }
                 self.cw_session = None;
+                self.execution.state("handoff", "awaiting successor");
             }
             Err(error) => debug!(core_id = self.core_id, error = %error, "committee session status unavailable"),
         }
@@ -4062,18 +4073,51 @@ impl AppConsensusEngine {
         crate::app_shard_metadata::has_committed_shard_data(hg, &self.filter)
     }
 
+    /// Refresh only from authenticated lifecycle state and local staging.
+    /// Progress, quorum and peer traffic remain separate observations.
+    fn observe_consensus_phase(&self) {
+        use quil_execution::global_intrinsic::handoff::{schedule, CommittedView};
+        let session_id = match self.cw_session.as_ref().map(|session| session.id()).transpose() {
+            Ok(id) => id,
+            Err(_) => { self.execution.state("unknown", "session identity unavailable"); return; }
+        };
+        let sealed_id = self.sealed_session.as_ref().map(|(id, _)| *id);
+        let ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire);
+        let closing = if ready && !(session_id.is_some() && session_id == sealed_id) {
+            let closing = self.cw_session.as_ref().map(|session| {
+                let global = self.global_hypergraph.as_ref().ok_or_else(||
+                    QuilError::ExecutionUnavailable("GLOBAL state unavailable".into()))?;
+                let view = CommittedView::capture(global)?;
+                Ok::<_, QuilError>(schedule::closing_request(&view, session)?.is_some())
+            }).transpose();
+            match closing {
+                Ok(closing) => closing.unwrap_or(false),
+                Err(_) => { self.execution.state("unknown", "session state unavailable"); return; }
+            }
+        } else { false };
+        self.execution.consensus_phase(ready, closing, session_id, sealed_id);
+    }
+
     async fn start_consensus_cw(
         &mut self,
         signer: Box<dyn quil_types::crypto::Signer>,
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
         let result = self.start_consensus_cw_observed(signer).await;
         match &result {
-            Ok(_) => self.execution.state("running", ""),
+            Ok(_) => self.observe_consensus_phase(),
             Err(error) => {
                 let text = error.to_string();
+                if expected_admission_wait(error) {
+                    self.execution.state("waiting", "awaiting allocation activation");
+                    return result;
+                }
+                if text.contains("awaiting its successor") {
+                    self.execution.state("handoff", "awaiting successor");
+                    return result;
+                }
                 let blocker = if text.contains("sealed checkpoint") { "checkpoint mismatch" }
-                    else if text.contains("awaiting its successor") { "awaiting successor" }
                     else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") { "state unavailable" }
+                    else if text.contains("committee build failed") { "committee admission unavailable" }
                     else { "consensus startup unavailable" };
                 self.execution.state("blocked", blocker);
             }
@@ -4248,6 +4292,15 @@ impl AppConsensusEngine {
         self.cw_committee_fp = Some(Self::committee_fp(&member_pubkeys));
         let my_sk = bls_signer.private_key().to_vec();
         let my_pk = bls_signer.public_key().to_vec();
+        if !member_pubkeys.iter().any(|key| key == &my_pk) {
+            let frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+            if self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
+                .is_some_and(|p| p.allocations.iter().any(|a| a.confirmation_filter == filter
+                    && a.effective_status(frame) == quil_types::consensus::EffectiveStatus::Joining)) {
+                return Err(QuilError::ExecutionUnavailable("awaiting allocation activation".into()));
+            }
+        }
         let (scheme, peers) = match session.as_ref() {
             Some(session) => crate::cw_app_seams::build_session_committee(session, &my_sk, &my_pk),
             None => crate::cw_app_seams::build_app_committee(&member_pubkeys, &my_sk, &my_pk, &app_address),
@@ -5785,6 +5838,10 @@ impl AppConsensusEngine {
         self.drain_proposal_cache();
         self.pending_certified_parents.retain(|&r, _| r >= cutoff || self.retry_parent_seals.contains(&r));
     }
+}
+
+fn expected_admission_wait(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason) if reason == "awaiting allocation activation")
 }
 
 /// How bootstrap authenticates one of its two frames.
@@ -7440,6 +7497,13 @@ pub(crate) fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expected_admission_wait_is_distinct_from_preparation_failure() {
+        assert!(expected_admission_wait(&QuilError::ExecutionUnavailable("awaiting allocation activation".into())));
+        assert!(!expected_admission_wait(&QuilError::ExecutionUnavailable("sealed checkpoint mismatch".into())));
+        assert!(!expected_admission_wait(&QuilError::Consensus("committee admission unavailable".into())));
+    }
+
 
     /// A member re-installs its shard when proposals fail its pre-state, or,
     /// at a session base, when the seals it refuses are all it sees: the
