@@ -291,6 +291,36 @@ fn an_unfinalized_parent_executes_privately_without_touching_canonical_state() {
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
 }
 
+/// A retained parent can outlive its execution view while canonical
+/// materialization stays at the same base. Rebuild it from authenticated
+/// bodies instead of returning the unusable cache entry forever.
+#[test]
+fn a_closed_or_failed_private_parent_is_rebuilt_without_canonical_writes() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let sequence = rig.db.inner().latest_sequence_number();
+    let prepared = executor.prepare(digest, RANK).unwrap();
+    assert!(Arc::ptr_eq(&prepared, &executor.prepare(digest, RANK).unwrap()));
+    prepared._branch.overlay().close();
+    let fresh = executor.prepare(digest, RANK).unwrap();
+    assert!(!Arc::ptr_eq(&prepared, &fresh));
+    assert_eq!(cursor(&fresh.crdt, &rig.filter), Some(1));
+    assert!(fresh._branch.overlay().ensure_readable().is_ok());
+    assert!(Arc::ptr_eq(&fresh, &executor.prepare(digest, RANK).unwrap()));
+
+    fresh._branch.overlay().record_execution_failure();
+    let recovered = executor.prepare(digest, RANK).unwrap();
+    assert!(!Arc::ptr_eq(&fresh, &recovered));
+    assert_eq!(cursor(&recovered.crdt, &rig.filter), Some(1));
+    assert!(recovered._branch.overlay().ensure_readable().is_ok());
+    assert!(Arc::ptr_eq(&recovered, &executor.prepare(digest, RANK).unwrap()));
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+    assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    assert!(rig.clock.get_shard_clock_frame(&rig.filter, 1, false).is_err());
+}
+
 /// A restart can leave several frames notarized but not finalized above the
 /// materialized tip (e.g. 5403 and 5404 above 5402, with every member
 /// abstaining). The chain up to the selected parent executes privately,

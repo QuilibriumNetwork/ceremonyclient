@@ -222,7 +222,9 @@ impl AppParentExecutor {
             .map_err(|_| unavailable("private parent cache poisoned"))?;
         let tip = self.tip()?;
         if let Some(existing) = prepared.as_ref() {
-            if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor {
+            if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor
+                && existing._branch.overlay().ensure_readable().is_ok()
+            {
                 return Ok(existing.clone());
             }
         }
