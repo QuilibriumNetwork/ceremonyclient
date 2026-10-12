@@ -91,6 +91,8 @@ pub(crate) struct PeerScore {
     peer_stats: HashMap<PeerId, PeerStats>,
     /// Tracking peers per IP.
     peer_ips: HashMap<IpAddr, HashSet<PeerId>>,
+    /// Protocol-authorized peers exempt only from the shared-IP penalty.
+    ip_colocation_peer_whitelist: HashSet<PeerId>,
     /// Message delivery tracking. This is a time-cache of [`DeliveryRecord`]s.
     deliveries: TimeCache<MessageId, DeliveryRecord>,
     /// Callback for monitoring message delivery times.
@@ -260,13 +262,19 @@ impl PeerScore {
             thresholds,
             peer_stats: HashMap::new(),
             peer_ips: HashMap::new(),
+            ip_colocation_peer_whitelist: HashSet::new(),
             deliveries: TimeCache::new(Duration::from_secs(TIME_CACHE_DURATION)),
             message_delivery_time_callback: callback,
         }
     }
 
+    /// Replace the protocol-authorized IP-penalty exemptions.
+    pub(crate) fn set_ip_colocation_peer_whitelist(&mut self, peers: HashSet<PeerId>) {
+        self.ip_colocation_peer_whitelist = peers;
+    }
+
     /// Returns the score report for a peer, with applied penalties.
-    /// This is called from the heartbeat
+    /// This is called from the heartbeat.
     pub(crate) fn score_report(&self, peer_id: &PeerId) -> PeerScoreReport {
         let mut report = PeerScoreReport::default();
         let Some(peer_stats) = self.peer_stats.get(peer_id) else {
@@ -360,8 +368,9 @@ impl PeerScore {
         report.score += p5 * self.params.app_specific_weight;
 
         // P6: IP collocation factor
+        let exempt = self.ip_colocation_peer_whitelist.contains(peer_id);
         for ip in peer_stats.known_ips.iter() {
-            if self.params.ip_colocation_factor_whitelist.contains(ip) {
+            if exempt || self.params.ip_colocation_factor_whitelist.contains(ip) {
                 continue;
             }
 
