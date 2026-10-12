@@ -126,6 +126,7 @@ pub struct AllocationRow {
     pub execution: Option<quil_types::proto::node::WorkerExecution>,
     /// A shard-info row was actually returned for this allocation.
     pub shard_info_known: bool,
+    pub allocation_reason: Option<String>,
     pub filter: Vec<u8>,
     pub filter_key: String,
     pub filter_hex: String,
@@ -670,6 +671,7 @@ impl Model {
                 global_head: None,
                 execution,
                 shard_info_known: false,
+                allocation_reason: None,
                 filter: a.filter.clone(),
                 filter_key: filter_hex.clone(),
                 filter_hex: filter_hex.clone(),
@@ -696,6 +698,7 @@ impl Model {
             if let Some(info) = reward_by_filter.get(&filter_hex) {
                 row.global_head = info.global_head.clone();
                 row.shard_info_known = true;
+                row.allocation_reason = info.allocation_reason.clone();
                 row.ring = reward_ring(info);
                 row.active_provers = info.active_provers;
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
@@ -722,6 +725,7 @@ impl Model {
                         global_head: reward_by_filter.get(&filter_hex).and_then(|info| info.global_head.clone()),
                         execution: w.execution.clone(),
                         shard_info_known: false,
+                        allocation_reason: None,
                         filter: w.filter.clone(),
                         filter_key: format!("worker:{}", w.core_id),
                         filter_hex,

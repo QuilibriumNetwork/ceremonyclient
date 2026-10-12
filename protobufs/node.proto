@@ -391,6 +391,8 @@ message ShardRewardInfo {
   // Absent on older servers; false means ring/reward are unavailable.
   optional bool ring_known = 10;
   GlobalAppFrameHead global_head = 11;
+  // Recorded local proposal intent; absent on older servers or without history.
+  optional string allocation_reason = 14;
 }
 
 message GetShardInfoRequest {

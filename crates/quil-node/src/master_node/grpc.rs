@@ -1557,11 +1557,15 @@ pub(crate) fn spawn_all(
         // RPC reached a non-archive node, which tried a raw BlossomSub
         // publish and bounced.
         let send_transport = prover_pipeline.transport.clone();
+        let send_lifecycle = prover_pipeline.lifecycle.clone();
+        let send_owner = prover_address.to_vec();
         let send_handler: quil_rpc::SendHandler = Arc::new(
             move |domain: Vec<u8>, payload: Vec<u8>, authentication: Vec<u8>|
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
                 let p2p = send_p2p.clone();
                 let transport = send_transport.clone();
+                let lifecycle = send_lifecycle.clone();
+                let owner = send_owner.clone();
                 let ed448_pub = peer_ed448_pub.clone();
                 Box::pin(async move {
                     if domain.len() != 32 {
@@ -1593,6 +1597,18 @@ pub(crate) fn spawn_all(
                         return Err(format!("authentication failed: {:?}", e));
                     }
                     if domain.iter().all(|&b| b == 0xff) {
+                        if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&payload) {
+                            for request in bundle.requests.into_iter().flatten() {
+                                if request.inner_type_prefix == quil_execution::global_intrinsic::prover_filter_ops::TYPE_PROVER_LEAVE {
+                                    if let Ok(leave) = quil_execution::global_intrinsic::prover_filter_ops::ProverLeave::from_canonical_bytes(&request.inner_bytes) {
+                                        if leave.public_key_signature_bls48581.as_ref().is_some_and(|sig| sig.address == owner) {
+                                            lifecycle.allocation_reasons.record(&leave.filters, false, leave.frame_number, "M")
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Global-prover-domain bundle (Join / Leave /
                         // Confirm / Resume / Reject / AltShard /
                         // Delegate). Route through the transport so a
@@ -1669,6 +1685,7 @@ pub(crate) fn spawn_all(
                         wm.set_pending_filter_frame(core_id, frame).map_err(|e| format!("set_pending_filter_frame {core_id}: {e}"))?;
                     }
                 }
+                pp.lifecycle.allocation_reasons.record(&filters, true, frame, "M").map_err(|e| e.to_string())?;
                 let filters_for_task = filters.clone();
                 let worker_ids_for_task = worker_ids.clone();
                 join_spawner.detach("request-join-submit", async move {
@@ -1719,6 +1736,7 @@ pub(crate) fn spawn_all(
     node_rpc_builder = node_rpc_builder.with_workers_view(workers_view.clone());
 
     struct LocalShardInfoProvider {
+        lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
         allocation_scoring_strategy: &'static str,
         registry: Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
@@ -1749,6 +1767,23 @@ pub(crate) fn spawn_all(
         fn get_shard_info(&self, include_all: bool)
             -> quil_types::error::Result<(Vec<quil_types::consensus::ShardDetail>, u64, num_bigint::BigInt, u64, num_bigint::BigInt)>
         {
+            let mut result = self.get_shard_info_inner(include_all)?;
+            let own = self.registry.get_prover_info(&self.self_address)?;
+            for detail in &mut result.0 {
+                if let Some(a) = own.as_ref().and_then(|p| p.allocations.iter().find(|a| a.confirmation_filter == detail.filter)) {
+                    let joining = a.effective_status(result.3) == quil_types::consensus::EffectiveStatus::Joining;
+                    if joining || a.effective_status(result.3) == quil_types::consensus::EffectiveStatus::Leaving {
+                        detail.allocation_reason = self.lifecycle.allocation_reasons.reason(&detail.filter, joining,
+                            if joining { a.join_frame_number } else { a.leave_frame_number });
+                    }
+                }
+            }
+            Ok(result)
+        }
+    }
+    impl LocalShardInfoProvider {
+        fn get_shard_info_inner(&self, include_all: bool)
+            -> quil_types::error::Result<(Vec<quil_types::consensus::ShardDetail>, u64, num_bigint::BigInt, u64, num_bigint::BigInt)> {
             let cf = self.current_frame.effective();
             let (difficulty, frame_number) = match self.clock_store.get_latest_global_clock_frame() {
                 Ok(frame) => {
@@ -1991,6 +2026,7 @@ pub(crate) fn spawn_all(
     }
 
     node_rpc_builder = node_rpc_builder.with_shard_info_provider(Arc::new(LocalShardInfoProvider {
+        lifecycle: prover_pipeline.lifecycle.clone(),
         allocation_scoring_strategy: if config.engine.reward_strategy == "reward-greedy" {
             "reward-greedy"
         } else { "data-greedy" },

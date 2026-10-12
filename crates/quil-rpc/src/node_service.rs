@@ -1290,6 +1290,7 @@ impl NodeService for NodeRpcServer {
         let mut shards = Vec::with_capacity(details.len());
         for (i, d) in details.iter().enumerate() {
             shards.push(node::ShardRewardInfo {
+                allocation_reason: d.allocation_reason.clone(),
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
                 ring: d.ring,
@@ -1910,6 +1911,7 @@ mod shard_world_size_tests {
             -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
             let count = if include_all { 2 } else { 1 };
             let details = (1..=count).map(|id| ShardDetail {
+                allocation_reason: Some("$".into()),
                 filter: vec![id], shard_size: BigInt::from(1000 * u32::from(id)),
                 active_provers: 8, ring: 0, ring_known: id == 1, estimated_reward: BigInt::from(7),
                 is_allocated: id == 1, data_shards: 1, materialized_frame: 10, latest_frame: 10,
@@ -1928,6 +1930,7 @@ mod shard_world_size_tests {
             assert_eq!(response.allocation_scoring_strategy, "reward-greedy");
             assert_eq!(response.shards[0].ring_known, Some(true));
             let response = <node::GetShardInfoResponse as prost::Message>::decode(prost::Message::encode_to_vec(&response).as_slice()).unwrap();
+            assert_eq!(response.shards[0].allocation_reason.as_deref(), Some("$"));
             assert_eq!(response.shards[0].global_head.as_ref().map(|head| (head.frame, head.global_frame, head.generation)), Some((0, 12, 2)));
             if include_all { assert!(response.shards[1].global_head.is_none()); }
             if include_all { assert_eq!(response.shards[1].ring_known, Some(false)); }

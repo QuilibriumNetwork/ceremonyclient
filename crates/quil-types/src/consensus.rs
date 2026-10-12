@@ -894,6 +894,8 @@ pub trait RewardIssuance: Send + Sync {
 /// Shard detail for info queries.
 #[derive(Debug, Clone)]
 pub struct ShardDetail {
+    /// Recorded local proposal intent; absent when historical intent is unavailable.
+    pub allocation_reason: Option<String>,
     /// Whether the reward position is established or explicitly projected.
     pub ring_known: bool,
     pub filter: Vec<u8>,

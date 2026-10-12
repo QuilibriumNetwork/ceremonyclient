@@ -745,8 +745,16 @@ fn warning_slot(text: &str, color_coding: bool) -> String {
     }
 }
 
-pub(super) fn allocation_status_text(_m: &Model, a: &AllocationRow) -> String {
-    a.status_name.clone()
+pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
+    if !matches!(a.status_name.as_str(), "joining" | "leaving") { return a.status_name.clone(); }
+    let (symbol, name) = match a.allocation_reason.as_deref() {
+        Some("$") => ("$", "reward"), Some("H") => ("H", "halt risk"),
+        Some("S") => ("S", "split"), Some("G") => ("G", "merge"), Some("T") => ("T", "retired"),
+        Some("E") => ("E", "empty"), Some("C") => ("C", "capacity"),
+        Some("O") => ("O", "orphan"), Some("M") => ("M", "manual"),
+        Some("D") => ("D", "data"), _ => ("?", "unknown"),
+    };
+    format!("{}({})", a.status_name, if m.compact_actions { symbol } else { name })
 }
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
@@ -868,8 +876,9 @@ fn alloc_widths_fixed(
             .map(|a| printed_width(&alloc_display_cell(m, a, 10, 0))),
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&alloc_header(m, 8))), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 8, 0))));
+    let status_w = fit(STATUS_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 12, 0))));
     // Whatever the wide columns took comes out of the flexible Filter column.
-    let grown = (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
+    let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -897,7 +906,7 @@ fn alloc_widths_fixed(
         STATE_WIDTH,
         reward_w,
         WORKER_WIDTH,
-        STATUS_WIDTH,
+        status_w,
         MODE_WIDTH,
         NEXT_ACTION_WIDTH,
         DEFAULT_ACTION_WIDTH,
@@ -2038,6 +2047,7 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Strategy", "H → $: halt-risk first, then reward; H → D: halt-risk first, then data. Expanded mode spells out the priorities"),
         kv("Compact balance", "[Q]: authenticated claimable funds at the cited frame; [Q/d]: estimated daily rewards. Expand to show Claimable and Reward labels"),
         kv("Compact rewards", "Now: current net estimate; Paused: paused; Δ: joining minus leaving. Zero breakdown fields are omitted; unknown values remain visible. These are estimates, not measured earnings"),
+        kv("Allocation reasons", "$ reward; H halt risk; S split; G merge; T retired; E empty; C capacity; O orphan; M manual; D data; ? unavailable history. n expands names and details. Joining and leaving use recorded local intent; current counts never establish history"),
         kv("Status", "joining, active, paused, leaving, rejected, kicked;"),
         kv("", "expiredJoin / expiredLeave: confirm window missed;"),
         kv("", "re-confirm!: the allocation's epoch is stale but recoverable"),
@@ -3048,6 +3058,7 @@ mod tests {
         AllocationRow {
             global_head: None,
             execution: None,
+            allocation_reason: None,
             shard_info_known: true,
             filter: Vec::new(),
             filter_key: hex.to_string(),
@@ -3424,7 +3435,7 @@ mod tests {
             w,
             vec![
                 6,  // "Select"
-                24, // Filter — what the pane has left
+                15, // Filter — what the pane has left
                 7,  // "Provers"
                 4,  // "Ring"
                 9,  // "Size [GB]"
@@ -3435,13 +3446,13 @@ mod tests {
                 9,  // "Execution"
                 12, // "Reward [Q/d]"
                 7,  // "↑Worker", including the active sort arrow
-                8, // "joining" plus marker position, wider than "Status"
+                17, // "joining(unknown)" plus marker position, wider than "Status"
                 4,  // "Mode"
                 13, // "(pause|leave)", wider than "NextAction"
                 16, // "activate@f699840", wider than "DefaultAction"
             ]
         );
-        assert_eq!(fw, 24);
+        assert_eq!(fw, 15);
         // 16 columns + 15 separators + 2 borders fill the pane exactly.
         assert_eq!(w.iter().sum::<usize>() + 15 + 2, 171);
     }
@@ -3458,7 +3469,10 @@ mod tests {
 
     #[test]
     fn no_cell_overflows_its_column() {
-        for m in [Model::new(), fixed()] {
+        let mut expanded = fixed();
+        expanded.compact_actions = false;
+        expanded.compact_units = false;
+        for m in [Model::new(), fixed(), expanded] {
             let rows = joining_table();
             let (w, fw) = alloc_col_widths(&m, 165, &rows);
             for (c, width) in w.iter().enumerate() {
@@ -3495,9 +3509,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 184, &rows).1, 37);
+        assert_eq!(alloc_col_widths(&m, 184, &rows).1, 28);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 171, &rows).1, 24);
+        assert_eq!(alloc_col_widths(&m, 171, &rows).1, 15);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
@@ -3902,6 +3916,35 @@ mod compact_action_tests {
         assert!(m.compact_units && m.compact_actions);
         super::super::update::handle_key(&mut m, key('n'));
         assert!(!m.compact_units && !m.compact_actions);
+        super::super::update::handle_key(&mut m, key('n'));
+        assert!(m.compact_units && m.compact_actions);
+        assert_eq!(header_text("Size [GB]", 4, 7, true, false, m.compact_units), "[GB]");
+    }
+
+    #[test]
+    fn reasons_actions_and_units_share_one_display_toggle() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = Model::new();
+        let mut a = super::tests::row("aa", 1, 1, 7, "", "");
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for status in ["joining", "leaving"] {
+            a.status_name = status.into();
+            for (symbol, name) in [("$", "reward"), ("H", "halt risk"), ("S", "split"), ("G", "merge"), ("T", "retired"), ("E", "empty"), ("C", "capacity"), ("O", "orphan"), ("M", "manual"), ("D", "data")] {
+                a.allocation_reason = Some(symbol.into());
+                assert_eq!(allocation_status_text(&m, &a), format!("{status}({symbol})"));
+                super::super::update::handle_key(&mut m, key('n'));
+                assert_eq!(allocation_status_text(&m, &a), format!("{status}({name})"));
+                super::super::update::handle_key(&mut m, key('n'));
+            }
+        }
+        a.allocation_reason = None;
+        assert_eq!(allocation_status_text(&m, &a), "leaving(?)");
+        assert!(m.compact_units && m.compact_actions);
+        super::super::update::handle_key(&mut m, key('n'));
+        assert!(!m.compact_units && !m.compact_actions);
+        assert_eq!(allocation_status_text(&m, &a), "leaving(unknown)");
+        a.status_name = "active".into();
+        assert_eq!(allocation_status_text(&m, &a), "active");
         super::super::update::handle_key(&mut m, key('n'));
         assert!(m.compact_units && m.compact_actions);
         assert_eq!(header_text("Size [GB]", 4, 7, true, false, m.compact_units), "[GB]");
