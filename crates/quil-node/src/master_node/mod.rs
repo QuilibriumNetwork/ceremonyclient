@@ -12,6 +12,7 @@ pub(crate) mod grpc;
 pub(crate) mod keys;
 pub(crate) mod message_loop;
 mod shard_sender;
+mod committee_peer_policy;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;

@@ -376,6 +376,11 @@ impl BlossomSubBehaviour {
         }).count()
     }
 
+    /// Exempt authorized committee peers from IP-colocation only.
+    pub fn set_committee_peers(&mut self, peers: HashSet<PeerId>) {
+        self.inner.set_ip_colocation_peer_whitelist(peers);
+    }
+
     /// Read-only access to our own subscription set.
     pub fn subscriptions(&self) -> &HashSet<Vec<u8>> {
         &self.subscriptions
