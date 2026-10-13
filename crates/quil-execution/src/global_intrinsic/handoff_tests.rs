@@ -1389,6 +1389,58 @@ fn a_re_seal_of_a_notarized_seal_closes_the_source_at_the_same_frame() {
     assert_eq!(closed_checkpoint(&state, &reseal.session).unwrap().unwrap(), reseal.checkpoint);
 }
 
+/// A re-seal's checkpoint names the notarized seal's view, not its data
+/// frame's. That frame, the session tip GLOBAL executed, stays verifiable as
+/// history (archives ingest its body after the seal); GLOBAL header execution
+/// still refuses it, and nothing else at or past the checkpoint passes.
+#[test]
+fn a_re_sealed_checkpoint_keeps_its_data_frame_verifiable_as_history() {
+    use super::frames::{verify, verify_history, FrameClaim};
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5f; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let source = &request.sources[0];
+    let notarized = submission(&request, 0, &keys, 6).seal;
+    let reseal = Seal {
+        view: 14,
+        checkpoint: Checkpoint { view: notarized.view, ..notarized.checkpoint.clone() },
+        ..notarized.clone()
+    };
+    let data = notarized.checkpoint.clone();
+    let tip = FrameClaim { filter: &filter, frame: data.frame, view: data.view, parent: &[0x21; 32], digest: data.digest };
+    let tip_cert = sign_certificate(source, &keys, tip.view, 4, tip.digest);
+    let earlier = FrameClaim { frame: 5, view: 4, digest: [0x32; 32], ..tip };
+    let earlier_cert = sign_certificate(source, &keys, 4, 3, earlier.digest);
+    record_session_tip(&state, 3, &reseal.session, &data).unwrap();
+    let finalized = CertificateSubmission {
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.view, reseal.digest()),
+        seal: reseal,
+    };
+    assert!(super::apply_submission(&state, 3, &finalized).unwrap());
+    commit(&state, 3);
+    let committed = CommittedView::capture(state.crdt()).unwrap();
+
+    assert!(verify_history(&committed, &tip, &tip_cert).unwrap().is_some());
+    assert!(verify_history(&committed, &earlier, &earlier_cert).unwrap().is_some());
+    let refused = verify(&committed, &tip, &tip_cert).err().unwrap();
+    assert!(refused.to_string().contains("outside the terminal checkpoint"), "{refused}");
+    assert!(verify(&committed, &earlier, &earlier_cert).unwrap().is_some());
+
+    // Another frame at the checkpoint, the tip's digest at another view
+    // below the seal's, and a frame past it.
+    let forked = FrameClaim { digest: [0x34; 32], ..tip };
+    let other_view = FrameClaim { view: 7, ..tip };
+    let beyond = FrameClaim { frame: 7, view: 15, digest: [0x35; 32], ..tip };
+    for claim in [forked, other_view, beyond] {
+        let certificate = sign_certificate(source, &keys, claim.view, 4, claim.digest);
+        let error = verify_history(&committed, &claim, &certificate).err().unwrap();
+        assert!(error.to_string().contains("outside the terminal checkpoint"), "{error}");
+    }
+}
+
 /// A session asked to close before its first frame seals at its base; when
 /// that seal is notarized but never finalized, its re-seal names the genesis
 /// at the notarized seal's view. GLOBAL refuses it before the seal recovery

@@ -1124,12 +1124,20 @@ pub(crate) type AppIngestCell =
 /// against the pre-state (the check execution itself applies first) require
 /// their bodies, so an invalid header, which execution skips, cannot stall the
 /// chain. Every archive decides this from the same state.
+///
+/// A frame that keeps waiting names the shards and frames it waits for: the
+/// wait itself was silent, and an archive sat on one GLOBAL frame for two
+/// days with nothing in its log but the stall.
 fn sequenced_ingest_hook(
     cell: AppIngestCell,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
     prover_registry: Arc<quil_execution::SharedProverRegistry>,
 ) -> quil_engine::global_finalization::SequencedIngest {
+    const QUIET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    const WAIT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    // (GLOBAL frame, waiting since, last logged)
+    let wait: std::sync::Mutex<Option<(u64, std::time::Instant, Option<std::time::Instant>)>> = Default::default();
     Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
         use quil_execution::global_intrinsic::{conversions, prover_shard_update};
         use quil_types::proto::global::message_request::Request;
@@ -1158,11 +1166,28 @@ fn sequenced_ingest_hook(
             *entry = (*entry).max(op.frame_number);
         }
         let mut ingest = ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut ready = true;
-        for (address, frame_number) in through {
-            ready &= ingest.materialize_through(&address, frame_number)?;
+        let mut missing = Vec::new();
+        for (address, through) in through {
+            if !ingest.materialize_through(&address, through)? {
+                let held = ingest.materialized_height(&address).unwrap_or(0);
+                missing.push(format!("{}: frame {} of {through}", hex::encode(&address), held + 1));
+            }
         }
-        Ok(ready)
+        if missing.is_empty() {
+            return Ok(true);
+        }
+        let mut wait = wait.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = std::time::Instant::now();
+        let (_, since, logged) = match wait.as_mut() {
+            Some(state) if state.0 == frame_number => state,
+            _ => wait.insert((frame_number, now, None)),
+        };
+        if since.elapsed() >= QUIET_WAIT && logged.is_none_or(|at| at.elapsed() >= WAIT_LOG_INTERVAL) {
+            *logged = Some(now);
+            warn!(frame = frame_number, waited_secs = since.elapsed().as_secs(), ?missing,
+                "GLOBAL frame waits for application frames this archive has not ingested");
+        }
+        Ok(false)
     })
 }
 

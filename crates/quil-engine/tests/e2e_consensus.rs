@@ -2235,12 +2235,14 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
     let handles = wm.snapshot_handles();
     assert_eq!(handles.len(), 1, "expected one engine handle");
 
-    // Wait for the spawned engine to emit at least one real
-    // `AppEngineEvent`. In a single-prover committee
-    // (quorum_threshold = 0), the leader's own proposal forms a QC
-    // immediately on self-vote, so `FrameProduced` / `VoteProduced`
-    // arrive quickly. A timeout here means the event-loop is
-    // busy-looping and starving the engine run-loop.
+    // Wait for the spawned engine to start its consensus (or emit any real
+    // `AppEngineEvent`). A committee of this node alone sends no consensus
+    // messages, so its start is read from the engine's own state. A timeout
+    // here means the event-loop is busy-looping and starving the engine
+    // run-loop.
+    let engine = handles[0].1.clone();
+    // The phases a started host reports (`SharedWorkerExecution::consensus_phase`).
+    let running = || matches!(engine.execution().state.as_str(), "serving" | "syncing" | "closing");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2250,7 +2252,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         let live = entries
             .iter()
             .any(|e| !e.starts_with("engine_panic") && e.as_str() != "engine_task_returned");
-        if live {
+        if live || running() {
             break;
         }
     }
@@ -2269,8 +2271,8 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         .filter(|e| !e.starts_with("engine_panic") && e.as_str() != "engine_task_returned")
         .collect();
     assert!(
-        !live.is_empty(),
-        "spawned engine produced no AppEngineEvent within 60s — \
-         single-prover event-loop is likely busy-looping"
+        !live.is_empty() || running(),
+        "spawned engine neither started consensus nor produced an AppEngineEvent \
+         within 60s — single-prover event-loop is likely busy-looping"
     );
 }

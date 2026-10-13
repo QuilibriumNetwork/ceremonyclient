@@ -57,7 +57,7 @@ pub enum DirectOutcome {
     Failed,
 }
 
-/// Counters for direct delivery, sent and received.
+/// Counters for direct delivery and gossip admission to the receive queue.
 #[derive(Default)]
 pub struct DirectStats {
     pub delivered: AtomicU64,
@@ -69,6 +69,12 @@ pub struct DirectStats {
     pub fallbacks: AtomicU64,
     pub received: AtomicU64,
     pub received_refused: AtomicU64,
+    /// Gossip messages admitted to the local application queue, not processed.
+    pub gossip_received: AtomicU64,
+    /// Gossip messages dropped because the application queue was full.
+    pub gossip_received_queue_full: AtomicU64,
+    /// Gossip messages dropped because the application receiver was closed.
+    pub gossip_received_queue_closed: AtomicU64,
 }
 
 /// A point-in-time copy of [`DirectStats`].
@@ -82,9 +88,24 @@ pub struct DirectStatsSnapshot {
     pub fallbacks: u64,
     pub received: u64,
     pub received_refused: u64,
+    pub gossip_received: u64,
+    pub gossip_received_queue_full: u64,
+    pub gossip_received_queue_closed: u64,
 }
 
 impl DirectStats {
+    pub(crate) fn note_gossip_receive<T>(
+        &self,
+        result: &Result<(), tokio::sync::mpsc::error::TrySendError<T>>,
+    ) {
+        let counter = match result {
+            Ok(()) => &self.gossip_received,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => &self.gossip_received_queue_full,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => &self.gossip_received_queue_closed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn note(&self, outcome: DirectOutcome) {
         let counter = match outcome {
             DirectOutcome::Delivered => &self.delivered,
@@ -107,6 +128,9 @@ impl DirectStats {
             fallbacks: get(&self.fallbacks),
             received: get(&self.received),
             received_refused: get(&self.received_refused),
+            gossip_received: get(&self.gossip_received),
+            gossip_received_queue_full: get(&self.gossip_received_queue_full),
+            gossip_received_queue_closed: get(&self.gossip_received_queue_closed),
         }
     }
 }
@@ -220,5 +244,54 @@ mod tests {
         stats.note(DirectOutcome::Unsupported);
         let snapshot = stats.snapshot();
         assert_eq!((snapshot.delivered, snapshot.unsupported, snapshot.failed), (2, 1, 0));
+    }
+
+    #[test]
+    fn gossip_queue_counts_admission_full_recovery_and_closed_without_changing_messages() {
+        let stats = DirectStats::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let message = |payload| crate::ReceivedMessage {
+            bitmask: vec![1, 2],
+            data: vec![payload],
+            from: vec![3, 4],
+            direct: false,
+        };
+        stats.note_gossip_receive(&tx.try_send(message(10)));
+        let full = tx.try_send(message(20));
+        stats.note_gossip_receive(&full);
+        assert!(matches!(full, Err(tokio::sync::mpsc::error::TrySendError::Full(_))));
+        let admitted = rx.try_recv().unwrap();
+        assert_eq!(admitted.bitmask, vec![1, 2]);
+        assert_eq!(admitted.data, vec![10]);
+        assert_eq!(admitted.from, vec![3, 4]);
+        assert!(!admitted.direct);
+        stats.note_gossip_receive(&tx.try_send(message(30)));
+        assert_eq!(rx.try_recv().unwrap().data, vec![30]);
+        drop(rx);
+        let closed = tx.try_send(message(40));
+        stats.note_gossip_receive(&closed);
+        assert!(matches!(closed, Err(tokio::sync::mpsc::error::TrySendError::Closed(_))));
+        assert_eq!(stats.snapshot(), DirectStatsSnapshot {
+            gossip_received: 2,
+            gossip_received_queue_full: 1,
+            gossip_received_queue_closed: 1,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn direct_outcomes_do_not_increment_gossip_queue_counters() {
+        let stats = DirectStats::default();
+        stats.note(DirectOutcome::Delivered);
+        stats.note(DirectOutcome::Refused);
+        stats.received.fetch_add(1, Ordering::Relaxed);
+        stats.received_refused.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(stats.snapshot(), DirectStatsSnapshot {
+            delivered: 1,
+            refused: 1,
+            received: 1,
+            received_refused: 1,
+            ..Default::default()
+        });
     }
 }

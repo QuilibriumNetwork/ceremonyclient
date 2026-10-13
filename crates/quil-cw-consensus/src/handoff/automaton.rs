@@ -312,7 +312,9 @@ impl HandoffProposer {
             if voting {
                 self.vote_roots(&Checkpoint { view: checkpoint.view, ..parent.checkpoint.clone() }, checkpoint);
             }
-            return Err(refused("checkpoint"));
+            // The local frame tells a member behind the checkpoint from one
+            // whose state differs at it.
+            return Err(refused(&format!("checkpoint (local frame {} {})", checkpoint.frame, short(&checkpoint.digest))));
         }
         // A seal at the base names the genesis at view zero; its re-seal names
         // the genesis at the seal's view, which GLOBAL accepts only from its

@@ -71,9 +71,17 @@ pub(crate) fn init(
     }
 
     std::fs::create_dir_all(&db_path)?;
-    let db = quil_store::RocksDb::open(&db_path)?;
+    let db = if archive_mode {
+        quil_store::RocksDb::open_archive(&db_path)?
+    } else {
+        quil_store::RocksDb::open(&db_path)?
+    };
     let db_arc = Arc::new(db);
-    info!(path = %db_path.display(), "opened database");
+    info!(
+        path = %db_path.display(),
+        block_cache_mb = db_arc.health().block_cache_capacity / (1024 * 1024),
+        "opened database"
+    );
 
     // ---------------------------------------------------------------
     // 2. Create stores

@@ -36,7 +36,9 @@ use crate::app_engine::{compute_requests_root, materialize_app_shard_requests};
 use crate::frame_validator::BlsAppFrameValidator;
 
 pub struct ArchiveAppShardIngest {
-    validator: BlsAppFrameValidator,
+    /// Shared with the gap fetch, which prepares a fetched frame's historical
+    /// storage registrations into it before the frame reaches this ingest.
+    validator: Arc<BlsAppFrameValidator>,
     execution_manager: Arc<quil_execution::ExecutionEngineManager>,
     inclusion_prover: Arc<dyn InclusionProver>,
     hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
@@ -92,9 +94,11 @@ impl ArchiveAppShardIngest {
             // (frame_validator: deterministic-output) hard-errors and the
             // archive rejects every post-genesis app frame at ingest, so it
             // never materializes app-shard state.
-            validator: BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
-                .with_clock_store(clock_store.clone())
-                .with_handoff_authority(hypergraph.clone()),
+            validator: Arc::new(
+                BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
+                    .with_clock_store(clock_store.clone())
+                    .with_handoff_authority(hypergraph.clone()),
+            ),
             clock_store,
             execution_manager,
             inclusion_prover,
@@ -135,9 +139,32 @@ impl ArchiveAppShardIngest {
         self
     }
 
+    /// Where to fetch a storage registration that neither this archive's
+    /// executed GLOBAL state nor its live registry holds: the one an app
+    /// frame's GLOBAL anchor names when this archive's execution is behind
+    /// that anchor. Executing the next GLOBAL frame first needs the app frames
+    /// it rewards, so an archive that fell behind could otherwise never
+    /// validate them or execute again: one sat at 869,765 for two days
+    /// ("historical storage registration unavailable at epoch 1208"). The
+    /// gap fetch prepares them ([`Self::validator`]); each proof is checked
+    /// against the root the anchor frame declares.
+    pub fn with_storage_history_source(mut self, source: crate::storage_history::GlobalVertexProofSource) -> Self {
+        self.validator = match Arc::try_unwrap(self.validator) {
+            Ok(validator) => Arc::new(validator.with_storage_history_source(source)),
+            Err(shared) => shared,
+        };
+        self
+    }
+
+    /// The validator this ingest checks frames with, for preparing a frame's
+    /// historical storage registrations without holding the ingest.
+    pub fn validator(&self) -> Arc<BlsAppFrameValidator> {
+        self.validator.clone()
+    }
+
     /// Read the cursor co-committed with app state. Read failures must not look
     /// like genesis and trigger reexecution against already advanced state.
-    fn materialized_height(&mut self, address: &[u8]) -> quil_types::error::Result<u64> {
+    pub fn materialized_height(&mut self, address: &[u8]) -> quil_types::error::Result<u64> {
         if let Some(&h) = self.last_materialized.get(address) {
             return Ok(h);
         }
@@ -233,9 +260,7 @@ impl ArchiveAppShardIngest {
         // no certificate of its own is one a certified descendant finalized
         // (see `admit`): it gets every check but the quorum here, and is only
         // ever materialized once a certified frame links to it.
-        let certified = frame.header.as_ref()
-            .and_then(|header| header.public_key_signature_bls48581.as_ref())
-            .is_some_and(|signature| !signature.signature.is_empty());
+        let certified = has_certificate(&frame);
         let validated = if certified { self.validator.validate(&frame) } else { self.validator.validate_proposal(&frame) };
         match validated {
             Ok(true) => {}
@@ -256,6 +281,7 @@ impl ArchiveAppShardIngest {
                 warn!(
                     frame = frame_number,
                     address = %hex::encode(&address[..address.len().min(8)]),
+                    certified,
                     error = %e,
                     "archive ingest: shard frame validation FAILED — rejecting"
                 );
@@ -518,6 +544,69 @@ impl ArchiveAppShardIngest {
         }
         Ok(reached)
     }
+}
+
+/// Frames above a gap-fetched frame without a certificate that the gap
+/// fetch follows to the certified descendant making it final: as many as
+/// the ingest holds without one.
+const MAX_LINKED_RUN: usize = MAX_HELD_FRAMES_PER_SHARD;
+
+fn has_certificate(frame: &AppShardFrame) -> bool {
+    frame.header.as_ref()
+        .and_then(|header| header.public_key_signature_bls48581.as_ref())
+        .is_some_and(|signature| !signature.signature.is_empty())
+}
+
+/// Prepare the historical storage registrations a gap-fetched frame's
+/// validation needs ([`BlsAppFrameValidator::prepare_storage_history`]),
+/// returning the frames to hand the ingest and whether preparing succeeded.
+///
+/// A frame without a certificate is final only through a certified
+/// descendant, and its registrations are fetched only once that descendant's
+/// certificate and every link down to the frame check out, as a member's
+/// archive replay does. The run up to the descendant comes from `fetch` and
+/// is handed over with the frame. The gap fetch used to prepare certified
+/// frames only, so the ingest refused such a frame on every retry and never
+/// asked for its descendant: one archive sat at GLOBAL 870,123 for 20 hours
+/// on frames 291–292 of a shard (2026-10-12).
+pub async fn prepare_gap_fetched<F, Fut>(
+    validator: &BlsAppFrameValidator,
+    frame: AppShardFrame,
+    mut fetch: F,
+) -> (Vec<AppShardFrame>, quil_types::error::Result<()>)
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<AppShardFrame>>,
+{
+    use quil_types::error::QuilError;
+    let mut run = vec![frame];
+    while let Some(parent) = run.last().filter(|frame| !has_certificate(frame)).and_then(|frame| frame.header.clone()) {
+        if run.len() > MAX_LINKED_RUN {
+            return (run, Err(QuilError::ExecutionUnavailable(format!(
+                "no certified descendant within {MAX_LINKED_RUN} frames"))));
+        }
+        let Some(child) = fetch(parent.frame_number + 1).await else {
+            return (run, Err(QuilError::ExecutionUnavailable(format!(
+                "certified descendant unavailable: frame {} not fetched", parent.frame_number + 1))));
+        };
+        if !child.header.as_ref().is_some_and(|child| crate::frame_validator::app_frame_links_to_child(&parent, child)) {
+            return (run, Err(QuilError::InvalidArgument(format!(
+                "fetched frame {} does not link to frame {}", parent.frame_number + 1, parent.frame_number))));
+        }
+        run.push(child);
+    }
+    let prepared = async {
+        let (descendant, linked) = run.split_last().expect("the run holds the fetched frame");
+        if !linked.is_empty() && !validator.validate_certified_without_storage(descendant)? {
+            return Err(QuilError::InvalidSignature("certified descendant of a gap-fetched frame is invalid".into()));
+        }
+        validator.prepare_storage_history(descendant).await?;
+        for frame in linked.iter().rev() {
+            validator.prepare_storage_history_of_linked(frame).await?;
+        }
+        Ok(())
+    }.await;
+    (run, prepared)
 }
 
 #[cfg(test)]

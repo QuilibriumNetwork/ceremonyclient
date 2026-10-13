@@ -1719,6 +1719,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 struct EngineCwTransport {
     filter: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppEngineEvent>,
+    /// The host's committee is this node alone, so it has no one to send to.
+    /// Its committee is the one it was built with (a session's members);
+    /// the node used to judge this from its prover registry, and a registry
+    /// lagging the session (a regular node's, after a split or reassignment)
+    /// silently dropped a real committee's messages (2026-10-13).
+    alone: bool,
 }
 impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     fn deliver(
@@ -1727,6 +1733,9 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
         recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
         bytes: Vec<u8>,
     ) {
+        if self.alone {
+            return;
+        }
         let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
             crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
             recipients.iter().map(|key| key.as_ref().to_vec()).collect()
@@ -3459,16 +3468,13 @@ impl AppConsensusEngine {
                                     // (the block is still verified at `verify`, so this
                                     // is authorization/DoS hardening, not a safety hole).
                                     if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
-                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data.as_slice()) {
-                                            if let Some(header) = frame.header.as_ref() {
-                                                let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
-                                                if header.frame_number > cursor.saturating_add(1) {
-                                                    let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
-                                                        filter: self.filter.clone(),
-                                                        missing_frames: vec![cursor.saturating_add(1)],
-                                                    });
-                                                }
-                                            }
+                                        let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
+                                        let session = || self.cw_session.as_ref().and_then(|session| session.id().ok());
+                                        if let Some(missing) = block_sync_from(&data, cursor, session) {
+                                            let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                                                filter: self.filter.clone(),
+                                                missing_frames: vec![missing],
+                                            });
                                         }
                                         (h.ingest_block)(data);
                                     } else {
@@ -3501,6 +3507,8 @@ impl AppConsensusEngine {
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                                             "shard commonware-simplex consensus running after transport readiness");
                                     }
+                                    Err(e) if expected_admission_wait(&e) => info!(core_id = self.core_id,
+                                        "app worker preparing; awaiting allocation activation"),
                                     Err(e) => warn!(core_id = self.core_id, error = %e,
                                         "failed to start shard simplex after transport readiness — will retry"),
                                 }
@@ -3548,6 +3556,7 @@ impl AppConsensusEngine {
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
+                        self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
                             "app consensus host died; rebuilding it");
                         if let Some(dead) = self.cw_handle.take() {
@@ -3569,7 +3578,9 @@ impl AppConsensusEngine {
                             Err(e) => {
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
-                                if quil_types::consensus::committee_handoff_policy().is_some() {
+                                if expected_admission_wait(&e) {
+                                    debug!(core_id = self.core_id, "app worker awaiting allocation activation");
+                                } else if quil_types::consensus::committee_handoff_policy().is_some() {
                                     info!(core_id = self.core_id, error = %e, "cw retry: app consensus not startable yet");
                                 } else {
                                     debug!(
@@ -3636,6 +3647,9 @@ impl AppConsensusEngine {
                             }
                         }
                     }
+                    if self.cw_handle.as_ref().is_some_and(|host| !host.is_dead()) {
+                        self.observe_consensus_phase();
+                    }
                 }
 
                 // Shutdown
@@ -3666,6 +3680,7 @@ impl AppConsensusEngine {
                 warn!(core_id = self.core_id, error = %e, "app consensus host stopped with an error");
             }
         }
+        self.execution.state("stopped", "engine exited");
     }
 
     /// Stop the engine.
@@ -3729,6 +3744,7 @@ impl AppConsensusEngine {
         self.publish_seal(&submission.1);
         self.sealed_session = Some(submission);
         self.seal_published_at = Some(std::time::Instant::now());
+        self.execution.state("handoff", "awaiting successor");
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "sealed app consensus host stopped with an error");
@@ -3869,6 +3885,7 @@ impl AppConsensusEngine {
                     }
                 }
                 self.cw_session = None;
+                self.execution.state("handoff", "awaiting successor");
             }
             Err(error) => debug!(core_id = self.core_id, error = %error, "committee session status unavailable"),
         }
@@ -4062,18 +4079,51 @@ impl AppConsensusEngine {
         crate::app_shard_metadata::has_committed_shard_data(hg, &self.filter)
     }
 
+    /// Refresh only from authenticated lifecycle state and local staging.
+    /// Progress, quorum and peer traffic remain separate observations.
+    fn observe_consensus_phase(&self) {
+        use quil_execution::global_intrinsic::handoff::{schedule, CommittedView};
+        let session_id = match self.cw_session.as_ref().map(|session| session.id()).transpose() {
+            Ok(id) => id,
+            Err(_) => { self.execution.state("unknown", "session identity unavailable"); return; }
+        };
+        let sealed_id = self.sealed_session.as_ref().map(|(id, _)| *id);
+        let ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire);
+        let closing = if ready && !(session_id.is_some() && session_id == sealed_id) {
+            let closing = self.cw_session.as_ref().map(|session| {
+                let global = self.global_hypergraph.as_ref().ok_or_else(||
+                    QuilError::ExecutionUnavailable("GLOBAL state unavailable".into()))?;
+                let view = CommittedView::capture(global)?;
+                Ok::<_, QuilError>(schedule::closing_request(&view, session)?.is_some())
+            }).transpose();
+            match closing {
+                Ok(closing) => closing.unwrap_or(false),
+                Err(_) => { self.execution.state("unknown", "session state unavailable"); return; }
+            }
+        } else { false };
+        self.execution.consensus_phase(ready, closing, session_id, sealed_id);
+    }
+
     async fn start_consensus_cw(
         &mut self,
         signer: Box<dyn quil_types::crypto::Signer>,
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
         let result = self.start_consensus_cw_observed(signer).await;
         match &result {
-            Ok(_) => self.execution.state("running", ""),
+            Ok(_) => self.observe_consensus_phase(),
             Err(error) => {
                 let text = error.to_string();
+                if expected_admission_wait(error) {
+                    self.execution.state("waiting", "awaiting allocation activation");
+                    return result;
+                }
+                if text.contains("awaiting its successor") {
+                    self.execution.state("handoff", "awaiting successor");
+                    return result;
+                }
                 let blocker = if text.contains("sealed checkpoint") { "checkpoint mismatch" }
-                    else if text.contains("awaiting its successor") { "awaiting successor" }
                     else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") { "state unavailable" }
+                    else if text.contains("committee build failed") { "committee admission unavailable" }
                     else { "consensus startup unavailable" };
                 self.execution.state("blocked", blocker);
             }
@@ -4248,6 +4298,15 @@ impl AppConsensusEngine {
         self.cw_committee_fp = Some(Self::committee_fp(&member_pubkeys));
         let my_sk = bls_signer.private_key().to_vec();
         let my_pk = bls_signer.public_key().to_vec();
+        if !member_pubkeys.iter().any(|key| key == &my_pk) {
+            let frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+            if self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
+                .is_some_and(|p| p.allocations.iter().any(|a| a.confirmation_filter == filter
+                    && a.effective_status(frame) == quil_types::consensus::EffectiveStatus::Joining)) {
+                return Err(QuilError::ExecutionUnavailable("awaiting allocation activation".into()));
+            }
+        }
         let (scheme, peers) = match session.as_ref() {
             Some(session) => crate::cw_app_seams::build_session_committee(session, &my_sk, &my_pk),
             None => crate::cw_app_seams::build_app_committee(&member_pubkeys, &my_sk, &my_pk, &app_address),
@@ -4371,6 +4430,7 @@ impl AppConsensusEngine {
             Arc::new(EngineCwTransport {
                 filter: filter.clone(),
                 event_tx: self.event_tx.clone(),
+                alone: member_pubkeys.len() == 1,
             });
 
         let partition = format!("app-{}", hex::encode(&app_address));
@@ -5787,6 +5847,10 @@ impl AppConsensusEngine {
     }
 }
 
+fn expected_admission_wait(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason) if reason == "awaiting allocation activation")
+}
+
 /// How bootstrap authenticates one of its two frames.
 #[derive(Debug, PartialEq, Eq)]
 enum BootstrapFrameRoute {
@@ -6639,6 +6703,24 @@ const PRE_STATE_MISMATCH_BOOTSTRAP: u64 = 6;
 /// At most one such self-heal per this interval.
 const PRE_STATE_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The frame a member materialized through `cursor` must sync from, when a
+/// received consensus block shows it is behind: a data frame more than one
+/// above it, or a seal of its own `session` over a checkpoint above it. A seal
+/// ends its session, so no later data frame comes to show a member that is
+/// behind its checkpoint (it missed that frame's finalization, or was down as
+/// the session closed), and a re-seal is voted only against the materialized
+/// checkpoint: such a member refuses every one until GLOBAL fences the
+/// session (2026-10-13).
+fn block_sync_from(bytes: &[u8], cursor: u64, session: impl FnOnce() -> Option<[u8; 32]>) -> Option<u64> {
+    let next = cursor.saturating_add(1);
+    if quil_cw_consensus::handoff::Seal::is_encoding(bytes) {
+        let seal = quil_cw_consensus::handoff::Seal::decode(bytes).ok()?;
+        return (seal.checkpoint.frame > cursor && session() == Some(seal.session)).then_some(next);
+    }
+    let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes).ok()?;
+    (frame.header?.frame_number > next).then_some(next)
+}
+
 /// Why this member's state looks like no one else's, given, since the last
 /// frame it materialized, the proposals whose pre-state it did not reproduce
 /// and the seals it verified that `agreed` with its state roots or
@@ -7440,6 +7522,13 @@ pub(crate) fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expected_admission_wait_is_distinct_from_preparation_failure() {
+        assert!(expected_admission_wait(&QuilError::ExecutionUnavailable("awaiting allocation activation".into())));
+        assert!(!expected_admission_wait(&QuilError::ExecutionUnavailable("sealed checkpoint mismatch".into())));
+        assert!(!expected_admission_wait(&QuilError::Consensus("committee admission unavailable".into())));
+    }
+
 
     /// A member re-installs its shard when proposals fail its pre-state, or,
     /// at a session base, when the seals it refuses are all it sees: the
@@ -7452,13 +7541,43 @@ mod tests {
         assert_eq!(disagreeing_state(0, 1, 40), None, "another leader proposed this member's roots");
     }
 
+    /// A member behind a closing session's checkpoint learns it from the
+    /// seals it receives, as it does from data frames ahead of it.
+    #[test]
+    fn a_seal_above_the_materialized_frame_requests_a_sync() {
+        use prost::Message as _;
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        let seal = |session: [u8; 32], frame: u64| Seal {
+            request: [1; 32],
+            session,
+            view: 955,
+            checkpoint: Checkpoint { frame, view: 900, digest: [2; 32], state_roots: [[3; 32]; 4], history_root: [4; 32] },
+        }.encode();
+        let ours = || Some([7; 32]);
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2504, ours), Some(2505));
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2500, ours), Some(2501));
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2505, ours), None, "materialized through its checkpoint");
+        assert_eq!(block_sync_from(&seal([8; 32], 2505), 2504, ours), None, "another session's seal");
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2504, || None), None, "no session running");
+        let mut truncated = seal([7; 32], 2505);
+        truncated.truncate(100);
+        assert_eq!(block_sync_from(&truncated, 2504, ours), None, "a malformed seal is not parsed as a frame");
+
+        let frame = |frame_number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader { frame_number, ..Default::default() }),
+            ..Default::default()
+        }.encode_to_vec();
+        assert_eq!(block_sync_from(&frame(2505), 2504, ours), None, "the next frame");
+        assert_eq!(block_sync_from(&frame(2506), 2504, ours), Some(2505));
+    }
+
     /// Resolver messages carry the members they are addressed to; votes,
     /// certificates and blocks go to the whole topic.
     #[test]
     fn only_resolver_messages_carry_their_recipients() {
         use crate::cw_app_seams::AppConsensusTransport as _;
         let (event_tx, mut events) = mpsc::unbounded_channel();
-        let transport = EngineCwTransport { filter: vec![1; 32], event_tx };
+        let transport = EngineCwTransport { filter: vec![1; 32], event_tx, alone: false };
         let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
         for (channel, expected) in [
             (crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, vec![vec![5u8; 897]]),
@@ -7474,6 +7593,20 @@ mod tests {
                 _ => panic!("expected a CwOut"),
             }
         }
+    }
+
+    /// Only a host whose own committee is this node alone stays silent; the
+    /// node's prover registry has no say in it.
+    #[test]
+    fn a_committee_of_this_node_alone_sends_nothing() {
+        use crate::cw_app_seams::AppConsensusTransport as _;
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let alone = EngineCwTransport { filter: vec![1; 32], event_tx, alone: true };
+        let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
+        for channel in [0, 1, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL] {
+            alone.deliver(channel, vec![member.clone()], vec![channel as u8]);
+        }
+        assert!(events.try_recv().is_err());
     }
 
     /// Each confidential bundle is proposed by exactly one live shard, the

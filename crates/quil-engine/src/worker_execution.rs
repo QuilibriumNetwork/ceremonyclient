@@ -27,6 +27,21 @@ impl SharedWorkerExecution {
         s.observed_unix_ms = now_ms();
     }
 
+    /// Observed host phase, independent of frame progress or voting health.
+    /// A retained seal belongs only to its own session, not its successor.
+    pub fn consensus_phase(&self, ready: bool, closing: bool, session: Option<[u8; 32]>, sealed: Option<[u8; 32]>) {
+        let (state, reason) = if session.is_some() && session == sealed {
+            ("handoff", "awaiting successor")
+        } else if !ready {
+            ("syncing", "staging shard data")
+        } else if closing {
+            ("closing", "awaiting closing certificate")
+        } else {
+            ("serving", "")
+        };
+        self.state(state, reason);
+    }
+
     pub fn restored(&self, height: u64) {
         let mut s = self.0.lock().unwrap();
         s.materialized_frame = Some(height);
@@ -207,6 +222,26 @@ mod tests {
         s.state("running", "");
         assert!(s.snapshot().blocker.is_empty());
         assert!(s.snapshot().observed_unix_ms > 0);
+    }
+
+    #[test]
+    fn consensus_phases_follow_readiness_and_the_current_session_seal() {
+        let execution = SharedWorkerExecution::default();
+        execution.restored(0);
+        execution.consensus_phase(false, false, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "syncing");
+        execution.consensus_phase(true, false, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "serving");
+        assert_eq!(execution.snapshot().last_advance_unix_ms, 0, "serving is not a progress claim");
+        execution.consensus_phase(true, true, Some([1; 32]), None);
+        assert_eq!(execution.snapshot().state, "closing");
+        execution.consensus_phase(false, true, Some([1; 32]), Some([1; 32]));
+        assert_eq!(execution.snapshot().state, "handoff");
+        execution.consensus_phase(true, false, Some([2; 32]), Some([1; 32]));
+        assert_eq!(execution.snapshot().state, "serving", "an old seal must not label a successor as waiting");
+        assert!(execution.snapshot().blocker.is_empty());
+        execution.consensus_phase(true, false, None, None);
+        assert_eq!(execution.snapshot().state, "serving", "legacy hosts have no session seal");
     }
 
     #[tokio::test]

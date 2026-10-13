@@ -978,12 +978,13 @@ impl P2PNode {
                                         message, ..
                                     } => {
                                         // Moved, not copied: the event owns the message.
-                                        let _ = msg_tx.try_send(ReceivedMessage {
+                                        let result = msg_tx.try_send(ReceivedMessage {
                                             bitmask: message.bitmask,
                                             data: message.data,
                                             from: message.from,
                                             direct: false,
                                         });
+                                        direct_stats.note_gossip_receive(&result);
                                     }
                                     BlossomSubEvent::Subscribed { peer_id, bitmask } => {
                                         debug!(%peer_id, bitmask = hex::encode(&bitmask), "peer subscribed");
@@ -1035,6 +1036,11 @@ impl P2PNode {
                             }
                             Some(P2PCommand::SubscribedPeerCount { bitmask, ack }) => {
                                 let _ = ack.send(swarm.behaviour().blossomsub.subscribed_peer_count(&bitmask));
+                            }
+                            Some(P2PCommand::SetCommitteePeers { peers, ack }) => {
+                                let count = peers.len();
+                                swarm.behaviour_mut().blossomsub.set_committee_peers(peers);
+                                let _ = ack.send(count);
                             }
                             Some(P2PCommand::Unsubscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.unsubscribe(&bitmask);
@@ -1192,6 +1198,18 @@ impl P2PHandle {
         self.cmd_tx.send(P2PCommand::SubscribedPeerCount { bitmask, ack: ack_tx }).await
             .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
         ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into()))
+    }
+
+    /// Refresh peers derived from committed committees; never trust PeerInfo
+    /// for this exemption. Only the IP-colocation penalty is exempted.
+    pub async fn set_committee_peers(&self, peers: std::collections::HashSet<PeerId>) -> quil_types::error::Result<usize> {
+        if peers.len() > 16_384 {
+            return Err(QuilError::P2p("committee peer policy exceeds its bounds".into()));
+        }
+        let (ack, received) = oneshot::channel();
+        self.cmd_tx.send(P2PCommand::SetCommitteePeers { peers, ack }).await
+            .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
+        received.await.map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
     }
 
     /// Register a blossomsub-level validator on `bitmask` that filters stale
@@ -1561,6 +1579,7 @@ enum P2PCommand {
     Subscribe(Vec<u8>),
     SubscribeConfirmed { bitmask: Vec<u8>, ack: oneshot::Sender<()> },
     SubscribedPeerCount { bitmask: Vec<u8>, ack: oneshot::Sender<usize> },
+    SetCommitteePeers { peers: std::collections::HashSet<PeerId>, ack: oneshot::Sender<usize> },
     Unsubscribe(Vec<u8>),
     /// Install a per-(source, target) gossip forward filter. Used by the
     /// devnet test proxy to impose bipartite network partitions.

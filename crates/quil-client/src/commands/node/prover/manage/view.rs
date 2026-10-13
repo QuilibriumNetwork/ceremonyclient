@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, advance_age, recovery, recovery_summary, sealed, seal_summary};
+use super::super::local_execution::{local_execution_state, observed, advance_age, recovery, recovery_summary, sealed, seal_summary};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -1642,7 +1642,7 @@ fn update_app_progress_warning(m: &mut Model) {
     let rows: Vec<_> = m.allocations.iter().filter(|a| matches!(a.reward_status(m.epoch_frame(), m.epoch_length), Some(EffectiveStatus::Active | EffectiveStatus::Leaving)))
         .filter(|a| !matches!(m.execution_state(a.execution.as_ref()), "waiting" | "syncing" | "closing" | "handoff")).collect();
     let known = m.reachable && !rows.is_empty() && rows.iter().all(|a| {
-        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && matches!(local_execution_state(Some(e)), "starting" | "running" | "serving" | "blocked" | "stopped"))
+        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && observed(local_execution_state(Some(e))))
     });
     if !known { m.app_progress_observed_since = None; m.app_stall_time = None; return; }
     let observed = m.app_progress_observed_since.get_or_insert_with(std::time::Instant::now);
@@ -3361,6 +3361,36 @@ mod tests {
         m.cached_worker_info = None;
         assert!(worker_counts_line(&m).to_string().contains("Auto ? | Manual ?"));
         assert!(alloc_title(&m, &[]).to_string().contains("Status: Active 3 | Paused 1"));
+    }
+
+    /// Nodes report lifecycle phases; older nodes report `running`. Both
+    /// show as themselves, and only a host with no frames warns.
+    #[test]
+    fn lifecycle_phases_show_and_color_like_running() {
+        use quil_types::proto::node::WorkerExecution;
+        let m = Model::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let worker = |state: &str, frame: u64| {
+            let mut a = row("01", 2, 1, 7, "", "");
+            a.execution = Some(WorkerExecution { state: state.into(), observed_unix_ms: now,
+                materialized_frame: Some(frame), ..Default::default() });
+            a
+        };
+        for (state, color) in [("running", SUCCESS), ("serving", SUCCESS), ("syncing", HELP), ("closing", HELP),
+            ("handoff", HELP), ("waiting", HELP), ("starting", HELP), ("blocked", ERROR), ("stopped", ERROR)] {
+            let a = worker(state, 124);
+            assert_eq!(alloc_cell(&m, &a, 9, 12), state);
+            assert_eq!(local_color(&m, &a), color, "{state}");
+            assert!(!local_warning(&m, &a), "{state}");
+        }
+        for state in ["running", "serving"] {
+            let a = worker(state, 0);
+            assert!(local_warning(&m, &a), "{state}");
+            assert_eq!(local_color(&m, &a), Color::Yellow, "{state}");
+        }
+        for state in ["syncing", "closing", "handoff", "waiting"] {
+            assert!(!local_warning(&m, &worker(state, 0)), "{state}");
+        }
     }
 
     #[test]

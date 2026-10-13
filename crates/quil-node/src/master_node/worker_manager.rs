@@ -989,25 +989,11 @@ pub(crate) fn init(
                                         }
                                         debug!(core_id, filter = %hex::encode(&filter), channel, bytes = bytes.len(),
                                             "publishing shard CW message");
-                                        // A committee of one has nobody to send to: every
-                                        // publish would fail and retry for half a minute, and a
-                                        // lone Simplex host turns views quickly. A live run logged
-                                        // about 230,000 such warnings in seventeen minutes.
-                                        {
-                                            use quil_types::consensus::ProverRegistry as _;
-                                            use quil_types::store::ClockStore as _;
-                                            let frame = drain_clock.get_latest_global_clock_frame().ok()
-                                                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-                                            // Exactly one member, and it is this node. An empty
-                                            // answer (a registry still loading) is NOT a committee
-                                            // of one: dropping a real committee's votes on it would
-                                            // be far worse than a few wasted retries.
-                                            if drain_registry.get_active_provers(&filter, frame)
-                                                .is_ok_and(|members| members.len() == 1 && members[0].public_key == drain_pubkey)
-                                            {
-                                                continue;
-                                            }
-                                        }
+                                        // A committee of one sends nothing: its engine knows
+                                        // its committee (`EngineCwTransport::alone`). Judged
+                                        // here from this node's prover registry, a registry
+                                        // lagging the session's committee silently dropped
+                                        // every message of a real one.
                                         let p2p = drain_p2p.clone();
                                         let committee_peers = drain_committee_peers.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {

@@ -691,6 +691,21 @@ impl ExecutionOverlay {
         })
     }
 
+    /// The captured database view this branch and its forks read beneath
+    /// their writes, whatever they wrote: `None` once closed, or when its
+    /// database watches no keys. A cache of that view's rows, updated with
+    /// [`Self::written_keys_under`], matches this branch.
+    pub fn base_capture_point(&self) -> Option<quil_types::store::CapturePoint> {
+        let inner = self.lock_cleanup();
+        let base = inner.base.as_ref()?;
+        base._db.watched_prefixes()?;
+        Some(quil_types::store::CapturePoint {
+            database: base._db.instance(),
+            sequence: base.sequence,
+            watched: base.watched?,
+        })
+    }
+
     /// Every key this branch put or deleted under `prefixes`; `None` when a
     /// deleted range reaches into one of them, whose keys cannot be listed.
     pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {

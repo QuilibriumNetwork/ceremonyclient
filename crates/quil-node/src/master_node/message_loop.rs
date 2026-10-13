@@ -283,6 +283,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // those whose worker lacks `DeliverShardConsensus` (an older build).
         let mut remote_direct_timer = tokio::time::interval(std::time::Duration::from_secs(5));
         remote_direct_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut committee_peer_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+        committee_peer_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let committee_peer_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut last_committee_peers = std::collections::HashSet::new();
+        let mut pending_committee_policy: Option<(std::collections::HashSet<quil_p2p::PeerId>, Arc<std::sync::atomic::AtomicBool>)> = None;
         let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let remote_direct_unsupported: Arc<parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>> =
             Default::default();
@@ -342,6 +347,52 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 p2p_for_recv.revoke_direct(topic).await;
                             }
                         }
+                    }
+                }
+                _ = committee_peer_timer.tick() => {
+                    if !committee_peer_busy.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some((peers, applied)) = pending_committee_policy.take() {
+                            if applied.load(std::sync::atomic::Ordering::Acquire) { last_committee_peers = peers; }
+                        }
+                    }
+                    use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+                    let mut filters: std::collections::BTreeSet<Vec<u8>> =
+                        shard_engines_for_recv.read().keys().cloned().collect();
+                    if let Some(remote) = remote_workers_for_recv.get() {
+                        filters.extend(remote.served_filters());
+                    }
+                    // Read one committed snapshot, then drop it before any await.
+                    let desired = CommittedView::capture(&crdt_for_recv).and_then(|view|
+                        super::committee_peer_policy::collect(&filters, |filter| handoff::head(&view, filter)));
+                    match desired {
+                        Ok(peers) if peers != last_committee_peers => {
+                            if committee_peer_busy.compare_exchange(false, true,
+                                std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
+                            {
+                                let guard = super::committee_peer_policy::RefreshGuard(committee_peer_busy.clone());
+                                let p2p = p2p_for_recv.clone();
+                                // Keep a failed update retryable, including timeout/cancellation.
+                                let expected = peers.clone();
+                                let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let applied_for_task = applied.clone();
+                                spawner.detach("committee-peer-policy", async move {
+                                    let _guard = guard;
+                                    match tokio::time::timeout(std::time::Duration::from_secs(2), p2p.set_committee_peers(peers)).await {
+                                        Ok(Ok(count)) => {
+                                            applied_for_task.store(true, std::sync::atomic::Ordering::Release);
+                                            info!(committee_peers = count, "committed committee IP-colocation exemptions refreshed");
+                                        }
+                                        Ok(Err(error)) => warn!(%error, "committee peer policy refresh failed"),
+                                        Err(_) => warn!("committee peer policy refresh timed out"),
+                                    }
+                                    Ok(())
+                                });
+                                // Result is observed on the next tick, without blocking ingress.
+                                pending_committee_policy = Some((expected, applied));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, "committed committee peer policy unavailable"),
                     }
                 }
                 _ = status_timer.tick() => {
@@ -409,6 +460,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         direct_failed = direct.failed,
                         direct_received = direct.received,
                         direct_received_refused = direct.received_refused,
+                        gossip_received = direct.gossip_received,
+                        gossip_received_queue_full = direct.gossip_received_queue_full,
+                        gossip_received_queue_closed = direct.gossip_received_queue_closed,
                         rdrop_peer_info = router_drops_peer_info,
                         rdrop_prover = router_drops_prover,
                         rdrop_frame = router_drops_frame,

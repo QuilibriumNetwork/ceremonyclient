@@ -74,8 +74,31 @@ fn certify(frame: &mut AppShardFrame, signer: &quil_crypto::FalconSigner, global
     });
 }
 
-#[tokio::test]
-async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipping_possession() {
+/// A certified storage-bearing frame whose registration aged out of the live
+/// registry, and the archive state that still proves it.
+struct AgedOutRegistration {
+    member: [u8; 32],
+    leaf_id: Vec<u8>,
+    global_frame: u64,
+    epoch: u64,
+    archive: Archive,
+    root: [u8; 32],
+    proof: Vec<u8>,
+    clock: Arc<quil_store::testing::InMemoryClockStore>,
+    registry: Arc<crate::test_support::TestProverRegistry>,
+    frame: AppShardFrame,
+    signer: quil_crypto::FalconSigner,
+    output: Vec<u8>,
+}
+
+fn aged_out_registration(requests_root: Vec<u8>) -> AgedOutRegistration {
+    aged_out_registration_attested(requests_root, &[1])
+}
+
+/// [`aged_out_registration`] with the attestation bound to `bitmask`: the
+/// certificate's (`[1]`), or none (`[]`) for a frame that will carry no
+/// certificate of its own.
+fn aged_out_registration_attested(requests_root: Vec<u8>, bitmask: &[u8]) -> AgedOutRegistration {
     quil_crypto::init();
     let member = [7; 32];
     let filter = [8; 32];
@@ -101,7 +124,7 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
         })
         .collect();
     let (attestation, attestation_root): (StorageAttestation, _) =
-        quil_crypto::porep::build_frame_storage_attestation(&openings, 95, &rho, &[1], poly);
+        quil_crypto::porep::build_frame_storage_attestation(&openings, 95, &rho, bitmask, poly);
     let archive = Archive::new(&member, &leaf_id);
     let mut tree = materialize::create_leaf_root_vertex_tree(
         &member,
@@ -170,12 +193,31 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
             state_roots: vec![vec![0; 32]; 4],
             prover: member.to_vec(),
             storage_attestation_root: attestation_root,
+            requests_root,
             ..Default::default()
         }),
         requests: vec![],
         storage_attestation: Some(attestation),
     };
     certify(&mut frame, &signer, &output);
+    AgedOutRegistration { member, leaf_id, global_frame, epoch, archive, root, proof, clock, registry, frame, signer, output }
+}
+
+/// A proof source serving `proof` for `root`'s record, counting requests.
+fn serving(root: [u8; 32], address: [u8; 32], proof: Vec<u8>, calls: Arc<AtomicUsize>) -> GlobalVertexProofSource {
+    Arc::new(move |requested_root, requested_address| {
+        assert_eq!(requested_root, root);
+        assert_eq!(requested_address, address);
+        calls.fetch_add(1, Ordering::SeqCst);
+        let bytes = proof.clone();
+        Box::pin(async move { Ok(Some(bytes)) })
+    })
+}
+
+#[tokio::test]
+async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipping_possession() {
+    let AgedOutRegistration { member, leaf_id, global_frame, epoch, archive, root, proof, clock, registry, frame, .. } =
+        aged_out_registration(Vec::new());
     let validator = || {
         BlsAppFrameValidator::new(
             registry.clone(),
@@ -192,17 +234,7 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
     assert!(validator().validate(&frame).is_err());
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let source: GlobalVertexProofSource = {
-        let calls = calls.clone();
-        let address = archive.address;
-        Arc::new(move |requested_root, requested_address| {
-            assert_eq!(requested_root, root);
-            assert_eq!(requested_address, address);
-            calls.fetch_add(1, Ordering::SeqCst);
-            let bytes = proof.clone();
-            Box::pin(async move { Ok(Some(bytes)) })
-        })
-    };
+    let source = serving(root, archive.address, proof, calls.clone());
     let remote = validator().with_storage_history_source(source.clone());
     assert!(matches!(
         remote.validate(&frame),
@@ -323,6 +355,156 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
             .frame_number,
         global_frame + 20
     );
+}
+
+/// An archive whose GLOBAL execution is behind an app frame's anchor holds
+/// neither that anchor's root nor the registration in its live registry, so
+/// its ingest refused the frame; GLOBAL execution waited on that frame, and
+/// the archive sat at 869,765 for two days (2026-10-11). Its gap fetch now
+/// prepares the registration from another archive into the validator the
+/// ingest checks with.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_behind_a_frames_anchor_fetches_its_registration_and_ingests_it() {
+    use quil_types::store::ClockStore as _;
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+    let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+    let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+        inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
+        crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+    ));
+    let filter = [8; 32];
+    let requests_root = crate::app_engine::compute_requests_root(
+        &[], &filter, 95, Some(manager.as_ref()), Some(inclusion.as_ref()), crdt.has_forest(),
+    )
+    .unwrap();
+    let aged = aged_out_registration(requests_root);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ingest = crate::archive_ingest::ArchiveAppShardIngest::new(
+        aged.registry.clone(),
+        Arc::new(quil_crypto::FalconKeyConstructor),
+        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        manager,
+        inclusion,
+        crdt,
+        aged.clock.clone(),
+    )
+    .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), calls.clone()))
+    .sequenced();
+    let bytes = prost::Message::encode_to_vec(&aged.frame);
+    let served = || aged.clock.get_shard_clock_frame(&filter, 95, false).ok();
+
+    ingest.ingest(&bytes);
+    assert_eq!(served(), None, "refused before its registration is prepared");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "ingest itself never waits on a peer");
+    ingest.validator().prepare_storage_history(&aged.frame).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    ingest.ingest(&bytes);
+    assert_eq!(served(), Some(aged.frame.clone()));
+}
+
+/// A frame final only through its certified child carries no certificate of
+/// its own. The gap fetch prepared certified frames only, so the ingest
+/// refused such a frame on every retry and never asked for the child: an
+/// archive sat at GLOBAL 870,123 for 20 hours (2026-10-12). The gap fetch now
+/// fetches the child and prepares the frame once the child's certificate and
+/// the link check out, and nothing before.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child() {
+    use crate::archive_ingest::prepare_gap_fetched;
+    use quil_types::store::ClockStore as _;
+    let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+    let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+    let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+    let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+        inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
+        crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+    ));
+    let filter = [8; 32];
+    let requests_root = |number| crate::app_engine::compute_requests_root(
+        &[], &filter, number, Some(manager.as_ref()), Some(inclusion.as_ref()), crdt.has_forest(),
+    )
+    .unwrap();
+    let aged = aged_out_registration_attested(requests_root(95), &[]);
+    let mut frame = aged.frame.clone();
+    frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    let child_signed_by = |signer: &quil_crypto::FalconSigner, parent: &AppShardFrame| {
+        let mut child = AppShardFrame {
+            header: Some(FrameHeader {
+                address: filter.to_vec(),
+                frame_number: 96,
+                rank: 96,
+                global_frame_number: aged.global_frame,
+                timestamp: 2,
+                state_roots: vec![vec![0; 32]; 4],
+                prover: aged.member.to_vec(),
+                parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output).unwrap().to_vec(),
+                requests_root: requests_root(96),
+                ..Default::default()
+            }),
+            requests: vec![],
+            storage_attestation: None,
+        };
+        certify(&mut child, signer, &aged.output);
+        child
+    };
+    let child = child_signed_by(&aged.signer, &frame);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut ingest = crate::archive_ingest::ArchiveAppShardIngest::new(
+        aged.registry.clone(),
+        Arc::new(quil_crypto::FalconKeyConstructor),
+        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        manager.clone(),
+        inclusion.clone(),
+        crdt.clone(),
+        aged.clock.clone(),
+    )
+    .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), calls.clone()))
+    .sequenced();
+    let validator = ingest.validator();
+    let served = |number| aged.clock.get_shard_clock_frame(&filter, number, false).ok();
+    let fetched = |offered: Option<AppShardFrame>| move |number: u64| {
+        let offered = offered.clone().filter(|frame| frame.header.as_ref().is_some_and(|h| h.frame_number == number));
+        async move { offered }
+    };
+
+    ingest.ingest(&prost::Message::encode_to_vec(&frame));
+    assert_eq!(served(95), None, "refused before its registration is prepared");
+
+    // No child, a child that does not link, one without a certificate and
+    // one certified by a stranger authenticate nothing: no peer is asked.
+    let mut stranger_parent = frame.clone();
+    stranger_parent.header.as_mut().unwrap().output[0] ^= 1;
+    let mut uncertified = child.clone();
+    uncertified.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    for offered in [
+        None,
+        Some(child_signed_by(&aged.signer, &stranger_parent)),
+        Some(uncertified),
+        Some(child_signed_by(&quil_crypto::FalconSigner::generate(), &frame)),
+    ] {
+        let (frames, prepared) = prepare_gap_fetched(&validator, frame.clone(), fetched(offered)).await;
+        assert!(prepared.is_err());
+        assert_eq!(frames[0], frame);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "authenticate before remote reads");
+    }
+
+    let (frames, prepared) = prepare_gap_fetched(&validator, frame.clone(), fetched(Some(child.clone()))).await;
+    prepared.unwrap();
+    assert_eq!(frames, vec![frame.clone(), child.clone()]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for delivered in &frames {
+        ingest.ingest(&prost::Message::encode_to_vec(delivered));
+    }
+    assert_eq!(served(95), Some(frame.clone()));
+    assert_eq!(served(96), Some(child.clone()));
+
+    // A certified frame is prepared on its own, as before.
+    let (frames, prepared) = prepare_gap_fetched(&validator, child.clone(), fetched(None)).await;
+    prepared.unwrap();
+    assert_eq!(frames, vec![child]);
 }
 
 /// A legacy certificate signed by a committee today's registry no longer

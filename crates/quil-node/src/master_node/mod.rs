@@ -12,6 +12,7 @@ pub(crate) mod grpc;
 pub(crate) mod keys;
 pub(crate) mod message_loop;
 mod shard_sender;
+mod committee_peer_policy;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;
@@ -1236,9 +1237,13 @@ pub(crate) async fn start(
     // Fetched frames are fed back through the consensus loopback so they take
     // exactly the same verify-store-and-materialize path as gossiped ones.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(128);
+    // The archive ingest's validator, once built below.
+    let gap_validator: Arc<std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>> =
+        Default::default();
     if archive_mode {
         let pool = archive_pool.clone();
         let loopback = consensus_loopback_tx.clone();
+        let gap_validator = gap_validator.clone();
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
         let gap_network = config.p2p.network;
@@ -1251,6 +1256,7 @@ pub(crate) async fn start(
                 let pool = pool.clone();
                 let loopback = loopback.clone();
                 let key = key.clone();
+                let validator = gap_validator.get().cloned();
                 // The shard's own members first: they produced the frame and
                 // keep it, and they publish a stream endpoint for exactly this
                 // filter. Another archive is only a fallback, and a poor one:
@@ -1316,10 +1322,50 @@ pub(crate) async fn start(
                     }
                     match recovered {
                         Some((source, frame)) => {
-                            let data = prost::Message::encode_to_vec(&frame);
-                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %source,
+                            // Validation needs the storage registrations the
+                            // frames' GLOBAL anchors name; an archive whose
+                            // execution is behind those anchors fetches them
+                            // here, off the ingest lock. A frame without a
+                            // certificate comes with the run up to its
+                            // certified descendant, the source asked first.
+                            let frames = match validator.as_ref() {
+                                Some(validator) => {
+                                    let fetch = |number: u64| {
+                                        let order: Vec<String> = std::iter::once(source.clone())
+                                            .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
+                                            .collect();
+                                        let filter = filter.clone();
+                                        async move {
+                                            for addr in order {
+                                                let attempt = tokio::time::timeout(PER_ENDPOINT, async {
+                                                    let mut client = quil_rpc::ArchiveClient::connect_mtls(&addr, key).await.ok()?;
+                                                    client.get_app_shard_frame(filter.clone(), number).await.ok().flatten()
+                                                });
+                                                if let Ok(Some(frame)) = attempt.await {
+                                                    if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
+                                                        return Some(frame);
+                                                    }
+                                                }
+                                            }
+                                            None
+                                        }
+                                    };
+                                    let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
+                                    if let Err(error) = prepared {
+                                        tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                            "app-shard gap fetch: historical storage registrations unavailable");
+                                    }
+                                    frames
+                                }
+                                None => vec![frame],
+                            };
+                            let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
+                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, through, %source,
                                 "app-shard gap fetch recovered a missing frame");
-                            let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                            for frame in frames {
+                                let data = prost::Message::encode_to_vec(&frame);
+                                let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                            }
                         }
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             tried = endpoints.len(), ?failures,
@@ -1335,7 +1381,7 @@ pub(crate) async fn start(
     // Archive-only: ingest full app-shard frames into the archive's CRDT
     // so it holds (and can serve via HyperSync) every shard's state.
     let archive_app_shard_ingest = if archive_mode {
-        Some(Arc::new(std::sync::Mutex::new(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
+        let ingest = quil_engine::archive_ingest::ArchiveAppShardIngest::new(
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             Arc::new(quil_crypto::FalconKeyConstructor)
                 as Arc<dyn quil_types::crypto::BlsConstructor>,
@@ -1344,7 +1390,13 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ).with_gap_fetch(gap_tx).sequenced())))
+        ).with_gap_fetch(gap_tx).sequenced();
+        let ingest = match mtls_seed.map(|_| falcon_signing_key.clone()) {
+            Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(archive_pool.clone(), key)),
+            None => ingest,
+        };
+        let _ = gap_validator.set(ingest.validator());
+        Some(Arc::new(std::sync::Mutex::new(ingest)))
     } else {
         None
     };

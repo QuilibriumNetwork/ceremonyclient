@@ -19,7 +19,19 @@ pub struct GlobalParentLimits {
     /// Cooperative deadline, checked between reads, execution and proving.
     /// Blocking crypto is not preempted; hard lifetime/disk policy is separate.
     pub max_elapsed: Duration,
+    /// How long an executed unfinalized ancestry is reused before it is
+    /// executed again from a fresh capture; at most five minutes.
+    pub max_kept_age: Duration,
 }
+
+/// Every child of a kept execution reads through the database view it was
+/// captured on, which the process admission releases at
+/// `quil_forest::DEFAULT_EXECUTION_VIEW_MAX_AGE`. At half of that, a
+/// preparation that starts just inside it still finishes (`max_elapsed`)
+/// long before the view goes. It also bounds how long the view keeps old
+/// database versions from compaction.
+const MAX_KEPT_EXECUTION_AGE: Duration = Duration::from_secs(300);
+const _: () = assert!(MAX_KEPT_EXECUTION_AGE.as_secs() * 2 <= quil_forest::DEFAULT_EXECUTION_VIEW_MAX_AGE.as_secs());
 
 impl Default for GlobalParentLimits {
     fn default() -> Self {
@@ -62,6 +74,7 @@ impl Default for GlobalParentLimits {
             max_proposal_message_bytes: 8 << 20,
             max_proposal_message_items: 100_000,
             max_elapsed: Duration::from_secs(60),
+            max_kept_age: MAX_KEPT_EXECUTION_AGE,
         }
     }
 }
@@ -128,9 +141,48 @@ pub struct GlobalParentExecutor {
     limits: GlobalParentLimits,
     active: Arc<AtomicBool>,
     authenticated: std::sync::Mutex<AuthenticatedAncestors>,
+    /// Used and replaced only under the execution lease.
+    executed: std::sync::Mutex<Option<ExecutedAncestry>>,
     /// Highest frame whose certified finalization waits to be published here
     /// ([`Self::note_finalized`]).
     finalized: std::sync::atomic::AtomicU64,
+}
+
+/// Ancestors an earlier preparation executed above the published base,
+/// kept unchanged. Until a notarized chain finalizes, every proposal and
+/// every vote needs it executed. Executing it again each time took a slower
+/// archive 30 s of a 35 s view for two such frames, so it never voted or
+/// proposed in time; with another member far behind, no view reached 4 of 5
+/// and GLOBAL halted at 874,880 (2026-10-11). A preparation over the same
+/// base whose ancestry starts with exactly these frames works in a child of
+/// this branch and executes only the frames above them.
+struct ExecutedAncestry {
+    /// Executed through the highest of `frames`; never proved or voted in.
+    branch: MaterializerBranch,
+    base: ExecutedBaseKey,
+    /// The executed frames, lowest first. Reuse compares whole frames, not
+    /// identities: an identity does not cover every header field.
+    frames: Vec<GlobalFrame>,
+    /// Bundles those frames consumed.
+    consumed: Vec<Vec<u8>>,
+    /// When its database view was captured; every child reads through it.
+    captured: Instant,
+}
+
+/// The published base an execution was captured over.
+#[derive(PartialEq)]
+struct ExecutedBaseKey {
+    frame: GlobalFrame,
+    checkpoint: Option<GlobalExecutionCheckpoint>,
+    state: ParentState,
+}
+
+/// A child of the kept execution, ready to execute the rest of an ancestry.
+struct KeptExecution {
+    branch: MaterializerBranch,
+    executed: usize,
+    consumed: Vec<Vec<u8>>,
+    captured: Instant,
 }
 
 /// Ancestors of an earlier preparation, by identity: each linked by parent
@@ -226,6 +278,9 @@ pub(crate) struct PreparedGlobalParent {
     /// The base state is this node's own receipted execution, not a re-synced
     /// or unreceipted tree.
     receipted_base: bool,
+    /// Ancestors taken from a kept execution rather than executed here.
+    #[cfg(test)]
+    kept: usize,
     // Last: storage and provider handles are released before another lease.
     _admission: Admission,
 }
@@ -233,6 +288,10 @@ pub(crate) struct PreparedGlobalParent {
 impl PreparedGlobalParent {
     pub(crate) fn ancestors(&self) -> &[GlobalFrame] {
         &self.ancestry
+    }
+    #[cfg(test)]
+    pub(crate) fn kept_ancestors(&self) -> usize {
+        self.kept
     }
     pub(crate) fn check(&self) -> Result<()> {
         if self.started.elapsed() > self.max_elapsed {
@@ -518,7 +577,8 @@ impl GlobalParentExecutor {
             .header
             .as_ref()
             .ok_or_else(|| unavailable("finalized GLOBAL frame has no header"))?;
-        self.source
+        let published = self
+            .source
             .materialize_atomically(frame, self.limits.branch.for_finalized_frame(), |branch| {
                 let cursor = branch.cursor()?;
                 let base = self.executed_base(branch, verifier)?;
@@ -546,7 +606,12 @@ impl GlobalParentExecutor {
                     ));
                 }
                 Ok(true)
-            })
+            })?;
+        if published.is_some() {
+            // The base moved: an execution kept over the old one is spent.
+            self.release_executed(|_| true);
+        }
+        Ok(published)
     }
 
     /// This node's own GLOBAL execution is in use: a proposal, verification or
@@ -591,6 +656,7 @@ impl GlobalParentExecutor {
             limits,
             active: Arc::new(AtomicBool::new(false)),
             authenticated: Default::default(),
+            executed: Default::default(),
             finalized: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -607,6 +673,12 @@ impl GlobalParentExecutor {
     /// some 25 shard headers took about 5 s.
     pub(crate) fn publication_pending(&self, number: u64) -> bool {
         self.finalized.load(Ordering::Acquire) >= number && self.source.last_materialized_frame() < number
+    }
+
+    /// Whether a parent at `number` can be executed from `cursor`: at most
+    /// `max_ancestors` frames above it.
+    fn within_window(&self, cursor: u64, number: u64) -> bool {
+        number >= cursor && number - cursor <= self.limits.max_ancestors as u64
     }
 
     pub(crate) fn prepare(
@@ -631,6 +703,14 @@ impl GlobalParentExecutor {
                 "GLOBAL leader does not use the captured execution source",
             ));
         }
+        // Checked again on the capture. A node catching up far below the
+        // parent spent ~5 s capturing for every proposal it was asked about,
+        // holding the frame lock its own catch-up needed (2026-10-12).
+        if !self.within_window(self.source.last_materialized_frame(), number) {
+            return Err(unavailable(
+                "selected GLOBAL parent is outside the execution window",
+            ));
+        }
         self.active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| unavailable("selected GLOBAL execution is busy"))?;
@@ -652,10 +732,11 @@ impl GlobalParentExecutor {
                 Ok(())
             }
         };
+        let mut captured = Instant::now();
         let mut branch = self.source.capture_execution_branch(self.limits.branch)?;
         timing.mark("capture branch");
         let cursor = branch.cursor()?;
-        if number < cursor || number - cursor > self.limits.max_ancestors as u64 {
+        if !self.within_window(cursor, number) {
             return Err(unavailable(
                 "selected GLOBAL parent is outside the execution window",
             ));
@@ -726,9 +807,29 @@ impl GlobalParentExecutor {
                 "selected GLOBAL ancestry does not reach the executed base",
             ));
         }
-        let parent = ancestry.first().cloned().unwrap_or(base);
+        let parent = ancestry.first().cloned().unwrap_or_else(|| base.clone());
         let mut consumed = Vec::new();
-        for frame in ancestry.iter().rev() {
+        let mut kept = 0;
+        let mut keep = None;
+        if ancestry.is_empty() {
+            // The parent is published: an execution kept over an older base is spent.
+            self.release_executed(|executed| executed.base.frame != base);
+        } else {
+            let key = ExecutedBaseKey {
+                frame: base,
+                checkpoint: base_checkpoint.clone(),
+                state: ParentState::read(&branch)?,
+            };
+            if let Some(child) = self.kept_execution(&key, &ancestry) {
+                branch = child.branch;
+                kept = child.executed;
+                consumed = child.consumed;
+                captured = child.captured;
+                timing.mark("kept ancestors");
+            }
+            keep = Some(key);
+        }
+        for frame in ancestry.iter().rev().skip(kept) {
             deadline()?;
             let header = frame.header.as_ref().unwrap();
             if !ParentState::read(&branch)?.matches(header) {
@@ -738,20 +839,41 @@ impl GlobalParentExecutor {
             }
             // Only this lease sees the chosen ancestry as its clock history.
             // The public clock, consensus head and materializer remain untouched.
+            let clock = branch.execution().clock_store().clone();
             let txn = clock.new_transaction(false)?;
             clock.put_global_clock_frame(frame, txn.as_ref())?;
             txn.commit()?;
             consumed.extend(branch.materialize(frame)?.consumed_bundles);
         }
         timing.mark("execute ancestors");
-        if let Ok(mut kept) = self.authenticated.lock() {
+        if let Ok(mut authenticated) = self.authenticated.lock() {
             for frame in &ancestry {
                 if let Some(digest) = frame.header.as_ref().and_then(|h| identity(h).ok()) {
-                    kept.remember(digest, frame);
+                    authenticated.remember(digest, frame);
                 }
             }
         }
         branch.log_reads("selected GLOBAL parent execution", number);
+        if let Some(base) = keep.filter(|_| kept < ancestry.len()) {
+            // Keep this execution unchanged; the proposal or vote works in a
+            // child of it. Without a child it proceeds here, keeping nothing.
+            match branch.capture_child(self.limits.branch) {
+                Ok(working) => {
+                    let executed = std::mem::replace(&mut branch, working);
+                    if let Ok(mut slot) = self.executed.lock() {
+                        *slot = Some(ExecutedAncestry {
+                            branch: executed,
+                            base,
+                            frames: ancestry.iter().rev().cloned().collect(),
+                            consumed: consumed.clone(),
+                            captured,
+                        });
+                    }
+                    timing.mark("keep execution");
+                }
+                Err(error) => tracing::debug!(frame = number, %error, "selected GLOBAL execution not kept"),
+            }
+        }
         deadline()?;
         let state = ParentState::read(&branch)?;
         let leader = if for_proposal {
@@ -780,10 +902,51 @@ impl GlobalParentExecutor {
             max_elapsed: self.limits.max_elapsed,
             receipt_less_base,
             receipted_base,
+            #[cfg(test)]
+            kept,
             _admission: admission,
         };
         prepared.check()?;
         Ok(prepared)
+    }
+
+    /// A child of the kept execution, when that was captured over `base`
+    /// within the reuse age and executed exactly the lowest frames of
+    /// `ancestry` (highest first). One over another base, too old, or whose
+    /// view is gone is released; one for another chain over this base stays.
+    fn kept_execution(&self, base: &ExecutedBaseKey, ancestry: &[GlobalFrame]) -> Option<KeptExecution> {
+        let mut slot = self.executed.lock().ok()?;
+        let max_age = self.limits.max_kept_age.min(MAX_KEPT_EXECUTION_AGE);
+        let current = slot.as_ref().is_some_and(|kept| kept.base == *base && kept.captured.elapsed() < max_age);
+        if !current {
+            *slot = None;
+            return None;
+        }
+        let kept = slot.as_ref()?;
+        if kept.frames.len() > ancestry.len() || !kept.frames.iter().zip(ancestry.iter().rev()).all(|(a, b)| a == b) {
+            return None;
+        }
+        match kept.branch.capture_child(self.limits.branch) {
+            Ok(branch) => Some(KeptExecution {
+                branch,
+                executed: kept.frames.len(),
+                consumed: kept.consumed.clone(),
+                captured: kept.captured,
+            }),
+            Err(error) => {
+                tracing::debug!(%error, "kept GLOBAL execution is unusable; executing again");
+                *slot = None;
+                None
+            }
+        }
+    }
+
+    fn release_executed(&self, spent: impl FnOnce(&ExecutedAncestry) -> bool) {
+        if let Ok(mut slot) = self.executed.lock() {
+            if slot.as_ref().is_some_and(spent) {
+                *slot = None;
+            }
+        }
     }
 
     fn check_input_budget(&self, frame: &GlobalFrame) -> Result<()> {
