@@ -198,11 +198,8 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         };
 
         let (grpc_ok_count, bs_result) = tokio::join!(grpc_future, bs_future);
-        // Non-archive nodes never publish on BlossomSub (they don't
-        // subscribe to GLOBAL_PROVER), so for them BlossomSub cannot
-        // count as a delivery path. Treat `p2p_ok` as true only when
-        // we actually attempted a publish AND it succeeded.
-        let p2p_ok = publish_bs && bs_result.is_ok();
+        // Only an attempted BlossomSub publish counts as a delivery path;
+        // disabled publishing must not turn archive rejection into success.
         if publish_bs {
             if let Err(ref e) = bs_result {
                 warn!(error = %e, "BlossomSub publish failed for prover message");
@@ -220,24 +217,33 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             warn!("no archives discovered AND BlossomSub publish disabled — prover message has no delivery path");
         }
 
-        combine_publish_outcome(grpc_ok_count, p2p_ok)
+        combine_publish_outcome(archive_count, grpc_ok_count, publish_bs.then_some(&bs_result))
     }
 }
 
-/// Combine fan-out outcomes into a final result. Returns `Err` only when
-/// every archive failed AND the BlossomSub publish failed. `p2p_ok` is
-/// only `true` when we actually attempted a BlossomSub publish AND the
-/// swarm accepted the message (or had no peers but accepted for
-/// buffered redelivery). Non-archive callers that skip the BlossomSub
-/// path must pass `p2p_ok = false` so a zero-archive-accepted outcome
-/// is correctly classified as a failure rather than a silent drop.
-fn combine_publish_outcome(archive_ok_count: usize, p2p_ok: bool) -> Result<()> {
-    if archive_ok_count == 0 && !p2p_ok {
-        return Err(QuilError::P2p(
-            "publish_prover_bundle: all paths failed (no archive accepted, BlossomSub publish failed)".into(),
-        ));
+/// Report success if any archive accepted or an attempted BlossomSub publish
+/// succeeded. A disabled BlossomSub path is not a failed publish.
+fn combine_publish_outcome(
+    archive_count: usize,
+    archive_ok_count: usize,
+    blossomsub_result: Option<&Result<()>>,
+) -> Result<()> {
+    if archive_ok_count > 0 || matches!(blossomsub_result, Some(Ok(()))) {
+        return Ok(());
     }
-    Ok(())
+    let archive_status = if archive_count == 0 {
+        "no archives discovered"
+    } else {
+        "no archive accepted submission"
+    };
+    let blossomsub_status = match blossomsub_result {
+        None => "BlossomSub publish disabled".to_string(),
+        Some(Err(error)) => format!("BlossomSub publish failed: {error}"),
+        Some(Ok(())) => unreachable!("successful publish returned above"),
+    };
+    Err(QuilError::P2p(format!(
+        "publish_prover_bundle: {archive_status}; {blossomsub_status}"
+    )))
 }
 
 /// Fan out a submission to every archive endpoint concurrently.
@@ -288,9 +294,36 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::fan_out_to_archives;
+    use super::{combine_publish_outcome, fan_out_to_archives};
+    use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn publish_errors_distinguish_skipped_and_failed_paths() {
+        let disabled = combine_publish_outcome(7, 0, None).unwrap_err().to_string();
+        assert!(disabled.contains("no archive accepted submission; BlossomSub publish disabled"));
+        assert!(!disabled.contains("BlossomSub publish failed"));
+        let absent = combine_publish_outcome(0, 0, None).unwrap_err().to_string();
+        assert!(absent.contains("no archives discovered; BlossomSub publish disabled"));
+        let failed = Err(QuilError::P2p("topic mesh unavailable".into()));
+        let attempted = combine_publish_outcome(7, 0, Some(&failed)).unwrap_err().to_string();
+        assert!(attempted.contains("no archive accepted submission; BlossomSub publish failed:"));
+        assert!(attempted.contains("topic mesh unavailable"));
+        assert!(!attempted.contains("publish disabled"));
+    }
+
+    #[test]
+    fn publish_success_still_requires_an_accepted_path() {
+        let failed = Err(QuilError::P2p("topic mesh unavailable".into()));
+        let succeeded = Ok(());
+        assert!(combine_publish_outcome(7, 1, None).is_ok());
+        assert!(combine_publish_outcome(7, 1, Some(&failed)).is_ok());
+        assert!(combine_publish_outcome(0, 0, Some(&succeeded)).is_ok());
+        assert!(combine_publish_outcome(7, 0, Some(&succeeded)).is_ok());
+        assert!(combine_publish_outcome(7, 0, None).is_err());
+        assert!(combine_publish_outcome(7, 0, Some(&failed)).is_err());
+    }
 
     /// Verify that fan-out attempts every archive and counts every success.
     #[tokio::test]
