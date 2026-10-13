@@ -1027,6 +1027,29 @@ pub trait HypergraphStore: Send + Sync {
         callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<usize>;
 
+    /// Enumerate only vertices accepted by `matches`, with the same newest-version
+    /// and legacy precedence as `for_each_vertex_underlying`. Returns the number
+    /// emitted. Backends may reject keys before retaining their blob bytes; the
+    /// default preserves compatibility for stores without a selective walk.
+    /// `matches` must be a stable predicate on the vertex key.
+    fn for_each_vertex_underlying_matching(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        matches: &dyn Fn(&[u8]) -> bool,
+        callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        let mut count = 0;
+        self.for_each_vertex_underlying(set_type, phase_type, shard_key, &mut |key, blob| {
+            if matches(&key) {
+                callback(key, blob);
+                count += 1;
+            }
+        })?;
+        Ok(count)
+    }
+
     // -------------------------------------------------------------------
     // Versioned (MVCC) blob store + root→version index + split-app manifest.
     // Default impls make the versioned store degrade to the legacy unversioned

@@ -15,6 +15,16 @@ macro_rules! impl_hypergraph_storage {
             /// walk cost one counted read per retained version (9M on mainnet's GLOBAL
             /// prover shard by 865,000).
             fn newest_v2_blobs(&self, prefix: &[u8]) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+                self.newest_v2_blobs_matching(prefix, &|_| true)
+            }
+
+            /// Select keys before copying their latest blobs. Nonmatching vertices
+            /// do not contribute to the retained payload collection.
+            fn newest_v2_blobs_matching(
+                &self,
+                prefix: &[u8],
+                matches: &dyn Fn(&[u8]) -> bool,
+            ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
                 const READ_BEFORE_SEEK: usize = 4;
                 let mut it = self.db.raw_iterator();
                 it.seek(prefix);
@@ -33,6 +43,18 @@ macro_rules! impl_hypergraph_storage {
                     }
                     let len = key.len();
                     let vertex_prefix = key[..len - 8].to_vec();
+                    if !matches(&vertex_prefix[prefix.len()..]) {
+                        // Do not seek across a rejected key: a longer vertex key
+                        // can interleave with its versions. Leave that key for
+                        // the length check and general fallback above.
+                        loop {
+                            it.next();
+                            if !it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix)) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     let mut newest = Vec::new();
                     let mut read = 0usize;
                     loop {
@@ -67,6 +89,14 @@ macro_rules! impl_hypergraph_storage {
             /// vertex, accumulated in a map because keys of different lengths can
             /// interleave.
             fn newest_v2_blobs_general(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+                self.newest_v2_blobs_general_matching(prefix, &|_| true)
+            }
+
+            fn newest_v2_blobs_general_matching(
+                &self,
+                prefix: &[u8],
+                matches: &dyn Fn(&[u8]) -> bool,
+            ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
                 use std::collections::HashMap;
                 let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
                 for entry in self
@@ -80,7 +110,11 @@ macro_rules! impl_hypergraph_storage {
                     if k.len() < prefix.len() + 8 {
                         continue;
                     }
-                    let vk = k[prefix.len()..k.len() - 8].to_vec();
+                    let vertex_key = &k[prefix.len()..k.len() - 8];
+                    if !matches(vertex_key) {
+                        continue;
+                    }
+                    let vk = vertex_key.to_vec();
                     let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
                     match latest.get_mut(&vk) {
                         Some((mv, mb)) if ver > *mv => {
@@ -710,15 +744,28 @@ macro_rules! impl_hypergraph_storage {
                 shard_key: &ShardKey,
                 callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
             ) -> Result<usize> {
+                self.for_each_vertex_underlying_matching(
+                    set_type, phase_type, shard_key, &|_| true, callback,
+                )
+            }
+
+            fn for_each_vertex_underlying_matching(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_key: &ShardKey,
+                matches: &dyn Fn(&[u8]) -> bool,
+                callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+            ) -> Result<usize> {
                 use std::collections::HashSet;
                 // v2 (versioned) keyspace: the newest version of each vertex, seeking
                 // past older ones (the map walk when key lengths differ).
                 let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
                     set_type, phase_type, shard_key,
                 );
-                let latest = match self.newest_v2_blobs(&v2_prefix)? {
+                let latest = match self.newest_v2_blobs_matching(&v2_prefix, matches)? {
                     Some(latest) => latest,
-                    None => self.newest_v2_blobs_general(&v2_prefix)?,
+                    None => self.newest_v2_blobs_general_matching(&v2_prefix, matches)?,
                 };
                 let mut count = 0usize;
                 let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
@@ -742,7 +789,7 @@ macro_rules! impl_hypergraph_storage {
                         continue;
                     }
                     let vk = k[old_prefix.len()..].to_vec();
-                    if seen.contains(&vk) {
+                    if !matches(&vk) || seen.contains(&vk) {
                         continue;
                     }
                     callback(vk, v.into_vec());
