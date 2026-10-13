@@ -3376,10 +3376,10 @@ mod tests {
                 materialized_frame: Some(frame), ..Default::default() });
             a
         };
-        for (state, color) in [("running", SUCCESS), ("serving", SUCCESS), ("syncing", HELP), ("closing", HELP),
-            ("handoff", HELP), ("waiting", HELP), ("starting", HELP), ("blocked", ERROR), ("stopped", ERROR)] {
+        for (state, label, color) in [("running", "running", SUCCESS), ("serving", "serve", SUCCESS), ("syncing", "sync", HELP), ("closing", "close", HELP),
+            ("handoff", "handoff", HELP), ("waiting", "wait", HELP), ("starting", "start", HELP), ("blocked", "blocked", ERROR), ("stopped", "stopped", ERROR)] {
             let a = worker(state, 124);
-            assert_eq!(alloc_cell(&m, &a, 9, 12), state);
+            assert_eq!(alloc_cell(&m, &a, 9, 12), label);
             assert_eq!(local_color(&m, &a), color, "{state}");
             assert!(!local_warning(&m, &a), "{state}");
         }
