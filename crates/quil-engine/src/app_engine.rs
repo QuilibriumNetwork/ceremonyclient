@@ -97,8 +97,8 @@ pub enum AppEngineMessage {
     /// and replay it on the engine actor so derived history advances with data.
     ReplayArchiveFrame {
         frame: quil_types::proto::global::AppShardFrame,
-        /// The certified frame after `frame`, when `frame` has no certificate.
-        child: Option<quil_types::proto::global::AppShardFrame>,
+        /// Consecutive descendants ending in a certified header.
+        descendants: Vec<quil_types::proto::global::AppShardFrame>,
         reply: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     /// A worker with no local app-shard clock head fetched an archive anchor and
@@ -377,11 +377,11 @@ impl AppEngineHandle {
     pub(crate) async fn replay_archive_frame(
         &self,
         frame: quil_types::proto::global::AppShardFrame,
-        child: Option<quil_types::proto::global::AppShardFrame>,
+        descendants: Vec<quil_types::proto::global::AppShardFrame>,
     ) -> Result<u64> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            self.msg_tx.send(AppEngineMessage::ReplayArchiveFrame { frame, child, reply })
+            self.msg_tx.send(AppEngineMessage::ReplayArchiveFrame { frame, descendants, reply })
                 .await.map_err(|_| QuilError::ExecutionUnavailable("shard engine stopped before archive replay".into()))?;
             receive.await.map_err(|_| QuilError::ExecutionUnavailable("archive replay was cancelled".into()))?
         }).await.map_err(|_| QuilError::ExecutionUnavailable("archive replay timed out".into()))?
@@ -2762,7 +2762,7 @@ impl AppConsensusEngine {
     async fn replay_archive_frame(
         &mut self,
         frame: quil_types::proto::global::AppShardFrame,
-        child: Option<quil_types::proto::global::AppShardFrame>,
+        descendants: Vec<quil_types::proto::global::AppShardFrame>,
     ) -> Result<u64> {
         let validator = self.frame_validator();
         let uncertified = frame.header.as_ref()
@@ -2774,18 +2774,23 @@ impl AppConsensusEngine {
                 validate_certified_frame(&validator, frame, retained)
             }).await;
         }
-        // Final only through its certified child: authenticate the child and
-        // the link first, then the frame itself as a proposal. Its storage
-        // history is fetched on the strength of the child's certificate: asked
-        // for a certificate of its own, every such replay failed.
-        let child = child.ok_or_else(|| QuilError::InvalidSignature(
-            "archive replay frame has no certificate and no certified child".into()))?;
-        let child_retained = storage_history_retained(&validator, &child).await;
-        let linked = frame.header.as_ref().zip(child.header.as_ref())
-            .is_some_and(|(parent, child)| crate::frame_validator::app_frame_links_to_child(parent, child));
-        if !linked || !validate_certified_frame(&validator, &child, child_retained)? {
-            return Err(QuilError::InvalidSignature("archive replay frame is not final through a certified child".into()));
-        }
+        // Authenticate the terminal certificate and every intermediate body
+        // and selector before replaying anything. Simplex finalizes ancestors,
+        // which may span several headers without certificates of their own.
+        let terminal = descendants.last().ok_or_else(|| QuilError::InvalidSignature(
+            "archive replay frame has no certified descendant".into()))?;
+        let terminal_retained = storage_history_retained(&validator, terminal).await;
+        crate::frame_validator::validate_archive_replay_chain(
+            &frame, &descendants,
+            |terminal| Ok(validate_certified_frame(&validator, terminal, terminal_retained)?
+                && self.body_matches_requests_root(terminal)),
+            |linked| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                Ok(validator.validate_linked_without_storage(linked)?
+                    && self.body_matches_requests_root(linked)))) {
+                Ok(result) => result,
+                Err(_) => Err(QuilError::Internal("linked ancestor validation panicked".into())),
+            },
+        )?;
         let retained = match validator.prepare_storage_history_of_linked(&frame).await {
             Ok(()) => true,
             Err(error) => {
@@ -3036,7 +3041,7 @@ impl AppConsensusEngine {
         // In particular, syncing the pre-state of frame 1 must not leave a
         // joining member at clock/cursor zero, proposing frame 1 again while
         // existing members are already at 1 and require frame 2.
-        if let Err(error) = self.replay_archive_frame(anchor, None).await {
+        if let Err(error) = self.replay_archive_frame(anchor, Vec::new()).await {
             warn!(core_id = self.core_id, anchor_frame = anchor_n, %error,
                 "app-shard bootstrap anchor replay failed");
             return false;
@@ -3371,9 +3376,9 @@ impl AppConsensusEngine {
                                 );
                             }
                         }
-                        Some(AppEngineMessage::ReplayArchiveFrame { frame, child, reply }) => {
+                        Some(AppEngineMessage::ReplayArchiveFrame { frame, descendants, reply }) => {
                             if !reply.is_closed() {
-                                let result = self.replay_archive_frame(frame, child).await;
+                                let result = self.replay_archive_frame(frame, descendants).await;
                                 let _ = reply.send(result);
                             }
                         }
@@ -8507,10 +8512,12 @@ mod tests {
             }), ..Default::default()
         };
         // The production entry requires a ready certificate validator.
-        assert!(engine.replay_archive_frame(frame.clone(), None).await.is_err());
+        assert!(engine.replay_archive_frame(frame.clone(), Vec::new()).await.is_err());
         assert!(engine.replay_archive_frame_with(frame.clone(), |_| Ok(false)).await.is_err());
         let mut bad_body = frame.clone();
         bad_body.header.as_mut().unwrap().requests_root = vec![9; 32];
+        assert!(engine.body_matches_requests_root(&frame));
+        assert!(!engine.body_matches_requests_root(&bad_body));
         assert!(engine.replay_archive_frame_with(bad_body, |_| Ok(true)).await.is_err());
         assert!(clock.get_latest_shard_clock_frame(&app).is_err());
         assert_eq!(engine.load_materialized_cursor().unwrap(), 0);

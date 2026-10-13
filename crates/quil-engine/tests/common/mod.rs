@@ -716,7 +716,7 @@ impl AppShardHarness {
             let (reply, replayed) = tokio::sync::oneshot::channel();
             worker.handle.send(quil_engine::app_engine::AppEngineMessage::ReplayArchiveFrame {
                 frame: frame.clone(),
-                child: None,
+                descendants: Vec::new(),
                 reply,
             });
             let through = replayed.await.expect("replay answered").expect("the head replays");
