@@ -39,23 +39,14 @@ macro_rules! impl_hypergraph_storage {
                     }
                     let len = key.len();
                     let vertex_prefix = key[..len - 8].to_vec();
-                    if !matches(&vertex_prefix[prefix.len()..]) {
-                        // Do not seek across a rejected key: a longer vertex key
-                        // can interleave with its versions. Leave that key for
-                        // the length check and general fallback above.
-                        loop {
-                            it.next();
-                            if !it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix)) {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
+                    let selected = matches(&vertex_prefix[prefix.len()..]);
                     let mut newest = Vec::new();
                     let mut read = 0usize;
                     loop {
-                        newest.clear();
-                        newest.extend_from_slice(it.value().unwrap_or_default());
+                        if selected {
+                            newest.clear();
+                            newest.extend_from_slice(it.value().unwrap_or_default());
+                        }
                         read += 1;
                         it.next();
                         let same = it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix));
@@ -69,13 +60,17 @@ macro_rules! impl_hypergraph_storage {
                             if !it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix)) {
                                 return Ok(None);
                             }
-                            newest.clear();
-                            newest.extend_from_slice(it.value().unwrap_or_default());
+                            if selected {
+                                newest.clear();
+                                newest.extend_from_slice(it.value().unwrap_or_default());
+                            }
                             it.next();
                             break;
                         }
                     }
-                    out.push((vertex_prefix[prefix.len()..].to_vec(), newest));
+                    if selected {
+                        out.push((vertex_prefix[prefix.len()..].to_vec(), newest));
+                    }
                 }
                 it.status().map_err(|e| QuilError::Store(e.to_string()))?;
                 Ok(Some(out))
