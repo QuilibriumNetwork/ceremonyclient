@@ -10,14 +10,10 @@ macro_rules! impl_hypergraph_storage {
             /// to its newest instead of reading each (allocations are rewritten often,
             /// and the walk otherwise read every retained version). `None` when key
             /// lengths differ, where versions can interleave; see
-            /// [`Self::newest_v2_blobs_general`]. Shared by both backends: on the
+            /// [`Self::newest_v2_blobs_general_matching`]. Shared by both backends: on the
             /// execution overlay every cursor step is a fresh seek, so the per-version
             /// walk cost one counted read per retained version (9M on mainnet's GLOBAL
             /// prover shard by 865,000).
-            fn newest_v2_blobs(&self, prefix: &[u8]) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
-                self.newest_v2_blobs_matching(prefix, &|_| true)
-            }
-
             /// Select keys before copying their latest blobs. Nonmatching vertices
             /// do not contribute to the retained payload collection.
             fn newest_v2_blobs_matching(
@@ -85,13 +81,9 @@ macro_rules! impl_hypergraph_storage {
                 Ok(Some(out))
             }
 
-            /// [`Self::newest_v2_blobs`] for any key lengths: the max-version blob per
-            /// vertex, accumulated in a map because keys of different lengths can
-            /// interleave.
-            fn newest_v2_blobs_general(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-                self.newest_v2_blobs_general_matching(prefix, &|_| true)
-            }
-
+            /// [`Self::newest_v2_blobs_matching`] for any key lengths: the max-version
+            /// blob per matching vertex, accumulated in a map because keys of
+            /// different lengths can interleave.
             fn newest_v2_blobs_general_matching(
                 &self,
                 prefix: &[u8],
