@@ -62,9 +62,9 @@ pub(crate) enum ShardSyncResult {
 #[async_trait]
 pub(crate) trait ShardRecoveryTarget: Send + Sync {
     fn materialized(&self) -> u64;
-    /// `child`: the certified frame after `frame`, when `frame` has no
-    /// certificate of its own and is final only through it.
-    async fn replay(&self, frame: AppShardFrame, child: Option<AppShardFrame>) -> Result<u64>;
+    /// Consecutive descendants ending at a certified frame authenticate a
+    /// frame with no certificate of its own. The actor verifies the whole chain.
+    async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64>;
     async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool>;
     async fn install(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<()>;
     fn inherited(&self);
@@ -84,8 +84,8 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
 #[async_trait]
 impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     fn materialized(&self) -> u64 { self.materialized_frame() }
-    async fn replay(&self, frame: AppShardFrame, child: Option<AppShardFrame>) -> Result<u64> {
-        self.replay_archive_frame(frame, child).await
+    async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
+        self.replay_archive_frame(frame, descendants).await
     }
     async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool> {
         self.validate_sync_anchor(anchor, predecessor).await
@@ -221,7 +221,7 @@ pub(crate) async fn replay_shard_from_latest<F, Fut>(
     mut replay: F,
 ) -> Result<ShardReplay>
 where
-    F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
+    F: FnMut(AppShardFrame, Vec<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
     use prost::Message;
@@ -285,19 +285,36 @@ where
             || frame.encoded_len() > 16 * 1024 * 1024 {
             return Err(QuilError::InvalidArgument("invalid or oversized archive replay frame".into()));
         }
-        // A frame with no certificate of its own is final only through the
-        // certified frame after it, which the replay authenticates it by.
-        let uncertified = frame.header.as_ref()
+        let certified = |frame: &AppShardFrame| frame.header.as_ref()
             .and_then(|header| header.public_key_signature_bls48581.as_ref())
-            .is_none_or(|signature| signature.signature.is_empty());
-        let child = if !uncertified {
-            None
-        } else if next + 1 == tip_height {
-            Some(tip.clone())
-        } else {
-            fetch_shard_frame(syncer, filter, next + 1, FRAME_ATTEMPTS).await?
-        };
-        let advanced = replay(frame, child).await?;
+            .is_some_and(|signature| !signature.signature.is_empty());
+        let mut descendants = Vec::new();
+        let mut bytes = frame.encoded_len();
+        if !certified(&frame) {
+            for offset in 1..=crate::frame_validator::MAX_REPLAY_DESCENDANTS {
+                let number = next.checked_add(offset as u64)
+                    .filter(|number| *number <= target)
+                    .ok_or_else(|| QuilError::ExecutionUnavailable(
+                        "archive replay has no certified descendant within its target".into()))?;
+                let child = if number == tip_height { tip.clone() } else {
+                    fetch_shard_frame(syncer, filter, number, FRAME_ATTEMPTS).await?
+                        .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
+                            "archive replay is missing descendant frame {number}")))?
+                };
+                bytes = bytes.saturating_add(child.encoded_len());
+                if child.header.as_ref().is_none_or(|h| h.address != filter || h.frame_number != number)
+                    || bytes > crate::frame_validator::MAX_REPLAY_CHAIN_BYTES {
+                    return Err(QuilError::InvalidArgument("invalid or oversized archive replay chain".into()));
+                }
+                let terminal = certified(&child);
+                descendants.push(child);
+                if terminal { break; }
+            }
+            if !descendants.last().is_some_and(certified) {
+                return Err(QuilError::ExecutionUnavailable("archive replay certified descendant limit reached".into()));
+            }
+        }
+        let advanced = replay(frame, descendants).await?;
         if advanced < next {
             return Err(QuilError::ExecutionUnavailable("archive replay did not materialize its frame".into()));
         }
@@ -408,7 +425,7 @@ mod tests {
     #[async_trait]
     impl ShardRecoveryTarget for Target {
         fn materialized(&self) -> u64 { self.cursor.load(std::sync::atomic::Ordering::SeqCst) }
-        async fn replay(&self, frame: AppShardFrame, _child: Option<AppShardFrame>) -> Result<u64> {
+        async fn replay(&self, frame: AppShardFrame, _descendants: Vec<AppShardFrame>) -> Result<u64> {
             let number = frame.header.unwrap().frame_number;
             assert_eq!(number, self.materialized()+1);
             self.calls.lock().unwrap().push(format!("replay {number}"));
@@ -553,11 +570,59 @@ mod tests {
         let result = replay_shard_from_latest(&BareArchive, &[5; 32], frame(130), 130, None,
             move |frame, child| {
                 let height = frame.header.unwrap().frame_number;
-                seen.lock().unwrap().push((height, child.map(|child| child.header.unwrap().frame_number)));
+                seen.lock().unwrap().push((height, child.into_iter().map(|child| child.header.unwrap().frame_number).collect::<Vec<_>>()));
                 async move { Ok(height) }
             }).await.unwrap();
         assert_eq!(result, ShardReplay { materialized: 134, archive_tip: Some(134), target: 134 });
-        assert_eq!(*replayed.lock().unwrap(), vec![(131, None), (132, Some(133)), (133, None), (134, None)]);
+        assert_eq!(*replayed.lock().unwrap(), vec![(131, vec![]), (132, vec![133]), (133, vec![]), (134, vec![])]);
+    }
+
+    struct ChainArchive { missing: Option<u64>, wrong_shard: bool, unsigned_end: u64 }
+
+    #[async_trait]
+    impl ProverTreeSyncer for ChainArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            if self.missing == Some(number) { return Ok(None); }
+            let mut served = frame(if number == 0 { 200 } else { number });
+            if (131..=self.unsigned_end).contains(&number) {
+                served.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+            }
+            if self.wrong_shard && number == 132 { served.header.as_mut().unwrap().address = vec![9; 32]; }
+            Ok(Some(served))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+    }
+
+    #[tokio::test]
+    async fn archive_replay_fetches_past_consecutive_unsigned_headers() {
+        let archive = ChainArchive { missing: None, wrong_shard: false, unsigned_end: 132 };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None,
+            move |frame, descendants| {
+                let height = frame.header.unwrap().frame_number;
+                seen.lock().unwrap().push((height, descendants.iter()
+                    .map(|child| child.header.as_ref().unwrap().frame_number).collect::<Vec<_>>()));
+                async move { Ok(height) }
+            }).await.unwrap();
+        assert_eq!(result.materialized, 162);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], (131, vec![132, 133]));
+        assert_eq!(calls[1], (132, vec![133]));
+        assert_eq!(calls[2], (133, vec![]));
+    }
+
+    #[tokio::test]
+    async fn archive_replay_never_sends_an_unbounded_missing_or_wrong_shard_chain_to_the_actor() {
+        for archive in [
+            ChainArchive { missing: None, wrong_shard: false, unsigned_end: 200 },
+            ChainArchive { missing: Some(132), wrong_shard: false, unsigned_end: 132 },
+            ChainArchive { missing: None, wrong_shard: true, unsigned_end: 132 },
+        ] {
+            assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None,
+                |_, _| async { panic!("incomplete chain must not reach replay") }).await.is_err());
+        }
     }
 
     #[tokio::test]
