@@ -601,6 +601,117 @@ fn selected_parent_bounds_ancestry_and_releases_admission_on_unwind() {
         .is_ok());
 }
 
+/// A node far below a proposal's parent learns it cannot execute it before
+/// capturing any state: one catching up 5,300 frames behind spent ~5 s
+/// capturing for every proposal, holding the frame lock its catch-up needed
+/// (2026-10-12).
+#[test]
+fn a_parent_outside_the_window_is_refused_without_a_capture() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let executor = GlobalParentExecutor::new(
+        rig.source.clone(),
+        rig.leader.clone(),
+        0,
+        0,
+        rig.genesis,
+        GlobalParentLimits {
+            branch: limits(),
+            max_ancestors: 1,
+            ..GlobalParentLimits::default()
+        },
+    );
+    let refusal = |number| {
+        executor
+            .prepare(rig.context(&parent), number, &rig.blocks, &rig.verifier, false)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    };
+    // A capture reports the held frame lock.
+    let held = rig.source.frame_execution.lock().unwrap();
+    assert!(refusal(2).contains("outside the execution window"), "{}", refusal(2));
+    assert!(refusal(1).contains("busy"), "inside the window it captures: {}", refusal(1));
+    drop(held);
+    assert!(executor
+        .prepare(rig.context(&parent), 1, &rig.blocks, &rig.verifier, false)
+        .is_ok());
+}
+
+/// While a notarized chain stays unfinalized, each proposal and vote builds
+/// on it. It is executed once and kept: a slower archive that executed two
+/// such frames for every view took 30 s of a 35 s view and never voted, and
+/// GLOBAL halted at 874,880 (2026-10-11).
+#[test]
+fn an_unfinalized_ancestry_is_executed_once_and_extended_in_children() {
+    let rig = Rig::new();
+    let sequence = rig.db.inner().latest_sequence_number();
+    let first = rig.deploy();
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&first).unwrap();
+    let second = state_frame(&expected.source, 2, 42, id(&first));
+    expected.source.materialize(&second).unwrap();
+    let child_of_second = state_frame(&expected.source, 3, 73, id(&second));
+    let third = state_frame(&expected.source, 3, 43, id(&second));
+    expected.source.materialize(&third).unwrap();
+    let child_of_third = state_frame(&expected.source, 4, 73, id(&third));
+    for frame in [&first, &second, &third] {
+        rig.put(frame);
+    }
+    let prepare = |executor: &GlobalParentExecutor, parent: &GlobalFrame, for_proposal: bool| {
+        let number = parent.header.as_ref().unwrap().frame_number;
+        executor.prepare(rig.context(parent), number, &rig.blocks, &rig.verifier, for_proposal).unwrap()
+    };
+    let kept = |parent: &GlobalFrame, child: &GlobalFrame| {
+        let lease = prepare(&rig.executor, parent, false);
+        assert!(lease.matches_child(child.header.as_ref().unwrap()));
+        lease.kept_ancestors()
+    };
+
+    assert_eq!(kept(&second, &child_of_second), 0, "executed the first time");
+    assert_eq!(kept(&second, &child_of_second), 2, "then kept");
+    let proposal = prepare(&rig.executor, &second, true);
+    assert_eq!(proposal.kept_ancestors(), 2);
+    let proved = proposal.prove(&[]).unwrap();
+    assert_eq!(proved.state.prover_tree_commitment, child_of_second.header.as_ref().unwrap().prover_tree_commitment);
+    assert_eq!(proved.state.prover_tree_aux_roots, child_of_second.header.as_ref().unwrap().prover_tree_aux_roots);
+    drop(proposal);
+    assert_eq!(kept(&second, &child_of_second), 2, "proving leaves the kept execution unchanged");
+
+    assert_eq!(kept(&third, &child_of_third), 2, "a longer chain executes only its new frame");
+    assert_eq!(kept(&third, &child_of_third), 3);
+    assert_eq!(kept(&second, &child_of_second), 0, "a chain the kept one runs past is executed again");
+
+    // The kept execution is used only for exactly the frames it executed: a
+    // substituted body at the same identity is executed, and refused.
+    rig.executor.forget_authenticated_ancestors();
+    let mut forged = second.clone();
+    forged.header.as_mut().unwrap().prover_tree_commitment[7] ^= 1;
+    let blocks = BlockStore::new();
+    blocks.put(id(&first), crate::consensus_wire::encode_global_frame(&first).unwrap());
+    blocks.put(id(&second), crate::consensus_wire::encode_global_frame(&forged).unwrap());
+    assert!(rig.executor.prepare(rig.context(&second), 2, &blocks, &rig.verifier, false).is_err());
+    assert_eq!(kept(&second, &child_of_second), 2, "a refused preparation leaves it");
+
+    let unkept = GlobalParentExecutor::new(
+        rig.source.clone(),
+        rig.leader.clone(),
+        0,
+        0,
+        rig.genesis,
+        GlobalParentLimits {
+            branch: limits(),
+            max_kept_age: std::time::Duration::ZERO,
+            ..GlobalParentLimits::default()
+        },
+    );
+    for _ in 0..2 {
+        assert_eq!(prepare(&unkept, &second, false).kept_ancestors(), 0, "past its age it is executed again");
+    }
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+}
+
 fn certify(frame: &mut GlobalFrame, signer: &quil_crypto::FalconSigner, epoch: u64) {
     certify_parent(frame, signer, epoch, 0);
 }

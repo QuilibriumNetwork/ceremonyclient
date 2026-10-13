@@ -1122,6 +1122,41 @@ impl SharedProverRegistry {
         Ok(registry)
     }
 
+    /// [`Self::for_execution_capture`] for a branch over `overlay`. A fork of
+    /// a branch that wrote prover rows has no capture point of its own; when
+    /// `seed` holds a scan of the view beneath those writes, its cache is
+    /// copied and brought up to date with the rows the fork carries
+    /// ([`Self::update_written_rows`]), which is what reading every prover
+    /// vertex through the fork gives. Forking a kept GLOBAL execution read
+    /// them all again: 184 MB per fork, 6 s on one archive and 13–18 s on
+    /// another, as long as executing its frames once more (2026-10-11).
+    pub fn for_execution_overlay(
+        store: &dyn HypergraphStore,
+        limits: RegistryLimits,
+        seed: Option<&SharedProverRegistry>,
+        overlay: &quil_forest::ExecutionOverlay,
+    ) -> QuilResult<Self> {
+        if let Some(capture) = overlay.capture_point() {
+            return Self::for_execution_capture(store, limits, seed, Some(capture));
+        }
+        let seeded = seed.zip(overlay.base_capture_point()).and_then(|(seed, base)| {
+            let source = seed.inner.try_read().ok()?;
+            source.reproduces(&base, limits).then(|| source.clone())
+        });
+        let Some(seeded) = seeded else {
+            return Self::for_execution_capture(store, limits, None, None);
+        };
+        let identity = store.backing_store_identity().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("registry requires identifiable execution store".into())
+        })?;
+        let registry = Self {
+            inner: Arc::new(RwLock::new(seeded)),
+            execution_binding: Some((identity, limits)),
+        };
+        registry.update_written_rows(store, overlay)?;
+        Ok(registry)
+    }
+
     fn check_execution_store(&self, identity: Option<quil_types::store::BackingStoreIdentity>) -> QuilResult<()> {
         if self.execution_binding.as_ref().is_some_and(|(expected, _)| identity.as_ref() != Some(expected)) {
             return Err(QuilError::ExecutionUnavailable("registry execution store mismatch".into()));

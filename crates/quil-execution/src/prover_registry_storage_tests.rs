@@ -819,3 +819,82 @@ fn registry_seed_needs_an_unchanged_scan_and_limits_a_refresh_would_accept() {
     let overlay = quil_forest::ExecutionOverlay::capture(plain, registry_overlay_limits()).unwrap();
     assert!(overlay.capture_point().is_none());
 }
+
+/// A fork of a branch that wrote prover rows copies a seed scanned beneath
+/// those writes and re-reads only the rows the fork carries: the registry a
+/// full read of the fork gives, without reading every prover vertex. A seed
+/// scanned before a later database write is not used.
+#[test]
+fn a_branch_fork_seeds_its_registry_from_the_view_beneath_the_branch_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(dir.path()).unwrap();
+    let canonical = RocksHypergraphStore::new(db.inner());
+    let shard = quil_store::encoding::prover_registry_shard();
+    for n in 1..=40 {
+        canonical
+            .save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(n), &registry_prover_blob(1))
+            .unwrap();
+    }
+    let seed = SharedProverRegistry::new();
+    seed.refresh_from_store(&canonical).unwrap();
+
+    let branch = || {
+        let overlay = Arc::new(
+            quil_forest::ExecutionOverlay::capture(db.inner(), registry_overlay_limits()).unwrap(),
+        );
+        let store = quil_store::OverlayHypergraphStore::new(overlay.clone());
+        let txn = store.new_transaction(false).unwrap();
+        for (n, phase, data) in [
+            (1, "adds", registry_prover_blob(2)),
+            (41, "adds", registry_prover_blob(1)),
+            (2, "removes", b"removed".to_vec()),
+        ] {
+            store
+                .save_vertex_underlying(txn.as_ref(), "vertex", phase, &shard, &make_vertex_key(n), &data)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert!(overlay.capture_point().is_none());
+        overlay
+    };
+    let fingerprint = |registry: &SharedProverRegistry| {
+        registry.read(|r| {
+            let statuses: Vec<_> =
+                (1..=42u8).map(|n| r.get_prover_info(&[n; 32]).map(|p| p.status.clone())).collect();
+            (statuses, r.distinct_provers(), r.resource_usage())
+        })
+    };
+    let fork = |seed: Option<&SharedProverRegistry>, parent: &quil_forest::ExecutionOverlay| {
+        let overlay = Arc::new(parent.fork(registry_overlay_limits()).unwrap());
+        let store = quil_store::OverlayHypergraphStore::new(overlay.clone());
+        let before = overlay.stats().read_operations;
+        let registry =
+            SharedProverRegistry::for_execution_overlay(&store, RegistryLimits::UNBOUNDED, seed, &overlay)
+                .unwrap();
+        (fingerprint(&registry), overlay.stats().read_operations - before)
+    };
+
+    let parent = branch();
+    let (full, full_reads) = fork(None, &parent);
+    let (seeded, seeded_reads) = fork(Some(&seed), &parent);
+    assert_eq!(seeded, full);
+    assert_eq!(full.0[0], Some(ProverStatus::Paused));
+    assert_eq!(full.0[1], None);
+    assert!(full.0[40].is_some());
+    assert!(seeded_reads * 4 < full_reads, "{seeded_reads} reads, a full read {full_reads}");
+    assert_eq!(
+        seed.read(|r| r.get_prover_info(&[1; 32]).map(|p| p.status.clone())),
+        Some(ProverStatus::Active),
+        "the seed is copied, not updated"
+    );
+
+    canonical
+        .save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(42), &registry_prover_blob(1))
+        .unwrap();
+    let later = branch();
+    let (full, full_reads) = fork(None, &later);
+    let (unseeded, reads) = fork(Some(&seed), &later);
+    assert_eq!(unseeded, full);
+    assert!(full.0[41].is_some());
+    assert_eq!(reads, full_reads);
+}

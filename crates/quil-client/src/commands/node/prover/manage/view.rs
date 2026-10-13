@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, age, recovery, sealed};
+use super::super::local_execution::{local_execution_state, hosting, observed, age, recovery, sealed};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -757,15 +757,15 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
 }
 
 fn local_warning(a: &AllocationRow) -> bool {
-    local_execution_state(a.execution.as_ref()) == "running"
+    hosting(local_execution_state(a.execution.as_ref()))
         && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
 }
 
 fn local_color(a: &AllocationRow) -> Color {
     match local_execution_state(a.execution.as_ref()) {
         "blocked" | "stopped" => ERROR,
-        "running" if local_warning(a) => Color::Yellow,
-        "running" => SUCCESS,
+        _ if local_warning(a) => Color::Yellow,
+        "running" | "serving" => SUCCESS,
         _ => HELP,
     }
 }
@@ -1358,7 +1358,7 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
 fn update_app_progress_warning(m: &mut Model) {
     let rows: Vec<_> = m.allocations.iter().filter(|a| matches!(a.reward_status(m.epoch_frame(), m.epoch_length), Some(EffectiveStatus::Active | EffectiveStatus::Leaving))).collect();
     let known = m.reachable && !rows.is_empty() && rows.iter().all(|a| {
-        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && matches!(local_execution_state(Some(e)), "starting" | "running" | "blocked" | "stopped"))
+        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && observed(local_execution_state(Some(e))))
     });
     if !known { m.app_progress_observed_since = None; m.app_stall_time = None; return; }
     let observed = m.app_progress_observed_since.get_or_insert_with(std::time::Instant::now);
@@ -2564,6 +2564,34 @@ mod tests {
         m.cached_worker_info = None;
         assert!(worker_counts_line(&m).to_string().contains("Auto ? | Manual ?"));
         assert!(alloc_title(&m, &[]).to_string().contains("Allocations: 2/3 | Active ?"));
+    }
+
+    /// Nodes report lifecycle phases; older nodes report `running`. Both
+    /// show as themselves, and only a host with no frames warns.
+    #[test]
+    fn lifecycle_phases_show_and_color_like_running() {
+        use quil_types::proto::node::WorkerExecution;
+        let m = Model::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let worker = |state: &str, frame: u64| {
+            let mut a = row("01", 2, 1, 7, "", "");
+            a.execution = Some(WorkerExecution { state: state.into(), observed_unix_ms: now,
+                materialized_frame: Some(frame), ..Default::default() });
+            a
+        };
+        for (state, color) in [("running", SUCCESS), ("serving", SUCCESS), ("syncing", HELP), ("closing", HELP),
+            ("handoff", HELP), ("waiting", HELP), ("starting", HELP), ("blocked", ERROR), ("stopped", ERROR)] {
+            let a = worker(state, 124);
+            assert_eq!(alloc_cell(&m, &a, 9, 12), state);
+            assert_eq!(local_color(&a), color, "{state}");
+            assert!(!local_warning(&a), "{state}");
+        }
+        for state in ["running", "serving", "syncing", "closing"] {
+            let a = worker(state, 0);
+            assert!(local_warning(&a), "{state}");
+            assert_eq!(local_color(&a), Color::Yellow, "{state}");
+        }
+        assert!(!local_warning(&worker("handoff", 0)));
     }
 
     #[test]

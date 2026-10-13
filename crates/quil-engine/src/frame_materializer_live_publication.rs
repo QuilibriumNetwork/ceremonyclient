@@ -32,9 +32,22 @@ impl FrameMaterializer {
         frame: &quil_types::proto::global::GlobalFrame,
         limits: MaterializerBranchLimits,
     ) -> CanonicalAttempt {
-        let Some(number) = frame.header.as_ref().map(|h| h.frame_number) else {
+        let Some(header) = frame.header.as_ref() else {
             return CanonicalAttempt::Unavailable(unavailable("canonical frame has no header"));
         };
+        let number = header.frame_number;
+        // A capture starts at the completed frame's recorded prover root and
+        // execution needs that root to be the header's parent commitment, so
+        // when they differ the attempt can only fail, and only after the
+        // capture. An archive replaying far below the head, where the in-place
+        // path does not compare roots, spent ~5 s capturing three times per
+        // frame: 16 s a frame, a day for 5,300 frames (2026-10-12).
+        let cursor = self.last_materialized_frame.load(Ordering::SeqCst);
+        if cursor.checked_add(1) == Some(number)
+            && self.hypergraph.prover_root_at(cursor).is_some_and(|recorded| recorded != header.prover_tree_commitment)
+        {
+            return CanonicalAttempt::Unavailable(unavailable("tentative parent prover root mismatch"));
+        }
         let attempt = self.publish_atomically(frame, limits, false, |branch| {
             let cursor = branch.cursor()?;
             let clock = branch.execution.clock_store();

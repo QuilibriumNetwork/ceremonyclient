@@ -1024,7 +1024,7 @@ impl BlsAppFrameValidator {
             let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
             let authorized = if let Some(view) = handoff_view()? {
                 use quil_execution::global_intrinsic::handoff::frames;
-                frames::verify(
+                frames::verify_history(
                     &view,
                     &frames::FrameClaim {
                         filter: &header.address,

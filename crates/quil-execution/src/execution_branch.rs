@@ -234,11 +234,11 @@ impl ExecutionEngineManager {
             .shards_store
             .as_ref()
             .map(|_| Arc::new(OverlayShardsStore::new(storage.0.clone())));
-        let registry = SharedProverRegistry::for_execution_capture(
+        let registry = SharedProverRegistry::for_execution_overlay(
             store.as_ref(),
             limits.registry,
             seed,
-            storage.0.capture_point(),
+            &storage.0,
         )?;
         let global_clock_store: Arc<dyn ClockStore> = match &anchor {
             Some((_, view)) => view.clone(),

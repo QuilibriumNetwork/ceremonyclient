@@ -514,6 +514,27 @@ fn a_canonical_frame_executes_atomically_and_then_replays() {
     ));
 }
 
+// A frame committing to another parent prover root than the one recorded for
+// the cursor can only fail in a branch. An archive replaying below the head
+// captured three times a frame, ~5 s each, to find that out (2026-10-12).
+#[test]
+fn a_canonical_frame_on_another_parent_root_is_refused_without_a_capture() {
+    use crate::frame_materializer::CanonicalAttempt;
+    let fixture = Fixture::new(None);
+    let input = frame(1, [7; 32]);
+    store_canonical(&fixture, &input);
+    // A capture would wait out the held frame lock and report it instead.
+    let held = fixture.source.frame_execution.lock().unwrap();
+    match fixture.source.materialize_canonical_atomically(&input, limits()) {
+        CanonicalAttempt::Unavailable(error) => {
+            assert!(error.to_string().contains("tentative parent prover root mismatch"), "{error}")
+        }
+        other => panic!("expected the recorded root to refuse the frame, got {other:?}"),
+    }
+    drop(held);
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 0);
+}
+
 // The in-place path's unfinished-execution marker refuses every retry. A
 // canonical attempt that fails at publication leaves no marker, no cursor
 // change and no receipt, and a later attempt succeeds.

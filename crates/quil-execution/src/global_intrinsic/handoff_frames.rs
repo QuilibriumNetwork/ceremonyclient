@@ -38,6 +38,32 @@ pub fn verify(
     claim: &FrameClaim<'_>,
     bytes: &[u8],
 ) -> Result<Option<VerifiedFrame>> {
+    verify_with(state, claim, bytes, false)
+}
+
+/// [`verify`] for a data frame read as history (archive ingest, followers,
+/// sync), which also accepts the data frame a re-seal checkpoints. A re-seal
+/// (`HandoffProposer::with_seal_parents`) names the notarized seal it extends
+/// as `checkpoint.view`, so that data frame was certified at a lower view;
+/// it is the session tip GLOBAL executed and matched with the checkpoint's
+/// frame and digest before accepting the seal. GLOBAL header execution keeps
+/// [`verify`], whose outcomes must not change. Every archive refused frame
+/// 7078 of a re-sealed …000508 session and GLOBAL halted at 874,887
+/// (2026-10-11).
+pub fn verify_history(
+    state: &impl Records,
+    claim: &FrameClaim<'_>,
+    bytes: &[u8],
+) -> Result<Option<VerifiedFrame>> {
+    verify_with(state, claim, bytes, true)
+}
+
+fn verify_with(
+    state: &impl Records,
+    claim: &FrameClaim<'_>,
+    bytes: &[u8],
+    history: bool,
+) -> Result<Option<VerifiedFrame>> {
     let generation =
         unverified_finalization_epoch(bytes).ok_or_else(|| invalid("malformed proposal prefix"))?;
     // Legacy history (at or below a generation-0 source's base, or on a shard
@@ -85,10 +111,11 @@ pub fn verify(
     // A terminal certificate can arrive before the remaining source shards
     // close. Its cutoff applies immediately, including to historical replay.
     if let Some(end) = submitted_checkpoint(state, &session.id()?)? {
-        if claim.frame > end.frame
+        if (claim.frame > end.frame
             || claim.view > end.view
             || (claim.frame == end.frame && (claim.view != end.view || claim.digest != end.digest))
-            || (claim.frame < end.frame && claim.view >= end.view)
+            || (claim.frame < end.frame && claim.view >= end.view))
+            && !(history && resealed_tip(state, &session, claim, &end)?)
         {
             return Err(invalid("data frame is outside the terminal checkpoint"));
         }
@@ -97,6 +124,21 @@ pub fn verify(
         session,
         certificate,
     }))
+}
+
+/// The data frame a re-seal checkpoints: its frame and digest, certified
+/// below the checkpoint's view, and exactly the session's executed tip.
+fn resealed_tip(
+    state: &impl Records,
+    session: &Session,
+    claim: &FrameClaim<'_>,
+    end: &quil_cw_consensus::handoff::Checkpoint,
+) -> Result<bool> {
+    if claim.frame != end.frame || claim.digest != end.digest || claim.view >= end.view {
+        return Ok(false);
+    }
+    Ok(super::session_tip(state, &session.id()?)?
+        .is_some_and(|tip| (tip.frame, tip.view, tip.digest) == (claim.frame, claim.view, claim.digest)))
 }
 
 /// Under a committee-handoff flag day (`LegacyHistory::Discard`) the legacy

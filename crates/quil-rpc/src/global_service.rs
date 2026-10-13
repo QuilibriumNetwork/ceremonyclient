@@ -410,17 +410,25 @@ pub struct GlobalRpcServer {
 
 // Shared across peer-facing server instances. A cancelled RPC keeps its
 // permit inside the blocking closure until storage work actually finishes.
-// `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default 32); a batched
-// request reads up to `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached
-// nodes and values (`forest_read_cache`) take no slot at all. Sixteen kept
-// an archive's disk below its queue depth while syncs waited on it.
+// `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default
+// `default_forest_read_slots`); a batched request reads up to
+// `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached nodes and values
+// (`forest_read_cache`) take no slot at all.
 static FOREST_READ_WORKERS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
     let slots = std::env::var("QUIL_FOREST_READ_SLOTS").ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| (1..=1024).contains(n))
-        .unwrap_or(32);
+        .unwrap_or_else(|| default_forest_read_slots(std::thread::available_parallelism().map_or(4, |n| n.get())));
     tokio::sync::Semaphore::new(slots)
 });
+
+/// A quarter of `cores`, from 1 to 32. Each slot is a blocking storage read
+/// that can hold a core: 32 of them on a 32-core archive, decompressing
+/// blocks for peers, left its own GLOBAL execution and votes nothing, and
+/// GLOBAL halted (2026-10-13). A refused peer retries another archive.
+fn default_forest_read_slots(cores: usize) -> usize {
+    (cores / 4).clamp(1, 32)
+}
 static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// How long a forest read waits for a storage slot before the archive answers
@@ -2002,6 +2010,17 @@ mod app_shards_cache_tests {
 #[cfg(test)]
 mod forest_read_tests {
     use super::*;
+
+    #[test]
+    fn peers_read_storage_on_a_quarter_of_the_cores() {
+        assert_eq!(default_forest_read_slots(32), 8);
+        assert_eq!(default_forest_read_slots(8), 2);
+        assert_eq!(default_forest_read_slots(2), 1);
+        assert_eq!(default_forest_read_slots(256), 32);
+        for cores in 2..=256 {
+            assert!(default_forest_read_slots(cores) < cores, "{cores} cores");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_keeps_storage_slot_and_runtime_responsive() {

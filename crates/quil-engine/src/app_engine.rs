@@ -1719,6 +1719,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 struct EngineCwTransport {
     filter: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppEngineEvent>,
+    /// The host's committee is this node alone, so it has no one to send to.
+    /// Its committee is the one it was built with (a session's members);
+    /// the node used to judge this from its prover registry, and a registry
+    /// lagging the session (a regular node's, after a split or reassignment)
+    /// silently dropped a real committee's messages (2026-10-13).
+    alone: bool,
 }
 impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     fn deliver(
@@ -1727,6 +1733,9 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
         recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
         bytes: Vec<u8>,
     ) {
+        if self.alone {
+            return;
+        }
         let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
             crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
             recipients.iter().map(|key| key.as_ref().to_vec()).collect()
@@ -3459,16 +3468,13 @@ impl AppConsensusEngine {
                                     // (the block is still verified at `verify`, so this
                                     // is authorization/DoS hardening, not a safety hole).
                                     if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
-                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data.as_slice()) {
-                                            if let Some(header) = frame.header.as_ref() {
-                                                let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
-                                                if header.frame_number > cursor.saturating_add(1) {
-                                                    let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
-                                                        filter: self.filter.clone(),
-                                                        missing_frames: vec![cursor.saturating_add(1)],
-                                                    });
-                                                }
-                                            }
+                                        let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
+                                        let session = || self.cw_session.as_ref().and_then(|session| session.id().ok());
+                                        if let Some(missing) = block_sync_from(&data, cursor, session) {
+                                            let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                                                filter: self.filter.clone(),
+                                                missing_frames: vec![missing],
+                                            });
                                         }
                                         (h.ingest_block)(data);
                                     } else {
@@ -4424,6 +4430,7 @@ impl AppConsensusEngine {
             Arc::new(EngineCwTransport {
                 filter: filter.clone(),
                 event_tx: self.event_tx.clone(),
+                alone: member_pubkeys.len() == 1,
             });
 
         let partition = format!("app-{}", hex::encode(&app_address));
@@ -6696,6 +6703,24 @@ const PRE_STATE_MISMATCH_BOOTSTRAP: u64 = 6;
 /// At most one such self-heal per this interval.
 const PRE_STATE_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The frame a member materialized through `cursor` must sync from, when a
+/// received consensus block shows it is behind: a data frame more than one
+/// above it, or a seal of its own `session` over a checkpoint above it. A seal
+/// ends its session, so no later data frame comes to show a member that is
+/// behind its checkpoint (it missed that frame's finalization, or was down as
+/// the session closed), and a re-seal is voted only against the materialized
+/// checkpoint: such a member refuses every one until GLOBAL fences the
+/// session (2026-10-13).
+fn block_sync_from(bytes: &[u8], cursor: u64, session: impl FnOnce() -> Option<[u8; 32]>) -> Option<u64> {
+    let next = cursor.saturating_add(1);
+    if quil_cw_consensus::handoff::Seal::is_encoding(bytes) {
+        let seal = quil_cw_consensus::handoff::Seal::decode(bytes).ok()?;
+        return (seal.checkpoint.frame > cursor && session() == Some(seal.session)).then_some(next);
+    }
+    let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes).ok()?;
+    (frame.header?.frame_number > next).then_some(next)
+}
+
 /// Why this member's state looks like no one else's, given, since the last
 /// frame it materialized, the proposals whose pre-state it did not reproduce
 /// and the seals it verified that `agreed` with its state roots or
@@ -7516,13 +7541,43 @@ mod tests {
         assert_eq!(disagreeing_state(0, 1, 40), None, "another leader proposed this member's roots");
     }
 
+    /// A member behind a closing session's checkpoint learns it from the
+    /// seals it receives, as it does from data frames ahead of it.
+    #[test]
+    fn a_seal_above_the_materialized_frame_requests_a_sync() {
+        use prost::Message as _;
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        let seal = |session: [u8; 32], frame: u64| Seal {
+            request: [1; 32],
+            session,
+            view: 955,
+            checkpoint: Checkpoint { frame, view: 900, digest: [2; 32], state_roots: [[3; 32]; 4], history_root: [4; 32] },
+        }.encode();
+        let ours = || Some([7; 32]);
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2504, ours), Some(2505));
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2500, ours), Some(2501));
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2505, ours), None, "materialized through its checkpoint");
+        assert_eq!(block_sync_from(&seal([8; 32], 2505), 2504, ours), None, "another session's seal");
+        assert_eq!(block_sync_from(&seal([7; 32], 2505), 2504, || None), None, "no session running");
+        let mut truncated = seal([7; 32], 2505);
+        truncated.truncate(100);
+        assert_eq!(block_sync_from(&truncated, 2504, ours), None, "a malformed seal is not parsed as a frame");
+
+        let frame = |frame_number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader { frame_number, ..Default::default() }),
+            ..Default::default()
+        }.encode_to_vec();
+        assert_eq!(block_sync_from(&frame(2505), 2504, ours), None, "the next frame");
+        assert_eq!(block_sync_from(&frame(2506), 2504, ours), Some(2505));
+    }
+
     /// Resolver messages carry the members they are addressed to; votes,
     /// certificates and blocks go to the whole topic.
     #[test]
     fn only_resolver_messages_carry_their_recipients() {
         use crate::cw_app_seams::AppConsensusTransport as _;
         let (event_tx, mut events) = mpsc::unbounded_channel();
-        let transport = EngineCwTransport { filter: vec![1; 32], event_tx };
+        let transport = EngineCwTransport { filter: vec![1; 32], event_tx, alone: false };
         let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
         for (channel, expected) in [
             (crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, vec![vec![5u8; 897]]),
@@ -7538,6 +7593,20 @@ mod tests {
                 _ => panic!("expected a CwOut"),
             }
         }
+    }
+
+    /// Only a host whose own committee is this node alone stays silent; the
+    /// node's prover registry has no say in it.
+    #[test]
+    fn a_committee_of_this_node_alone_sends_nothing() {
+        use crate::cw_app_seams::AppConsensusTransport as _;
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let alone = EngineCwTransport { filter: vec![1; 32], event_tx, alone: true };
+        let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
+        for channel in [0, 1, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL] {
+            alone.deliver(channel, vec![member.clone()], vec![channel as u8]);
+        }
+        assert!(events.try_recv().is_err());
     }
 
     /// Each confidential bundle is proposed by exactly one live shard, the

@@ -114,10 +114,57 @@ impl RocksDbMemory {
     }
 }
 
+/// Block cache of a store that is not an archive's: enough for the hot
+/// working set of a regular node, which also runs a store per worker.
+const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 << 20;
+/// Bounds of an archive's block cache ([`archive_block_cache_bytes`]).
+const MIN_ARCHIVE_BLOCK_CACHE_BYTES: usize = DEFAULT_BLOCK_CACHE_BYTES;
+const MAX_ARCHIVE_BLOCK_CACHE_BYTES: usize = 32 << 30;
+
+/// An archive's block cache: a quarter of the memory this process may use,
+/// within 256 MB and 32 GB. An archive's store holds every application's
+/// history (280 GB on one), its index blocks are cached alongside its data,
+/// and peers' reads reach all of it; at 256 MB one archive spent 68% of 32
+/// cores decompressing blocks it had just evicted (2026-10-13).
+pub fn archive_block_cache_bytes() -> usize {
+    archive_block_cache_for(memory_budget_bytes())
+}
+
+fn archive_block_cache_for(memory: Option<u64>) -> usize {
+    memory
+        .map(|bytes| usize::try_from(bytes / 4).unwrap_or(usize::MAX))
+        .unwrap_or(MIN_ARCHIVE_BLOCK_CACHE_BYTES)
+        .clamp(MIN_ARCHIVE_BLOCK_CACHE_BYTES, MAX_ARCHIVE_BLOCK_CACHE_BYTES)
+}
+
+/// Physical memory, or the process's cgroup limit when lower (a container
+/// sees the host's memory but may use only its limit).
+fn memory_budget_bytes() -> Option<u64> {
+    // SAFETY: sysconf reads system configuration and has no preconditions.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    let physical = u64::try_from(pages).ok()?.checked_mul(u64::try_from(page).ok()?)?;
+    // cgroup v2, then v1; "max" (no limit) does not parse.
+    let limit = ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok());
+    Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
+}
+
 impl RocksDb {
     /// Open a RocksDB database at the given path.
     /// Runs pending migrations automatically.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_block_cache(path, DEFAULT_BLOCK_CACHE_BYTES)
+    }
+
+    /// [`Self::open`] for an archive's store, with its block cache sized
+    /// from memory ([`archive_block_cache_bytes`]).
+    pub fn open_archive(path: &Path) -> Result<Self> {
+        Self::open_with_block_cache(path, archive_block_cache_bytes())
+    }
+
+    /// `QUIL_ROCKSDB_BLOCK_CACHE_MB` overrides `block_cache_bytes`.
+    fn open_with_block_cache(path: &Path, block_cache_bytes: usize) -> Result<Self> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
 
@@ -161,14 +208,11 @@ impl RocksDb {
 
         // Block-cache budget. Without an explicit cache RocksDB
         // grows an internal cache that can balloon under churn.
-        // 256 MB is enough for the hot working set on a typical
-        // mainnet archive node; tune via env if needed.
-        const DEFAULT_BLOCK_CACHE_MB: usize = 256;
-        let cache_mb: usize = std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
+        let cache_bytes = std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_BLOCK_CACHE_MB);
-        let block_cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(block_cache_bytes, |mb| mb.saturating_mul(1024 * 1024));
+        let block_cache = rocksdb::Cache::new_lru_cache(cache_bytes);
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(&block_cache);
         // Account index + filter blocks against the cache budget,
@@ -176,6 +220,16 @@ impl RocksDb {
         // evict the hot consensus working set.
         block_opts.set_cache_index_and_filter_blocks(true);
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // Partitioned index: a table file's index is cut into 4 KB blocks
+        // under a small top level, pinned while the file is open, so a read
+        // loads one partition instead of the file's whole index. Whole
+        // indexes of a 280 GB store did not fit a 256 MB cache: every read
+        // that missed re-read and decompressed one (2026-10-13). Files keep
+        // the index they were written with, so this reaches older data as
+        // compaction rewrites it, and any build reads either kind.
+        block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+        block_opts.set_metadata_block_size(4096);
+        block_opts.set_pin_top_level_index_and_filter(true);
         opts.set_block_based_table_factory(&block_opts);
 
         let db = rocksdb::DB::open(&opts, path)
@@ -321,6 +375,53 @@ mod read_only_tests {
         let reopened = rocksdb::DB::open_default(directory.path()).unwrap();
         assert_eq!(reopened.get(b"saved").unwrap(), Some(b"checkpoint".to_vec()));
         assert_eq!(reopened.iterator(rocksdb::IteratorMode::Start).count(), 1);
+    }
+
+    #[test]
+    fn an_archive_block_cache_is_a_quarter_of_memory_within_bounds() {
+        const GB: u64 = 1 << 30;
+        assert_eq!(archive_block_cache_for(Some(123 * GB)), (123 * GB / 4) as usize);
+        assert_eq!(archive_block_cache_for(Some(8 * GB)), (2 * GB) as usize);
+        assert_eq!(archive_block_cache_for(Some(GB / 2)), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
+        assert_eq!(archive_block_cache_for(Some(1024 * GB)), MAX_ARCHIVE_BLOCK_CACHE_BYTES);
+        assert_eq!(archive_block_cache_for(None), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
+        assert!(memory_budget_bytes().is_some_and(|bytes| bytes > 0));
+    }
+
+    /// New table files carry a partitioned index; files written without one
+    /// (an older build) still read.
+    #[test]
+    fn new_table_files_have_a_partitioned_index_and_older_ones_still_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = |i: u32| format!("key-{i:08}").into_bytes();
+        {
+            let older = rocksdb::DB::open_default(directory.path()).unwrap();
+            for i in 0..20_000 {
+                older.put(key(i), [7u8; 64]).unwrap();
+            }
+            older.flush().unwrap();
+        }
+        {
+            let store = RocksDb::open_archive(directory.path()).unwrap();
+            let db = store.inner();
+            for i in 20_000..40_000 {
+                db.put(key(i), [9u8; 64]).unwrap();
+            }
+            db.flush().unwrap();
+            assert_eq!(db.get(key(7)).unwrap(), Some(vec![7u8; 64]));
+            assert_eq!(db.get(key(30_000)).unwrap(), Some(vec![9u8; 64]));
+            assert!(store.health().block_cache_capacity >= MIN_ARCHIVE_BLOCK_CACHE_BYTES as u64);
+        }
+        // Table properties live in the files: read them under default options.
+        let reopened = rocksdb::DB::open_default(directory.path()).unwrap();
+        let properties = reopened.property_value("rocksdb.aggregated-table-properties").unwrap().unwrap();
+        let partitions = properties
+            .split(';')
+            .find_map(|field| field.trim().strip_prefix("# index partitions=")?.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(partitions > 0, "the new file has a partitioned index: {properties}");
+        assert_eq!(reopened.get(key(7)).unwrap(), Some(vec![7u8; 64]));
+        assert_eq!(reopened.get(key(30_000)).unwrap(), Some(vec![9u8; 64]));
     }
 }
 
