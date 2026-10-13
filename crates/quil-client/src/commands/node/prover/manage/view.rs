@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, observed, advance_age, recovery, recovery_summary, sealed, seal_summary};
+use super::super::local_execution::{local_execution_state, advance_age, recovery, recovery_summary, sealed, seal_summary};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -1642,7 +1642,7 @@ fn update_app_progress_warning(m: &mut Model) {
     let rows: Vec<_> = m.allocations.iter().filter(|a| matches!(a.reward_status(m.epoch_frame(), m.epoch_length), Some(EffectiveStatus::Active | EffectiveStatus::Leaving)))
         .filter(|a| !matches!(m.execution_state(a.execution.as_ref()), "waiting" | "syncing" | "closing" | "handoff")).collect();
     let known = m.reachable && !rows.is_empty() && rows.iter().all(|a| {
-        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && observed(local_execution_state(Some(e))))
+        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && matches!(local_execution_state(Some(e)), "starting" | "running" | "serving" | "blocked" | "stopped"))
     });
     if !known { m.app_progress_observed_since = None; m.app_stall_time = None; return; }
     let observed = m.app_progress_observed_since.get_or_insert_with(std::time::Instant::now);
