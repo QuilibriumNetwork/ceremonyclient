@@ -43,6 +43,40 @@ pub fn app_frame_links_to_child(
             .is_ok_and(|identity| child.parent_selector == identity.as_slice())
 }
 
+/// Limits apply to the entire authentication chain, before any replay writes.
+pub(crate) const MAX_REPLAY_DESCENDANTS: usize = 32;
+pub(crate) const MAX_REPLAY_CHAIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Authenticate a missing frame through a bounded certified descendant chain.
+/// The terminal callback must verify its historical committee certificate;
+/// linked validation must bind every intermediate body and deterministic output.
+pub(crate) fn validate_archive_replay_chain(
+    frame: &AppShardFrame,
+    descendants: &[AppShardFrame],
+    certified: impl FnOnce(&AppShardFrame) -> Result<bool>,
+    mut linked: impl FnMut(&AppShardFrame) -> Result<bool>,
+) -> Result<()> {
+    if descendants.is_empty() || descendants.len() > MAX_REPLAY_DESCENDANTS
+        || descendants.iter().fold(frame.encoded_len(), |bytes, child| bytes.saturating_add(child.encoded_len()))
+            > MAX_REPLAY_CHAIN_BYTES {
+        return Err(QuilError::InvalidArgument("invalid archive replay chain bounds".into()));
+    }
+    let terminal = descendants.last().unwrap();
+    if !certified(terminal)? {
+        return Err(QuilError::InvalidSignature("archive replay descendant certificate rejected".into()));
+    }
+    let mut child = terminal;
+    for parent in descendants[..descendants.len() - 1].iter().rev().chain(std::iter::once(frame)) {
+        if !parent.header.as_ref().zip(child.header.as_ref())
+            .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child))
+            || !linked(parent)? {
+            return Err(QuilError::InvalidSignature("archive replay ancestor chain rejected".into()));
+        }
+        child = parent;
+    }
+    Ok(())
+}
+
 /// True iff the request BODY hashes to the header's `requests_root`.
 ///
 /// The header is authenticated (VDF binds `requests_root`; the finalization cert
@@ -1300,6 +1334,70 @@ mod tests {
         ] {
             assert!(!app_frame_links_to_child(&parent, &bad));
         }
+    }
+
+    fn replay_chain() -> Vec<AppShardFrame> {
+        let mut frames = Vec::new();
+        for number in 10..14 {
+            let selector = frames.last().map(|parent: &AppShardFrame|
+                quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output).unwrap().to_vec())
+                .unwrap_or_default();
+            frames.push(AppShardFrame { header: Some(quil_types::proto::global::FrameHeader {
+                address: vec![1; 32], frame_number: number, rank: number * 2,
+                output: vec![number as u8; 32], parent_selector: selector, ..Default::default()
+            }), ..Default::default() });
+        }
+        frames
+    }
+
+    #[test]
+    fn replay_chain_authenticates_all_ancestors_before_replay() {
+        let frames = replay_chain();
+        let mut seen = Vec::new();
+        validate_archive_replay_chain(&frames[0], &frames[1..],
+            |terminal| Ok(terminal.header.as_ref().unwrap().frame_number == 13),
+            |parent| { seen.push(parent.header.as_ref().unwrap().frame_number); Ok(true) }).unwrap();
+        assert_eq!(seen, [12, 11, 10]);
+        assert!(validate_archive_replay_chain(&frames[0], &frames[1..],
+            |_| Ok(false), |_| panic!("must not trust ancestors without a certificate")).is_err());
+        assert!(validate_archive_replay_chain(&frames[0], &frames[1..],
+            |_| Err(QuilError::InvalidSignature("wrong historical session".into())),
+            |_| panic!("must not trust a wrong-session certificate")).is_err());
+    }
+
+    #[test]
+    fn replay_chain_rejects_bad_links_and_intermediate_bodies() {
+        let frames = replay_chain();
+        for index in 1..frames.len() {
+            for change in 0..4 {
+                let mut bad = frames.clone();
+                let header = bad[index].header.as_mut().unwrap();
+                match change {
+                    0 => header.address = vec![2; 32],
+                    1 => header.frame_number += 1,
+                    2 => header.rank = 0,
+                    _ => header.parent_selector = vec![0; 32],
+                }
+                assert!(validate_archive_replay_chain(&bad[0], &bad[1..], |_| Ok(true), |_| Ok(true)).is_err());
+            }
+        }
+        for invalid in 10..13 {
+            assert!(validate_archive_replay_chain(&frames[0], &frames[1..], |_| Ok(true),
+                |parent| Ok(parent.header.as_ref().unwrap().frame_number != invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn replay_chain_rejects_empty_overlong_and_oversized_inputs_before_verification() {
+        let frames = replay_chain();
+        for descendants in [Vec::new(), vec![frames[1].clone(); MAX_REPLAY_DESCENDANTS + 1]] {
+            assert!(validate_archive_replay_chain(&frames[0], &descendants,
+                |_| panic!("bounds checked first"), |_| panic!("bounds checked first")).is_err());
+        }
+        let mut oversized = frames[0].clone();
+        oversized.header.as_mut().unwrap().output = vec![0; MAX_REPLAY_CHAIN_BYTES];
+        assert!(validate_archive_replay_chain(&oversized, &frames[1..],
+            |_| panic!("byte limit checked first"), |_| panic!("byte limit checked first")).is_err());
     }
 
     #[test]

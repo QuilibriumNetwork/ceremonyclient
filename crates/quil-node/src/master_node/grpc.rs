@@ -858,14 +858,25 @@ pub(crate) fn spawn_all(
                     quil_engine::metrics::inc_grpc_submits_duplicate();
                     Ok(())
                 }
-                quil_engine::message_collector::SubmitOutcome::Filtered => {
+                quil_engine::message_collector::SubmitOutcome::Filtered(refusal) => {
                     quil_engine::metrics::inc_grpc_submits_rejected();
+                    // The submitter cannot read this log, so the reply says
+                    // why, with this node's executed frame against its head:
+                    // a node still executing older frames judges shard
+                    // addresses and ranks by its own state.
+                    let (executed, head) = (submit_cf.materialized(), submit_cf.effective());
                     tracing::warn!(
                         peer = %auth.peer_id,
                         rank,
-                        "gRPC submit REJECTED by message collector (reason logged by collector: attestation / stale-shard-address / buffer-full / prover-only)"
+                        reason = refusal.reason(),
+                        executed,
+                        head,
+                        "gRPC submit REJECTED by message collector"
                     );
-                    Err("message collector rejected".into())
+                    Err(format!(
+                        "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
+                        refusal.reason(),
+                    ))
                 }
             }
         },
@@ -1239,8 +1250,8 @@ pub(crate) fn spawn_all(
                 // Duplicate = already delivered → success (not a drop).
                 quil_engine::message_collector::SubmitOutcome::Accepted
                 | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
-                quil_engine::message_collector::SubmitOutcome::Filtered => {
-                    Err("message collector rejected".into())
+                quil_engine::message_collector::SubmitOutcome::Filtered(refusal) => {
+                    Err(format!("message collector rejected: {} (rank {rank})", refusal.reason()))
                 }
             }
         },

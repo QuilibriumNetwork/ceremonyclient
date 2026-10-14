@@ -3460,20 +3460,22 @@ impl HypergraphCrdt {
         // This also works for databases written before subtree sync was wired.
         // Bound unknown-root requests; no unauthenticated tree is returned when
         // a peer is behind or the required history has been pruned.
-        const SUBTREE_ROOT_LOOKBACK: u64 = 720;
+        //
+        // The bound counts the subtree's OWN changes. It used to count the
+        // app's versions, which every sub-shard's frame advances: with a dozen
+        // QUIL shards producing, 720 versions were about 20 minutes, and an
+        // idle shard's state before its last frame could not be served to a
+        // member joining its next session (2026-10-14).
+        const SUBTREE_ROOT_LOOKBACK: usize = 720;
         let bits = self.canonical_bits_for_filter(shard_id)?;
         let app = &shard_id[..32];
         let forest = self.forest.read().ok()?;
         let head = self.resolve_phase_version_with(&forest, app, phase_idx)?;
-        for version in (head.saturating_sub(SUBTREE_ROOT_LOOKBACK - 1)..=head).rev() {
-            if forest.app_subtree_root(app, PHASES[phase_idx], version, &bits).ok() == Some(root) {
-                // Version is exact; a subtree lookup has no recorded global
-                // frame. Its sync caller uses the certified shard header's
-                // frame, never this zero, to advance its materialized cursor.
-                return Some((version, 0));
-            }
-        }
-        None
+        // Version is exact; a subtree lookup has no recorded global frame. Its
+        // sync caller uses the certified shard header's frame, never this zero,
+        // to advance its materialized cursor.
+        forest.app_subtree_version_of(app, PHASES[phase_idx], head, &bits, root, SUBTREE_ROOT_LOOKBACK)
+            .map(|version| (version, 0))
     }
 
     /// Whether this node retains the GLOBAL prover-shard (vertex-adds) tree at
@@ -3924,11 +3926,15 @@ impl HypergraphCrdt {
         // top — so metadata reflects mutations made this frame before commit
         // (the old in-memory KZG tree held them; the forest-native path merges).
         let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        self.store.for_each_vertex_underlying(set, phase, shard, &mut |k, v| {
-            if path.is_empty() || id_matches_path(&k, path) {
-                map.insert(k, v);
-            }
-        })?;
+        self.store.for_each_vertex_underlying_matching(
+            set,
+            phase,
+            shard,
+            &|key| path.is_empty() || id_matches_path(key, path),
+            &mut |key, blob| {
+                map.insert(key, blob);
+            },
+        )?;
         if let Some(pb) = self.pending_blobs.read().unwrap().get(&(shard.clone(), phase_idx)) {
             for (k, v) in pb {
                 if path.is_empty() || id_matches_path(k, path) {
@@ -4294,6 +4300,42 @@ mod size_index_tests {
 
     fn crdt() -> HypergraphCrdt {
         HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    #[test]
+    fn selective_phase_serialization_preserves_canonical_bytes_and_pending_overlay() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0x42; 32] };
+        let keys = [vec![0x00; 64], vec![0x03; 64], vec![0x04; 64]];
+        let txn = store.new_transaction(false).unwrap();
+        for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+            for (idx, key) in keys.iter().enumerate() {
+                store.save_vertex_underlying(txn.as_ref(), set, phase, &shard, key, &[phase_idx as u8, idx as u8]).unwrap();
+            }
+            hg.pending_blobs.write().unwrap().insert((shard.clone(), phase_idx),
+                [(keys[0].clone(), vec![9, phase_idx as u8]), (vec![0x01; 64], vec![8])].into_iter().collect());
+        }
+        txn.commit().unwrap();
+        for path in [vec![], vec![0], vec![0, 0], vec![1], vec![63], vec![64], vec![-1], vec![0; 86]] {
+            let mut expected = Vec::new();
+            for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+                let mut rows = BTreeMap::new();
+                store.for_each_vertex_underlying(set, phase, &shard, &mut |key, blob| {
+                    if id_matches_path(&key, &path) { rows.insert(key, blob); }
+                }).unwrap();
+                for (key, blob) in &hg.pending_blobs.read().unwrap()[&(shard.clone(), phase_idx)] {
+                    if id_matches_path(key, &path) { rows.insert(key.clone(), blob.clone()); }
+                }
+                expected.push(phase_idx as u8);
+                expected.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+                for (key, blob) in rows {
+                    expected.extend_from_slice(&(key.len() as u32).to_be_bytes()); expected.extend_from_slice(&key);
+                    expected.extend_from_slice(&(blob.len() as u32).to_be_bytes()); expected.extend_from_slice(&blob);
+                }
+            }
+            assert_eq!(hg.serialize_phase_subtrees(&shard, &path).unwrap(), expected, "path {path:?}");
+        }
     }
 
     /// The world size is recorded per materialized frame with the prover root

@@ -1123,14 +1123,29 @@ impl Forest {
         version: u64,
         bit_path: &[bool],
     ) -> Result<[u8; 32]> {
+        Ok(self.app_subtree_root_changed(app_address, phase, version, bit_path)?.0)
+    }
+
+    /// [`Self::app_subtree_root`] and the version, at or below `version`, at
+    /// which that subtree last changed: the version of the deepest node the
+    /// descent read, or for a sub-nibble range the newest of its children. Any
+    /// write under `bit_path` rewrites that node or child, so the subtree is the
+    /// same at every version from there through `version`.
+    pub fn app_subtree_root_changed(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        bit_path: &[bool],
+    ) -> Result<([u8; 32], u64)> {
         let store = self.store(&TreeId::shard_phase(app_address, phase));
         // Empty tree → placeholder; empty path → whole app-phase root.
         let root_hash = match Sha256Jmt::new(&store).get_root_hash_option(version)? {
             Some(r) => r.0,
-            None => return Ok([0u8; 32]),
+            None => return Ok(([0u8; 32], 0)),
         };
         if bit_path.is_empty() {
-            return Ok(root_hash);
+            return Ok((root_hash, version));
         }
         let full = bit_path.len() / 4; // whole nibbles to descend
         let rem = bit_path.len() % 4; // trailing sub-nibble bits (1..=3)
@@ -1147,8 +1162,8 @@ impl Forest {
             let int = match cur_node {
                 // The subtree collapsed to a single leaf ABOVE our target depth:
                 // it's the shard's subtree iff the leaf address carries `bit_path`.
-                Node::Leaf(leaf) => return Ok(leaf_if_under(&leaf, bit_path)),
-                Node::Null => return Ok([0u8; 32]),
+                Node::Leaf(leaf) => return Ok((leaf_if_under(&leaf, bit_path), cur_key.version())),
+                Node::Null => return Ok(([0u8; 32], cur_key.version())),
                 Node::Internal(int) => int,
             };
             // Find the child at `nib_val` (its Nibble + version) without
@@ -1159,7 +1174,7 @@ impl Forest {
                 .map(|(nibble, c)| (nibble, c.version));
             let (nibble, cver) = match child {
                 Some(x) => x,
-                None => return Ok([0u8; 32]), // empty subtree under this prefix
+                None => return Ok(([0u8; 32], cur_key.version())), // empty subtree under this prefix
             };
             cur_key = cur_key.gen_child_node_key(cver, nibble);
             cur_node = match store.get_node_option(&cur_key)? {
@@ -1170,20 +1185,57 @@ impl Forest {
 
         // At the whole-nibble prefix node. Nibble-aligned ⇒ the node hash IS the
         // subtree root; sub-nibble ⇒ a width-(16>>rem) sub-range of it.
+        let changed = cur_key.version();
         Ok(match cur_node {
-            Node::Null => [0u8; 32],
-            Node::Leaf(leaf) => leaf_if_under(&leaf, bit_path),
+            Node::Null => ([0u8; 32], changed),
+            Node::Leaf(leaf) => (leaf_if_under(&leaf, bit_path), changed),
             Node::Internal(int) => {
                 if rem == 0 {
-                    int.hash::<Sha256>()
+                    (int.hash::<Sha256>(), changed)
                 } else {
                     let top = bits_to_nibble(&bit_path[full * 4..]); // MSB-first, `rem` bits
                     let width = 16u8 >> rem;
                     let start = top << (4 - rem);
-                    int.subtree_hash::<Sha256>(start, width)
+                    // The node also holds sibling shards' ranges, rewritten with
+                    // each of their writes; the range's own children say when
+                    // it changed. (A child removed from the range leaves no
+                    // version behind: a search can step over the state before
+                    // that removal, never return a wrong version.)
+                    let range = start as usize..(start + width) as usize;
+                    let changed = int.children_sorted()
+                        .filter(|(nibble, _)| range.contains(&nibble.as_usize()))
+                        .map(|(_, child)| child.version)
+                        .max()
+                        .unwrap_or(changed);
+                    (int.subtree_hash::<Sha256>(start, width), changed)
                 }
             }
         })
+    }
+
+    /// The newest version, at or below `head`, at which the subtree at
+    /// `bit_path` had `root`, looking back over at most `max_changes` of that
+    /// subtree's own changes. Commits elsewhere in the app do not count, so a
+    /// shard idle for days is as cheap to search as one that changed a minute
+    /// ago. `None` when not found within them, or when a node is unreadable.
+    pub fn app_subtree_version_of(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        head: u64,
+        bit_path: &[bool],
+        root: [u8; 32],
+        max_changes: usize,
+    ) -> Option<u64> {
+        let mut version = head;
+        for _ in 0..max_changes {
+            let (found, changed) = self.app_subtree_root_changed(app_address, phase, version, bit_path).ok()?;
+            if found == root {
+                return Some(version);
+            }
+            version = changed.checked_sub(1)?;
+        }
+        None
     }
 
     /// The number of leaves under `bit_path` in the app's phase tree — the COUNT
@@ -1717,6 +1769,44 @@ mod tests {
             [0u8; 32],
             "empty shard → all-zero placeholder"
         );
+    }
+
+    /// A shard idle under hundreds of a sibling's commits still resolves its
+    /// state before its last change: the search counts the shard's own
+    /// changes, also when the sibling shares its sub-nibble node.
+    #[test]
+    fn an_idle_subtree_resolves_its_old_state_past_a_siblings_commits() {
+        let forest = Forest::in_memory();
+        let app = b"quil-app-address-0123456789abcd!".to_vec();
+        let phase = Phase::VertexAdds;
+        let key = |b0: u8| -> Vec<u8> {
+            let mut k = vec![0u8; 32];
+            k[0] = b0;
+            k[31] = b0;
+            k
+        };
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = (0u8..8).map(|b| (key(b), vec![0xCC, b])).collect();
+        leaves.push((key(0x80), vec![0xDD, 0]));
+        forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+        // X = 000000 (byte0 0x00..0x03), Y = 000001 (0x04..0x07): one node.
+        let bits_x = crate::prefix_to_bits(&[0u32], 6);
+        let bits_y = crate::prefix_to_bits(&[1u32], 6);
+        let before = forest.app_subtree_root(&app, phase, 0, &bits_x).unwrap();
+        forest.commit_shard_phase_raw(&app, phase, 1, vec![(key(1), vec![0xEE])]).unwrap();
+        let after = forest.app_subtree_root(&app, phase, 1, &bits_x).unwrap();
+        assert_ne!(before, after);
+        let head = 1_000u64;
+        for version in 2..=head {
+            forest.commit_shard_phase_raw(&app, phase, version, vec![(key(5), version.to_be_bytes().to_vec())]).unwrap();
+        }
+        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &bits_x).unwrap(), (after, 1));
+        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &bits_y).unwrap().1, head);
+        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, after, 1), Some(head));
+        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 2), Some(0));
+        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 1), None);
+        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, [7; 32], 720), None);
+        // The nibble-aligned parent holds both shards: it changes with Y.
+        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &[false; 4]).unwrap().1, head);
     }
 
     /// CRUX of shard-prover subtree-range sync: a PARTIAL app tree holding only
