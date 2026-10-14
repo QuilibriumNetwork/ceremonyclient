@@ -153,8 +153,9 @@ pub(crate) async fn recover_shard_from_latest(
         tracing::warn!(filter = %hex::encode(filter), %error, "origin anchors unavailable; bootstrap unpinned");
         Vec::new()
     });
+    let committed_tip = target.committed_tip().await;
     recovery_phase("fetching_checkpoint");
-    match sync_shard_from_latest(syncer, filter, None, &anchors, |anchor, predecessor| target.validate(anchor, predecessor)).await? {
+    match sync_shard_from_latest(syncer, filter, None, &anchors, committed_tip, |anchor, predecessor| target.validate(anchor, predecessor)).await? {
         ShardSyncResult::Anchored { anchor, predecessor } => {
             let frame = anchor.header.as_ref().map_or(0, |header| header.frame_number);
             recovery_phase("installing_checkpoint");
@@ -323,22 +324,53 @@ where
     Ok(ShardReplay { materialized, archive_tip, target })
 }
 
+/// An anchor and its predecessor, both accepted by `validate`; `None` when
+/// refused. A malformed or wrong-shard anchor, or one that is not frame
+/// `expected`, is an error.
+async fn authenticated_anchor<F, Fut>(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    anchor: AppShardFrame,
+    expected: Option<u64>,
+    validate: &mut F,
+) -> Result<Option<(AppShardFrame, Option<AppShardFrame>)>>
+where
+    F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    use quil_types::error::QuilError;
+    let header = anchor.header.as_ref().ok_or_else(|| QuilError::InvalidArgument("archive anchor has no header".into()))?;
+    if header.address != filter || header.frame_number == 0
+        || expected.is_some_and(|number| header.frame_number != number)
+        || header.state_roots.len() != 4 || header.state_roots.iter().any(|root| root.len() != 32) {
+        return Err(QuilError::InvalidArgument("malformed or wrong-shard archive anchor".into()));
+    }
+    let predecessor = if header.frame_number > 1 {
+        syncer.get_app_shard_frame(filter, header.frame_number - 1).await?
+    } else { None };
+    Ok(validate(anchor.clone(), predecessor.clone()).await?.then_some((anchor, predecessor)))
+}
+
 /// A stale worker must discover the archive tip even when it has a local
 /// clock head. Authenticate the selected chain before installing any leaves.
 /// The validator runs on the engine that owns the worker's committee view.
+///
+/// `committed`: the frame GLOBAL has executed the shard's current session
+/// through, or its base (`app_handoff::committed_tip`). When the archive's
+/// latest frame is refused, the anchor falls back to that frame.
 pub(crate) async fn sync_shard_from_latest<F, Fut>(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: Option<AppShardFrame>,
     origin_anchors: &[(Vec<u8>, [[u8; 32]; 4])],
-    validate: F,
+    committed: Option<u64>,
+    mut validate: F,
 ) -> Result<ShardSyncResult>
 where
-    F: FnOnce(AppShardFrame, Option<AppShardFrame>) -> Fut,
+    F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
 {
     use crate::worker_execution::recovery_phase;
-    use quil_types::error::QuilError;
     let remote = syncer.get_app_shard_frame(filter, 0).await?;
     let height = |frame: &AppShardFrame| frame.header.as_ref().map_or(0, |h| h.frame_number);
     let anchor = match (local, remote) {
@@ -393,18 +425,34 @@ where
             ShardSyncResult::Inherited { pinned: false }
         } else { ShardSyncResult::NotReady("the archive could not supply the covered subtree") });
     };
-    let header = anchor.header.as_ref().ok_or_else(|| QuilError::InvalidArgument("archive anchor has no header".into()))?;
-    if header.address != filter || header.frame_number == 0
-        || header.state_roots.len() != 4 || header.state_roots.iter().any(|root| root.len() != 32) {
-        return Err(QuilError::InvalidArgument("malformed or wrong-shard archive anchor".into()));
-    }
-    let expected_roots = header.state_roots.clone();
-    let predecessor = if header.frame_number > 1 {
-        syncer.get_app_shard_frame(filter, header.frame_number - 1).await?
-    } else { None };
-    if !validate(anchor.clone(), predecessor.clone()).await? {
-        return Ok(ShardSyncResult::NotReady("the archive checkpoint failed validation"));
-    }
+    let latest = height(&anchor);
+    let (anchor, predecessor) = match authenticated_anchor(syncer, filter, anchor, None, &mut validate).await? {
+        Some(pair) => pair,
+        // The latest frame an archive holds can lie above the checkpoint GLOBAL
+        // fenced the shard's last session at: frames its closing committee
+        // finalized that GLOBAL never executed. Validation refuses every frame
+        // past a terminal checkpoint, and archives serve them as the latest
+        // until a successor produces past them. A member holding none of the
+        // shard's data never bootstrapped, so never started, and a successor
+        // that needed such members for quorum never produced (2026-10-13). The
+        // frame GLOBAL committed is the successor's base and authenticated.
+        None => {
+            let Some(committed) = committed.filter(|&number| number > 0 && number < latest) else {
+                return Ok(ShardSyncResult::NotReady("the archive checkpoint failed validation"));
+            };
+            let fallback = match syncer.get_app_shard_frame(filter, committed).await? {
+                Some(frame) => authenticated_anchor(syncer, filter, frame, Some(committed), &mut validate).await?,
+                None => None,
+            };
+            let Some(pair) = fallback else {
+                return Ok(ShardSyncResult::NotReady("the archive checkpoint failed validation"));
+            };
+            tracing::info!(filter = %hex::encode(filter), latest, committed,
+                "archive's latest shard frame refused; bootstrapping from the frame GLOBAL committed");
+            pair
+        }
+    };
+    let expected_roots = anchor.header.as_ref().map(|header| header.state_roots.clone()).unwrap_or_default();
     recovery_phase("installing_leaves");
     Ok(if syncer.sync_shard_tree(filter, &expected_roots).await? {
         ShardSyncResult::Anchored { anchor, predecessor }
@@ -515,12 +563,12 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
         let validate_calls = calls.clone();
-        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[],
-            move |anchor, predecessor| async move {
+        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[], None,
+            move |anchor, predecessor| {
                 assert_eq!(anchor.header.unwrap().frame_number, 600);
                 assert_eq!(predecessor.unwrap().header.unwrap().frame_number, 599);
                 validate_calls.lock().unwrap().push("validate 600".into());
-                Ok(true)
+                async { Ok(true) }
             }).await.unwrap();
         assert!(matches!(result, ShardSyncResult::Anchored { .. }));
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 599", "validate 600", "sync 88"]);
@@ -639,10 +687,38 @@ mod tests {
     async fn rejected_archive_chain_never_installs_its_tree() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
-        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[],
+        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[], None,
             |_, _| async { Ok(false) }).await.unwrap();
         assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 599"]);
+    }
+
+    /// GLOBAL fenced the shard's last session at 505; its committee had
+    /// finalized 506 and 507, which archives still serve as the latest and
+    /// validation refuses (past the terminal checkpoint). A member without the
+    /// shard's data bootstraps from the frame GLOBAL committed instead.
+    #[tokio::test]
+    async fn a_refused_archive_tip_falls_back_to_the_committed_frame() {
+        let validate = |anchor: AppShardFrame, predecessor: Option<AppShardFrame>| {
+            let number = anchor.header.unwrap().frame_number;
+            assert_eq!(predecessor.unwrap().header.unwrap().frame_number, number - 1);
+            async move { Ok(number <= 505) }
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let result = sync_shard_from_latest(&archive, &[5; 32], None, &[], Some(505), validate).await.unwrap();
+        let ShardSyncResult::Anchored { anchor, .. } = result else { panic!("expected the committed frame as the anchor") };
+        assert_eq!(anchor.header.unwrap().frame_number, 505);
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 506", "fetch 505", "fetch 504", "sync 249"]);
+
+        // Without a committed frame below it the refusal stands.
+        for committed in [None, Some(0), Some(507)] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+            let result = sync_shard_from_latest(&archive, &[5; 32], None, &[], committed, validate).await.unwrap();
+            assert!(matches!(result, ShardSyncResult::NotReady(_)));
+            assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 506"]);
+        }
     }
 
     /// Holds no frame of the shard; records each tree sync as
@@ -675,19 +751,19 @@ mod tests {
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: None };
-        let result = sync_shard_from_latest(&archive, &child, None, &anchors, never).await.unwrap();
+        let result = sync_shard_from_latest(&archive, &child, None, &anchors, None, never).await.unwrap();
         assert!(matches!(result, ShardSyncResult::Inherited { pinned: true }));
         assert_eq!(*calls.lock().unwrap(), [(1, Some(0x51)), (2, Some(0x61))], "pinned, never unpinned");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: Some(right) };
-        let result = sync_shard_from_latest(&archive, &child, None, &anchors, never).await.unwrap();
+        let result = sync_shard_from_latest(&archive, &child, None, &anchors, None, never).await.unwrap();
         assert!(matches!(result, ShardSyncResult::Inherited { pinned: false }));
         assert_eq!(*calls.lock().unwrap(), [(1, Some(0x51)), (2, Some(0x61)), (5, None)], "falls back when an origin is unavailable");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: None };
-        let result = sync_shard_from_latest(&archive, &child, None, &[], never).await.unwrap();
+        let result = sync_shard_from_latest(&archive, &child, None, &[], None, never).await.unwrap();
         assert!(matches!(result, ShardSyncResult::Inherited { pinned: false }));
         assert_eq!(*calls.lock().unwrap(), [(5, None)], "no certified origin: unpinned");
     }
@@ -703,7 +779,7 @@ mod tests {
         let never = |_: AppShardFrame, _: Option<AppShardFrame>| async { panic!("no frame to validate") };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: Some(filter.clone()) };
-        let result = sync_shard_from_latest(&archive, &filter, None, &anchors, never).await.unwrap();
+        let result = sync_shard_from_latest(&archive, &filter, None, &anchors, None, never).await.unwrap();
         assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), [(5, Some(0x71))], "pinned only");
     }
@@ -806,7 +882,7 @@ mod tests {
     async fn missing_peer_tip_does_not_turn_an_existing_worker_into_unanchored_bootstrap() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: None, calls: calls.clone() };
-        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[],
+        let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[], None,
             |anchor, predecessor| async move {
                 assert_eq!(anchor.header.unwrap().frame_number, 130);
                 assert_eq!(predecessor.unwrap().header.unwrap().frame_number, 129);
@@ -820,7 +896,7 @@ mod tests {
         let mut malformed = frame(600);
         malformed.header.as_mut().unwrap().state_roots[0].pop();
         let archive = Archive { latest: Some(malformed), calls: calls.clone() };
-        assert!(sync_shard_from_latest(&archive, &[5; 32], None, &[],
+        assert!(sync_shard_from_latest(&archive, &[5; 32], None, &[], None,
             |_, _| async { panic!("malformed anchor reached validator") }).await.is_err());
         assert_eq!(calls.lock().unwrap().last().unwrap(), "fetch 0");
     }

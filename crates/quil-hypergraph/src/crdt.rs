@@ -3460,20 +3460,22 @@ impl HypergraphCrdt {
         // This also works for databases written before subtree sync was wired.
         // Bound unknown-root requests; no unauthenticated tree is returned when
         // a peer is behind or the required history has been pruned.
-        const SUBTREE_ROOT_LOOKBACK: u64 = 720;
+        //
+        // The bound counts the subtree's OWN changes. It used to count the
+        // app's versions, which every sub-shard's frame advances: with a dozen
+        // QUIL shards producing, 720 versions were about 20 minutes, and an
+        // idle shard's state before its last frame could not be served to a
+        // member joining its next session (2026-10-14).
+        const SUBTREE_ROOT_LOOKBACK: usize = 720;
         let bits = self.canonical_bits_for_filter(shard_id)?;
         let app = &shard_id[..32];
         let forest = self.forest.read().ok()?;
         let head = self.resolve_phase_version_with(&forest, app, phase_idx)?;
-        for version in (head.saturating_sub(SUBTREE_ROOT_LOOKBACK - 1)..=head).rev() {
-            if forest.app_subtree_root(app, PHASES[phase_idx], version, &bits).ok() == Some(root) {
-                // Version is exact; a subtree lookup has no recorded global
-                // frame. Its sync caller uses the certified shard header's
-                // frame, never this zero, to advance its materialized cursor.
-                return Some((version, 0));
-            }
-        }
-        None
+        // Version is exact; a subtree lookup has no recorded global frame. Its
+        // sync caller uses the certified shard header's frame, never this zero,
+        // to advance its materialized cursor.
+        forest.app_subtree_version_of(app, PHASES[phase_idx], head, &bits, root, SUBTREE_ROOT_LOOKBACK)
+            .map(|version| (version, 0))
     }
 
     /// Whether this node retains the GLOBAL prover-shard (vertex-adds) tree at

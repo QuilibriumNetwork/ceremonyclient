@@ -135,9 +135,31 @@ pub enum SubmitOutcome {
     /// The submitter's work is NOT lost — a network submit handler should
     /// report this to the caller as success, not a dropped message.
     Duplicate,
-    /// Rejected by a real filter (prover-only mode dropped a non-prover
-    /// message during degraded coverage); the message was NOT retained.
-    Filtered,
+    /// Rejected by a real filter; the message was NOT retained.
+    Filtered(Refusal),
+}
+
+/// Why a submission was not retained. A submitter cannot read the
+/// receiver's log, so a submit handler returns [`Refusal::reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Prover-only mode (degraded coverage) and not a prover message.
+    ProverOnly,
+    /// A shard frame's address is not in this node's committed shard set,
+    /// which a node still executing older frames has not reached yet.
+    UnknownShard,
+    /// The rank's count or byte cap is reached.
+    RankFull,
+}
+
+impl Refusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ProverOnly => "prover-only mode admits prover messages only",
+            Self::UnknownShard => "shard frame address not in this node's committed shard set",
+            Self::RankFull => "rank buffer full",
+        }
+    }
 }
 
 /// Thread-safe message collector. The message receive loop (writer)
@@ -311,7 +333,7 @@ impl MessageCollector {
                 tracing::debug!(
                     "message collector: submit rejected — prover-only (degraded coverage) mode, non-prover message"
                 );
-                return SubmitOutcome::Filtered;
+                return SubmitOutcome::Filtered(Refusal::ProverOnly);
             }
         }
 
@@ -357,18 +379,21 @@ impl MessageCollector {
                     );
                 }
                 if !valid.is_empty() && !valid.contains(&c.address) {
+                    // The whole address: every shard of an application shares
+                    // its first 32 bytes, so a prefix names none of them.
                     tracing::warn!(
-                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        address = %hex::encode(&c.address),
                         frame_number = c.frame_number,
                         valid_shard_count = valid.len(),
                         "message collector: shard-frame submit REJECTED — address not in current valid-shard set (stale / pre-split / wrong-grid address)"
                     );
-                    return SubmitOutcome::Filtered;
+                    return SubmitOutcome::Filtered(Refusal::UnknownShard);
                 }
             }
         }
 
         let mut buffers = self.buffers.write().unwrap();
+        let ranks_held = buffers.len();
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         match buffer.add(data) {
             AddOutcome::Added => SubmitOutcome::Accepted,
@@ -376,9 +401,14 @@ impl MessageCollector {
             AddOutcome::Full => {
                 tracing::warn!(
                     rank,
+                    pending = buffer.len(),
+                    pending_bytes = buffer.bytes,
+                    max_messages = MAX_MESSAGES_PER_RANK,
+                    max_bytes = MAX_BYTES_PER_RANK,
+                    ranks_held,
                     "message collector: submit rejected — rank buffer full (per-rank count/byte cap reached)"
                 );
-                SubmitOutcome::Filtered
+                SubmitOutcome::Filtered(Refusal::RankFull)
             }
         }
     }
@@ -1018,8 +1048,16 @@ mod tests {
         mc.set_prover_only_mode(true);
         assert_eq!(
             mc.add_message_outcome(2, b"not-a-prover-message".to_vec()),
-            SubmitOutcome::Filtered
+            SubmitOutcome::Filtered(Refusal::ProverOnly)
         );
+        mc.set_prover_only_mode(false);
+        // A rank over its byte cap refuses, and says so.
+        assert_eq!(
+            mc.add_message_outcome(4, vec![0; MAX_BYTES_PER_RANK + 1]),
+            SubmitOutcome::Filtered(Refusal::RankFull)
+        );
+        assert_eq!(Refusal::RankFull.reason(), "rank buffer full");
+        mc.set_prover_only_mode(true);
         // The bool `add_message` wrapper is unchanged: true only for Accepted.
         let mut b2 = 0x0301u32.to_be_bytes().to_vec();
         b2.extend_from_slice(b"another");
@@ -1133,13 +1171,13 @@ mod tests {
         for child in &children { shards.put_app_shard(txn.as_ref(), child).unwrap(); }
         // A staged topology must not leak through a committed-store refresh.
         collector.refresh_valid_shard_addresses(&shards).unwrap();
-        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 1)), SubmitOutcome::Filtered);
+        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 1)), SubmitOutcome::Filtered(Refusal::UnknownShard));
         txn.commit().unwrap();
         collector.refresh_valid_shard_addresses(&shards).unwrap();
         for child in &children {
             assert_eq!(collector.add_message_outcome(1, bundle(&child.prefix, 1)), SubmitOutcome::Accepted);
         }
-        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Filtered);
+        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Filtered(Refusal::UnknownShard));
 
         let txn = clock.new_transaction(false).unwrap();
         for child in &children { shards.delete_app_shard(txn.as_ref(), &key, &child.prefix).unwrap(); }
@@ -1147,7 +1185,7 @@ mod tests {
         txn.commit().unwrap();
         collector.refresh_valid_shard_addresses(&shards).unwrap();
         assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Accepted);
-        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 2)), SubmitOutcome::Filtered);
+        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 2)), SubmitOutcome::Filtered(Refusal::UnknownShard));
     }
 
     #[test]
