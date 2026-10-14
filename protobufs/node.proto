@@ -91,6 +91,7 @@ message NodeInfoResponse {
   // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
   // this rather than hardcoding a value.
   uint64 epoch_length_frames = 13;
+  FrameCadence frame_cadence = 14;
 }
 
 message WorkerInfo {
@@ -371,6 +372,19 @@ message CreateTraversalProofResponse {
   bytes proof = 1;  // serialized TraversalProof (via ToBytes())
 }
 
+// Node observations, independent of client lifetime. Gaps are excluded.
+// Coverage can be less than the requested window; zero advances is observed zero.
+message FrameWindow {
+  uint64 window_seconds = 1;
+  uint64 observed_seconds = 2;
+  uint64 advanced_frames = 3;
+}
+message FrameCadence {
+  uint64 last_observed_unix_seconds = 1;
+  FrameWindow hour = 2;
+  FrameWindow day = 3;
+}
+
 // A shard cursor from this node's committed GLOBAL state, independent of peer metadata.
 message GlobalAppFrameHead {
   uint64 frame = 1;
@@ -393,6 +407,7 @@ message ShardRewardInfo {
   GlobalAppFrameHead global_head = 11;
   // Recorded local proposal intent; absent on older servers or without history.
   optional string allocation_reason = 14;
+  FrameCadence frame_cadence = 15;
 }
 
 message GetShardInfoRequest {

@@ -10,6 +10,8 @@
 //! * [`view`] renders (the `View`).
 
 mod actions;
+#[cfg(test)]
+mod cadence;
 mod filter;
 mod model;
 mod msg;

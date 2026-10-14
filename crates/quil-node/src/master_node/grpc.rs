@@ -78,6 +78,7 @@ fn owned_filters(
 }
 
 pub(crate) struct GrpcArgs {
+    pub frame_observations_path: std::path::PathBuf,
     /// Rebuilds legacy committees; served to the node's standalone workers.
     pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
     /// Holds standalone workers' reward proofs back during a coverage halt, as
@@ -682,6 +683,7 @@ pub(crate) fn spawn_all(
     args: GrpcArgs,
 ) -> anyhow::Result<()> {
     let GrpcArgs {
+        frame_observations_path,
         historical_committees,
         halt_state,
         committed_shard_sizes,
@@ -2061,6 +2063,70 @@ pub(crate) fn spawn_all(
         archive_mode,
         archive_pool: archive_pool.clone(),
     }));
+    // Sample without clients, archive requests or changes to consensus/reward policy.
+    let mut cadence_scope = vec![network]; cadence_scope.extend_from_slice(&prover_address);
+    let restored = match super::frame_observations::Observations::load(&frame_observations_path, &cadence_scope, super::frame_observations::unix_seconds()) {
+        Ok(cache) => { info!(tracked_shards = cache.filters().len(), "frame observation cache restored; awaiting fresh samples"); cache },
+        Err(e) => { if e.kind() != std::io::ErrorKind::NotFound { warn!(error = %e, "frame observation cache unavailable; starting fresh"); } Default::default() }
+    };
+    let cadence = Arc::new(std::sync::Mutex::new(restored));
+    {
+        let state = cadence.clone();
+        node_rpc_builder = node_rpc_builder.with_frame_cadence_provider(Arc::new(move |filter| {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.track(filter);
+            state.snapshot(filter, super::frame_observations::unix_seconds())
+        }));
+    }
+    {
+        let state = cadence.clone(); let registry = prover_registry.clone(); let wm = worker_manager.clone();
+        let committed = crdt.clone(); let head = current_frame.clone();
+        sup.spawn("frame-observation-sampler", move |token| async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks = 0;
+            loop {
+                tokio::select! { _ = token.cancelled() => break, _ = interval.tick() => {} }
+                let (state, registry, wm, committed, head) = (state.clone(), registry.clone(), wm.clone(), committed.clone(), head.clone());
+                let path = frame_observations_path.clone(); let scope = cadence_scope.clone();
+                tokio::task::spawn_blocking(move || {
+                    let now = super::frame_observations::unix_seconds();
+                    let mut filters = std::collections::BTreeSet::new();
+                    filters.extend(owned_filters(registry.as_ref(), &prover_address, head.effective()));
+                    filters.extend(quil_engine::worker::WorkerView::snapshot(wm.as_ref()).all.into_iter().filter(|w| !w.filter.is_empty()).map(|w| w.filter));
+                    {
+                        let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.expire(now);
+                        cache.prioritize(&filters);
+                        filters.extend(cache.filters());
+                    }
+                    let filters: Vec<_> = filters.into_iter().collect();
+                    let heads = committed_global_app_heads(&committed, &filters).ok();
+                    let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.observe(&[], Some((head.effective(), 0)), now);
+                    for (i, filter) in filters.iter().enumerate() {
+                        let head = heads.as_ref().and_then(|h| h.get(i)).and_then(|h| h.as_ref()).map(|h| (h.frame, h.generation));
+                        cache.observe(filter, head, now);
+                    }
+                    if ticks % 5 == 0 {
+                        match cache.save(&path, &scope) {
+                            Ok(()) => { let global = cache.snapshot(&[], now); info!(tracked_shards = filters.len(), global_frame = head.effective(),
+                                hour_observed_seconds = global.as_ref().and_then(|c| c.hour.as_ref()).map_or(0, |w| w.observed_seconds),
+                                day_observed_seconds = global.as_ref().and_then(|c| c.day.as_ref()).map_or(0, |w| w.observed_seconds),
+                                "frame observation cache saved"); },
+                            Err(e) => warn!(error = %e, "frame observation cache save failed"),
+                        }
+                    }
+                }).await?;
+                ticks += 1;
+            }
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = state.lock().unwrap_or_else(|e| e.into_inner()).save(&frame_observations_path, &cadence_scope) { warn!(error = %e, "frame observation cache shutdown save failed"); }
+            }).await?;
+            Ok(())
+        });
+    }
     let node_rpc = node_rpc_builder;
 
     let stream_addr = {

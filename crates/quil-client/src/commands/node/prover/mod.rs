@@ -253,6 +253,21 @@ pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
+pub(crate) fn format_quil_daily_units(v: &BigInt) -> String {
+    let negative = v.sign() == Sign::Minus;
+    let magnitude = if negative { -v } else { v.clone() };
+    let tenths = (&magnitude + BigInt::from(5_000_000u64)) / BigInt::from(10_000_000u64);
+    let text = if magnitude > BigInt::from(0) && tenths == BigInt::from(0) { "<0.1".into() }
+        else { format!("{}.{}", &tenths / 10, &tenths % 10) };
+    format!("~{}{text}", if negative { "-" } else { "" })
+}
+pub(crate) fn observed_quil_daily(per_frame: &BigInt, cadence: &quil_types::proto::node::FrameCadence, day: bool, now: u64) -> Option<BigInt> {
+    if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 { return None; }
+    let w = if day { cadence.day.as_ref()? } else { cadence.hour.as_ref()? };
+    if w.observed_seconds < 60 || w.observed_seconds > w.window_seconds { return None; }
+    Some(per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400) / BigInt::from(w.observed_seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,6 +58,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             let elapsed = m.shard_fetch_started.take().map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
+                    m.observe_app_intervals(&shards, Instant::now());
                     m.observe_reported_app_heads(&shards, Instant::now());
                     m.shard_error = None;
                     m.shard_last_success = Some(Instant::now());
@@ -85,9 +86,11 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 return vec![];
             }
             if let Some(node) = &node_info {
+                m.node_global_cadence = node.frame_cadence.clone();
                 m.observe_global_head(node.last_received_frame, Instant::now());
             }
             if let Some(shards) = &shard_info {
+                m.observe_app_intervals(shards, Instant::now());
                 m.observe_reported_app_heads(shards, Instant::now());
             }
             m.last_fetch_success = Some(Instant::now());
@@ -643,16 +646,27 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if is_quit(&ev) { return vec![Cmd::Quit]; }
     if ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) { return vec![]; }
     match ev.code {
+        KeyCode::Up if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 => m.move_picker_column(true),
+        KeyCode::Down if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 => m.move_picker_column(false),
+        KeyCode::Char('r') if m.visibility_section == 0 => m.reset_picker_column_order(),
         KeyCode::Up | KeyCode::Char('k') => m.column_picker_cursor = m.column_picker_cursor.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => m.column_picker_cursor = (m.column_picker_cursor + 1).min(m.visibility_names().len() - 1),
         KeyCode::Tab | KeyCode::BackTab => {
-            m.visibility_section = (m.visibility_section + if ev.code == KeyCode::BackTab { 2 } else { 1 }) % 3;
+            m.visibility_section = (m.visibility_section + if ev.code == KeyCode::BackTab { 4 } else { 1 }) % 5;
             m.column_picker_cursor = if m.visibility_section == 0 { 2 } else { 0 };
             m.column_picker_offset = 0;
         }
         KeyCode::Char(' ') => {
-            if m.visibility_section == 0 {
-                if m.column_picker_cursor >= 2 && !m.hidden_columns.remove(&m.column_picker_cursor) { m.hidden_columns.insert(m.column_picker_cursor); }
+            if let Some((global, window)) = m.visibility_interval_window(m.visibility_section, m.column_picker_cursor) {
+                let next = (if global { m.global_interval_mask() } else { m.interval_mask() }) ^ (1 << window);
+                if next != 0 { if global { m.global_interval_windows = next; } else { m.interval_windows = next; } }
+            } else if let Some(window) = m.visibility_reward_window(m.visibility_section, m.column_picker_cursor) {
+                let next = m.reward_mask() ^ (1 << window);
+                if next != 0 { m.reward_windows = next; }
+            } else if m.visibility_section == 0 {
+                let col = m.visibility_column_index(m.column_picker_cursor).unwrap();
+                let key = m.column_visibility_key(col);
+                if col >= 2 && !m.hidden_columns.remove(&key) { m.hidden_columns.insert(key); }
             } else {
                 let name = m.visibility_names()[m.column_picker_cursor];
                 if !m.hidden_header_kpis.remove(name) { m.hidden_header_kpis.insert(name.into()); }
@@ -660,8 +674,8 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Char('c') if m.visibility_section == 0 => m.hidden_columns.extend([2, 4, 5]),
         KeyCode::Char('a') => {
-            if m.visibility_section == 0 { m.hidden_columns.clear(); }
-            else { for name in m.visibility_names() { m.hidden_header_kpis.remove(*name); } }
+            if m.visibility_section == 0 { m.hidden_columns.clear(); m.interval_windows = 3; m.reward_windows = 7; }
+            else { for name in m.visibility_names() { m.hidden_header_kpis.remove(name); } if m.visibility_section == 1 { m.global_interval_windows = 3; } if m.visibility_section == 2 { m.reward_windows = 7; } }
         }
         KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => m.column_picker_active = false,
         _ => {}
@@ -1696,4 +1710,83 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn nested_intervals_have_independent_masks_and_preserve_parent_visibility() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for focus in [PanelFocus::Allocations, PanelFocus::Available] {
+            let mut m = Model::new(); m.focus = focus; m.column_picker_active = true;
+            let interval = if focus.is_alloc() { 16 } else { 11 };
+            let parent = m.display_columns().iter().position(|&col| col == interval).unwrap();
+            m.column_picker_cursor = parent + 1; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.interval_mask(), 2);
+            m.column_picker_cursor += 1; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.interval_mask(), 2);
+            assert_eq!(m.global_interval_mask(), 3); assert!(m.column_visible(interval));
+            m.column_picker_cursor = parent; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.column_visible(interval));
+            assert_eq!(m.interval_mask(), 2);
+            handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+            m.column_picker_cursor = 6; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
+            m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
+            assert_eq!(m.interval_mask(), 2); assert!(m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 4; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global interval"));
+            handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.global_interval_mask(), 3); assert!(m.header_kpi_visible("Global interval"));
+            assert_eq!(m.interval_mask(), 2); assert_eq!(m.reward_mask(), 7);
+            handle_key(&mut m, key(KeyCode::BackTab)); handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.interval_mask(), 3);
+        }
+    }
+    #[test]
+    fn shifted_arrows_move_columns_with_children_and_preserve_identity_and_other_panel() {
+        use super::super::model::{ALLOC_DISPLAY_COLS, AVAIL_DISPLAY_COLS};
+        let mut m = Model::new(); m.column_picker_active = true;
+        let shifted = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        m.column_picker_cursor = 10;
+        handle_key(&mut m, shifted(KeyCode::Down));
+        assert_eq!(m.alloc_display_columns()[10], 16); assert_eq!(m.column_picker_cursor, 11);
+        assert_eq!(m.visibility_interval_window(0, 11), Some((false, 0)));
+        assert_eq!(m.avail_display_columns(), AVAIL_DISPLAY_COLS);
+        m.column_picker_cursor = 12; handle_key(&mut m, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)); assert_eq!(m.interval_mask(), 1);
+        m.column_picker_cursor = 0; handle_key(&mut m, shifted(KeyCode::Down)); assert_eq!(&m.alloc_display_columns()[..2], &[0,1]);
+        m.column_picker_cursor = 2; handle_key(&mut m, shifted(KeyCode::Up)); assert_eq!(&m.alloc_display_columns()[..2], &[0,1]);
+        handle_key(&mut m, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)); assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
+        assert_eq!(m.interval_mask(), 1);
+        m.focus = PanelFocus::Available; m.column_picker_cursor = 9; handle_key(&mut m, shifted(KeyCode::Up));
+        assert_eq!(m.avail_display_columns()[8], 11); assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
+        assert_eq!(m.active_visible_columns()[8], 11);
+        m.focus = PanelFocus::Notifications; m.column_picker_cursor = 2; m.horizontal_offsets = [1,12];
+        handle_key(&mut m, shifted(KeyCode::Down)); assert_eq!(m.horizontal_offsets, [1,0]);
+    }
+    #[test]
+    fn reward_visibility_selects_any_nonempty_subset_for_both_panels() {
+        let mut m = Model::new(); m.column_picker_active = true; m.visibility_section = 2; m.column_picker_cursor = 6;
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        handle_key(&mut m, space); assert_eq!(m.reward_mask(), 3);
+        m.column_picker_cursor = 4; handle_key(&mut m, space); assert_eq!(m.reward_mask(), 2);
+        m.column_picker_cursor = 5; handle_key(&mut m, space); assert_eq!(m.reward_mask(), 2);
+        handle_key(&mut m, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)); assert_eq!(m.reward_mask(), 7);
+    }
+
+    #[test]
+    fn reward_children_follow_reordered_columns_and_share_the_header_selection() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.column_picker_active = true;
+        for focus in [PanelFocus::Allocations, PanelFocus::Available] {
+            m.focus = focus; m.visibility_section = 0; m.reward_windows = 7;
+            m.column_picker_cursor = m.visibility_names().iter().position(|&name| name == "Reward [~Q/d]").unwrap() + 1;
+            handle_key(&mut m, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+            assert_eq!(m.visibility_reward_window(0, m.column_picker_cursor), Some(0));
+            handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.reward_mask(), 6);
+            m.visibility_section = 2;
+            assert!(!m.visibility_item_visible_in(2, 4));
+            m.column_picker_cursor = 6; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.reward_mask(), 2);
+            m.column_picker_cursor = 3; handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert!(!m.header_kpi_visible("Reward")); assert!(m.column_visible(10));
+            assert_eq!(m.reward_mask(), 2);
+            handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.reward_mask(), 7);
+        }
+        m.focus = PanelFocus::Notifications;
+        assert_eq!(m.visibility_names_for(2)[0], "Workers");
+        assert_eq!(m.visibility_names_for(3)[0], "Available count");
+        m.visibility_section = 4; m.column_picker_cursor = 0;
+        handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Notification level"));
+        assert!(m.header_kpi_visible("Notification position"));
+    }
+
 }
