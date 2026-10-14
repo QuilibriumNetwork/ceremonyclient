@@ -103,17 +103,20 @@ pub trait Attributable {
 /// Each signer can insert at most one item.
 pub struct AttributableMap<T: Attributable> {
     data: Vec<Option<T>>,
+    participants: usize,
     added: usize,
 }
 
 impl<T: Attributable> AttributableMap<T> {
     /// Creates a new [AttributableMap] with the given number of participants.
     pub fn new(participants: usize) -> Self {
-        // `resize_with` avoids requiring `T: Clone` while pre-filling with `None`.
-        let mut data = Vec::with_capacity(participants);
-        data.resize_with(participants, || None);
-
-        Self { data, added: 0 }
+        // QUILIBRIUM: a retained view may never receive this phase of votes.
+        // Defer its slots until the first valid insertion, retaining O(1) lookup.
+        Self {
+            data: Vec::new(),
+            participants,
+            added: 0,
+        }
     }
 
     /// Clears all existing items from the [AttributableMap].
@@ -129,8 +132,11 @@ impl<T: Attributable> AttributableMap<T> {
     /// signer already exists or if the signer index is out of bounds.
     pub fn insert(&mut self, item: T) -> bool {
         let index: usize = item.signer().into();
-        if index >= self.data.len() {
+        if index >= self.participants {
             return false;
+        }
+        if self.data.is_empty() {
+            self.data.resize_with(self.participants, || None);
         }
         if self.data[index].is_some() {
             return false;
@@ -3386,6 +3392,34 @@ mod tests {
         fn signer(&self) -> Participant {
             self.0
         }
+    }
+
+    // QUILIBRIUM: unobserved vote phases must not reserve participant slots.
+    #[test]
+    fn test_attributable_map_allocates_only_for_valid_insertions() {
+        let mut map = AttributableMap::<MockAttributable>::new(26);
+        assert_eq!(map.data.capacity(), 0);
+        assert!(map.get(Participant::new(25)).is_none());
+        assert!(!map.insert(MockAttributable(Participant::new(26))));
+        map.clear();
+        assert_eq!(map.data.capacity(), 0);
+        assert!(map.is_empty());
+
+        assert!(map.insert(MockAttributable(Participant::new(25))));
+        let capacity = map.data.capacity();
+        assert!(capacity >= 26);
+        assert!(map.insert(MockAttributable(Participant::new(0))));
+        assert!(!map.insert(MockAttributable(Participant::new(25))));
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.iter().map(|vote| vote.signer()).collect::<Vec<_>>(),
+            vec![Participant::new(0), Participant::new(25)]
+        );
+        map.clear();
+        assert!(map.get(Participant::new(25)).is_none());
+        assert_eq!(map.data.capacity(), capacity);
+        assert!(map.insert(MockAttributable(Participant::new(1))));
+        assert_eq!(map.data.capacity(), capacity);
     }
 
     #[test]

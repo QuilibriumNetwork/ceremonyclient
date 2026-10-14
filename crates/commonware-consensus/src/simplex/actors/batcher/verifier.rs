@@ -28,6 +28,19 @@ where
         .await
 }
 
+// QUILIBRIUM: reserve a phase's original quorum capacity only when it is used.
+// Retained nullified views otherwise reserve buffers for all three vote phases.
+fn reserve_votes<T>(votes: &mut Vec<T>, quorum: usize) {
+    if votes.capacity() == 0 {
+        votes.reserve_exact(quorum);
+    }
+}
+
+fn push_vote<T>(votes: &mut Vec<T>, vote: T, quorum: usize) {
+    reserve_votes(votes, quorum);
+    votes.push(vote);
+}
+
 /// `Verifier` is a utility for tracking and verifying consensus messages.
 ///
 /// For schemes where [`Verifier::is_batchable()`](commonware_cryptography::certificate::Verifier::is_batchable)
@@ -92,14 +105,14 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
             leader: None,
             leader_proposal: None,
 
-            pending_notarizes: Vec::with_capacity(quorum),
-            verified_notarizes: Vec::with_capacity(quorum),
+            pending_notarizes: Vec::new(),
+            verified_notarizes: Vec::new(),
 
-            pending_nullifies: Vec::with_capacity(quorum),
-            verified_nullifies: Vec::with_capacity(quorum),
+            pending_nullifies: Vec::new(),
+            verified_nullifies: Vec::new(),
 
-            pending_finalizes: Vec::with_capacity(quorum),
-            verified_finalizes: Vec::with_capacity(quorum),
+            pending_finalizes: Vec::new(),
+            verified_finalizes: Vec::new(),
         }
     }
 
@@ -183,16 +196,16 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
 
                 // If we've made it this far, add the notarize
                 if verified {
-                    self.verified_notarizes.push(notarize);
+                    push_vote(&mut self.verified_notarizes, notarize, self.quorum);
                 } else {
-                    self.pending_notarizes.push(notarize);
+                    push_vote(&mut self.pending_notarizes, notarize, self.quorum);
                 }
             }
             Vote::Nullify(nullify) => {
                 if verified {
-                    self.verified_nullifies.push(nullify);
+                    push_vote(&mut self.verified_nullifies, nullify, self.quorum);
                 } else {
-                    self.pending_nullifies.push(nullify);
+                    push_vote(&mut self.pending_nullifies, nullify, self.quorum);
                 }
             }
             Vote::Finalize(finalize) => {
@@ -205,9 +218,9 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
 
                 // If we've made it this far, add the finalize
                 if verified {
-                    self.verified_finalizes.push(finalize);
+                    push_vote(&mut self.verified_finalizes, finalize, self.quorum);
                 } else {
-                    self.pending_finalizes.push(finalize);
+                    push_vote(&mut self.pending_finalizes, finalize, self.quorum);
                 }
             }
         }
@@ -261,6 +274,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         }
         let batch = notarizes.len();
         let mut verified_notarizes = mem::take(&mut self.verified_notarizes);
+        reserve_votes(&mut verified_notarizes, self.quorum);
 
         let scheme = Arc::clone(&self.scheme);
         let mut rng = StdRng::from_rng(rng);
@@ -358,6 +372,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         }
         let batch = nullifies.len();
         let mut verified_nullifies = mem::take(&mut self.verified_nullifies);
+        reserve_votes(&mut verified_nullifies, self.quorum);
 
         let round = nullifies[0].round;
 
@@ -443,6 +458,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         }
         let batch = finalizes.len();
         let mut verified_finalizes = mem::take(&mut self.verified_finalizes);
+        reserve_votes(&mut verified_finalizes, self.quorum);
 
         let scheme = Arc::clone(&self.scheme);
         let mut rng = StdRng::from_rng(rng);
@@ -538,6 +554,43 @@ mod tests {
     use commonware_utils::{test_rng, Faults, N3f1, TestRng};
 
     const NAMESPACE: &[u8] = b"test";
+
+    // QUILIBRIUM: a nullify quorum must not allocate other phase buffers.
+    #[test_async]
+    async fn test_lazy_vote_buffers_recover_nullification() {
+        let mut rng = test_rng();
+        let Fixture { schemes, .. } = secp256r1::fixture(&mut rng, NAMESPACE, 26);
+        let quorum = N3f1::quorum(schemes.len());
+        let scheme = &schemes[0];
+        let mut verifier = Verifier::<_, Sha256>::new(scheme.clone(), quorum);
+        assert_eq!(verifier.pending_nullifies.capacity(), 0);
+        assert_eq!(verifier.verified_nullifies.capacity(), 0);
+        let round = Round::new(Epoch::new(0), View::new(1));
+        for signer in schemes.iter().take(quorum as usize) {
+            verifier.add(Vote::Nullify(create_nullify(signer, round)), false);
+            assert_eq!(verifier.pending_nullifies.capacity(), quorum as usize);
+            assert!(verifier.ready_nullifies());
+            let (processed, invalid) = verifier.verify_nullifies(&mut rng, &Sequential).await;
+            assert_eq!(processed, 1);
+            assert!(invalid.is_empty());
+            assert_eq!(verifier.verified_nullifies.capacity(), quorum as usize);
+        }
+        let votes = verifier.take_verified_nullifies().expect("verified quorum");
+        let certificate =
+            crate::simplex::types::Nullification::from_owned_nullifies(scheme, votes, &Sequential)
+                .expect("nullification certificate");
+        assert!(certificate.verify::<_, Sha256>(&mut rng, scheme, &Sequential));
+        assert!(!verifier.ready_nullifies());
+        assert!(verifier.take_verified_nullifies().is_none());
+        assert_eq!(verifier.pending_notarizes.capacity(), 0);
+        assert_eq!(verifier.verified_notarizes.capacity(), 0);
+        assert_eq!(verifier.pending_finalizes.capacity(), 0);
+        assert_eq!(verifier.verified_finalizes.capacity(), 0);
+        // A new active buffer still reserves quorum after the old one was consumed.
+        verifier.add(Vote::Nullify(create_nullify(scheme, round)), true);
+        assert!(verifier.verified_nullifies.capacity() >= quorum as usize);
+        assert!(verifier.take_verified_nullifies().is_none());
+    }
 
     // Helper function to create a sample digest
     fn sample_digest(v: u8) -> Sha256 {
