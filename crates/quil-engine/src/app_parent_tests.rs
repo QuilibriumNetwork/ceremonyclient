@@ -525,3 +525,48 @@ fn a_private_session_parent_reads_as_the_committed_checkpoint_it_will_become() {
     assert_eq!(canonical.checkpoint, private.checkpoint);
     assert_eq!(canonical.closing_request, private.closing_request);
 }
+
+
+#[test]
+fn seal_checkpoint_executes_its_data_view_privately_and_keeps_canonical_state() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint {
+        frame: 1, view: RANK + 20, digest: digest.0,
+        state_roots: [[0; 32]; 4], history_root: [0; 32],
+    };
+    let sequence = rig.db.inner().latest_sequence_number();
+    let prepared = executor.prepare_checkpoint(&checkpoint).unwrap();
+    assert_eq!(prepared.view, RANK, "a re-seal's view is not the underlying data view");
+    assert_eq!(prepared.frame_number, 1);
+    assert_eq!(prepared.digest, digest);
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+    assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(1));
+    let wrong_height = quil_cw_consensus::handoff::Checkpoint { frame: 2, ..checkpoint.clone() };
+    assert!(executor.prepare_checkpoint(&wrong_height).is_err());
+    let absent = quil_cw_consensus::handoff::Checkpoint { digest: [42; 32], ..checkpoint };
+    assert!(executor.prepare_checkpoint(&absent).is_err());
+}
+
+#[test]
+fn seal_checkpoint_rejects_terminal_and_malformed_bodies_without_execution() {
+    use quil_cw_consensus::handoff::{Checkpoint, Seal};
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let checkpoint = Checkpoint {
+        frame: 1, view: 5, digest: [42; 32],
+        state_roots: [[0; 32]; 4], history_root: [0; 32],
+    };
+    let seal = Seal { request: [1; 32], session: [2; 32], view: 6, checkpoint: checkpoint.clone() };
+    let sequence = rig.db.inner().latest_sequence_number();
+    for bytes in [seal.encode(), b"QHSL\x02".to_vec(), vec![0xff], prost::Message::encode_to_vec(&AppShardFrame::default())] {
+        rig.blocks.put(digest_from_identity(checkpoint.digest), bytes);
+        assert!(executor.prepare_checkpoint(&checkpoint).is_err());
+        assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+        assert!(executor.prepared.lock().unwrap().is_none());
+        assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    }
+}
