@@ -178,6 +178,13 @@ impl ProverPipeline {
                 let encoded_filters = filters.clone();
                 let prepared = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    if prune_replicas {
+                        let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+                        prune_confirmation_replicas(
+                            encoder.replica_store.as_ref(), encoder.storage_for_filter.as_deref(),
+                            &encoded_filters, current_epoch,
+                        );
+                    }
                     let roots = encoder.storage_confirm_leaf_roots(&encoded_filters, frame_number);
                     (roots, attempt)
                 }).await;
@@ -201,16 +208,6 @@ impl ProverPipeline {
             ).await {
                 Ok(Ok(())) => {
                     attempt.published(me.current_frame.as_ref().map(|f| f.effective()).unwrap_or(frame_number));
-                    if prune_replicas {
-                        if let Some(store) = me.replica_store.as_ref() {
-                            // Keep current and next epoch replicas. Publication
-                            // alone is not an on-chain registration acknowledgement.
-                            let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
-                            if let Err(e) = store.evict_below_epoch(current_epoch) {
-                                warn!(frame = frame_number, %e, "replica cleanup failed");
-                            }
-                        }
-                    }
                 }
                 Ok(Err(e)) => warn!(frame = frame_number, %e, "confirmation submission failed"),
                 Err(_) => warn!(frame = frame_number, "confirmation submission timed out"),
@@ -915,10 +912,83 @@ impl ProverPipeline {
     }
 }
 
+/// Retire obsolete replicas before encoding the next epoch so its writes do
+/// not overlap a fourth epoch. Clean the stores confirmations actually use. Preserve
+/// the previous epoch too: early in an epoch, frames can still anchor their
+/// storage beacon before its boundary. Publication is not registration proof.
+fn prune_confirmation_replicas(
+    master: Option<&quil_store::replica_store::ReplicaStore>,
+    worker: Option<&(dyn Fn(&[u8]) -> Option<(
+        Arc<quil_hypergraph::HypergraphCrdt>, quil_store::replica_store::ReplicaStore,
+    )> + Send + Sync)>,
+    filters: &[Vec<u8>],
+    current_epoch: u64,
+) {
+    let keep_from = current_epoch.saturating_sub(1);
+    let workers = filters.iter().filter_map(|filter| {
+        worker.and_then(|resolve| resolve(filter)).map(|(_, replicas)| replicas)
+    });
+    for (store_index, store) in master.cloned().into_iter().chain(workers).enumerate() {
+        if let Err(error) = store.evict_below_epoch(keep_from) {
+            warn!(store_index, keep_from_epoch = keep_from, %error, "replica cleanup failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::confirm_encoding_plan;
     use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    #[test]
+    fn confirmation_prunes_worker_stores_and_keeps_boundary_replicas() {
+        use std::sync::Arc;
+        use quil_store::replica_store::ReplicaStore;
+        let make = || ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let master = make(); let worker_a = make(); let worker_b = make(); let unrelated = make();
+        for store in [&master,&worker_a,&worker_b,&unrelated] {
+            for epoch in 5..=8 { store.put(epoch,b"leaf",&[epoch as u8]).unwrap(); }
+        }
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        let resolve = |filter:&[u8]| match filter {
+            [1] => Some((crdt.clone(),worker_a.clone())),
+            [2] => Some((crdt.clone(),worker_b.clone())),
+            _ => None,
+        };
+        super::prune_confirmation_replicas(Some(&master),Some(&resolve),&[vec![1],vec![2],vec![99]],7);
+        for store in [&master,&worker_a,&worker_b] {
+            assert!(store.get(5,b"leaf").unwrap().is_none(),"old epochs must be pruned in each encoded store");
+            for epoch in 6..=8 { assert_eq!(store.get(epoch,b"leaf").unwrap(),Some(vec![epoch as u8]),"previous/current/next replicas stay readable"); }
+        }
+        assert_eq!(unrelated.get(5,b"leaf").unwrap(),Some(vec![5]),"unselected stores are untouched");
+        // A low epoch cannot underflow the retention boundary.
+        super::prune_confirmation_replicas(None,Some(&resolve),&[vec![1]],0);
+        assert_eq!(worker_a.get(6,b"leaf").unwrap(),Some(vec![6]));
+    }
+
+    #[test]
+    fn a_failed_master_cleanup_does_not_skip_worker_cleanup() {
+        use std::sync::Arc;
+        use quil_store::replica_store::ReplicaStore;
+        let primary = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let writable = ReplicaStore::new(primary.clone());
+        writable.put(5,b"leaf",b"old").unwrap();
+        let readonly = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_for_read_only_live(primary.inner().path()).unwrap()));
+        assert_eq!(readonly.get(5,b"leaf").unwrap(),Some(b"old".to_vec()));
+        let worker = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        worker.put(5,b"leaf",b"old").unwrap();worker.put(7,b"leaf",b"current").unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        let resolve = |_:&[u8]|Some((crdt.clone(),worker.clone()));
+        super::prune_confirmation_replicas(Some(&readonly),Some(&resolve),&[vec![1]],7);
+        assert_eq!(readonly.get(5,b"leaf").unwrap(),Some(b"old".to_vec()));
+        assert!(worker.get(5,b"leaf").unwrap().is_none());
+        assert_eq!(worker.get(7,b"leaf").unwrap(),Some(b"current".to_vec()));
+    }
 
     fn change(kind: ShardChangeKind, parent: u8, children: &[u8]) -> PendingShardChange {
         PendingShardChange {
