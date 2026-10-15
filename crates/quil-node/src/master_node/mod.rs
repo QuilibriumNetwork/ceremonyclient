@@ -1,3 +1,4 @@
+mod frame_observations;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -1470,6 +1471,7 @@ pub(crate) async fn start(
     // 7. gRPC service
     // ---------------------------------------------------------------
     grpc::spawn_all(&mut sup, grpc::GrpcArgs {
+        frame_observations_path: std::path::Path::new(config_dir).join("frame-observations.bin"),
         historical_committees: historical_committees.clone(),
         halt_state: halt_state.clone(),
         committed_shard_sizes: committed_shard_sizes.clone(),

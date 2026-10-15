@@ -207,6 +207,7 @@ pub struct NodeRpcServer {
     pub last_global_head_frame: Arc<AtomicU64>,
     pub prover_address: Vec<u8>,
     pub reachable: bool,
+    pub frame_cadence_provider: Option<Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>>,
 
     // Stores and registries (optional — None means unavailable).
     pub prover_registry: Option<Arc<dyn ProverRegistry>>,
@@ -326,6 +327,7 @@ impl NodeRpcServer {
             last_global_head_frame: Arc::new(AtomicU64::new(0)),
             prover_address: Vec::new(),
             reachable: false,
+            frame_cadence_provider: None,
             prover_registry: None,
             shard_info_provider: None,
             token_fee_provider: None,
@@ -383,6 +385,10 @@ impl NodeRpcServer {
     }
     pub fn with_prover_registry(mut self, registry: Arc<dyn ProverRegistry>) -> Self {
         self.prover_registry = Some(registry);
+        self
+    }
+    pub fn with_frame_cadence_provider(mut self, provider: Arc<dyn Fn(&[u8]) -> Option<node::FrameCadence> + Send + Sync>) -> Self {
+        self.frame_cadence_provider = Some(provider);
         self
     }
     pub fn with_shard_info_provider(mut self, provider: Arc<dyn ShardInfoProvider>) -> Self {
@@ -667,6 +673,7 @@ impl NodeService for NodeRpcServer {
         };
 
         Ok(Response::new(node::NodeInfoResponse {
+            frame_cadence: self.frame_cadence_provider.as_ref().and_then(|p| p(&[])),
             peer_id: self.peer_id.clone(),
             peer_score,
             version: self.version.clone(),
@@ -1290,6 +1297,7 @@ impl NodeService for NodeRpcServer {
         let mut shards = Vec::with_capacity(details.len());
         for (i, d) in details.iter().enumerate() {
             shards.push(node::ShardRewardInfo {
+                frame_cadence: self.frame_cadence_provider.as_ref().and_then(|p| p(&d.filter)),
                 allocation_reason: d.allocation_reason.clone(),
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
@@ -1921,7 +1929,10 @@ mod shard_world_size_tests {
     }
     #[tokio::test]
     async fn owned_response_does_not_replace_world_size_with_row_subtotal() {
-        let server = NodeRpcServer::new().with_shard_info_provider(Arc::new(Provider));
+        let server = NodeRpcServer::new().with_shard_info_provider(Arc::new(Provider))
+            .with_frame_cadence_provider(Arc::new(|filter| Some(node::FrameCadence {
+                last_observed_unix_seconds: 1000,
+                hour: Some(node::FrameWindow { window_seconds: 3600, observed_seconds: 600, advanced_frames: filter[0] as u64 }), day: None })));
         for include_all in [false, true] {
             let response = server.get_shard_info(Request::new(node::GetShardInfoRequest {
                 include_all,
@@ -1929,6 +1940,7 @@ mod shard_world_size_tests {
             assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
             assert_eq!(response.allocation_scoring_strategy, "reward-greedy");
             assert_eq!(response.shards[0].ring_known, Some(true));
+            assert_eq!(response.shards[0].frame_cadence.as_ref().unwrap().hour.as_ref().unwrap().advanced_frames, response.shards[0].filter[0] as u64);
             let response = <node::GetShardInfoResponse as prost::Message>::decode(prost::Message::encode_to_vec(&response).as_slice()).unwrap();
             assert_eq!(response.shards[0].allocation_reason.as_deref(), Some("$"));
             assert_eq!(response.shards[0].global_head.as_ref().map(|head| (head.frame, head.global_frame, head.generation)), Some((0, 12, 2)));
@@ -1992,5 +2004,21 @@ mod legacy_coin_tests {
             Box::pin(async move { Some(page) })
         }));
         assert_eq!(forwarding.list_legacy_coins(request(vec![])).await.unwrap().into_inner().coins.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod frame_cadence_rpc_tests {
+    use super::*;
+    #[tokio::test]
+    async fn node_status_exposes_provider_coverage_without_a_client_observation_history() {
+        let cadence = node::FrameCadence { last_observed_unix_seconds: 1000,
+            hour: Some(node::FrameWindow { window_seconds: 3600, observed_seconds: 600, advanced_frames: 30 }), day: None };
+        let expected = cadence.clone();
+        let server = NodeRpcServer::new().with_frame_cadence_provider(Arc::new(move |filter| { assert!(filter.is_empty()); Some(cadence.clone()) }));
+        let response = server.get_node_info(Request::new(node::GetNodeInfoRequest {})).await.unwrap().into_inner();
+        assert_eq!(response.frame_cadence,Some(expected));
+        let legacy = NodeRpcServer::new().get_node_info(Request::new(node::GetNodeInfoRequest {})).await.unwrap().into_inner();
+        assert!(legacy.frame_cadence.is_none());
     }
 }
