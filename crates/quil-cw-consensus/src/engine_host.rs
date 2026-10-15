@@ -310,7 +310,13 @@ where
                 }
             }
             if let Some(outcome) = stopped {
-                tracing::error!(?outcome, "consensus engine stopped on its own; host exiting");
+                // The owner may ask for a stop while the engine is already
+                // returning: closing its inputs also ends the engine.
+                if shutdown.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                    tracing::info!(?outcome, "consensus engine stopped on request; host exiting");
+                } else {
+                    tracing::error!(?outcome, "consensus engine stopped on its own; host exiting");
+                }
             }
             // An actor may still be returning from a blocking proposer or
             // filesystem operation after its parent stopped. Dropping the
