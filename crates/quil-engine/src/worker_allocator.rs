@@ -17,6 +17,23 @@ use quil_types::error::Result;
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// A binding must stay unchanged this long before its worker evicts payload
+/// outside it: the previous engine's background tasks have finished by then.
+pub(crate) const PAYLOAD_EVICTION_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Repeat interval for a settled binding. Requests are idempotent; repeats
+/// retry refusals (pending mutations, an unfinished sync) and are cheap once
+/// nothing remains outside the protected scopes.
+const PAYLOAD_EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+pub type PendingShardChanges =
+    Arc<dyn Fn() -> Result<Vec<quil_types::store::PendingShardChange>> + Send + Sync>;
+
+struct EvictionTrack {
+    filter: Vec<u8>,
+    since: std::time::Instant,
+    requested: Option<std::time::Instant>,
+}
+
 /// A rejected leave restores Active without renewing storage. Keep its worker
 /// available to encode renewal until the end of the rejection epoch. This is
 /// local recovery scheduling only: the allocation remains ExpiredEpoch for
@@ -470,6 +487,11 @@ pub struct WorkerAllocator {
     /// is recorded, whatever the registry says about the allocation meanwhile.
     /// The closing committee needs its quorum to finalize that seal.
     session_authority: RwLock<Option<Arc<quil_hypergraph::HypergraphCrdt>>>,
+    /// Staged splits and merges. A confirmation encodes their targets from the
+    /// confirming worker's store, so they stay protected from eviction. Unset
+    /// means unknown: no eviction is requested.
+    pending_shard_changes: RwLock<Option<PendingShardChanges>>,
+    payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
 }
 
 impl WorkerAllocator {
@@ -509,7 +531,70 @@ impl WorkerAllocator {
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
+            pending_shard_changes: RwLock::new(None),
+            payload_eviction: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn set_pending_shard_changes(&self, changes: PendingShardChanges) {
+        *self.pending_shard_changes.write().unwrap_or_else(|e| e.into_inner()) = Some(changes);
+    }
+
+    /// Ask each settled, serving worker to drop payload its store keeps from
+    /// shards it no longer serves. Protected: the binding (a closing session
+    /// keeps it bound) and staged split/merge filters of the bound
+    /// application.
+    pub(crate) fn schedule_payload_eviction(&self, now: std::time::Instant) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(changes) = self.pending_shard_changes.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Ok(());
+        };
+        let workers = self.worker_manager.range_workers()?;
+        let mut tracks = self.payload_eviction.lock().unwrap_or_else(|e| e.into_inner());
+        tracks.retain(|core, _| workers.iter().any(|w| w.core_id == *core));
+        let mut due = Vec::new();
+        for worker in &workers {
+            if worker.filter.is_empty() || !worker.allocated || worker.pending_filter_frame != 0 {
+                tracks.remove(&worker.core_id);
+                continue;
+            }
+            let track = tracks.entry(worker.core_id).or_insert_with(|| EvictionTrack {
+                filter: worker.filter.clone(),
+                since: now,
+                requested: None,
+            });
+            if track.filter != worker.filter {
+                *track = EvictionTrack { filter: worker.filter.clone(), since: now, requested: None };
+            }
+            let settled = now.saturating_duration_since(track.since) >= PAYLOAD_EVICTION_SETTLE;
+            let repeat = track.requested.is_none_or(|at| now.saturating_duration_since(at) >= PAYLOAD_EVICTION_INTERVAL);
+            if settled && repeat {
+                due.push(worker.core_id);
+            }
+        }
+        if due.is_empty() {
+            return Ok(());
+        }
+        let staged = changes()?;
+        for worker in workers.iter().filter(|w| due.contains(&w.core_id)) {
+            let application = &worker.filter[..worker.filter.len().min(32)];
+            let mut keep = vec![worker.filter.clone()];
+            keep.extend(
+                staged.iter()
+                    .flat_map(|c| std::iter::once(&c.parent).chain(c.children.iter()))
+                    .filter(|f| f.len() >= 32 && f[..32] == *application)
+                    .cloned(),
+            );
+            keep.sort();
+            keep.dedup();
+            match self.worker_manager.evict_payload(worker.core_id, keep) {
+                Ok(()) => if let Some(track) = tracks.get_mut(&worker.core_id) {
+                    track.requested = Some(now);
+                },
+                Err(error) => warn!(core_id = worker.core_id, %error, "worker payload eviction request failed"),
+            }
+        }
+        Ok(())
     }
 
     /// Cached config-derived seniority estimate. Computed once at
@@ -669,6 +754,14 @@ impl WorkerAllocator {
     /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
     /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
+        let result = self.reconcile(frame_number);
+        if let Err(error) = self.schedule_payload_eviction(std::time::Instant::now()) {
+            warn!(%error, "worker payload eviction not scheduled");
+        }
+        result
+    }
+
+    fn reconcile(&self, frame_number: u64) -> Result<()> {
         let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
@@ -2595,5 +2688,50 @@ mod tests {
         assert_eq!(stats.skipped_empty, 1);
 
         assert!(find_worker(&wm, 1).filter.is_empty());
+    }
+
+    /// Eviction waits for a settled binding, protects every scope the worker
+    /// may still read (binding, staged changes of its own application),
+    /// repeats on its interval and restarts its wait on rebind.
+    #[test]
+    fn payload_eviction_waits_for_settled_bindings_and_protects_live_scopes() {
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
+        let filter = |app: u8, tail: u8| { let mut f = vec![app; 32]; f.extend([0, 1, tail]); f };
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add_with_filter(1, filter(7, 0x00));
+        wm.add_with_filter(2, filter(7, 0x80));
+        wm.add(WorkerInfo { pending_filter_frame: 5, ..find_worker(&wm, 2) });
+        wm.add_with_filter(3, Vec::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let t0 = std::time::Instant::now();
+        alloc.schedule_payload_eviction(t0 + minutes(120)).unwrap();
+        assert!(wm.evictions().is_empty(), "unknown staged changes must not evict");
+
+        let staged = vec![
+            PendingShardChange { kind: ShardChangeKind::Merge, parent: vec![7; 32], children: vec![filter(7, 0x00), filter(7, 0x80)], effective_epoch: 9, proposed_frame: 1 },
+            PendingShardChange { kind: ShardChangeKind::Split, parent: filter(8, 0x00), children: vec![], effective_epoch: 9, proposed_frame: 1 },
+        ];
+        alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
+        alloc.schedule_payload_eviction(t0).unwrap();
+        alloc.schedule_payload_eviction(t0 + minutes(29)).unwrap();
+        assert!(wm.evictions().is_empty(), "an unsettled binding must not evict");
+        alloc.schedule_payload_eviction(t0 + minutes(30)).unwrap();
+        let mut expected = vec![filter(7, 0x00), filter(7, 0x80), vec![7; 32]];
+        expected.sort();
+        assert_eq!(wm.evictions(), vec![(1, expected)], "pending joins and idle workers never evict");
+        alloc.schedule_payload_eviction(t0 + minutes(89)).unwrap();
+        assert_eq!(wm.evictions().len(), 1);
+        alloc.schedule_payload_eviction(t0 + minutes(90)).unwrap();
+        assert_eq!(wm.evictions().len(), 2, "settled bindings repeat on their interval");
+
+        wm.add_with_filter(1, filter(7, 0xc0));
+        alloc.schedule_payload_eviction(t0 + minutes(100)).unwrap();
+        alloc.schedule_payload_eviction(t0 + minutes(129)).unwrap();
+        assert_eq!(wm.evictions().len(), 2, "a rebind restarts the settle period");
+        alloc.schedule_payload_eviction(t0 + minutes(130)).unwrap();
+        assert_eq!(wm.evictions().len(), 3);
+        assert!(wm.evictions()[2].1.contains(&filter(7, 0xc0)));
     }
 }

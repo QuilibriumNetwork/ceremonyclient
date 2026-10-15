@@ -68,6 +68,10 @@ pub(crate) fn init(
     if quil_types::consensus::committee_handoff_policy().is_some() {
         worker_allocator.set_session_authority(crdt.clone());
     }
+    {
+        let shards = shards_store.clone();
+        worker_allocator.set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
+    }
 
     // Compute the config-derived seniority estimate from the mainnet
     // compat table. Uses our local libp2p peer ID plus any peer IDs

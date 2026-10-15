@@ -38,6 +38,12 @@ pub enum MasterToWorker {
     /// Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
     /// state from `worker_allocator.go:421-440`.
     Respawn { filter: Vec<u8>, start_consensus: bool },
+    /// Remove application payload outside `keep` from this worker's store,
+    /// once its running engine serves only kept scopes and the binding has
+    /// settled.
+    EvictPayload {
+        keep: Vec<Vec<u8>>,
+    },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
         challenge: [u8; 32],
@@ -445,6 +451,10 @@ impl ThreadWorkerManager {
                     // drains before its flip) go on to the replacement's
                     // engine instead of being dropped with the old engine.
                     let mut retained_mempool: Option<(Vec<u8>, Arc<crate::message_collector::MessageCollector>)> = None;
+                    // When the engine generation last changed: eviction waits for
+                    // the previous engine's detached tasks to finish with its scope.
+                    let mut bound_since = std::time::Instant::now();
+                    let evicting = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                     // Per-worker memory tick. Each worker owns its own RocksDB
                     // (block cache + memtables + table readers) in this thread,
@@ -481,6 +491,7 @@ impl ThreadWorkerManager {
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
+                                        bound_since = std::time::Instant::now();
                                         // Retire telemetry before replacing the engine generation.
                                         *execution_slot.lock().unwrap() = None;
                                         // Stop existing engine if any
@@ -856,6 +867,44 @@ impl ThreadWorkerManager {
                                             .send(WorkerToMaster::Ready { core_id })
                                             .await;
                                     }
+                                    Some(MasterToWorker::EvictPayload { keep }) => {
+                                        let Some(owned) = worker_owned.clone() else { continue };
+                                        let serving = execution_slot.lock().unwrap().as_ref()
+                                            .is_some_and(|h| h.filter == current_filter && h.is_running());
+                                        let refusal = if current_filter.is_empty() || !keep.contains(&current_filter) {
+                                            Some("binding is not protected")
+                                        } else if !serving {
+                                            Some("engine is not serving the binding")
+                                        } else if bound_since.elapsed() < crate::worker_allocator::PAYLOAD_EVICTION_SETTLE {
+                                            Some("binding has not settled")
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(reason) = refusal {
+                                            info!(core_id, reason, "worker payload eviction deferred");
+                                            continue;
+                                        }
+                                        if evicting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                            continue;
+                                        }
+                                        let flag = evicting.clone();
+                                        let crdt = owned.hypergraph.clone();
+                                        let filter = hex::encode(&current_filter);
+                                        tokio::spawn(async move {
+                                            let started = std::time::Instant::now();
+                                            let outcome = tokio::task::spawn_blocking(move ||
+                                                crate::worker_payload_eviction::evict_outside(&crdt, &keep)).await;
+                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            match outcome {
+                                                Ok(Ok(o)) if o.ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
+                                                    removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
+                                                    secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
+                                                Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
+                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
+                                                Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
+                                            }
+                                        });
+                                    }
                                     Some(MasterToWorker::CreateJoinProof {
                                         challenge,
                                         difficulty,
@@ -931,6 +980,20 @@ impl ThreadWorkerManager {
 }
 
 impl WorkerManager for ThreadWorkerManager {
+    fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        let workers = self
+            .workers
+            .lock()
+            .map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+        let worker = workers
+            .get(&core_id)
+            .ok_or_else(|| QuilError::InvalidArgument("eviction worker missing".into()))?;
+        worker
+            .tx
+            .try_send(MasterToWorker::EvictPayload { keep })
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("payload eviction: {e}")))
+    }
+
     fn set_worker_filter(
         &self,
         core_id: u32,
