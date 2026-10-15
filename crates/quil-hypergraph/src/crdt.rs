@@ -1229,6 +1229,18 @@ impl HypergraphCrdt {
         self.store.for_each_vertex_underlying("vertex", "adds", &shard, cb)
     }
 
+    /// Enumerate committed vertex-adds selected by key before the backend
+    /// retains payloads. The callback and predicate see the full vertex id.
+    pub fn for_each_vertex_adds_blob_matching(
+        &self,
+        domain: &[u8; 32],
+        matches: &dyn Fn(&[u8]) -> bool,
+        cb: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        let shard = shard_key_for_location(&Location { app_address: *domain, data_address: [0; 32] });
+        self.store.for_each_vertex_underlying_matching("vertex", "adds", &shard, matches, cb)
+    }
+
     /// Collect vertex-adds blobs including writes staged since the last forest
     /// commit. Execution uses this to derive state from earlier messages in the
     /// same frame. Callers must serialize mutations while deriving that state;
