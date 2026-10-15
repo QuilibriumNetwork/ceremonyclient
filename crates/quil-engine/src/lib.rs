@@ -55,6 +55,7 @@ pub mod worker_allocator;
 pub mod worker_node;
 pub mod worker;
 pub mod worker_payload_eviction;
+pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod prover_tree_syncer;
 

@@ -890,11 +890,13 @@ impl ThreadWorkerManager {
                                         let flag = evicting.clone();
                                         let crdt = owned.hypergraph.clone();
                                         let filter = hex::encode(&current_filter);
+                                        let storage = consensus_deps.clone().and_then(|deps|
+                                            crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base, deps)));
+                                        let storage_keep = keep.clone();
                                         tokio::spawn(async move {
                                             let started = std::time::Instant::now();
                                             let outcome = tokio::task::spawn_blocking(move ||
                                                 crate::worker_payload_eviction::evict_outside(&crdt, &keep)).await;
-                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                             match outcome {
                                                 Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
                                                     removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
@@ -904,6 +906,23 @@ impl ThreadWorkerManager {
                                                 Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
                                                 Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
                                             }
+                                            // Consensus storage of shards this worker left, unless it
+                                            // still owes that shard's committee a vote or seal.
+                                            if let Some((base, deps)) = storage {
+                                                let outcome = tokio::task::spawn_blocking(move || {
+                                                    let retained = |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
+                                                        crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey));
+                                                    crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)
+                                                }).await;
+                                                match outcome {
+                                                    Ok(Ok(o)) if o.entries > 0 => info!(core_id, filter, entries = o.entries, bytes = o.bytes,
+                                                        "worker consensus storage outside served scopes removed"),
+                                                    Ok(Ok(_)) => debug!(core_id, "no worker consensus storage outside served scopes"),
+                                                    Ok(Err(error)) => warn!(core_id, filter, %error, "worker consensus storage removal failed"),
+                                                    Err(error) => warn!(core_id, filter, %error, "worker consensus storage removal task failed"),
+                                                }
+                                            }
+                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                         });
                                     }
                                     Some(MasterToWorker::CreateJoinProof {
