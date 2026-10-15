@@ -4675,6 +4675,18 @@ impl AppConsensusEngine {
                     read_parent: source.reader(),
                     read_tip: source.tip_reader(),
                     read_private_parent,
+                    read_private_checkpoint: self.private_parents.clone().map(|parents| {
+                        let source = source.clone();
+                        Arc::new(move |context: quil_cw_consensus::adapters::ProposalContext,
+                                      checkpoint: &quil_cw_consensus::handoff::Checkpoint| {
+                            let parent = parents.prepare_checkpoint(checkpoint)?;
+                            source.read_private(quil_cw_consensus::adapters::ProposalContext {
+                                parent: parent.digest,
+                                parent_view: parent.view,
+                                ..context
+                            }, &parent)
+                        }) as quil_cw_consensus::handoff::automaton::CheckpointReader
+                    }),
                     on_sealed: Arc::new(move |seal, cert| {
                         msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert }).is_ok()
                     }),

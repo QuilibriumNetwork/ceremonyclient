@@ -30,6 +30,11 @@ pub struct AuthorizedParent {
 /// the only exception is a re-seal ([`HandoffProposer::with_seal_parents`]).
 pub type ParentReader = Arc<dyn Fn(ProposalContext) -> Result<AuthorizedParent> + Send + Sync>;
 
+/// Reconstruct a seal's data checkpoint through bounded private execution.
+/// The reader must authenticate the current session and closing request and
+/// derive state and history locally; the supplied roots are never trusted.
+pub type CheckpointReader = Arc<dyn Fn(ProposalContext, &Checkpoint) -> Result<AuthorizedParent> + Send + Sync>;
+
 pub struct HandoffProposer {
     inner: Arc<dyn GlobalProposer>,
     session: Session,
@@ -39,6 +44,7 @@ pub struct HandoffProposer {
     /// materialized, from a private execution of it. A leader uses it only
     /// after its waits; a voter uses it at once.
     read_private_parent: Option<ParentReader>,
+    read_private_checkpoint: Option<CheckpointReader>,
     /// View whose parent this leader could not read yet, and how often it asked.
     parent_waits: std::sync::Mutex<(u64, u32)>,
     /// Where this member's reasons for declining and refusing are noted.
@@ -83,6 +89,7 @@ impl HandoffProposer {
             session_id,
             read_parent,
             read_private_parent: None,
+            read_private_checkpoint: None,
             parent_waits: std::sync::Mutex::new((0, 0)),
             liveness: None,
             seal_parents: None,
@@ -145,6 +152,14 @@ impl HandoffProposer {
 
     pub fn with_private_reader(mut self, reader: Option<ParentReader>) -> Self {
         self.read_private_parent = reader;
+        self
+    }
+
+    /// Authorize a re-seal above the committed tip through private execution
+    /// of its underlying data. Exact checkpoint and closing-request equality
+    /// is still required; this never repairs a same-height disagreement.
+    pub fn with_private_checkpoint_reader(mut self, reader: Option<CheckpointReader>) -> Self {
+        self.read_private_checkpoint = reader;
         self
     }
 
@@ -296,7 +311,18 @@ impl HandoffProposer {
         let Some((_, read_tip)) = self.seal_parents.as_ref() else {
             return Err(("selected parent is a terminal seal", String::new()));
         };
-        let tip = read_tip(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        let mut tip = read_tip(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        // A seal can be built above privately executed data that is notarized
+        // but not finalized. Requiring that data to materialize before its
+        // seal can finalize leaves every later view unable to extend it.
+        // Reconstruct only a checkpoint above our tip; mismatching state at
+        // the same height must continue to fail closed.
+        if parent.checkpoint.frame > tip.checkpoint.frame {
+            if let Some(read) = &self.read_private_checkpoint {
+                tip = read(context, &parent.checkpoint)
+                    .map_err(|error| ("seal checkpoint unavailable", error.to_string()))?;
+            }
+        }
         let Some(request) = tip.closing_request else {
             return Err(("seal parent while no closing request", String::new()));
         };
