@@ -733,6 +733,19 @@ impl ExecutionOverlay {
         !self.failed_execution.load(Ordering::Acquire) && !self.inner.is_poisoned()
     }
 
+    /// Check a cached execution branch before reuse, without reading records
+    /// or consuming its read budget. Expired views are released as on a read;
+    /// a closed or failed branch must be discarded by its execution owner.
+    pub fn ensure_readable(&self) -> Result<()> {
+        self.observe((|| {
+            ensure!(self.execution_healthy(), "failed execution overlay cannot be reused");
+            let inner = self.lock_inner()?;
+            let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            drop(base.view()?);
+            Ok(())
+        })())
+    }
+
     /// Storage adapters call this when staging fails before reaching `apply`.
     pub fn record_execution_failure(&self) {
         self.failed_execution.store(true, Ordering::Release);

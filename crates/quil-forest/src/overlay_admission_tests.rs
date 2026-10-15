@@ -84,3 +84,29 @@ fn a_new_capture_releases_an_idle_holders_expired_view() {
     assert!(idle.get(b"k").unwrap_err().to_string().contains("expired"));
     assert_eq!(admission.release_expired(), 0, "nothing else is held past its age");
 }
+
+/// Cache validation must detect expiry before a record read has discovered it,
+/// including a view already released by another capture's admission sweep.
+#[test]
+fn cached_view_validation_detects_expiry_without_spending_read_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let admission = ExecutionViewAdmission::new(2, Duration::from_secs(3600));
+    let overlay = ExecutionOverlay::capture_admitted(db.clone(), limits(), &admission).unwrap();
+    let before = overlay.stats();
+    overlay.ensure_readable().unwrap();
+    let after = overlay.stats();
+    assert_eq!((before.read_bytes, before.read_operations), (after.read_bytes, after.read_operations));
+    admission.set_policy(2, Duration::ZERO);
+    assert!(overlay.ensure_readable().unwrap_err().to_string().contains("expired"));
+    assert!(!overlay.execution_healthy());
+    assert!(overlay.stats().closed);
+    assert_eq!(admission.active(), 0);
+
+    admission.set_policy(2, Duration::from_secs(3600));
+    let swept = ExecutionOverlay::capture_admitted(db, limits(), &admission).unwrap();
+    admission.set_policy(2, Duration::ZERO);
+    assert_eq!(admission.release_expired(), 1);
+    assert!(swept.ensure_readable().unwrap_err().to_string().contains("expired"));
+    assert!(!swept.execution_healthy());
+}
