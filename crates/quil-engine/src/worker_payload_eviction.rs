@@ -422,6 +422,56 @@ mod tests {
     }
 
     #[test]
+    fn confining_the_forest_keeps_the_served_root_and_a_later_assignment_repairs_it() {
+        use quil_forest::{SubtreeSyncAnchor, PHASES};
+        let (source_db, _, source) = open();
+        for key in [1, 2, 129, 130] {
+            source.add_vertex(&location(key), &vec![key; 48]).unwrap();
+        }
+        source.commit(1).unwrap();
+        let (version, root) = source.serve_forest_head(&APP, 0).unwrap();
+        let forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
+        let reader = forest.shard_phase_reader(&APP, PHASES[0]);
+
+        let (_db, _, target) = open();
+        let mut sync = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        let blobs: Vec<_> = sync.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        target.apply_sync_chunk(&mut sync, &blobs).unwrap();
+        target.finish_phase_sync(&sync).unwrap();
+        let served = lower_half();
+        let served_root = target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]);
+        assert!(!served_root.is_empty());
+
+        evict_outside(&target, &served).unwrap();
+        let confined = target.confine_forest(&served, 1).unwrap();
+        assert_eq!(confined.commits, 1, "only the populated phase has a head");
+        assert!(confined.nodes > 0 && confined.key_ranges > 0);
+        assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]), served_root);
+        assert_ne!(target.serve_forest_head(&APP, 0).unwrap().1, root, "the dropped half left the head");
+        assert_eq!(target.get_vertex_data_checked(&location(1)).unwrap(), Some(vec![1; 48]));
+        assert_eq!(target.confine_forest(&served, 1).unwrap(), quil_hypergraph::ForestConfinement::default(),
+            "a repeat finds nothing and sweeps nothing");
+        // A frame commit on the confined tree keeps working.
+        target.add_vertex(&location(3), &vec![3; 48]).unwrap();
+        target.commit(2).unwrap();
+        assert_ne!(target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]), served_root);
+
+        // Reassignment to the whole application syncs the dropped half back.
+        let (version, root) = {
+            source.add_vertex(&location(3), &vec![3; 48]).unwrap();
+            source.commit(2).unwrap();
+            source.serve_forest_head(&APP, 0).unwrap()
+        };
+        let reader = forest.shard_phase_reader(&APP, PHASES[0]);
+        let mut repair = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        let blobs: Vec<_> = repair.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        target.apply_sync_chunk(&mut repair, &blobs).unwrap();
+        target.finish_phase_sync(&repair).unwrap();
+        assert_eq!(target.serve_forest_head(&APP, 0).unwrap().1, root);
+        assert_eq!(target.get_vertex_data_checked(&location(130)).unwrap(), Some(vec![130; 48]));
+    }
+
+    #[test]
     fn keeps_every_protected_version_phase_and_other_keyspaces() {
         let (db, _, crdt) = open();
         let inner = db.inner();

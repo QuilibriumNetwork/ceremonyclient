@@ -539,7 +539,7 @@ impl Forest {
         matches!(self.backend, Backend::Rocks { .. })
     }
 
-    fn store(&self, tree: &TreeId) -> TreeStore {
+    pub(crate) fn store(&self, tree: &TreeId) -> TreeStore {
         match &self.backend {
             Backend::Rocks { db, namespace } => {
                 TreeStore::Rocks(RocksTreeStore::with_backend(db.clone(), namespace, tree))

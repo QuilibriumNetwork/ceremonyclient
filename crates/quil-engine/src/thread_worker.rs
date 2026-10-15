@@ -17,6 +17,10 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// Forest node records a confinement sweep examines per hold of the worker's
+/// forest and commit locks, keeping each pause of its frame commits short.
+const FOREST_SCAN_BUDGET: usize = 250_000;
+
 /// Archive shard recoveries this process runs at once (see the recovery
 /// spawn below).
 static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -893,6 +897,7 @@ impl ThreadWorkerManager {
                                         let storage = consensus_deps.clone().and_then(|deps|
                                             crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base, deps)));
                                         let storage_keep = keep.clone();
+                                        let (forest_crdt, forest_keep) = (crdt.clone(), keep.clone());
                                         tokio::spawn(async move {
                                             let started = std::time::Instant::now();
                                             let outcome = tokio::task::spawn_blocking(move ||
@@ -905,6 +910,18 @@ impl ThreadWorkerManager {
                                                 Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
                                                 Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
                                                 Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
+                                            }
+                                            // The forest subtrees of the shards this worker left.
+                                            let started = std::time::Instant::now();
+                                            let outcome = tokio::task::spawn_blocking(move ||
+                                                forest_crdt.confine_forest(&forest_keep, FOREST_SCAN_BUDGET)).await;
+                                            match outcome {
+                                                Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(core_id, filter, commits = o.commits,
+                                                    nodes = o.nodes, stale_records = o.stale_records, key_ranges = o.key_ranges,
+                                                    secs = started.elapsed().as_secs(), "worker forest outside served scopes removed"),
+                                                Ok(Ok(_)) => debug!(core_id, "no worker forest outside served scopes"),
+                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker forest confinement refused"),
+                                                Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
                                             }
                                             // Consensus storage of shards this worker left, unless it
                                             // still owes that shard's committee a vote or seal.

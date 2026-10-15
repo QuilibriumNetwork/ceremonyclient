@@ -157,6 +157,15 @@ pub fn sync_blob_matches(phase_idx: usize, leaf: &[u8], blob: &[u8]) -> Result<b
     Ok(quil_tries::vertex_leaf_value(blob)? == leaf)
 }
 
+/// Marks an application phase whose confinement commit still needs its
+/// records outside the kept shards swept (see `confine_forest`).
+fn confinement_sweep_key(app: &[u8; 32], phase_idx: usize) -> Vec<u8> {
+    let mut key = b"quil/forest-scope/sweep/v1/".to_vec();
+    key.extend_from_slice(app);
+    key.push(phase_idx as u8);
+    key
+}
+
 fn sync_data_key(shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result<Vec<u8>> {
     if shard_id.len() < 32 || shard_id.len() > u16::MAX as usize || phase_idx >= 4 || bit_path.len() > 256 {
         return Err(QuilError::InvalidArgument("invalid sync data scope".into()));
@@ -346,6 +355,16 @@ pub use execution_capture::{ExecutionCapture, ExecutionFork, ExecutionForkLimits
 pub struct ForestWriteGuard<'a> {
     source: &'a HypergraphCrdt,
     _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+/// What [`HypergraphCrdt::confine_forest`] did: confinement commits, deleted
+/// node and stale records, and leaf-key ranges deleted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ForestConfinement {
+    pub commits: usize,
+    pub nodes: usize,
+    pub stale_records: usize,
+    pub key_ranges: usize,
 }
 
 /// The forest-native hypergraph CRDT.
@@ -3040,6 +3059,109 @@ impl HypergraphCrdt {
         }
         drop(forest);
         self.rebucket_app_locked(&app)
+    }
+
+    /// Confine each application's phase trees to the kept shards in `keep`
+    /// (shard filters, or an application address for all of it). A unified
+    /// store's frames commit only the subtree roots of the shards it serves,
+    /// so the subtrees of shards it left are dead weight. Each phase gets one
+    /// commit at its next version dropping them, then their records at every
+    /// version are deleted in sweeps of at most `scan_budget` node records,
+    /// each under the forest and commit locks and only while the head still
+    /// reaches nothing outside the kept shards, and the tree is compacted.
+    /// Applications without a kept shard are untouched. A later assignment
+    /// syncs a dropped shard as it would on a fresh store.
+    pub fn confine_forest(&self, keep: &[Vec<u8>], scan_budget: usize) -> Result<ForestConfinement> {
+        let mut outcome = ForestConfinement::default();
+        if !self.unified_tree() || !self.forest_is_persistent() {
+            return Ok(outcome);
+        }
+        let mut apps: BTreeMap<[u8; 32], Vec<Vec<bool>>> = BTreeMap::new();
+        for filter in keep {
+            let Some(app) = filter.get(..32).and_then(|app| <[u8; 32]>::try_from(app).ok()) else { continue };
+            let paths = apps.entry(app).or_default();
+            // Both decodings of a filter stay protected where they differ.
+            match (quil_forest::decode_shard_filter_or_root(filter, 32), self.canonical_bits_for_filter(filter)) {
+                (Some((_, decoded)), canonical) => {
+                    paths.push(decoded);
+                    paths.extend(canonical);
+                }
+                // An undecodable kept filter protects its whole application.
+                (None, _) => paths.push(Vec::new()),
+            }
+        }
+        for (app, paths) in apps {
+            if paths.iter().any(|bits| bits.is_empty()) {
+                continue;
+            }
+            {
+                let _forest_guard = self.forest_write_lock.lock().unwrap();
+                let _guard = self.commit_lock.lock().unwrap();
+                if self.pending.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+                    || self.pending_blobs.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+                {
+                    return Err(QuilError::ExecutionUnavailable("cannot confine a forest with staged application mutations".into()));
+                }
+                let forest = self.forest.read().unwrap();
+                let txn = self.store.new_transaction(false)?;
+                let mut staged = Vec::new();
+                for phase_idx in 0..4 {
+                    let Some(head) = self.resolve_phase_version_checked(&forest, &app, phase_idx)? else { continue };
+                    let version = head.checked_add(1).ok_or_else(|| QuilError::Internal("confinement version overflow".into()))?;
+                    let Some((_, puts)) = forest.stage_scope_confinement(&app, PHASES[phase_idx], head, version, &paths)
+                        .map_err(|e| QuilError::Internal(format!("confine phase {phase_idx}: {e}")))? else { continue };
+                    for (key, value) in &puts { txn.set(key, value)?; }
+                    if let Some((key, value)) = forest.head_version_put(&app, PHASES[phase_idx], version) {
+                        txn.set(&key, &value)?;
+                    }
+                    txn.set(&confinement_sweep_key(&app, phase_idx), &[1])?;
+                    staged.push((phase_idx, version));
+                }
+                if staged.is_empty() {
+                    txn.abort()?;
+                } else {
+                    txn.commit()?;
+                    for (phase_idx, version) in &staged {
+                        self.phase_versions.write().unwrap().insert((app.to_vec(), *phase_idx), *version);
+                    }
+                    outcome.commits += staged.len();
+                    drop(forest);
+                    self.rebucket_app_locked(&app)?;
+                }
+            }
+            // A sweep the confinement commit recorded, possibly left unfinished
+            // by an earlier pass, until it completes.
+            for phase_idx in 0..4 {
+                let marker = confinement_sweep_key(&app, phase_idx);
+                let txn = self.store.new_transaction(false)?;
+                let pending = txn.get(&marker)?.is_some();
+                txn.abort()?;
+                if !pending {
+                    continue;
+                }
+                let mut cursor = None;
+                loop {
+                    let _forest_guard = self.forest_write_lock.lock().unwrap();
+                    let _guard = self.commit_lock.lock().unwrap();
+                    let forest = self.forest.read().unwrap();
+                    let Some(head) = self.resolve_phase_version_checked(&forest, &app, phase_idx)? else { break };
+                    let deletion = forest.delete_outside_scope(&app, PHASES[phase_idx], head, &paths, cursor, scan_budget)
+                        .map_err(|e| QuilError::ExecutionUnavailable(format!("confine phase {phase_idx} records: {e}")))?;
+                    outcome.nodes += deletion.nodes;
+                    outcome.stale_records += deletion.stale_records;
+                    outcome.key_ranges += deletion.key_ranges;
+                    cursor = deletion.cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                self.forest.read().unwrap().compact_shard_phase(&app, PHASES[phase_idx]);
+                let txn = self.store.new_transaction(false)?;
+                txn.delete(&marker)?;
+                txn.commit()?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Forest-sync CLIENT: pull one shard/phase tree from a remote `source` (at
