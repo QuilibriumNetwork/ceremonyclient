@@ -481,6 +481,7 @@ pub struct ProverLifecycle {
     /// the gossip and poller callers. No network work runs under this lock.
     evaluation_lock: std::sync::Mutex<()>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
+    pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
     /// Whether a VDF computation is currently in progress. While set,
@@ -632,6 +633,7 @@ impl ProverLifecycle {
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
             leave_decisions: super::leave_decisions::LeaveDecisions::default(),
+            allocation_reasons: super::allocation_reasons::AllocationReasons::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
@@ -872,6 +874,7 @@ impl ProverLifecycle {
 
     /// Load durable rejection decisions before enabling lifecycle dispatch.
     pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
+        self.allocation_reasons.attach(db.clone(), &self.prover_address)?;
         self.leave_decisions.attach(db, &self.prover_address)
     }
 
@@ -1630,6 +1633,7 @@ impl ProverLifecycle {
         }
 
         let mut actions: Vec<LifecycleAction> = Vec::new();
+        let mut proposal_reasons: Vec<(Vec<u8>, bool, &str)> = Vec::new();
         let mut join_proposed_this_cycle = false;
         let mut forced_rejection = false;
 
@@ -1772,6 +1776,7 @@ impl ProverLifecycle {
                         reason = "capacity reduction (active count exceeds worker count)",
                         "proposing leaves for surplus actives"
                     );
+                    proposal_reasons.extend(surplus.iter().cloned().map(|f| (f, false, "C")));
                     actions.push(LifecycleAction::ProposeLeave {
                         filters: surplus,
                         frame_number,
@@ -1915,6 +1920,12 @@ impl ProverLifecycle {
                         "proposing join for shards"
                     );
 
+                    for filter in &filters {
+                        let reason = if proposal_descriptors_filtered.iter().any(|d| &d.filter == filter
+                            && d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT) { "H" }
+                            else if self.strategy == Strategy::RewardGreedy { "$" } else { "D" };
+                        proposal_reasons.push((filter.clone(), true, reason));
+                    }
                     actions.push(LifecycleAction::ProposeJoin {
                         filters,
                         worker_ids,
@@ -2431,6 +2442,11 @@ impl ProverLifecycle {
                         6
                     };
                     by_cause[cause] += 1;
+                    let reason = if cause == 6 && remote_shards.iter().any(|parent|
+                        is_split_parent(parent, std::iter::once(f))) { "G" }
+                        else if cause == 0 && self.strategy == Strategy::DataGreedy { "D" }
+                        else { ["$", "H", "E", "O", "C", "S", "T"][cause] };
+                    proposal_reasons.push((f.clone(), false, reason));
                 }
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
@@ -2635,6 +2651,14 @@ impl ProverLifecycle {
                 }).flatten().filter_map(|filter| leaving_filters.iter()
                     .find(|(f, _)| f == filter).cloned()).collect();
                 self.leave_decisions.commit(&rejected, frame_number)?;
+                for (filter, joining, reason) in proposal_reasons {
+                    let accepted = actions.iter().any(|a| match a {
+                        LifecycleAction::ProposeJoin { filters, .. } if joining => filters.contains(&filter),
+                        LifecycleAction::ProposeLeave { filters, .. } if !joining => filters.contains(&filter),
+                        _ => false,
+                    });
+                    if accepted { self.allocation_reasons.record(&[filter], joining, frame_number, reason)?; }
+                }
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
                     let inputs: Vec<_> = held_descriptors.iter().map(|d| {

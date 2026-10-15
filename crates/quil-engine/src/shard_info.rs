@@ -394,6 +394,7 @@ where
             let est = entry.ring.map_or_else(BigInt::zero, |ring| compute_shard_reward(
                 &basis, &entry.size, &world_bytes, ring, entry.data_shards));
             ShardDetail {
+                allocation_reason: None,
                 filter: entry.filter.clone(),
                 shard_size: entry.size.clone(),
                 active_provers: entry.total_active as u32,
