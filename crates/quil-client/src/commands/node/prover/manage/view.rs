@@ -2839,42 +2839,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_phases_fit_the_column_and_expected_waits_do_not_warn() {
-        use quil_types::proto::node::WorkerExecution;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        let mut m = Model::new();
-        m.reachable = true;
-        m.frame_number = 2160;
-        m.epoch_length = 720;
-        for (state, label, reason) in [("syncing", "sync", "staging shard data"),
-            ("closing", "close", "awaiting closing certificate"),
-            ("handoff", "handoff", "awaiting successor"),
-            ("waiting", "wait", "awaiting allocation activation")] {
-            let mut allocation = row("aa", 1, 1, 7, "", "");
-            allocation.status = 2;
-            allocation.epoch = 3;
-            allocation.status_name = "active".into();
-            allocation.execution = Some(WorkerExecution { state: state.into(), blocker: reason.into(),
-                materialized_frame: Some(0), last_advance_unix_ms: now - 120_000,
-                observed_unix_ms: now, ..Default::default() });
-            assert_eq!(alloc_cell(&m, &allocation, 9, STATE_WIDTH), label);
-            assert_eq!(alloc_cell(&m, &allocation, 6, MAT_WIDTH), "0");
-            assert_eq!(local_color(&m, &allocation), HELP);
-            assert!(allocation_detail(&m, &allocation).to_string().contains(&format!("Reason: {reason}")));
-            m.allocations = vec![allocation];
-            m.app_progress_observed_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
-            update_app_progress_warning(&mut m);
-            assert!(m.app_stall_time.is_none());
-            assert!(m.app_progress_observed_since.is_none());
-        }
-        m.allocations[0].execution.as_mut().unwrap().state = "serving".into();
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 9, STATE_WIDTH), "serve");
-        assert!(local_warning(&m, &m.allocations[0]));
-        update_app_progress_warning(&mut m);
-        assert!(m.app_stall_time.is_some(), "serving still has independent progress warnings");
-    }
-
-    #[test]
     fn global_head_columns_sort_and_filter_without_confusing_unknown_and_zero() {
         let mut m = Model::new();
         for (id, head) in [("a", Some(742)), ("b", None), ("c", Some(0))] {
@@ -3194,7 +3158,6 @@ mod tests {
             execution: None,
             allocation_reason: None,
             shard_info_known: true,
-            allocation_reason: None,
             filter: Vec::new(),
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),

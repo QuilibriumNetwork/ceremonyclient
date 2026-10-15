@@ -207,13 +207,47 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
 /// [`crate::peer_auth_middleware::AuthenticatedPeer`] extension and
 /// gate writes on peer identity.
 ///
-/// Returns `Ok(())` to acknowledge acceptance, or an error string that
-/// will be surfaced as `Status::invalid_argument`.
+/// Resolves to `Ok(())` to acknowledge acceptance, or a [`SubmitRefusal`].
+/// Asynchronous, so a handler can verify off the RPC runtime.
 pub type SubmitHandler = Arc<
-    dyn Fn(Request<global::SubmitGlobalMessageRequest>) -> Result<(), String>
+    dyn Fn(Request<global::SubmitGlobalMessageRequest>)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SubmitRefusal>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Why a submission was refused, and whether to retry it. A retryable
+/// refusal (the receiver's mempool is full, or it cannot verify the message
+/// yet) is `Status::resource_exhausted`; it was `invalid_argument` like any
+/// other until 2026-10-15, so submitters dropped messages a full archive
+/// would have taken later.
+#[derive(Debug, Clone)]
+pub struct SubmitRefusal {
+    pub reason: String,
+    pub retry: bool,
+}
+
+impl SubmitRefusal {
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), retry: false }
+    }
+
+    pub fn retry_later(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), retry: true }
+    }
+}
+
+impl From<String> for SubmitRefusal {
+    fn from(reason: String) -> Self {
+        Self::invalid(reason)
+    }
+}
+
+impl From<&str> for SubmitRefusal {
+    fn from(reason: &str) -> Self {
+        Self::invalid(reason)
+    }
+}
 
 /// Handler for `submit_global_consensus`: a directly-delivered global
 /// consensus message (proposal / vote / timeout) from a peer archive.
@@ -1098,11 +1132,12 @@ impl GlobalService for GlobalRpcServer {
     ) -> Result<Response<global::SubmitGlobalMessageResponse>, Status> {
         match &self.submit_handler {
             Some(handler) => {
-                match handler(request) {
+                match handler(request).await {
                     Ok(()) => Ok(Response::new(global::SubmitGlobalMessageResponse {})),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "global message submit rejected by collector");
-                        Err(Status::invalid_argument(format!("submit rejected: {}", e)))
+                    Err(refusal) => {
+                        tracing::debug!(error = %refusal.reason, retry = refusal.retry, "global message submit rejected by collector");
+                        let message = format!("submit rejected: {}", refusal.reason);
+                        Err(if refusal.retry { Status::resource_exhausted(message) } else { Status::invalid_argument(message) })
                     }
                 }
             }

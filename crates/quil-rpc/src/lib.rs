@@ -27,7 +27,7 @@ pub use frame_sync::{
 };
 pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ArchiveShardInfo, ShardInfoRefreshError};
 pub use forest_sync_reader::RemoteTreeReader;
-pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler};
+pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler, SubmitRefusal};
 pub use prover_counts::{
     census_global_prover_phase, class_for_type_hash, list_provers, DecodedProver, ProverCensus,
     TypeCount, KNOWN_TYPE_HASHES,

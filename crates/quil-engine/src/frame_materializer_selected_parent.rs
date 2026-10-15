@@ -880,6 +880,7 @@ impl GlobalParentExecutor {
             Some(self.leader.for_execution_branch(
                 branch.execution(),
                 context.view,
+                number + 1,
                 self.limits.max_proposal_message_bytes,
                 self.limits.max_proposal_message_items,
                 &consumed,

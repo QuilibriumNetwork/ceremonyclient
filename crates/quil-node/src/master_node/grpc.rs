@@ -822,6 +822,10 @@ pub(crate) fn spawn_all(
     let submit_cf = current_frame.clone();
     let submit_handler: quil_rpc::SubmitHandler = Arc::new(
         move |request: tonic::Request<quil_types::proto::global::SubmitGlobalMessageRequest>| {
+            let submit_mc = submit_mc.clone();
+            let submit_cf = submit_cf.clone();
+            Box::pin(async move {
+            use quil_rpc::SubmitRefusal;
             let auth = request
                 .extensions()
                 .get::<quil_rpc::peer_auth_middleware::AuthenticatedPeer>()
@@ -845,7 +849,17 @@ pub(crate) fn spawn_all(
             // frame number, larger by the genesis offset) put messages
             // out of the collect range, so they never landed.
             let rank = submit_cf.effective_rank();
-            match submit_mc.add_message_outcome(rank, data) {
+            // Shard frames are verified before they are held; that runs on
+            // the blocking pool, not the runtime that delivers consensus.
+            let outcome = if submit_mc.requires_verification(&data) {
+                let collector = submit_mc.clone();
+                tokio::task::spawn_blocking(move || collector.add_message_outcome(rank, data))
+                    .await
+                    .map_err(|error| SubmitRefusal::retry_later(format!("verification task failed: {error}")))?
+            } else {
+                submit_mc.add_message_outcome(rank, data)
+            };
+            match outcome {
                 quil_engine::message_collector::SubmitOutcome::Accepted => {
                     tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
                     quil_engine::metrics::inc_grpc_submits_accepted();
@@ -865,7 +879,8 @@ pub(crate) fn spawn_all(
                     // The submitter cannot read this log, so the reply says
                     // why, with this node's executed frame against its head:
                     // a node still executing older frames judges shard
-                    // addresses and ranks by its own state.
+                    // addresses and ranks by its own state. A full mempool or
+                    // a frame it cannot verify yet asks for a retry.
                     let (executed, head) = (submit_cf.materialized(), submit_cf.effective());
                     tracing::warn!(
                         peer = %auth.peer_id,
@@ -875,12 +890,16 @@ pub(crate) fn spawn_all(
                         head,
                         "gRPC submit REJECTED by message collector"
                     );
-                    Err(format!(
-                        "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
-                        refusal.reason(),
-                    ))
+                    Err(SubmitRefusal {
+                        reason: format!(
+                            "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
+                            refusal.reason(),
+                        ),
+                        retry: refusal.retryable(),
+                    })
                 }
             }
+            })
         },
     );
     // Direct global-consensus delivery handler. Peer archives call

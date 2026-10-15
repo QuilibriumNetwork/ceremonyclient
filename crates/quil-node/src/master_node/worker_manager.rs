@@ -840,7 +840,6 @@ pub(crate) fn init(
                 let drain_worker_stores = worker_stores_by_core.clone();
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
-                let drain_transport_cell = prover_message_transport.clone();
                 // Master clock store — worker-finalized app-shard frames are mirrored
                 // here so `AppShardService` (and any master-side reader) can serve
                 // them. Workers commit into their OWN per-worker store, which the
@@ -860,57 +859,26 @@ pub(crate) fn init(
                                 match event {
                                     WorkerToMaster::ShardFrameFinalized {
                                         core_id,
-                                        filter,
                                         header_canonical_bytes,
+                                        ..
                                     } => {
-                                        // Drop reward-proof submissions during a coverage
-                                        // halt. The engine's per-message halt gates stop
-                                        // new consensus from advancing, but a finalize
-                                        // event already in-flight when the halt arrived
-                                        // can still race through and emit here. Suppress
-                                        // the publish so we don't credit shard work that
-                                        // shouldn't have happened during the halt window.
+                                        // The engine's `coverage_publish` hook (above)
+                                        // already submits this header, as it does for
+                                        // standalone workers, which ignore this event.
+                                        // Submitting it here too sent every finalized
+                                        // frame twice from every member, each copy
+                                        // stamped with its own time so no archive could
+                                        // tell them apart: during the 880,560 halt
+                                        // (2026-10-14) the copies helped fill every
+                                        // archive's GLOBAL mempool, which then refused
+                                        // all submissions ("rank buffer full").
                                         if drain_halt.any_halted() {
-                                            debug!(
-                                                core_id,
-                                                filter = %hex::encode(&filter),
-                                                "suppressing GLOBAL_PROVER publish — coverage halt active"
-                                            );
                                             continue;
                                         }
                                         // A positive log line so the operator can see
                                         // each rewardable proof going out (standalone
                                         // workers' log the same through the master).
                                         super::reward_proofs::log_reward_proof(core_id, "thread", &header_canonical_bytes);
-                                        match super::reward_proofs::prover_bundle(header_canonical_bytes) {
-                                            Ok(bytes) => {
-                                                let cell = drain_transport_cell.clone();
-                                                let filter_owned = filter.clone();
-                                                drain_spawner.detach("shard-finalize-publish", async move {
-                                                    match cell.get() {
-                                                        Some(transport) => {
-                                                            if let Err(e) = transport
-                                                                .publish_prover_bundle(bytes)
-                                                                .await
-                                                            {
-                                                                warn!(core_id,
-                                                                    filter = %hex::encode(&filter_owned),
-                                                                    error = %e,
-                                                                    "shard finalize: transport submission failed");
-                                                            }
-                                                        }
-                                                        None => {
-                                                            warn!(core_id,
-                                                                filter = %hex::encode(&filter_owned),
-                                                                "shard finalize: transport not yet wired — dropping");
-                                                        }
-                                                    }
-                                                    Ok(())
-                                                });
-                                            }
-                                            Err(e) => warn!(core_id, error = %e,
-                                                "shard finalize: bundle encode failed"),
-                                        }
                                     }
                                     WorkerToMaster::FrameProduced { core_id, filter, frame_data, .. } => {
                                         // `FrameProduced` carries the proposal-time

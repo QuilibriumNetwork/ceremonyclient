@@ -173,13 +173,24 @@ impl GlobalLeaderProvider {
         self.rejected.lock().unwrap().reused
     }
 
+    /// A leader over a private execution branch proposing `frame_number` at
+    /// `rank`, with a copy of the pending messages within the proposal budget
+    /// ([`MessageCollector::snapshot_for_proposal`]); what `consumed`, the
+    /// executed ancestors, carried is left out.
     pub(crate) fn for_execution_branch(
-        &self, branch: &quil_execution::ExecutionBranch, rank: u64,
+        &self, branch: &quil_execution::ExecutionBranch, rank: u64, frame_number: u64,
         max_bytes: usize, max_items: usize, consumed: &[Vec<u8>],
     ) -> Result<Self> {
         let collector = Arc::new(MessageCollector::new());
-        for bytes in self.message_collector.snapshot_for_execution(rank, max_bytes, max_items)? {
-            collector.add_message(rank, bytes);
+        let messages = self.message_collector.snapshot_for_proposal(
+            rank, max_bytes, max_items, Some(frame_number), consumed,
+        )?;
+        for (bytes, verified) in messages {
+            if verified {
+                collector.add_verified_message(rank, bytes);
+            } else {
+                collector.add_message(rank, bytes);
+            }
         }
         collector.mark_finalized(consumed);
         let mut leader = Self::new(
@@ -473,50 +484,126 @@ pub fn compute_global_requests_root(
     tree.commit(prover)
 }
 
-/// Coalesce a set of shard-frame proof messages to the TIP per shard
-/// address — the highest LOCAL frame number (`FrameHeader.frame_number`) each
-/// shard carries. Returns `(kept, superseded)`: `kept` holds one proof per shard
-/// (its tip) plus any bundle that isn't a single-shard frame (0 or >1 shard frame
-/// — e.g. a multi-shard bundle — passes through untouched); `superseded` holds the
-/// lower-frame proofs the tip replaced (the caller drops them from the mempool).
+/// Unverified candidates a leader checks per shard and proposal, highest
+/// first. An archive verifies shard frames on admission, so its candidates
+/// arrive verified and this bounds only the work an unverified backlog can
+/// cost; a shard whose top candidates all fail waits for a later frame.
+pub(crate) const MAX_TIP_VERIFICATIONS: usize = 3;
+
+/// A leader's check of an unverified shard proof.
+pub(crate) enum TipCheck {
+    Valid,
+    Invalid(String),
+    /// The parent state cannot judge it now; it stays for a later frame.
+    Unavailable,
+}
+
+/// The shard proofs a proposal carries, and what it drops.
+#[derive(Default)]
+pub(crate) struct ShardTips {
+    /// One verified proof per shard (its tip), plus any bundle that is not a
+    /// single-shard frame (0 or >1 shard frames — e.g. a multi-shard bundle —
+    /// passes through untouched).
+    pub kept: Vec<Vec<u8>>,
+    /// Proofs at or below a shard's tip (the caller drops them).
+    pub superseded: Vec<Vec<u8>>,
+    /// Proofs that failed verification, with the reason.
+    pub invalid: Vec<(Vec<u8>, String)>,
+    /// Proofs left in the mempool unchecked or unjudged.
+    pub deferred: usize,
+}
+
+/// Coalesce shard-frame proof messages to the TIP per shard address: its
+/// highest LOCAL frame (`FrameHeader.frame_number`) that is VERIFIED — held
+/// verified by the collector (`verified`) or passing `verify` now.
 ///
 /// The global proposer's lockstep filter admits a shard proof by its ANCHOR
 /// (`global_frame_number`), NOT its count, so a shard that produced several local
 /// frames all anchored to the prior global frame passes them ALL. Rewards are
 /// per-global-frame and the tip's state roots subsume its ancestors, so only the
 /// tip needs to ride the global frame — this bounds the request set to O(#shards).
-/// Equal frame numbers (duplicate serializations of the same proof) collapse to
-/// the first seen. Order-independent: the tip for an address is the max regardless
-/// of arrival order.
-pub(crate) fn coalesce_shard_frames_to_tip(
+///
+/// A declared frame number is not evidence. Picking the highest before any
+/// certificate check (until 2026-10-15) let any authenticated peer submit a
+/// forged higher header for every shard each frame: execution skipped it, and
+/// the real proofs it had displaced never rode, so no shard was rewarded.
+/// Equal frame numbers (another member's copy of the same frame) collapse to
+/// the first verified.
+pub(crate) fn select_shard_tips(
     shard_frame_msgs: Vec<Vec<u8>>,
-) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let mut tip: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
+    verified: impl Fn(&[u8]) -> bool + Sync,
+    verify: impl Fn(&[u8]) -> TipCheck + Sync,
+) -> ShardTips {
+    let mut out = ShardTips::default();
+    let mut shards: std::collections::HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>> =
         std::collections::HashMap::new();
-    let mut kept: Vec<Vec<u8>> = Vec::new();
-    let mut superseded: Vec<Vec<u8>> = Vec::new();
     for raw in shard_frame_msgs {
-        let keys = crate::message_collector::extract_shard_frame_keys(&raw);
+        let mut keys = crate::message_collector::extract_shard_frame_keys(&raw);
         if keys.len() == 1 {
-            let (addr, local_frame) = keys.into_iter().next().unwrap();
-            match tip.get(&addr) {
-                // A higher-or-equal tip is already held → this is superseded
-                // (equal ⇒ a duplicate serialization of the same-height proof).
-                Some((best, _)) if *best >= local_frame => superseded.push(raw),
-                _ => {
-                    if let Some((_, old_raw)) = tip.insert(addr, (local_frame, raw)) {
-                        superseded.push(old_raw);
-                    }
-                }
-            }
+            let (address, frame) = keys.pop().unwrap();
+            shards.entry(address).or_default().push((frame, raw));
         } else {
-            // 0 keys (not a decodable single shard frame) or a multi-shard bundle:
-            // don't coalesce — pass through.
-            kept.push(raw);
+            out.kept.push(raw);
         }
     }
-    kept.extend(tip.into_values().map(|(_, raw)| raw));
-    (kept, superseded)
+    let select = |mut candidates: Vec<(u64, Vec<u8>)>, out: &mut ShardTips| {
+        // Highest first; a stable sort keeps arrival order within a height.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let (mut tip, mut checked) = (false, 0);
+        for (_, raw) in candidates {
+            if tip {
+                out.superseded.push(raw);
+            } else if verified(&raw) {
+                out.kept.push(raw);
+                tip = true;
+            } else if checked == MAX_TIP_VERIFICATIONS {
+                out.deferred += 1;
+            } else {
+                checked += 1;
+                match verify(&raw) {
+                    TipCheck::Valid => {
+                        out.kept.push(raw);
+                        tip = true;
+                    }
+                    TipCheck::Invalid(reason) => out.invalid.push((raw, reason)),
+                    TipCheck::Unavailable => out.deferred += 1,
+                }
+            }
+        }
+    };
+    let shards: Vec<_> = shards.into_values().collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(shards.len() / 16).max(1);
+    if threads == 1 {
+        for candidates in shards {
+            select(candidates, &mut out);
+        }
+        return out;
+    }
+    let chunk = shards.len().div_ceil(threads);
+    let mut shards = shards.into_iter();
+    let parts: Vec<ShardTips> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let part: Vec<_> = shards.by_ref().take(chunk).collect();
+                let select = &select;
+                scope.spawn(move || {
+                    let mut out = ShardTips::default();
+                    for candidates in part {
+                        select(candidates, &mut out);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("shard tip selection panicked")).collect()
+    });
+    for part in parts {
+        out.kept.extend(part.kept);
+        out.superseded.extend(part.superseded);
+        out.invalid.extend(part.invalid);
+        out.deferred += part.deferred;
+    }
+    out
 }
 
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
@@ -900,20 +987,63 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         "GLOBAL message validation budget spent; deferring the rest to a later frame",
                     );
                 }
-                let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
-                let coalesced = superseded.len();
-                valid.extend(tips);
-                for s in &superseded {
+                // Each shard's tip must be verified: held verified by the
+                // collector (an archive verifies on admission) or checked here,
+                // with refusals remembered under this validation context.
+                let tips = {
+                    let (collector, rejected) = (&self.message_collector, &self.rejected);
+                    let (context, global_addr) = (&context, &global_addr);
+                    select_shard_tips(
+                        in_lockstep_shard,
+                        |raw| collector.is_verified(raw),
+                        |raw| {
+                            let hash: [u8; 32] = Sha256::digest(raw).into();
+                            if let Some(reason) = rejected.lock().unwrap().refused(&hash) {
+                                return TipCheck::Invalid(reason);
+                            }
+                            match validator.validate_message(frame_number, global_addr, raw) {
+                                Ok(()) => TipCheck::Valid,
+                                Err(e) if e.is_execution_unavailable() => TipCheck::Unavailable,
+                                Err(e) => {
+                                    let reason: String = e
+                                        .to_string()
+                                        .chars()
+                                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                                        .take(90)
+                                        .collect();
+                                    rejected.lock().unwrap().remember(context, hash, reason.clone());
+                                    TipCheck::Invalid(reason)
+                                }
+                            }
+                        },
+                    )
+                };
+                let coalesced = tips.superseded.len();
+                valid.extend(tips.kept);
+                for s in &tips.superseded {
                     *drop_reasons
                         .entry(format!("{} :: coalesced-superseded-shard-tip", msg_type(s)))
                         .or_insert(0) += 1;
                 }
-                invalid.extend(superseded);
+                invalid.extend(tips.superseded);
+                for (raw, reason) in tips.invalid {
+                    *drop_reasons
+                        .entry(format!("{} :: shard tip: {}", msg_type(&raw), reason))
+                        .or_insert(0) += 1;
+                    invalid.push(raw);
+                }
                 if coalesced > 0 {
                     tracing::info!(
                         frame = frame_number,
                         coalesced,
                         "coalesced superseded shard-frame proofs to the per-shard tip",
+                    );
+                }
+                if tips.deferred > 0 {
+                    tracing::info!(
+                        frame = frame_number,
+                        deferred = tips.deferred,
+                        "shard-frame proofs not verified this frame; left for a later one",
                     );
                 }
                 if !invalid.is_empty() {
@@ -1669,6 +1799,86 @@ mod tests {
 
     /// Build a canonical shard-frame proof bundle carrying one
     /// `FrameHeader` for `addr` at LOCAL frame `local_frame`.
+    /// Tip selection over proofs the collector holds verified.
+    fn coalesce_verified(msgs: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let tips = select_shard_tips(msgs, |_| true, |_: &[u8]| -> TipCheck { unreachable!("every candidate is verified") });
+        assert!(tips.invalid.is_empty() && tips.deferred == 0);
+        (tips.kept, tips.superseded)
+    }
+
+    fn frame_of(raw: &[u8]) -> u64 {
+        crate::message_collector::extract_shard_frame_keys(raw)[0].1
+    }
+
+    #[test]
+    fn a_forged_higher_header_cannot_displace_a_verified_tip() {
+        let real = make_shard_frame(0x11, 877);
+        let lower = make_shard_frame(0x11, 876);
+        let forged = make_shard_frame(0x11, 1_000_000);
+        let other = make_shard_frame(0x22, 500);
+        let tips = select_shard_tips(
+            vec![lower.clone(), forged.clone(), real.clone(), other.clone()],
+            |raw| raw != forged.as_slice(),
+            |raw| if raw == forged.as_slice() { TipCheck::Invalid("certificate".into()) } else { TipCheck::Valid },
+        );
+        let mut kept = tips.kept.clone();
+        kept.sort();
+        let mut want = vec![real, other];
+        want.sort();
+        assert_eq!(kept, want, "the verified tip rides, not the forged header");
+        assert_eq!(tips.invalid.len(), 1);
+        assert_eq!(tips.invalid[0].0, forged);
+        assert_eq!(tips.superseded, vec![lower]);
+        assert_eq!(tips.deferred, 0);
+    }
+
+    #[test]
+    fn unverified_candidates_are_checked_highest_first_and_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let checks = AtomicUsize::new(0);
+        let msgs: Vec<_> = (1..=5).map(|n| make_shard_frame(0x11, n)).collect();
+        let tips = select_shard_tips(msgs, |_| false, |_| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            TipCheck::Valid
+        });
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "only the tip is checked");
+        assert_eq!(tips.kept.iter().map(|m| frame_of(m)).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(tips.superseded.len(), 4);
+
+        // Forged headers above an unverified real one: the work is bounded and
+        // the shard waits for a later frame rather than carrying a forgery.
+        let checks = AtomicUsize::new(0);
+        let mut msgs: Vec<_> = (100..110).map(|n| make_shard_frame(0x11, n)).collect();
+        msgs.push(make_shard_frame(0x11, 7));
+        let tips = select_shard_tips(msgs, |_| false, |raw| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            if frame_of(raw) >= 100 { TipCheck::Invalid("certificate".into()) } else { TipCheck::Valid }
+        });
+        assert_eq!(checks.load(Ordering::SeqCst), MAX_TIP_VERIFICATIONS);
+        assert!(tips.kept.is_empty());
+        assert_eq!(tips.invalid.len(), MAX_TIP_VERIFICATIONS);
+        assert_eq!(tips.deferred, 11 - MAX_TIP_VERIFICATIONS);
+    }
+
+    #[test]
+    fn an_unjudged_tip_leaves_the_next_verified_proof_in_its_place() {
+        let high = make_shard_frame(0x11, 9);
+        let low = make_shard_frame(0x11, 8);
+        let tips = select_shard_tips(vec![high, low.clone()], |raw| raw == low.as_slice(), |_| TipCheck::Unavailable);
+        assert_eq!(tips.kept, vec![low]);
+        assert_eq!(tips.deferred, 1, "the higher proof stays for a later frame");
+        assert!(tips.superseded.is_empty() && tips.invalid.is_empty());
+    }
+
+    #[test]
+    fn many_shards_select_in_parallel_with_the_same_result() {
+        let msgs: Vec<_> = (0..64u8).flat_map(|a| (1..=3).map(move |n| make_shard_frame(a, n))).collect();
+        let (kept, superseded) = coalesce_verified(msgs);
+        assert_eq!(kept.len(), 64);
+        assert!(kept.iter().all(|m| frame_of(m) == 3));
+        assert_eq!(superseded.len(), 128);
+    }
+
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
         use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -1737,7 +1947,7 @@ mod tests {
             make_shard_frame(0x22, 500),
         ];
 
-        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+        let (kept, superseded) = coalesce_verified(msgs);
 
         // One tip per shard → 2 kept; the other 3 (876, 877, dup 877) superseded.
         assert_eq!(kept.len(), 2, "one tip per shard address (A + B)");
@@ -1768,7 +1978,7 @@ mod tests {
     fn coalesce_bounds_a_deep_backlog_to_one_per_shard() {
         // A 1000-frame backlog for one shard (the mainnet balloon) collapses to 1.
         let msgs: Vec<Vec<u8>> = (1..=1000u64).map(|n| make_shard_frame(0x11, n)).collect();
-        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+        let (kept, superseded) = coalesce_verified(msgs);
         assert_eq!(kept.len(), 1, "backlog bounded to the single tip");
         assert_eq!(superseded.len(), 999);
         let keys = crate::message_collector::extract_shard_frame_keys(&kept[0]);
@@ -1779,11 +1989,11 @@ mod tests {
     fn coalesce_passes_through_undecodable_and_leaves_empty_empty() {
         // A non-bundle message has 0 shard-frame keys → passes through untouched.
         let junk = b"not a bundle".to_vec();
-        let (kept, superseded) = coalesce_shard_frames_to_tip(vec![junk.clone()]);
+        let (kept, superseded) = coalesce_verified(vec![junk.clone()]);
         assert_eq!(kept, vec![junk]);
         assert!(superseded.is_empty());
         // Empty in → empty out.
-        let (k, s) = coalesce_shard_frames_to_tip(Vec::new());
+        let (k, s) = coalesce_verified(Vec::new());
         assert!(k.is_empty() && s.is_empty());
     }
 }

@@ -1016,6 +1016,11 @@ fn private_snapshot_and_failed_budget_checks_preserve_public_retention_until_fin
     assert_eq!(collector.snapshot_for_execution(51, 8, 100).unwrap(), vec![b"boundary".to_vec()]);
     assert_eq!(collector.snapshot_for_execution(51, 4096, 1).unwrap(), vec![b"boundary".to_vec()]);
     assert_eq!(collector.total_pending(), 3);
+    // Retention counts finalized frames: ten after rank 41 keep it.
+    for rank in 41..51 {
+        collector.prune_after_finalization(rank);
+    }
+    assert_eq!(collector.pending_count(1), 1);
     collector.prune_after_finalization(51);
     assert_eq!(collector.pending_count(1), 0);
     assert_eq!(collector.pending_count(41), 1);

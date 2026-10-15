@@ -1451,7 +1451,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 // session-local counter in the wrong space, so
                                 // relayed prover messages were never collected.
                                 let current_rank = cf_for_recv.effective_rank();
-                                mc_for_recv.add_message(current_rank, received.data.clone());
+                                // Shard frames are verified before they are
+                                // held: off this loop.
+                                if mc_for_recv.requires_verification(&received.data) {
+                                    let (collector, data) = (mc_for_recv.clone(), received.data.clone());
+                                    tokio::task::spawn_blocking(move || collector.add_message(current_rank, data));
+                                } else {
+                                    mc_for_recv.add_message(current_rank, received.data.clone());
+                                }
                             }
                             GLOBAL_ALERT => {
                                 // Mirrors Go's alert validation at

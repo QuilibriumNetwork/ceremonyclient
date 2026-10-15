@@ -2058,9 +2058,15 @@ impl FrameMaterializer {
     /// the clock records; the idempotency gate (`frame_number <= last`) then
     /// guarantees no frame at or below the durable cursor is ever re-run.
     /// Monotonic: never lowers an already-higher in-memory cursor.
+    ///
+    /// The shared `CurrentFrame` advertises the seeded cursor too: unseeded,
+    /// a restarted node reported "executed 0" until it executed another frame.
     pub fn seed_cursor(&self, m: u64) {
         let _execution = self.frame_execution.lock().expect("materializer frame lock poisoned");
         self.last_materialized_frame.fetch_max(m, Ordering::SeqCst);
+        if let Some(cf) = &self.current_frame {
+            cf.materialize(m);
+        }
     }
 }
 

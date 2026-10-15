@@ -270,6 +270,11 @@ pub(crate) async fn start(
     if let Ok(frame) = clock_store.get_latest_global_frame() {
         if let Some(h) = frame.header.as_ref() {
             current_frame.observe(h.frame_number);
+            // The head's consensus rank, so submissions are filed and reported
+            // at it before this process finalizes a frame: unseeded, every
+            // archive restarted during the 880,560 halt (2026-10-14) answered
+            // "rank 0, executed 0" for as long as it lasted.
+            current_frame.observe_rank(h.rank);
             // Committee-handoff flag day: a master starting past activation
             // discards its legacy app frame chains before any worker, ingest
             // or mirror runs (the running paths discard at the crossing).
@@ -862,10 +867,11 @@ pub(crate) async fn start(
             // transport identity, gated by mtls_seed as before).
             falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
+            retry_queue: Default::default(),
         });
 
     // Hand the freshly-built transport to the worker_manager so its
-    // coverage_publish closure and shard-finalize drain can route
+    // coverage_publish closure can route
     // reward proofs through the gRPC archive fan-out instead of a
     // direct BlossomSub publish on GLOBAL_PROVER (which fails on
     // non-archive nodes — they don't subscribe to that bitmask).
