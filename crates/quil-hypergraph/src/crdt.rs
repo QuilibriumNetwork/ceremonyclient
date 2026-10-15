@@ -3913,8 +3913,9 @@ impl HypergraphCrdt {
     // ---- PoRep / shard-info (KV prefix scan, no trie) -------------------
 
     /// Collect a phase's committed `(id, blob)` leaves whose id matches the
-    /// nibble `path` prefix, from the store KV. `path` is a 6-bit-nibble path
-    /// (the KZG tree's branching); an empty path matches all. Ascending by id.
+    /// `path` prefix, from the store KV. Legacy paths use 6-bit nibbles;
+    /// unified paths append a sentinel and address bits to the app path.
+    /// An empty path matches all. Ascending by id.
     fn collect_phase_leaves(
         &self,
         shard: &ShardKey,
@@ -3922,6 +3923,17 @@ impl HypergraphCrdt {
         path: &[i32],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let (set, phase) = PHASE_STR[phase_idx];
+        let app_path = quil_tries::get_full_path(&shard.l2);
+        let bits = path.strip_prefix(app_path.as_slice())
+            .and_then(|suffix| suffix.strip_prefix(&[-1]));
+        let matches = |key: &[u8]| match bits {
+            Some(bits) => key.len() == 64 && key[..32] == shard.l2
+                && bits.len() <= 256 && bits.iter().enumerate().all(|(i, bit)| {
+                    matches!(*bit, 0 | 1)
+                        && ((key[32 + i / 8] >> (7 - i % 8)) & 1) as i32 == *bit
+                }),
+            None => id_matches_path(key, path),
+        };
         // Committed store leaves, then staged (uncommitted) blobs overlaid on
         // top — so metadata reflects mutations made this frame before commit
         // (the old in-memory KZG tree held them; the forest-native path merges).
@@ -3930,14 +3942,14 @@ impl HypergraphCrdt {
             set,
             phase,
             shard,
-            &|key| path.is_empty() || id_matches_path(key, path),
+            &matches,
             &mut |key, blob| {
                 map.insert(key, blob);
             },
         )?;
         if let Some(pb) = self.pending_blobs.read().unwrap().get(&(shard.clone(), phase_idx)) {
             for (k, v) in pb {
-                if path.is_empty() || id_matches_path(k, path) {
+                if matches(k) {
                     map.insert(k.clone(), v.clone());
                 }
             }
@@ -4300,6 +4312,55 @@ mod size_index_tests {
 
     fn crdt() -> HypergraphCrdt {
         HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    #[test]
+    fn sentinel_phase_serialization_selects_address_bits_and_staged_overrides() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        // Nonzero app bytes and a non-six-bit-aligned boundary expose treating
+        // the app's padded final nibble as part of the address path.
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0x71;32] };
+        let key = |app: [u8;32], address: u8| [app.to_vec(), vec![address;32]].concat();
+        let covered = key(shard.l2, 0xb5);
+        let sibling = key(shard.l2, 0x35);
+        let foreign = key([0x72;32], 0xb5);
+        let staged = key(shard.l2, 0xb4);
+        let mut persisted = covered.clone();
+        persisted[63] = 1;
+        let txn = store.new_transaction(false).unwrap();
+        for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+            for id in [&covered, &persisted, &sibling, &foreign] {
+                store.save_vertex_underlying(txn.as_ref(), set, phase, &shard, id, &[phase_idx as u8]).unwrap();
+            }
+            hg.pending_blobs.write().unwrap().insert((shard.clone(), phase_idx),
+                [(covered.clone(), vec![9]), (staged.clone(), vec![8]),
+                 (sibling.clone(), vec![7])].into_iter().collect());
+        }
+        txn.commit().unwrap();
+        let full_bits = covered[32..].iter().flat_map(|b|(0..8).rev().map(move|i| b & (1<<i)!=0)).collect();
+        for bits in [vec![], vec![true], vec![true,false,true,true,false,true,false],
+                     full_bits, vec![true;257]] {
+            let mut path = quil_tries::get_full_path(&shard.l2);
+            path.extend(quil_forest::bit_path_to_prefix(&bits).into_iter().map(|p|p as i32));
+            let mut expected = Vec::new();
+            for phase_idx in 0..4 {
+                let mut entries = BTreeMap::new();
+                for (id, blob) in [(&covered, vec![9]), (&persisted, vec![phase_idx]),
+                                   (&staged, vec![8]), (&sibling, vec![7])] {
+                    if bits.len()<=256 && bits.iter().enumerate().all(|(i,b)| ((id[32+i/8]>>(7-i%8))&1!=0)==*b) {
+                        entries.insert(id.clone(),blob);
+                    }
+                }
+                expected.push(phase_idx);
+                expected.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+                for (id, blob) in entries {
+                    expected.extend_from_slice(&(id.len() as u32).to_be_bytes());expected.extend_from_slice(&id);
+                    expected.extend_from_slice(&(blob.len() as u32).to_be_bytes());expected.extend_from_slice(&blob);
+                }
+            }
+            assert_eq!(hg.serialize_phase_subtrees(&shard,&path).unwrap(),expected,"bits {bits:?}");
+        }
     }
 
     #[test]

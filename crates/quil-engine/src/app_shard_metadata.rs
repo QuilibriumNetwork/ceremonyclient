@@ -561,6 +561,52 @@ mod tests {
         Arc::new(HypergraphCrdt::new(store, prover))
     }
 
+    #[test]
+    fn sentinel_replica_contains_committed_payload_and_verifies_registered_openings() {
+        use quil_execution::global_intrinsic::leaf_id_bytes;
+        quil_crypto::init();
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = HypergraphCrdt::new(store, Arc::new(StubProver));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        crdt.set_unified_tree(true);
+        let app = [0x71;32];
+        let bits = [true,false,true,true,false,true,false,true,true];
+        let filter = quil_forest::encode_shard_bit_path(&app,&bits);
+        let mut address = [0;32]; address[0]=0xb5;address[1]=0x80;
+        let payload = b"committed payload for sentinel storage leaf";
+        crdt.add_vertex(&Location { app_address:app,data_address:address },payload).unwrap();
+        address[0]=0x35;
+        crdt.add_vertex(&Location { app_address:app,data_address:address },b"excluded sibling payload").unwrap();
+        crdt.commit(1).unwrap();
+        let replicas = quil_store::replica_store::ReplicaStore::new(db);
+        let member = [0xe3;32];
+        let epoch = 7;
+        let leaf = leaf_id_bytes(&filter,&quil_forest::bit_path_to_prefix(&bits));
+        let previous = vec![0x45;128];
+        replicas.put(epoch-1,&leaf,&previous).unwrap();
+        let poly = quil_types::consensus::STORAGE_BLOCK_POLY_SIZE;
+        let params = quil_crypto::sdr::SdrParams::default();
+        let roots = compute_storage_confirm(&crdt,&replicas,std::slice::from_ref(&filter),&member,epoch,poly,&params).unwrap();
+        assert_eq!(roots.len(),1);
+        assert_eq!(roots[0].entries.len(),1);
+        let entry = &roots[0].entries[0];
+        assert_eq!(leaf_id_bytes(&filter,&entry.prefix),leaf);
+        let replica = replicas.get(epoch,&leaf).unwrap().unwrap();
+        let decoded = quil_crypto::sdr::sdr_decode(&replica,&quil_crypto::sdr::replica_key(&member,&leaf,epoch),&params);
+        assert!(decoded.windows(payload.len()).any(|w|w==payload),"replica must contain its committed shard data");
+        assert!(!decoded.windows(b"excluded sibling payload".len()).any(|w|w==b"excluded sibling payload"));
+        assert_eq!(replicas.get(epoch-1,&leaf).unwrap().unwrap(),previous,"new confirmation preserves older replicas");
+        let rho = quil_crypto::porep::derive_storage_beacon(42,&vec![9;516]);
+        let openings = decode_vote_openings(&build_vote_openings(&crdt,&replicas,&filter,&member,epoch,&rho).unwrap());
+        assert!(!openings.is_empty());
+        let (att,root)=quil_crypto::porep::build_frame_storage_attestation(&openings,100,&rho,&[],poly);
+        let lookup=|m:&[u8],l:&[u8],e:u64| {
+            (m==member && l==leaf && e==epoch).then(||(entry.leaf_root.clone(),entry.num_blocks,epoch))
+        };
+        assert!(quil_crypto::porep::verify_frame_storage_attestation_registered(&root,&att,100,&rho,&[],poly,epoch,lookup));
+    }
+
     /// A bit-path filter names its subtree in sentinel prefix form; a legacy
     /// byte-suffix filter keeps its bytes. (Read raw, a child shard's filter
     /// tail measured 0 after every split.)
