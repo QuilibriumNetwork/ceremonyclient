@@ -119,6 +119,11 @@ pub(crate) async fn start(
         #[cfg(feature = "native-proof")]
         proof_worker.as_ref(),
     )?;
+    // Only a regular node may drop old request bodies: an archive executes
+    // GLOBAL frames and serves their history.
+    if !archive_mode {
+        crate::clock_retention::spawn_request_pruner(&storage.clock_store, "master".into());
+    }
     let inclusion_prover = engines.inclusion_prover.clone();
     // Rebuilds legacy app committees from authenticated GLOBAL state; built by
     // the archive sync (which holds the frame verifier), used by every engine.

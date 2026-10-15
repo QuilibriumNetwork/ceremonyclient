@@ -46,6 +46,17 @@ pub struct CandidatePrune {
     pub next_from: Option<u64>,
 }
 
+/// One pass of [`RocksClockStore::prune_global_frame_requests`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestPrune {
+    /// Request bodies are kept from this frame on; `None` when the head is
+    /// not yet `keep` frames above genesis.
+    pub retained_from: Option<u64>,
+    /// Frames whose bodies this pass removed (the previous boundary up to
+    /// `retained_from`).
+    pub frames: u64,
+}
+
 fn store(error: impl std::fmt::Display) -> QuilError {
     QuilError::Store(error.to_string())
 }
@@ -186,6 +197,48 @@ impl RocksClockStore {
             self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)?;
         }
         Ok(result)
+    }
+}
+
+impl RocksClockStore {
+    /// The lowest global frame whose request bodies are kept, or `None` when
+    /// every stored frame keeps them.
+    pub fn global_requests_retained_from(&self) -> Option<u64> {
+        self.read_u64_index(&encoding::clock_global_requests_retained_index())
+    }
+
+    /// Delete the request bodies of global frames more than `keep` frames
+    /// below the head, keeping every header. The boundary is recorded in the
+    /// same write, and readers that would hand a frame to someone else refuse
+    /// frames below it (see [`Self::global_requests_retained_from`]). The
+    /// range below the boundary is deleted whole each pass, so bodies an old
+    /// backfill wrote back are removed too. Only a node that neither executes
+    /// GLOBAL frames nor serves history may call this.
+    pub fn prune_global_frame_requests(&self, keep: u64) -> Result<RequestPrune> {
+        let Some(limit) = self.get_latest_frame_number().and_then(|head| head.checked_sub(keep)) else {
+            return Ok(RequestPrune::default());
+        };
+        let recorded = self.global_requests_retained_from();
+        let previous = recorded.unwrap_or(0);
+        if limit <= previous {
+            return Ok(RequestPrune { retained_from: recorded, frames: 0 });
+        }
+        let _writes = self.global_memory.writes.lock().unwrap();
+        let mut batch = quil_forest::DisjointBatch::new(encoding::GLOBAL_REQUEST_PREFIXES);
+        let start = encoding::clock_global_frame_request_key(0, 0);
+        let end = encoding::clock_global_frame_request_key(limit, 0);
+        batch.delete_range(&start, &end).map_err(store)?;
+        batch.put(encoding::clock_global_requests_retained_index(), limit.to_be_bytes()).map_err(store)?;
+        self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)?;
+        let mut cache = self.global_memory.cache.write().unwrap();
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.frames.retain(|n, _| *n >= limit);
+        cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
+        drop(cache);
+        // Reclaim the space now rather than at some later compaction.
+        let first = encoding::clock_global_frame_request_key(previous, 0);
+        self.db.compact_range(Some(&first), Some(&end));
+        Ok(RequestPrune { retained_from: Some(limit), frames: limit - previous })
     }
 }
 
@@ -338,5 +391,47 @@ mod tests {
         assert_eq!(pruned.header.unwrap().frame_number, 2);
         let request = encoding::clock_global_frame_request_candidate_key(&identity(&candidate(2, 2)), 2, 0);
         assert!(s.db.get(request).unwrap().is_none(), "request bodies go with their header");
+    }
+
+    /// Request bodies more than `keep` frames below the head go, headers stay,
+    /// the boundary is recorded, and each pass also clears bodies written back
+    /// below it.
+    #[test]
+    fn old_request_bodies_are_pruned_and_headers_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        for n in 1..=10 {
+            s.put_global_frame(&candidate(n, n as u8), None).unwrap();
+        }
+        let bodies = |s: &RocksClockStore| {
+            let prefix = [encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME_REQUEST];
+            s.db.iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward))
+                .map(|e| e.unwrap().0)
+                .take_while(|k| k.starts_with(&prefix))
+                .map(|k| u64::from_be_bytes(k[2..10].try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bodies(&s).len(), 20);
+        assert_eq!(s.global_requests_retained_from(), None);
+        assert_eq!(s.prune_global_frame_requests(10).unwrap(), RequestPrune::default(), "nothing is old enough");
+
+        let pass = s.prune_global_frame_requests(3).unwrap();
+        assert_eq!(pass, RequestPrune { retained_from: Some(7), frames: 7 });
+        assert_eq!(s.global_requests_retained_from(), Some(7));
+        assert!(bodies(&s).iter().all(|n| *n >= 7));
+        assert_eq!(bodies(&s).len(), 8);
+        for n in 1..=10 {
+            let frame = s.get_global_frame(n).unwrap();
+            assert_eq!(frame.header, candidate(n, n as u8).header, "every header stays");
+            assert_eq!(frame.requests.len(), if n < 7 { 0 } else { 2 });
+        }
+        assert_eq!(s.prune_global_frame_requests(3).unwrap().frames, 0, "a repeat at the same head removes nothing");
+
+        s.db.put(encoding::clock_global_frame_request_key(2, 0), b"written back").unwrap();
+        s.put_global_frame(&candidate(11, 11), None).unwrap();
+        assert_eq!(s.prune_global_frame_requests(3).unwrap(), RequestPrune { retained_from: Some(8), frames: 1 });
+        assert!(bodies(&s).iter().all(|n| *n >= 8), "bodies written back below the boundary go too");
+        assert_eq!(s.get_global_frame(11).unwrap().requests.len(), 2);
+        assert_eq!(s.get_earliest_frame_number(), Some(1));
     }
 }

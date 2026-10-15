@@ -306,6 +306,13 @@ pub fn clock_global_earliest_index() -> Vec<u8> {
     vec![CLOCK_FRAME, INDEX_EARLIEST | CLOCK_GLOBAL_FRAME]
 }
 
+/// [0x00, 0x18]: the lowest global frame whose request bodies are kept. A
+/// node that keeps only recent bodies records here where they begin; frames
+/// below it keep their headers only.
+pub fn clock_global_requests_retained_index() -> Vec<u8> {
+    vec![CLOCK_FRAME, INDEX_EARLIEST | CLOCK_GLOBAL_FRAME_REQUEST]
+}
+
 /// [0x00, 0x0F, frame_number(8 BE), selector(32 bytes)]
 pub fn clock_global_frame_candidate_key(frame_number: u64, selector: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(10 + 32);
@@ -324,6 +331,13 @@ pub fn clock_global_frame_candidate_latest_index() -> Vec<u8> {
 /// Staged application-shard frames. Only `commit_shard_clock_frame` reads
 /// them; no execution plan does, so their cleanup is declared disjoint.
 pub const CLOCK_SHARD_STAGED_PREFIXES: &[[u8; 2]] = &[[CLOCK_FRAME, CLOCK_SHARD_STAGED]];
+
+/// Committed GLOBAL request bodies and their retention index. Only frame
+/// reads touch them; a regular node does not execute GLOBAL requests.
+pub const GLOBAL_REQUEST_PREFIXES: &[[u8; 2]] = &[
+    [CLOCK_FRAME, CLOCK_GLOBAL_FRAME_REQUEST],
+    [CLOCK_FRAME, INDEX_EARLIEST | CLOCK_GLOBAL_FRAME_REQUEST],
+];
 
 /// GLOBAL candidate headers and request bodies. Execution does not read these;
 /// writes confined to them do not invalidate an execution plan that never
