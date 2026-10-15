@@ -14,6 +14,8 @@ mod tests;
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionBranchLimits {
     pub state: ExecutionForkLimits,
+    /// Headroom for the registry rows the branch writes, above the committed
+    /// registry it captures ([`RegistryLimits::above`]).
     pub registry: RegistryLimits,
     /// Pending application summary rebuilds copied from the source manager.
     /// Each entry contains a fixed 32-byte address plus set overhead.

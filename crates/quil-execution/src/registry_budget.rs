@@ -26,6 +26,34 @@ impl RegistryLimits {
         max_cache_bytes: usize::MAX,
     };
 
+    /// These limits as headroom above `committed`, a registry read from
+    /// committed rows, whose largest row is `largest_row`: they bound what a
+    /// branch's tentative writes add, not the state every node's canonical
+    /// registry already holds in full. As a fixed ceiling they halted GLOBAL
+    /// at 880,560 (2026-10-14): mainnet's committed registry outgrew them,
+    /// so every member's private execution of that epoch's first frame
+    /// failed its registry refresh and nothing could build on it.
+    pub(super) fn above(self, committed: RegistryUsage, largest_row: usize) -> Self {
+        Self {
+            max_vertices: self.max_vertices.saturating_add(committed.vertices),
+            max_record_bytes: self.max_record_bytes.max(largest_row),
+            max_input_bytes: self.max_input_bytes.saturating_add(committed.input_bytes),
+            max_cache_entries: self.max_cache_entries.saturating_add(committed.cache_entries),
+            max_cache_bytes: self.max_cache_bytes.saturating_add(committed.cache_bytes),
+        }
+    }
+
+    /// The larger of each limit.
+    pub(super) fn max(self, other: Self) -> Self {
+        Self {
+            max_vertices: self.max_vertices.max(other.max_vertices),
+            max_record_bytes: self.max_record_bytes.max(other.max_record_bytes),
+            max_input_bytes: self.max_input_bytes.max(other.max_input_bytes),
+            max_cache_entries: self.max_cache_entries.max(other.max_cache_entries),
+            max_cache_bytes: self.max_cache_bytes.max(other.max_cache_bytes),
+        }
+    }
+
     pub(super) fn page(self) -> VertexPageLimits {
         VertexPageLimits {
             max_entries: self.max_vertices.clamp(1, 256),

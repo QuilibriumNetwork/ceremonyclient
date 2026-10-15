@@ -537,6 +537,14 @@ fn failed_context_construction_releases_child_admission_and_preserves_parent() {
     f.seed_prover(1, 1);
     let parent = f.source.capture_execution_branch(limits()).unwrap();
     let sequence = f.db.inner().latest_sequence_number();
+    // A registry row the parent wrote: the child's registry read covers it,
+    // so its registry limits apply to the whole read.
+    let txn = parent.hypergraph_store().new_transaction(false).unwrap();
+    parent
+        .hypergraph_store()
+        .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(2), &prover_blob(1))
+        .unwrap();
+    txn.commit().unwrap();
     let mut small = limits();
     small.registry.max_cache_bytes = 4095;
     assert!(parent.manager().capture_execution_branch(small).is_err());
@@ -577,10 +585,12 @@ fn failed_context_construction_releases_child_admission_and_preserves_parent() {
 fn branch_registry_refresh_cannot_outgrow_its_capture_budget() {
     let f = Fixture::new(true);
     f.seed_prover(1, 1);
+    // No headroom: the committed prover is read, the branch may add none.
     let mut bounded = limits();
-    bounded.registry.max_vertices = 1;
+    bounded.registry.max_vertices = 0;
     let branch = f.source.capture_execution_branch(bounded).unwrap();
     let usage = branch.registry_usage();
+    assert_eq!(usage.vertices, 1);
     let txn = branch.hypergraph_store().new_transaction(false).unwrap();
     branch
         .hypergraph_store()
@@ -609,6 +619,57 @@ fn branch_registry_refresh_cannot_outgrow_its_capture_budget() {
         .get_prover_info(&[2; 32])
         .unwrap()
         .is_none());
+}
+
+/// Mainnet's committed registry outgrew the fixed branch registry limits at
+/// GLOBAL 880,560 (2026-10-14): every member's private execution of that
+/// epoch's first frame failed its registry refresh and GLOBAL halted. The
+/// committed rows are read whole, seeded or not, and the limits bound only
+/// what a branch and its descendants write above them.
+#[test]
+fn a_committed_registry_past_the_branch_limits_still_executes() {
+    let f = Fixture::new(true);
+    for n in 1..=3 {
+        f.seed_prover(n, 1);
+    }
+    let canonical = SharedProverRegistry::new();
+    canonical.refresh_from_store(f.store.as_ref()).unwrap();
+    let mut bounded = limits();
+    bounded.registry.max_vertices = 1;
+    let write = |branch: &ExecutionBranch, n: u8| {
+        let store = branch.hypergraph_store();
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(n), &prover_blob(1))
+            .unwrap();
+        txn.commit().unwrap();
+    };
+    let refresh = |branch: &ExecutionBranch| branch.registry().refresh_from_store(branch.hypergraph_store().as_ref());
+    for seeded in [false, true] {
+        let branch = if seeded {
+            f.source.capture_execution_branch_seeded(bounded, &canonical).unwrap()
+        } else {
+            f.source.capture_execution_branch(bounded).unwrap()
+        };
+        assert_eq!(branch.registry_usage().vertices, 3, "seeded {seeded}");
+        // An epoch boundary refreshes the whole registry inside the branch.
+        refresh(&branch).unwrap();
+        write(&branch, 4);
+        refresh(&branch).unwrap();
+        assert!(branch.registry().get_prover_info(&[4; 32]).unwrap().is_some());
+
+        // A child of a branch that wrote rows keeps that branch's headroom.
+        let child = branch
+            .manager()
+            .capture_execution_branch_seeded(bounded, branch.registry())
+            .unwrap();
+        assert_eq!(child.registry_usage().vertices, 4, "seeded {seeded}");
+        write(&child, 5);
+        let usage = child.registry_usage();
+        assert!(refresh(&child).is_err(), "seeded {seeded}");
+        assert_eq!(child.registry_usage(), usage);
+        assert!(child.registry().get_prover_info(&[5; 32]).unwrap().is_none());
+    }
 }
 
 #[test]
@@ -758,9 +819,13 @@ fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
     drop(guard);
     check(true, &[1, 2, 3]);
 
-    // A budget a read would exceed is never satisfied by copying.
+    // Committed rows are read whole however tight the budget, which bounds
+    // only the branch's own writes; a copy and a read still agree.
     let mut tight = limits();
     tight.registry.max_vertices = 1;
-    assert!(f.source.capture_execution_branch(tight).is_err());
-    assert!(f.source.capture_execution_branch_seeded(tight, &canonical).is_err());
+    let read = f.source.capture_execution_branch(tight).unwrap();
+    let copied = f.source.capture_execution_branch_seeded(tight, &canonical).unwrap();
+    assert!(reads(&copied) < reads(&read));
+    assert_eq!(copied.registry_usage(), read.registry_usage());
+    assert_eq!(read.registry_usage().vertices, 3);
 }

@@ -744,3 +744,83 @@ fn a_generation_zero_session_extends_its_certified_legacy_tip() {
     let strict = HandoffProposer::new(Arc::new(DataProposer), later.clone(), reader(state)).unwrap();
     assert!(strict.propose_with_context(ProposalContext { epoch: 1, ..ctx }).is_none());
 }
+
+
+#[test]
+fn a_seal_of_private_data_can_be_resealed_without_materializing_its_checkpoint() {
+    let (session, _) = session();
+    let mut tip = genesis(&session);
+    tip.closing_request = Some([8; 32]);
+    let committed = Arc::new(Mutex::new(Some(tip.clone())));
+    let mut data = tip.clone();
+    data.checkpoint.frame += 1;
+    data.checkpoint.view = 5;
+    data.checkpoint.digest = [9; 32];
+    data.checkpoint.state_roots = [[10; 32]; 4];
+    data.checkpoint.history_root = [11; 32];
+    let private = Arc::new(Mutex::new(Some(data.clone())));
+    let blocks = BlockStore::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let proposer = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(committed.clone()))
+        .unwrap()
+        .with_private_reader(Some(reader(private.clone())))
+        .with_seal_parents(blocks.clone(), reader(committed.clone()))
+        .with_private_checkpoint_reader(Some({
+            let private = private.clone();
+            let reads = reads.clone();
+            Arc::new(move |_, _| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                private.lock().unwrap().clone()
+                    .ok_or_else(|| QuilError::ExecutionUnavailable("checkpoint body unavailable".into()))
+            })
+        }));
+    let ctx = context(&session, &data, 6);
+    let mut built = None;
+    for _ in 0..20 {
+        built = proposer.propose_with_context(ctx);
+        if built.is_some() { break; }
+    }
+    let (digest, bytes) = built.expect("the existing private-parent path produces a seal");
+    assert_eq!(Seal::decode(&bytes).unwrap().checkpoint, data.checkpoint);
+    blocks.seal(digest, bytes);
+    let above = ProposalContext { view: 8, parent_view: 6, parent: digest, ..ctx };
+    let (digest, bytes) = proposer.propose_with_context(above)
+        .expect("a seal of private data must have a valid successor");
+    assert!(proposer.verify_with_context(above, digest, Some(bytes.clone())));
+    blocks.seal(digest, bytes);
+    let again = ProposalContext { view: 11, parent_view: 8, parent: digest, ..ctx };
+    let (digest, bytes) = proposer.propose_with_context(again).expect("re-seal of a re-seal");
+    assert!(proposer.verify_with_context(again, digest, Some(bytes.clone())));
+    assert_eq!(Seal::decode(&bytes).unwrap().checkpoint.view, 8);
+    assert_eq!(committed.lock().unwrap().as_ref().unwrap().checkpoint, tip.checkpoint);
+
+    // Independently derived state/history, exact frame/digest and the current
+    // authorized request still have to match the selected seal.
+    for field in 0..6 {
+        let mut changed = data.clone();
+        match field {
+            0 => changed.checkpoint.frame += 1,
+            1 => changed.checkpoint.digest[0] ^= 1,
+            2 => changed.checkpoint.state_roots[0][0] ^= 1,
+            3 => changed.checkpoint.history_root[0] ^= 1,
+            4 => changed.closing_request = Some([7; 32]),
+            _ => changed.closing_request = None,
+        }
+        *private.lock().unwrap() = Some(changed);
+        assert!(proposer.propose_with_context(again).is_none(), "field {field}");
+        assert!(!proposer.verify_with_context(again, digest, Some(bytes.clone())), "field {field}");
+    }
+    *private.lock().unwrap() = None;
+    assert!(proposer.propose_with_context(again).is_none());
+    assert!(!proposer.verify_with_context(again, digest, Some(bytes.clone())));
+
+    // A same-height disagreement is never repaired using a private overlay.
+    let mut divergent = data.clone();
+    divergent.checkpoint.state_roots[0][0] ^= 1;
+    *committed.lock().unwrap() = Some(divergent);
+    *private.lock().unwrap() = Some(data);
+    let count = reads.load(Ordering::SeqCst);
+    assert!(proposer.propose_with_context(again).is_none());
+    assert!(!proposer.verify_with_context(again, digest, Some(bytes)));
+    assert_eq!(reads.load(Ordering::SeqCst), count);
+}

@@ -13,6 +13,7 @@
 # and limitations under the License.
 [workspace]
 resolver = "2"
+exclude = ["crates/commonware-consensus"]
 members = [
     "crates/vdf",
     "crates/channel",
@@ -63,6 +64,8 @@ members = [
 ]
 
 [patch.crates-io]
+# Keep the pinned consensus dependency available for targeted local fixes.
+commonware-consensus = { path = "crates/commonware-consensus" }
 # jmt: vendored 0.11.0 with a visibility-only patch (gen_child_node_key +
 # NibblePath::new made pub) so the forest's efficient Merkle-diff sync
 # (quil-forest/src/sync.rs) can walk two trees top-down and transfer only

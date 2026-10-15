@@ -752,6 +752,7 @@ impl Model {
             if let Some(info) = reward_by_filter.get(&filter_hex) {
                 row.global_head = info.global_head.clone();
                 row.shard_info_known = true;
+                row.allocation_reason = info.allocation_reason.clone();
                 row.ring = reward_ring(info);
                 row.allocation_reason = info.allocation_reason.clone();
                 row.active_provers = info.active_provers;
@@ -1770,6 +1771,10 @@ mod tests {
         assert_eq!(expired_epoch.allocations[0].reward_status(2160, 720), None);
         assert_eq!(active.allocations[0].reward_status(2160, 720), Some(EffectiveStatus::Active));
     }
+
+
+
+
 
     #[test]
     fn joining_allocations_show_projected_rewards_before_worker_assignment() {
