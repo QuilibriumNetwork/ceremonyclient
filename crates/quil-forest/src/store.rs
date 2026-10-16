@@ -939,6 +939,112 @@ impl RocksTreeStore {
     }
 }
 
+impl RocksTreeStore {
+    fn tag_bounds(&self, tag: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut lo = self.prefix.clone();
+        lo.push(tag);
+        let mut hi = self.prefix.clone();
+        hi.push(tag + 1);
+        (lo, hi)
+    }
+
+    /// Delete nodes whose path `doomed` selects, with their size memos,
+    /// examining at most `scan_budget` node records from `after` on. Returns
+    /// the deletions and where the next call resumes (`None`: finished).
+    pub(crate) fn delete_nodes_where(
+        &self,
+        doomed: &dyn Fn(&NibblePath) -> bool,
+        after: Option<Vec<u8>>,
+        scan_budget: usize,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        let (lo, hi) = self.tag_bounds(TAG_NODE);
+        let start = after.unwrap_or_else(|| lo.clone());
+        anyhow::ensure!(start >= lo && start <= hi, "node sweep cursor outside this tree");
+        let mut wb = self.db.batch();
+        let (mut deleted, mut scanned) = (0usize, 0usize);
+        let mut next = None;
+        {
+            let mut it = self.db.iterator(&start, &hi, rocksdb::ReadOptions::default())?;
+            it.seek(&start)?;
+            while it.valid() {
+                let Some(k) = it.key() else { break };
+                if scanned == scan_budget.max(1) {
+                    next = Some(k.to_vec());
+                    break;
+                }
+                scanned += 1;
+                let tail = &k[lo.len()..];
+                if let Ok(node_key) = borsh::from_slice::<NodeKey>(tail) {
+                    if doomed(node_key.nibble_path()) {
+                        wb.delete(k);
+                        let mut size = self.prefix.clone();
+                        size.push(TAG_SIZE);
+                        size.extend_from_slice(tail);
+                        wb.delete(size);
+                        deleted += 1;
+                    }
+                }
+                it.next()?;
+            }
+        }
+        self.db.write(wb)?;
+        Ok((deleted, next))
+    }
+
+    /// Delete stale-index records of nodes whose path `doomed` selects.
+    pub(crate) fn delete_stale_where(&self, doomed: &dyn Fn(&NibblePath) -> bool) -> Result<usize> {
+        let (lo, hi) = self.stale_scan_bounds();
+        let mut wb = self.db.batch();
+        let mut deleted = 0;
+        {
+            let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+            it.seek(&lo)?;
+            while it.valid() {
+                let Some(k) = it.key() else { break };
+                if k.len() > lo.len() + 8 {
+                    if let Ok(node_key) = borsh::from_slice::<NodeKey>(&k[lo.len() + 8..]) {
+                        if doomed(node_key.nibble_path()) {
+                            wb.delete(k);
+                            deleted += 1;
+                        }
+                    }
+                }
+                it.next()?;
+            }
+        }
+        self.db.write(wb)?;
+        Ok(deleted)
+    }
+
+    /// Compact this tree's key range through the bottommost level, so deleted
+    /// records free their space even where no newer write overlaps them.
+    pub(crate) fn compact(&self) {
+        let (Some(db), Some(upper)) = (self.db.db(), self.prefix_upper_bound()) else { return };
+        let mut options = rocksdb::CompactOptions::default();
+        options.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
+        db.compact_range_opt(Some(&self.prefix), Some(&upper), &options);
+    }
+
+    /// Range-delete leaf values and preimages whose key hash lies in one of
+    /// `ranges` (`[low, high)`, `None` for an open end).
+    pub(crate) fn delete_keyed_ranges(&self, ranges: &[(Option<[u8; 32]>, Option<[u8; 32]>)]) -> Result<()> {
+        let mut wb = self.db.batch();
+        for tag in [TAG_VALUE, TAG_PREIMAGE] {
+            let (lo, hi) = self.tag_bounds(tag);
+            for (low, high) in ranges {
+                let bound = |key: &Option<[u8; 32]>, open: &Vec<u8>| key.map_or_else(|| open.clone(), |key| {
+                    let mut k = lo.clone();
+                    k.extend_from_slice(&key);
+                    k
+                });
+                wb.delete_range(bound(low, &lo), bound(high, &hi));
+            }
+        }
+        self.db.write(wb)?;
+        Ok(())
+    }
+}
+
 impl ForestStore for RocksTreeStore {
     fn apply_update(&self, batch: &TreeUpdateBatch) -> Result<()> {
         // Nodes, values, and stale records all land in one atomic write.
