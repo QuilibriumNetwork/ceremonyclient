@@ -344,6 +344,11 @@ impl CoordinatedDb {
     pub fn prefix_iterator(&self, prefix: impl AsRef<[u8]>) -> DBIterator<'_> {
         self.0.db.prefix_iterator(prefix)
     }
+    /// SST file metadata, for maintenance that needs per-range file sizes.
+    pub fn live_files(&self) -> Result<Vec<rocksdb::LiveFile>, rocksdb::Error> {
+        self.0.db.live_files()
+    }
+
     pub fn property_int_value(&self, name: &str) -> Result<Option<u64>, rocksdb::Error> {
         self.0.db.property_int_value(name)
     }
@@ -358,6 +363,14 @@ impl CoordinatedDb {
     }
     pub fn compact_range<S: AsRef<[u8]>, E: AsRef<[u8]>>(&self, start: Option<S>, end: Option<E>) {
         self.0.db.compact_range(start, end);
+    }
+    pub fn compact_range_opt<S: AsRef<[u8]>, E: AsRef<[u8]>>(
+        &self,
+        start: Option<S>,
+        end: Option<E>,
+        opts: &rocksdb::CompactOptions,
+    ) {
+        self.0.db.compact_range_opt(start, end, opts);
     }
     pub fn try_catch_up_with_primary(&self) -> Result<(), DatabaseCommitError> {
         let mut guard = self.lock_writes()?;

@@ -25,6 +25,11 @@ pub struct Outcome {
     pub removed_bytes: u64,
     pub ranges: usize,
     pub invalidated_markers: usize,
+    /// Payload ranges compacted to reclaim files that hold only deleted
+    /// records, and those files' bytes. A snapshot older than the deletion
+    /// keeps them until it is released; a later pass compacts again.
+    pub compacted_ranges: usize,
+    pub reclaimable_bytes: u64,
 }
 
 fn unavailable(message: impl Into<String>) -> QuilError {
@@ -139,7 +144,10 @@ fn scan(
 }
 
 struct Plan {
+    /// Gap ranges that still hold records.
     ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Every gap range of the protected applications.
+    gaps: Vec<(Vec<u8>, Vec<u8>)>,
     records: u64,
     bytes: u64,
 }
@@ -147,7 +155,7 @@ struct Plan {
 /// Read-only: the payload ranges outside `keep`, refusing anything whose
 /// layout or completeness it cannot vouch for.
 fn plan(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>) -> Result<Plan> {
-    let mut plan = Plan { ranges: Vec::new(), records: 0, bytes: 0 };
+    let mut plan = Plan { ranges: Vec::new(), gaps: Vec::new(), records: 0, bytes: 0 };
     for (app, keep) in apps {
         let shard = quil_types::store::ShardKey {
             l1: quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3),
@@ -176,8 +184,9 @@ fn plan(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>) -> Result<P
                     Ok(())
                 })?;
                 if found {
-                    plan.ranges.push((lower, upper));
+                    plan.ranges.push((lower.clone(), upper.clone()));
                 }
+                plan.gaps.push((lower, upper));
             }
         }
     }
@@ -253,9 +262,43 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
     })?;
     drop(guard);
     let planned = plan(&db, &apps)?;
-    if planned.ranges.is_empty() {
-        return Ok(Outcome::default());
+    let mut outcome = Outcome::default();
+    if !planned.ranges.is_empty() {
+        outcome = delete(crdt, &db, &apps, &planned)?;
     }
+    reclaim(&db, &planned.gaps, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// Compact gap ranges that still contain SST files lying wholly inside them:
+/// with no visible keys left there, those files hold only deleted records.
+/// A file ends at `upper` when it carries the range tombstone, whose bound
+/// is its exclusive end; no payload key equals that shorter bound. Such
+/// files usually sit in the bottommost level, which a default range
+/// compaction skips, so the bottommost level is compacted explicitly.
+fn reclaim(db: &CoordinatedDb, gaps: &[(Vec<u8>, Vec<u8>)], outcome: &mut Outcome) -> Result<()> {
+    let files = db.live_files().map_err(store_error)?;
+    let mut options = rocksdb::CompactOptions::default();
+    options.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
+    for (lower, upper) in gaps {
+        let inside: u64 = files
+            .iter()
+            .filter(|f| match (f.start_key.as_deref(), f.end_key.as_deref()) {
+                (Some(a), Some(b)) => a >= lower.as_slice() && b <= upper.as_slice(),
+                _ => false,
+            })
+            .map(|f| f.size as u64)
+            .sum();
+        if inside > 0 {
+            db.compact_range_opt(Some(lower), Some(upper), &options);
+            outcome.compacted_ranges += 1;
+            outcome.reclaimable_bytes += inside;
+        }
+    }
+    Ok(())
+}
+
+fn delete(crdt: &HypergraphCrdt, db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>, planned: &Plan) -> Result<Outcome> {
     let affected: Vec<Address> = apps
         .keys()
         .filter(|app| planned.ranges.iter().any(|(lower, _)| lower[38..70] == app[..]))
@@ -263,7 +306,7 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
         .collect();
     let guard = crdt.lock_forest_writes();
     let invalidated = crdt.maintain_forest(&guard, |_| {
-        let invalid = markers(&db, &apps, &affected)?;
+        let invalid = markers(db, apps, &affected)?;
         let mut batch = rocksdb::WriteBatch::default();
         for (lower, upper) in &planned.ranges {
             batch.delete_range(lower, upper);
@@ -279,7 +322,7 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
     drop(guard);
     for (lower, upper) in &planned.ranges {
         let mut residue = false;
-        scan(&db, lower, Some(upper), |_, _| {
+        scan(db, lower, Some(upper), |_, _| {
             residue = true;
             Ok(())
         })?;
@@ -287,8 +330,8 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
             return Err(QuilError::Store("payload eviction left records in a deleted range".into()));
         }
     }
-    // Reclaim the space; files wholly inside a range are dropped, boundary
-    // files are rewritten without the deleted records.
+    // Reclaim now where no older snapshot holds the records; boundary files
+    // are rewritten without them. `reclaim` retries what a snapshot kept.
     for (lower, upper) in &planned.ranges {
         db.compact_range(Some(lower), Some(upper));
     }
@@ -297,6 +340,7 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
         removed_bytes: planned.bytes,
         ranges: planned.ranges.len(),
         invalidated_markers: invalidated,
+        ..Outcome::default()
     })
 }
 
@@ -442,5 +486,39 @@ mod tests {
         refuses(&|| inner.put(&root_index, [0; 16]).unwrap(), &|| inner.delete(&root_index).unwrap());
         refuses(&|| crdt.set_unified_tree(false), &|| crdt.set_unified_tree(true));
         assert_eq!(evict_outside(&crdt, &lower_half()).unwrap().removed_records, 1, "each refusal was the only obstacle");
+    }
+
+    /// A snapshot older than the deletion keeps the deleted records on disk;
+    /// once it is released, the next pass compacts them away.
+    #[test]
+    fn a_later_pass_reclaims_space_a_snapshot_held() {
+        let (db, _, crdt) = open();
+        let inner = db.inner();
+        // Kept and unprotected halves in separate files.
+        for half in [0u8..=127, 128u8..=255] {
+            for address in half {
+                let mut id = APP.to_vec();
+                id.extend([address; 32]);
+                let key = quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0);
+                inner.put(&key, vec![address; 4096]).unwrap();
+            }
+            inner.flush().unwrap();
+        }
+        let inside = |db: &CoordinatedDb| {
+            let mut lower = quil_store::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard());
+            lower.extend(APP);
+            lower.push(0x80);
+            db.live_files().unwrap().iter().filter(|f| f.start_key.as_deref().is_some_and(|a| a >= lower.as_slice())).map(|f| f.size).sum::<usize>()
+        };
+        let snapshot = inner.snapshot();
+        let first = evict_outside(&crdt, &lower_half()).unwrap();
+        assert_eq!(first.removed_records, 128);
+        assert!(inside(&inner) > 0, "the held snapshot keeps the deleted records");
+        drop(snapshot);
+        let second = evict_outside(&crdt, &lower_half()).unwrap();
+        assert_eq!(second.removed_records, 0, "nothing visible is left to delete");
+        assert!(second.compacted_ranges >= 1 && second.reclaimable_bytes > 0);
+        assert_eq!(inside(&inner), 0, "the released records are compacted away");
+        assert_eq!(evict_outside(&crdt, &lower_half()).unwrap(), Outcome::default());
     }
 }

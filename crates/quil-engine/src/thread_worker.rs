@@ -896,8 +896,9 @@ impl ThreadWorkerManager {
                                                 crate::worker_payload_eviction::evict_outside(&crdt, &keep)).await;
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                             match outcome {
-                                                Ok(Ok(o)) if o.ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
+                                                Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
                                                     removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
+                                                    compacted_ranges = o.compacted_ranges, reclaimable_bytes = o.reclaimable_bytes,
                                                     secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
                                                 Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
                                                 Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
