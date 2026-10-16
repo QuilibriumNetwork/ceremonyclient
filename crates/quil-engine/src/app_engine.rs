@@ -1533,9 +1533,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 if opening_blob.is_empty() && !self.private_parent {
                     // (1) worker-side shard-data sync into its OWN store.
                     if let Some(source) = self.storage_source_hypergraph.as_ref() {
-                        let app_addr = &self.filter[..self.filter.len().min(32)];
                         match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
-                            source, own_crdt, app_addr, anchor_gfn,
+                            source, own_crdt, &self.filter, anchor_gfn,
                         ) {
                             Ok(n) if n > 0 => tracing::info!(
                                 frame = frame_number, copied = n,
@@ -3295,11 +3294,10 @@ impl AppConsensusEngine {
         if let (Some(source), Some(own_crdt)) =
             (self.storage_source_hypergraph.as_ref(), self.hypergraph.as_ref())
         {
-            let app_addr = self.filter[..self.filter.len().min(32)].to_vec();
             match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
                 source.as_ref(),
                 own_crdt.as_ref(),
-                &app_addr,
+                &self.filter,
                 0,
             ) {
                 Ok(n) if n > 0 => info!(
