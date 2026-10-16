@@ -299,6 +299,8 @@ impl AppEngineHandle {
     pub fn execution(&self) -> quil_types::proto::node::WorkerExecution { self.execution.snapshot() }
     pub fn execution_state(&self, state: &str, blocker: &str) { self.execution.state(state, blocker); }
     pub(crate) fn execution_record(&self) -> &crate::worker_execution::SharedWorkerExecution { &self.execution }
+    /// Whether the engine still accepts messages and has not been cancelled.
+    pub(crate) fn is_running(&self) -> bool { !self.msg_tx.is_closed() && !self.cancel.is_cancelled() }
     /// A handle for `filter` whose messages arrive on the returned receiver.
     #[cfg(test)]
     pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {

@@ -5956,6 +5956,7 @@ dependencies = [
  "quil-tries",
  "quil-types",
  "rand 0.8.5",
+ "rocksdb",
  "serde",
  "serde_json",
  "sha2 0.10.9",

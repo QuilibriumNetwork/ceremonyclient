@@ -5,6 +5,13 @@ use quil_types::error::Result;
 /// Worker manager: coordinates data worker processes for parallel
 /// proof computation across shards.
 pub trait WorkerManager: Send + Sync {
+    /// Ask the worker to remove application payload outside `keep` from its
+    /// own store. The worker revalidates its binding before any write;
+    /// managers without worker-owned stores ignore the request.
+    fn evict_payload(&self, _core_id: u32, _keep: Vec<Vec<u8>>) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind `core_id` to `filter` and (re)start the consensus engine.
     /// Equivalent to `set_worker_filter(core_id, filter, true)`.
     /// Kept as the default for callers that always want full

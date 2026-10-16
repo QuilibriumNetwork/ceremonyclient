@@ -31,6 +31,7 @@ num-bigint = "0.4"
 num-integer = "0.1"
 num-traits = "0.2"
 hex = "0.4"
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 lru = "0.12"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
