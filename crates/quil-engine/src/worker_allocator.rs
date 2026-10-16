@@ -978,6 +978,16 @@ impl WorkerAllocator {
                         ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
                     );
 
+                    // The join has landed once its allocation is confirmed. The
+                    // pending marker would otherwise exclude the worker from
+                    // priority replacement for as long as it stays bound.
+                    if worker.pending_filter_frame > 0 && matches!(
+                        alloc.status,
+                        ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
+                    ) {
+                        let _ = self.worker_manager.set_pending_filter_frame(worker.core_id, 0);
+                    }
+
                     match alloc.status {
                         ProverStatus::Active | ProverStatus::Paused => {
                             // Confirmed allocation — worker is correctly assigned
@@ -1764,6 +1774,27 @@ mod tests {
             "stuck pending-join marker must be cleared so the worker is free \
              again and the lifecycle can re-propose"
         );
+    }
+
+    #[test]
+    fn landed_join_clears_its_pending_marker() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: filter.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: true,
+        });
+        let alloc = WorkerAllocator::new(
+            wm.clone(), Arc::new(TestProverRegistry::with_prover(prover_with_active(&[filter.clone()], 200))), vec![0xAAu8; 32]);
+        alloc.on_new_frame(200).unwrap();
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers[0].filter, filter);
+        assert_eq!(workers[0].pending_filter_frame, 0, "a landed join must not stay pending");
     }
 
     #[test]
