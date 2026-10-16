@@ -430,6 +430,9 @@ pub struct WorkerAllocator {
     /// Serialize frame-driven and registry-sync reconciliation so their
     /// release/bind passes cannot compete for the same idle worker.
     reconcile_lock: std::sync::Mutex<()>,
+    /// Shard operations in progress, shared with the lifecycle that
+    /// dispatches them.
+    pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
@@ -473,6 +476,21 @@ pub struct WorkerAllocator {
 }
 
 impl WorkerAllocator {
+    /// Whether a missed renewal may keep or recover its worker: within the
+    /// recovery epoch, or for as long as this node's renewal of it is still
+    /// running or awaiting its retry. A renewal stuck in preparation past the
+    /// recovery epoch would otherwise lose its worker, and the orphan sweep
+    /// then proposes leaving a registration the protocol still accepts.
+    pub(crate) fn renewal_recovering(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> bool {
+        epoch_renewal_recovery_pending(allocation, frame)
+            || (allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                && self.submission_attempts.owned(&allocation.confirmation_filter, frame))
+    }
+
     /// Free a worker, unless its committee session is still closing.
     fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
         if retained {
@@ -494,6 +512,7 @@ impl WorkerAllocator {
     ) -> Self {
         Self {
             reconcile_lock: std::sync::Mutex::new(()),
+            submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             worker_manager,
             prover_registry,
             local_prover_address,
@@ -829,7 +848,7 @@ impl WorkerAllocator {
                                 | EffectiveStatus::Paused
                                 | EffectiveStatus::Joining
                                 | EffectiveStatus::Leaving
-                        ) || epoch_renewal_recovery_pending(a, frame_number)
+                        ) || self.renewal_recovering(a, frame_number)
                     })
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
@@ -858,7 +877,7 @@ impl WorkerAllocator {
                     // worker while a live allocation is unbound.
                     if alloc.effective_status(frame_number)
                         == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                        && !epoch_renewal_recovery_pending(alloc, frame_number)
+                        && !self.renewal_recovering(alloc, frame_number)
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1120,7 +1139,7 @@ impl WorkerAllocator {
                 | EffectiveStatus::Paused
                 | EffectiveStatus::Joining => {}
                 EffectiveStatus::ExpiredEpoch
-                    if epoch_renewal_recovery_pending(alloc, frame_number) => {}
+                    if self.renewal_recovering(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
                 // the worker or change the frozen committee mid-epoch.
@@ -1970,6 +1989,31 @@ mod tests {
             allocator.on_new_frame(1440).unwrap();
             assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
                 "an unrenewed registration cannot reserve capacity indefinitely");
+        }
+    }
+
+    #[test]
+    fn running_renewal_keeps_or_recovers_worker_past_the_recovery_epoch() {
+        use quil_types::consensus::EffectiveStatus;
+        let filter = vec![0x01; 32];
+        for initially_bound in [false, true] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            let mut renewing = make_alloc(filter.clone());
+            renewing.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![renewing.clone()])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            let renewal = allocator.submission_attempts.begin(std::slice::from_ref(&filter), 1400).unwrap();
+            for frame in [1440, 2160, 2900] {
+                allocator.on_new_frame(frame).unwrap();
+                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
+                    "a renewal still in preparation keeps its worker");
+                assert_eq!(renewing.effective_status(frame), EffectiveStatus::ExpiredEpoch);
+            }
+            drop(renewal);
+            allocator.on_new_frame(2901).unwrap();
+            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
+                "a failed renewal no longer reserves the worker");
         }
     }
 

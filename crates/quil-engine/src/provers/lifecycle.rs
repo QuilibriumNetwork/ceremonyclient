@@ -630,6 +630,7 @@ impl ProverLifecycle {
         current_frame: Arc<crate::current_frame::CurrentFrame>,
         strategy: Strategy,
     ) -> Self {
+        let submission_attempts = allocator.submission_attempts.clone();
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
             leave_decisions: super::leave_decisions::LeaveDecisions::default(),
@@ -653,7 +654,7 @@ impl ProverLifecycle {
             last_leave_attempt: RwLock::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
-            submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
+            submission_attempts,
             gone_shard_leaves_await_sync: AtomicBool::new(false),
             registry_syncs_begun: AtomicU64::new(0),
             registry_synced_through: AtomicU64::new(0),
@@ -1353,7 +1354,7 @@ impl ProverLifecycle {
         let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
             .as_ref()
             .map(|p| p.allocations.iter()
-                .filter(|a| crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))
+                .filter(|a| self.allocator.renewal_recovering(a, frame_number))
                 .map(|a| a.confirmation_filter.clone()).collect())
             .unwrap_or_default();
         let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
@@ -1492,7 +1493,7 @@ impl ProverLifecycle {
             let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
                 .find(|a| a.confirmation_filter == descriptor.filter
                     && (a.is_live(frame_number)
-                        || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))));
+                        || self.allocator.renewal_recovering(a, frame_number))));
             if let Some(estimate) = reward_rings.get(&descriptor.filter) {
                 if allocation.is_some() && estimate.source == "new_join_projection" { return false; }
                 descriptor.ring = estimate.ring;
