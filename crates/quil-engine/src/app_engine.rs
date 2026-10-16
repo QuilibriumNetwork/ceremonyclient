@@ -136,6 +136,10 @@ pub enum AppEngineMessage {
     CwSealed {
         seal: Vec<u8>,
         cert: Vec<u8>,
+        /// Data frames the seal makes final that never finalized on their own
+        /// (encoded, lowest first, with their verified flag), its checkpoint
+        /// frame last.
+        implied: Vec<(Vec<u8>, bool)>,
     },
     /// An inbound commonware-simplex message from a committee peer, demuxed
     /// from `shard_cw_bitmask` gossip. `channel` = CW channel id; `from` = the
@@ -3450,8 +3454,8 @@ impl AppConsensusEngine {
                             self.handle_cw_finalized_frame(&frame, &cert, locally_verified, implied)
                                 .await;
                         }
-                        Some(AppEngineMessage::CwSealed { seal, cert }) => {
-                            self.handle_cw_sealed(&seal, cert).await;
+                        Some(AppEngineMessage::CwSealed { seal, cert, implied }) => {
+                            self.handle_cw_sealed(&seal, cert, implied).await;
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
                             if let Some(count) = self.cw_inbound.get_mut(channel as usize) {
@@ -3729,9 +3733,16 @@ impl AppConsensusEngine {
 
     /// A finalized terminal seal: stop the closed session's host and submit the
     /// closing certificate. Every member that observes the finalization submits;
-    /// the global intrinsic accepts the identical seal idempotently.
-    async fn handle_cw_sealed(&mut self, seal: &[u8], cert: Vec<u8>) {
+    /// the global intrinsic accepts the identical seal idempotently. The data
+    /// frames the seal made final (`implied`) are committed first, so the
+    /// submission can carry its checkpoint frame to GLOBAL.
+    async fn handle_cw_sealed(&mut self, seal: &[u8], cert: Vec<u8>, implied: Vec<(Vec<u8>, bool)>) {
         let Some(session) = self.cw_session.clone() else { return };
+        if !implied.is_empty() {
+            if let Ok(decoded) = quil_cw_consensus::handoff::Seal::decode(seal) {
+                self.apply_seal_implied(&decoded.checkpoint, implied).await;
+            }
+        }
         let submission = match (session.id(), crate::app_handoff::submission(seal, cert)) {
             (Ok(id), Ok(bytes)) => (id, bytes),
             (id, bytes) => {
@@ -4687,8 +4698,11 @@ impl AppConsensusEngine {
                             }, &parent)
                         }) as quil_cw_consensus::handoff::automaton::CheckpointReader
                     }),
-                    on_sealed: Arc::new(move |seal, cert| {
-                        msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert }).is_ok()
+                    on_sealed: Arc::new(move |seal, cert, implied| {
+                        let implied = implied.into_iter()
+                            .map(|(frame, verified)| (prost::Message::encode_to_vec(&frame), verified))
+                            .collect();
+                        msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert, implied }).is_ok()
                     }),
                     liveness,
                     checkpoint_votes: Some({
@@ -4804,7 +4818,43 @@ impl AppConsensusEngine {
         descendant: &quil_types::proto::global::AppShardFrame,
         implied: Vec<(Vec<u8>, bool)>,
     ) {
-        let Some(descendant_header) = descendant.header.as_ref() else { return };
+        let Some(descendant_header) = descendant.header.clone() else { return };
+        self.apply_implied(
+            |header| crate::frame_validator::app_frame_links_to_child(header, &descendant_header),
+            implied,
+        )
+        .await;
+    }
+
+    /// [`Self::apply_implied_ancestors`] for the frames a finalized seal
+    /// makes final (`AppSeamFinalizer::seal_implied`), whose last is the
+    /// sealed checkpoint frame itself: committed before the seal is
+    /// published, so its drain can carry them to GLOBAL
+    /// (`app_handoff::drained_seal`).
+    async fn apply_seal_implied(
+        &mut self,
+        checkpoint: &quil_cw_consensus::handoff::Checkpoint,
+        implied: Vec<(Vec<u8>, bool)>,
+    ) {
+        let checkpoint = checkpoint.clone();
+        self.apply_implied(
+            |header| {
+                header.frame_number == checkpoint.frame
+                    && quil_crypto::poseidon::hash_bytes_to_32(&header.output).is_ok_and(|digest| digest == checkpoint.digest)
+            },
+            implied,
+        )
+        .await;
+    }
+
+    /// Commit, materialize and publish `implied`, lowest first. Each must link
+    /// to the next, and the last satisfy `last`; see
+    /// [`Self::apply_implied_ancestors`].
+    async fn apply_implied(
+        &mut self,
+        last: impl Fn(&quil_types::proto::global::FrameHeader) -> bool,
+        implied: Vec<(Vec<u8>, bool)>,
+    ) {
         let mut ancestors = Vec::with_capacity(implied.len());
         for (bytes, verified) in implied {
             let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes.as_slice()) else {
@@ -4814,9 +4864,10 @@ impl AppConsensusEngine {
             ancestors.push((frame, verified));
         }
         for (index, (frame, verified)) in ancestors.iter().enumerate() {
-            let child = ancestors.get(index + 1).and_then(|(next, _)| next.header.as_ref()).unwrap_or(descendant_header);
+            let child = ancestors.get(index + 1).and_then(|(next, _)| next.header.as_ref());
             let links = frame.header.as_ref().is_some_and(|header| {
-                header.address == self.app_address && crate::frame_validator::app_frame_links_to_child(header, child)
+                header.address == self.app_address
+                    && child.map_or_else(|| last(header), |child| crate::frame_validator::app_frame_links_to_child(header, child))
             });
             let valid = *verified || self.app_frame_validator.as_ref().is_some_and(|validator| {
                 matches!(validate_app_frame_panic_safe(validator, frame, /* proposal */ true), Ok(true))
@@ -8932,6 +8983,28 @@ mod tests {
         engine.try_materialize_follower_frames().await;
         assert_eq!(engine.last_materialized_frame, 3);
         assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap().header.unwrap().frame_number, 3);
+
+        // A seal built on a notarized 3 (and 2) makes both final: committed
+        // before the seal is published, so its drain can carry them. A chain
+        // that does not end at the sealed checkpoint is not applied.
+        let sealed = |frame: &quil_types::proto::global::AppShardFrame| quil_cw_consensus::handoff::Checkpoint {
+            frame: frame.header.as_ref().unwrap().frame_number,
+            view: frame.header.as_ref().unwrap().rank,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap(),
+            state_roots: [[0; 32]; 4],
+            history_root: [0; 32],
+        };
+        let implied = vec![(frames[1].encode_to_vec(), true), (frames[2].encode_to_vec(), true)];
+        let (events, _received) = mpsc::unbounded_channel();
+        let (mut engine, clock) = build(events);
+        engine.handle_cw_finalized_frame(&frames[0].encode_to_vec(), &[], true, Vec::new()).await;
+        engine.apply_seal_implied(&sealed(&frames[1]), implied.clone()).await;
+        assert_eq!(engine.last_materialized_frame, 1);
+        assert!(clock.get_shard_clock_frame(&filter, 2, false).is_err());
+        engine.apply_seal_implied(&sealed(&frames[2]), implied).await;
+        assert_eq!(engine.last_materialized_frame, 3);
+        let checkpoint = clock.get_shard_clock_frame(&filter, 3, false).unwrap();
+        assert!(checkpoint.header.unwrap().public_key_signature_bls48581.is_none(), "it has no certificate of its own");
     }
 
     #[test]

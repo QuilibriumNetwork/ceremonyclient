@@ -41,8 +41,9 @@ pub struct ProdProverMessageTransport {
     pub(crate) retry_queue: Arc<SubmitRetryQueue>,
 }
 
-/// Submissions every archive refused only for now (a full mempool, or shard
-/// frames it cannot verify yet), resent by one task per node. Each round
+/// Submissions every archive refused only for now (a full mempool, or, from
+/// archives of 2026-10-15, shard frames it could not verify yet), resent by
+/// one task per node. Each round
 /// sends the oldest first and ends while that is still refused everywhere,
 /// so a stalled network gets one submission per node per round rather than
 /// a resend of everything; rounds back off from 5 s to a minute. A message

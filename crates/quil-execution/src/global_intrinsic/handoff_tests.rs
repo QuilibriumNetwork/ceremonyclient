@@ -1492,6 +1492,19 @@ fn seal_recovery_activates_at_the_mainnet_frame_or_the_testnet_setting() {
     assert_eq!(seal_recovery_frame_for(1, None), u64::MAX);
 }
 
+/// Drains of frames certified only by their seal are GLOBAL consensus:
+/// mainnet starts at a fixed epoch boundary whatever the environment says;
+/// other networks only when set.
+#[test]
+fn seal_checkpoint_drains_activate_only_at_a_scheduled_frame() {
+    assert_eq!(seal_checkpoint_drain_frame_for(0, None), 887_040);
+    assert_eq!(seal_checkpoint_drain_frame_for(0, Some("7")), 887_040);
+    assert_eq!(887_040 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, Some("7")), 7);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, None), u64::MAX);
+}
+
 fn fence_timeout() -> u64 {
     schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames()
 }

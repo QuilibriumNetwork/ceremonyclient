@@ -249,11 +249,12 @@ pub(crate) fn init(
             inclusion_prover.clone(),
             frame_prover.clone(),
         ).expect("failed to install global frame header dependencies");
-        // This collector feeds GLOBAL proposals: hold a shard frame only once
-        // its certificate verifies in committed state, as the GLOBAL frame
-        // after the head would execute it. A verified frame then supersedes
+        // This collector feeds GLOBAL proposals: verify a shard frame's
+        // certificate in committed state, as the GLOBAL frame after the head
+        // would execute it, before holding it. A verified frame then supersedes
         // its shard's lower ones, and no forged header can stand in for a real
-        // one (decided 2026-10-15).
+        // one (decided 2026-10-15). One that cannot be verified now is held
+        // unverified for the leader to check (decided 2026-10-16).
         message_collector.set_shard_frame_verifier({
             use quil_engine::message_collector::ShardFrameVerdict;
             let (manager, current) = (exec_manager.clone(), current_frame.clone());

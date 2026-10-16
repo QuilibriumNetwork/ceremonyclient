@@ -2246,6 +2246,67 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
+    /// [`Self::check_drain_header`] for a header the seal certifies
+    /// ([`Self::drain_certified_by_seal`]): everything but its own certificate.
+    #[cfg_attr(not(feature = "confidential-tokens"), allow(unused_variables))]
+    fn check_seal_certified_header(&self, frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
+        self.verify_shard_frame_output(op)?;
+        super::prover_shard_update::verify_settlement_relay(op)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        Ok(())
+    }
+
+    /// Which drain headers, carrying no certificate of their own, the seal's
+    /// certificate authenticates (from `handoff::seal_checkpoint_drain_frame`):
+    /// the last when it is the sealed checkpoint frame itself, and each one
+    /// whose child, so authenticated or certified, names it as its parent. A
+    /// header's output digest commits to every field but its address, which
+    /// must be the session's shard. A seal built on a notarized checkpoint
+    /// finalizes that frame, and any notarized frame under it, with no
+    /// certificate of its own, so no proof or certified drain could bring it
+    /// to GLOBAL. Every other header must be certified by the session.
+    fn drain_certified_by_seal(
+        &self,
+        frame_number: u64,
+        sealed: &super::handoff::SealSubmission,
+        state: &HypergraphState,
+        headers: &[super::frame_header::FrameHeader],
+    ) -> Result<Vec<bool>> {
+        let uncertified: Vec<bool> = headers
+            .iter()
+            .map(|op| quil_cw_consensus::app_cert::unwrap_cert_from_header(&op.public_key_signature_bls48581).is_none())
+            .collect();
+        let mut by_seal = vec![false; headers.len()];
+        if !uncertified.contains(&true) || frame_number < super::handoff::seal_checkpoint_drain_frame() {
+            return Ok(by_seal);
+        }
+        // Only a valid seal certifies its checkpoint.
+        super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
+        let checkpoint = &sealed.submission.seal.checkpoint;
+        let identity = |op: &super::frame_header::FrameHeader| quil_crypto::poseidon::hash_bytes_to_32(&op.output);
+        for index in (0..headers.len()).rev() {
+            if !uncertified[index] {
+                continue;
+            }
+            let op = &headers[index];
+            by_seal[index] = match headers.get(index + 1) {
+                // A re-seal names its parent seal's view, above the frame's own.
+                None => op.frame_number == checkpoint.frame
+                    && op.rank <= checkpoint.view
+                    && identity(op)? == checkpoint.digest,
+                Some(child) => (by_seal[index + 1] || !uncertified[index + 1])
+                    && child.address == op.address
+                    && op.frame_number.checked_add(1) == Some(child.frame_number)
+                    && child.rank > op.rank
+                    && child.parent_selector == identity(op)?.as_slice(),
+            };
+        }
+        Ok(by_seal)
+    }
+
     /// What a seal submission's drain headers do once executed (`execute`)
     /// or would do (validation, which writes nothing), after checking each one
     /// (#699; `handoff::SealSubmission`): the sealed source's executed tip
@@ -2277,12 +2338,17 @@ impl GlobalIntrinsic {
             return Err(invalid("drain headers are not active"));
         }
         let session = handoff::session(state, &id)?.ok_or_else(|| invalid("no such session"))?;
+        let headers = sealed
+            .drain
+            .iter()
+            .map(|bytes| super::frame_header::FrameHeader::from_canonical_bytes(bytes))
+            .collect::<Result<Vec<_>>>()?;
+        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut executed = recorded;
         let mut next = executed.as_ref().map_or(session.base_frame, |tip| tip.frame).saturating_add(1);
         let mut last: Option<u64> = None;
         let mut drained = 0usize;
-        for bytes in &sealed.drain {
-            let op = super::frame_header::FrameHeader::from_canonical_bytes(bytes)?;
+        for (op, by_seal) in headers.into_iter().zip(by_seal) {
             if op.address != session.filter {
                 return Err(invalid("header from another shard"));
             }
@@ -2296,7 +2362,11 @@ impl GlobalIntrinsic {
             if op.frame_number > next {
                 return Err(invalid("headers leave a gap after the executed tip"));
             }
-            self.check_drain_header(frame_number, &op, state, &id)?;
+            if by_seal {
+                self.check_seal_certified_header(frame_number, &op)?;
+            } else {
+                self.check_drain_header(frame_number, &op, state, &id)?;
+            }
             let roots: Option<Vec<[u8; 32]>> =
                 op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
             let state_roots = roots.and_then(|roots| <[[u8; 32]; 4]>::try_from(roots).ok())

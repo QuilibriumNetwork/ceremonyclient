@@ -79,8 +79,11 @@ pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>, bool, Vec<(AppSha
 
 /// Called with a finalized terminal seal's bytes and its finalization
 /// certificate. Same contract as [`AppFinalizedSink`]: nonblocking, returns
-/// true only when the engine accepted the notification.
-pub type AppSealedSink = Arc<dyn Fn(Vec<u8>, Vec<u8>) -> bool + Send + Sync>;
+/// true only when the engine accepted the notification. The last argument
+/// carries the data frames the seal makes final that never finalized on their
+/// own, lowest first, its checkpoint frame last (see
+/// [`AppSeamFinalizer::seal_implied`]).
+pub type AppSealedSink = Arc<dyn Fn(Vec<u8>, Vec<u8>, Vec<(AppShardFrame, bool)>) -> bool + Send + Sync>;
 
 /// A globally authorized committee session for this host. Its namespace, epoch
 /// and genesis replace the legacy `appshard‖filter` / epoch-zero configuration,
@@ -1136,6 +1139,53 @@ impl AppSeamFinalizer {
         chain
     }
 
+    /// The data frames `seal`'s finalization makes final that the engine has
+    /// not been handed: its checkpoint frame, when it never finalized on its
+    /// own, and that frame's own implied ancestors, lowest first. A seal
+    /// built on a notarized parent finalizes it with no certificate of its
+    /// own; handed nothing, the engine never committed the checkpoint frame,
+    /// its seal went to GLOBAL without the frame as a drain header, and was
+    /// refused until GLOBAL fenced the session (eight sessions, 2026-10-15).
+    /// Empty when the chain is incomplete, as for a data frame.
+    fn seal_implied(&self, seal: &Seal) -> Vec<(AppShardFrame, bool, Vec<u8>)> {
+        use std::sync::atomic::Ordering;
+        let Some(materialized) = self.materialized.as_ref() else { return Vec::new() };
+        let floor = materialized.load(Ordering::SeqCst).max(self.delivered.load(Ordering::SeqCst));
+        if seal.checkpoint.frame <= floor {
+            return Vec::new();
+        }
+        let digest = digest_from_identity(seal.checkpoint.digest);
+        let Some((bytes, verified)) = self.store.get_with_verification(&digest) else { return Vec::new() };
+        if Seal::is_encoding(&bytes) {
+            return Vec::new();
+        }
+        let Some(frame) = decode_app_frame(&bytes) else { return Vec::new() };
+        let sealed = frame.header.as_ref().is_some_and(|header| {
+            header.address == self.filter && header.frame_number == seal.checkpoint.frame
+        });
+        if !sealed || app_frame_digest(&frame) != Some(digest) {
+            return Vec::new();
+        }
+        let mut chain = self.implied_ancestors(&frame);
+        if chain.is_empty() && seal.checkpoint.frame > floor.saturating_add(1) {
+            return Vec::new();
+        }
+        chain.push((frame, verified, bytes));
+        chain
+    }
+
+    /// Record `implied` durably before it goes to the engine: a restart
+    /// between the send and the engine's commit must not lose them.
+    fn persist_implied(&self, implied: &[(AppShardFrame, bool, Vec<u8>)]) {
+        let Some(records) = self.finalized_records.as_ref() else { return };
+        for (frame, verified, bytes) in implied {
+            let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+            if let Err(error) = records.persist_implied(number, *verified, bytes) {
+                tracing::warn!(frame = number, %error, "could not record an implied app frame; delivering it anyway");
+            }
+        }
+    }
+
     fn try_deliver(&self, digest: Digest) -> bool {
         // Serializes delivery across the host, ingress and retry timer. The
         // engine callback only attempts a nonblocking channel send.
@@ -1146,8 +1196,7 @@ impl AppSeamFinalizer {
             // A terminal seal is not a data frame. Only a session host installs
             // the sink; elsewhere the reserved encoding can never be delivered.
             let Some(on_sealed) = self.on_sealed.as_ref() else { return false };
-            let matches = Seal::decode(&bytes).is_ok_and(|seal| seal.digest() == digest.0);
-            if !matches { return false; }
+            let Some(seal) = Seal::decode(&bytes).ok().filter(|seal| seal.digest() == digest.0) else { return false };
             if let Some(record) = self.closing_certificate.as_ref() {
                 if let Err(error) = record.persist(&bytes, cert) {
                     if !self.seal_persist_error.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1157,8 +1206,19 @@ impl AppSeamFinalizer {
                 }
                 self.seal_persist_error.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            if on_sealed(bytes, cert.clone()) {
+            let implied = self.seal_implied(&seal);
+            self.persist_implied(&implied);
+            let through = implied.last().and_then(|(frame, _, _)| frame.header.as_ref().map(|h| h.frame_number));
+            if !implied.is_empty() {
+                tracing::info!(checkpoint = seal.checkpoint.frame, implied = implied.len(),
+                    "finalized seal makes its notarized checkpoint final; delivering it with the seal");
+            }
+            let implied = implied.into_iter().map(|(frame, verified, _)| (frame, verified)).collect();
+            if on_sealed(bytes, cert.clone(), implied) {
                 pending.remove(&digest);
+                if let Some(number) = through {
+                    self.delivered.fetch_max(number, std::sync::atomic::Ordering::SeqCst);
+                }
                 return true;
             }
             return false;
@@ -1174,12 +1234,7 @@ impl AppSeamFinalizer {
         // Durable before the queue send: a restart between the send and the
         // engine's commit must not lose a finalized frame.
         if let (Some(records), Some(number)) = (self.finalized_records.as_ref(), delivered) {
-            for (ancestor, verified, ancestor_bytes) in &implied {
-                let ancestor_number = ancestor.header.as_ref().map_or(0, |h| h.frame_number);
-                if let Err(error) = records.persist_implied(ancestor_number, *verified, ancestor_bytes) {
-                    tracing::warn!(frame = ancestor_number, %error, "could not record an implied app frame; delivering it anyway");
-                }
-            }
+            self.persist_implied(&implied);
             if let Err(error) = records.persist(number, cert, locally_verified, &bytes) {
                 tracing::warn!(frame = number, %error, "could not record a finalized app frame; delivering it anyway");
             }
@@ -1863,7 +1918,7 @@ mod tests {
                 let mut finalizer = AppSeamFinalizer::new(
                     Arc::new(|_| panic!("seal cannot become data")),
                     Arc::new(|_, _, _, _| panic!("seal cannot become data")), store, session.filter.clone(),
-                ).with_sealed_sink(Arc::new(move |bytes, cert| {
+                ).with_sealed_sink(Arc::new(move |bytes, cert, _| {
                     seen.lock().unwrap().push((bytes, cert)); accepted
                 }));
                 if durable { finalizer = finalizer.with_closing_certificate(record.clone()); }
@@ -1923,7 +1978,7 @@ mod tests {
         store.seal(digest, seal.encode());
         let finalizer = AppSeamFinalizer::new(
             Arc::new(|_| unreachable!()), Arc::new(|_, _, _, _| unreachable!()), store, session.filter,
-        ).with_closing_certificate(record.clone()).with_sealed_sink(Arc::new(move |bytes, cert| {
+        ).with_closing_certificate(record.clone()).with_sealed_sink(Arc::new(move |bytes, cert, _| {
             captured.lock().unwrap().push((bytes, cert)); true
         }));
         finalizer.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
@@ -2009,6 +2064,79 @@ mod tests {
         let (_, restarted) = implied_host(&directory, 1, again.clone());
         assert_eq!(restarted.replay_finalized_records().unwrap(), 1);
         assert_eq!(*again.lock().unwrap(), vec![(3, vec![3], vec![2])]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A seal built on a notarized checkpoint makes that frame (and a notarized
+    /// frame under it) final with no certificate of its own. They reach the
+    /// engine with the seal, and again after a restart that kept only the
+    /// records; one already delivered, or a broken chain, is not handed over.
+    #[test]
+    fn a_finalized_seal_delivers_the_notarized_checkpoint_it_makes_final() {
+        use quil_types::crypto::Signer;
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = Session {
+            chain_id: [1; 32], filter: vec![1; 32], generation: 1, genesis: [2; 32],
+            base_frame: 0, authorization: [3; 32], members: vec![signer.public_key().to_vec()],
+        };
+        let frames = linked_frames(1, 3);
+        let checkpoint = &frames[2];
+        let seal = Seal {
+            request: [4; 32], session: session.id().unwrap(), view: 20,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 3, view: checkpoint.header.as_ref().unwrap().rank,
+                digest: app_frame_digest(checkpoint).unwrap().0, state_roots: [[5; 32]; 4], history_root: [6; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &[signer], &seal);
+        let digest = digest_from_identity(seal.digest());
+        type Sealed = Arc<Mutex<Vec<Vec<u64>>>>;
+        let host = |directory: &std::path::Path, cursor: u64, sealed: Sealed| {
+            let store = BlockStore::new();
+            let finalizer = AppSeamFinalizer::new(
+                Arc::new(|_| {}), Arc::new(|_, _, _, _| panic!("no data frame finalized")), store.clone(), vec![1; 32],
+            )
+            .with_finalized_records(
+                Arc::new(FinalizedRecords::open(directory.join("records")).unwrap()),
+                Arc::new(std::sync::atomic::AtomicU64::new(cursor)),
+            )
+            .with_closing_certificate(Arc::new(crate::closing_certificate::ClosingCertificate::new(
+                directory.join("certificate"), session.clone(),
+            )))
+            .with_sealed_sink(Arc::new(move |_, _, implied: Vec<(AppShardFrame, bool)>| {
+                sealed.lock().unwrap().push(implied.into_iter().map(|(frame, _)| frame.header.unwrap().frame_number).collect());
+                true
+            }));
+            (store, finalizer)
+        };
+        let deliver = |directory: &std::path::Path, cursor: u64, bodies: &[&AppShardFrame]| {
+            std::fs::create_dir_all(directory).unwrap();
+            let sealed: Sealed = Default::default();
+            let (store, finalizer) = host(directory, cursor, sealed.clone());
+            for frame in bodies {
+                store.seal(app_frame_digest(frame).unwrap(), encode_app_frame(frame));
+            }
+            store.seal(digest, seal.encode());
+            finalizer.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+            assert!(finalizer.pending.lock().unwrap().is_empty());
+            let delivered = sealed.lock().unwrap().clone();
+            delivered
+        };
+
+        let directory = test_directory("seal-implied");
+        assert_eq!(deliver(&directory, 1, &[&frames[1], &frames[2]]), vec![vec![2, 3]]);
+        let again: Sealed = Default::default();
+        let (_, restarted) = host(&directory, 1, again.clone());
+        assert_eq!(restarted.replay_finalized_records().unwrap(), 0, "implied frames are bodies only");
+        assert!(restarted.replay_closing_certificate().unwrap());
+        assert_eq!(*again.lock().unwrap(), vec![vec![2, 3]]);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let directory = test_directory("seal-implied-delivered");
+        assert_eq!(deliver(&directory, 3, &[&frames[1], &frames[2]]), vec![Vec::<u64>::new()]);
+        std::fs::remove_dir_all(&directory).unwrap();
+        let directory = test_directory("seal-implied-broken");
+        assert_eq!(deliver(&directory, 1, &[&frames[2]]), vec![Vec::<u64>::new()], "frame 2's body is missing");
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2237,7 +2365,7 @@ mod tests {
             );
             if with_sink {
                 let sealed = sealed.clone();
-                finalizer = finalizer.with_sealed_sink(Arc::new(move |bytes, cert| {
+                finalizer = finalizer.with_sealed_sink(Arc::new(move |bytes, cert, _| {
                     sealed.lock().unwrap().push((bytes, cert));
                     true
                 }));

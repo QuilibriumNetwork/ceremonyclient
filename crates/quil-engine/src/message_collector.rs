@@ -278,9 +278,6 @@ pub enum Refusal {
     RankFull,
     /// A shard frame failed verification against committed state.
     InvalidShardFrame,
-    /// Shard frames could not be verified now (state unavailable, or the
-    /// verifier is busy).
-    VerificationUnavailable,
 }
 
 impl Refusal {
@@ -290,13 +287,12 @@ impl Refusal {
             Self::UnknownShard => "shard frame address not in this node's committed shard set",
             Self::RankFull => "rank buffer full",
             Self::InvalidShardFrame => "shard frame failed verification",
-            Self::VerificationUnavailable => "shard frame verification unavailable",
         }
     }
 
     /// The same message may be accepted later: the submitter should retry.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::RankFull | Self::VerificationUnavailable)
+        matches!(self, Self::RankFull)
     }
 }
 
@@ -314,12 +310,22 @@ pub enum ShardFrameVerdict {
 /// Verifies the shard frames of a bundle ([`MessageCollector::set_shard_frame_verifier`]).
 pub type ShardFrameVerifier = std::sync::Arc<dyn Fn(&[u8]) -> ShardFrameVerdict + Send + Sync>;
 
-/// Shard-frame verifications run at once; past it, submitters retry later.
+/// Shard-frame verifications run at once; past it, frames are held
+/// unverified.
 const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 
 /// How long a copy of a shard frame under verification waits for that
-/// verdict before its submitter is asked to retry.
+/// verdict before it is held unverified.
 const VERIFICATION_WAIT: Duration = Duration::from_secs(2);
+
+/// Why a copy of a shard frame was not claimed for verification
+/// ([`MessageCollector::claim_verification`]).
+enum Unclaimed {
+    /// The verdict on another copy superseded it.
+    Superseded,
+    /// Another copy was still under verification after [`VERIFICATION_WAIT`].
+    Busy,
+}
 
 /// A claim on verifying one shard frame ([`MessageCollector::claim_verification`]),
 /// released however the admission ends.
@@ -464,11 +470,10 @@ impl MessageCollector {
     }
 
     /// Claim the verification of `shard`'s frame, waiting while another copy
-    /// of it is verified. A copy that verdict superseded is a duplicate; one
-    /// still waiting after [`VERIFICATION_WAIT`] is retried by its submitter.
+    /// of it is verified, for that verdict or at most [`VERIFICATION_WAIT`].
     fn claim_verification(
         &self, shard: &ShardFrame, keys: &[(Vec<u8>, u64)],
-    ) -> Result<VerificationClaim<'_>, SubmitOutcome> {
+    ) -> Result<VerificationClaim<'_>, Unclaimed> {
         let frame = (shard.address.clone(), shard.frame);
         let deadline = Instant::now() + VERIFICATION_WAIT;
         loop {
@@ -478,11 +483,11 @@ impl MessageCollector {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(SubmitOutcome::Filtered(Refusal::VerificationUnavailable));
+                return Err(Unclaimed::Busy);
             }
             drop(self.verification_ended.wait_timeout(verifying, left).unwrap());
             if self.superseded(keys) {
-                return Err(SubmitOutcome::Duplicate);
+                return Err(Unclaimed::Superseded);
             }
         }
     }
@@ -699,10 +704,14 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         }
 
-        // Verify before holding: an unverified header cannot stand in for a
-        // real one, and only a verified one supersedes. Without a verifier
-        // (a node whose collector feeds no GLOBAL proposal) frames are held
-        // unverified, and the leader verifies the one it picks.
+        // Verify before holding when it can be now: an unverified header
+        // cannot stand in for a real one, and only a verified one supersedes.
+        // One that cannot be verified now (state unavailable, the verifier
+        // busy, another copy's verdict slow) is held unverified, and the
+        // leader verifies the one it picks, as without a verifier (a node
+        // whose collector feeds no GLOBAL proposal). Refused instead, frames
+        // outlived their GLOBAL window: every archive refused them at once
+        // while an epoch's first frame published (2026-10-15).
         message.verified = verified;
         // Held until the message is filed (declared before the buffers'
         // lock, so released after it): a waiting copy then finds it superseded.
@@ -711,12 +720,17 @@ impl MessageCollector {
             let verifier = self.shard_frame_verifier.read().unwrap().clone();
             if let Some(verify) = verifier {
                 use std::sync::atomic::{AtomicUsize, Ordering};
-                if let Some(shard) = &message.shard {
-                    match self.claim_verification(shard, &keys) {
-                        Ok(claim) => _claim = Some(claim),
-                        Err(outcome) => return outcome,
-                    }
-                }
+                let claimed = match &message.shard {
+                    Some(shard) => match self.claim_verification(shard, &keys) {
+                        Ok(claim) => {
+                            _claim = Some(claim);
+                            true
+                        }
+                        Err(Unclaimed::Superseded) => return SubmitOutcome::Duplicate,
+                        Err(Unclaimed::Busy) => false,
+                    },
+                    None => true,
+                };
                 // Released however the verification ends.
                 struct Slot<'a>(&'a AtomicUsize);
                 impl Drop for Slot<'_> {
@@ -724,25 +738,24 @@ impl MessageCollector {
                         self.0.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
-                let slot = Slot(&self.verifications);
-                if slot.0.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_VERIFICATIONS {
-                    return SubmitOutcome::Filtered(Refusal::VerificationUnavailable);
-                }
-                let verdict = verify(&message.data);
-                drop(slot);
-                match verdict {
-                    ShardFrameVerdict::Valid => message.verified = true,
-                    ShardFrameVerdict::Invalid(reason) => {
-                        tracing::warn!(
-                            shards = %keys.iter().map(|(a, f)| format!("{}@{f}", hex::encode(a))).collect::<Vec<_>>().join(","),
-                            %reason,
-                            "message collector: shard-frame submit REJECTED — verification failed"
-                        );
-                        return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
-                    }
-                    ShardFrameVerdict::Unavailable(reason) => {
-                        tracing::debug!(%reason, "message collector: shard-frame verification unavailable");
-                        return SubmitOutcome::Filtered(Refusal::VerificationUnavailable);
+                let slot = claimed.then(|| Slot(&self.verifications))
+                    .filter(|slot| slot.0.fetch_add(1, Ordering::AcqRel) < MAX_CONCURRENT_VERIFICATIONS);
+                if let Some(slot) = slot {
+                    let verdict = verify(&message.data);
+                    drop(slot);
+                    match verdict {
+                        ShardFrameVerdict::Valid => message.verified = true,
+                        ShardFrameVerdict::Invalid(reason) => {
+                            tracing::warn!(
+                                shards = %keys.iter().map(|(a, f)| format!("{}@{f}", hex::encode(a))).collect::<Vec<_>>().join(","),
+                                %reason,
+                                "message collector: shard-frame submit REJECTED — verification failed"
+                            );
+                            return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
+                        }
+                        ShardFrameVerdict::Unavailable(reason) => {
+                            tracing::debug!(%reason, "message collector: shard frame not verifiable now; held unverified");
+                        }
                     }
                 }
             }
@@ -1588,14 +1601,15 @@ mod tests {
     }
 
     #[test]
-    fn unverifiable_shard_frames_are_refused_for_a_retry() {
+    fn unverifiable_shard_frames_are_held_unverified() {
         let mc = MessageCollector::new();
         let (verifier, _) = counting_verifier(|_| ShardFrameVerdict::Unavailable("state".into()));
         mc.set_shard_frame_verifier(verifier);
-        let refused = mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0));
-        assert_eq!(refused, SubmitOutcome::Filtered(Refusal::VerificationUnavailable));
-        assert!(Refusal::VerificationUnavailable.retryable() && Refusal::RankFull.retryable());
-        assert_eq!(mc.total_pending(), 0);
+        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0)), SubmitOutcome::Accepted);
+        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 4, 0, 0)), SubmitOutcome::Accepted);
+        assert_eq!(mc.total_pending(), 2, "an unverified frame supersedes nothing");
+        assert!(!mc.is_verified(&shard_bundle(0x11, 5, 0, 0)));
+        assert!(Refusal::RankFull.retryable() && !Refusal::InvalidShardFrame.retryable());
         // Without a verifier, frames are held unverified and supersede nothing.
         let plain = MessageCollector::new();
         assert!(!plain.requires_verification(&shard_bundle(0x11, 5, 0, 0)));
@@ -2056,6 +2070,39 @@ mod tests {
             }
             assert!(mc.verifying.lock().unwrap().is_empty());
         }
+    }
+
+    /// With every verification slot taken (an epoch's first frame
+    /// publishing slows each one), a frame is held unverified at once
+    /// instead of refused: refused, it could outlive its GLOBAL window.
+    #[test]
+    fn a_frame_arriving_with_every_verification_busy_is_held_unverified() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let mc = Arc::new(MessageCollector::new());
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let (entered_tx, released) = (Mutex::new(entered_tx), Mutex::new(released));
+        mc.set_shard_frame_verifier(Arc::new(move |_: &[u8]| {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = released.lock().unwrap().recv();
+            ShardFrameVerdict::Valid
+        }));
+        let busy: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS as u8)
+            .map(|shard| {
+                let mc = mc.clone();
+                let handle = std::thread::spawn(move || mc.add_message_outcome(1, shard_bundle(0x20 + shard, 5, 0, 0)));
+                entered.recv().unwrap();
+                handle
+            })
+            .collect();
+        let late = shard_bundle(0x11, 5, 0, 0);
+        assert_eq!(mc.add_message_outcome(1, late.clone()), SubmitOutcome::Accepted);
+        assert!(!mc.is_verified(&late));
+        drop(release);
+        for handle in busy {
+            assert_eq!(handle.join().unwrap(), SubmitOutcome::Accepted);
+        }
+        assert_eq!(mc.verifications.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// The shard index follows proofs that move between ranks.

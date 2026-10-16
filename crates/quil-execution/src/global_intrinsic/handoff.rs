@@ -492,6 +492,54 @@ pub fn set_seal_recovery_frame_for_thread(frame: Option<u64>) {
     SEAL_RECOVERY_OVERRIDE.with(|cell| cell.set(frame));
 }
 
+/// From this GLOBAL frame a seal's drain may carry frames that have no
+/// certificate of their own, authenticated by the seal's: its checkpoint
+/// frame, and each frame below it that its child names as parent
+/// (`seal_drain`). A seal built on a notarized checkpoint finalizes that
+/// frame with no certificate of its own, so neither its proof nor a drain
+/// could bring it to GLOBAL, and the seal was refused until the fence
+/// (eight sessions, 2026-10-15). Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame.
+/// Mainnet: 887,040, an epoch boundary (decided 2026-10-16);
+/// `QUIL_SEAL_CHECKPOINT_DRAIN_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_CHECKPOINT_DRAIN_FRAME: Option<u64> = Some(887_040);
+
+static SEAL_CHECKPOINT_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_CHECKPOINT_DRAIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_checkpoint_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_CHECKPOINT_DRAIN_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal checkpoint drain frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_seal_checkpoint_drain_frame(network: u8) -> u64 {
+    *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
+        seal_checkpoint_drain_frame_for(network, std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().as_deref())
+    })
+}
+
+pub fn seal_checkpoint_drain_frame() -> u64 {
+    if let Some(frame) = SEAL_CHECKPOINT_DRAIN_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the seal checkpoint drain frame for the calling thread only (tests).
+pub fn set_seal_checkpoint_drain_frame_for_thread(frame: Option<u64>) {
+    SEAL_CHECKPOINT_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,

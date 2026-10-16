@@ -756,6 +756,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         seal_recovery_frame = %if seal_recovery_from == u64::MAX { "never".to_string() } else { seal_recovery_from.to_string() },
         "committee handoff partial drains and base re-seals"
     );
+    let seal_checkpoint_drain_from = quil_execution::global_intrinsic::handoff::init_seal_checkpoint_drain_frame(args.network);
+    info!(
+        seal_checkpoint_drain_frame = %if seal_checkpoint_drain_from == u64::MAX { "never".to_string() } else { seal_checkpoint_drain_from.to_string() },
+        "committee handoff drains of checkpoint frames certified only by their seal"
+    );
     let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
     info!(
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },

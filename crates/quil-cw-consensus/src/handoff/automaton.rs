@@ -175,15 +175,20 @@ impl HandoffProposer {
         }
     }
 
-    /// The committed parent, else, when allowed, a private execution of it.
-    fn parent_or_private(&self, context: ProposalContext, private: bool) -> std::result::Result<AuthorizedParent, Unauthorized> {
-        self.checked_parent(context, &self.read_parent).or_else(|(reason, committed)| {
-            let Some(reader) = self.read_private_parent.as_ref().filter(|_| private) else {
-                return Err((reason, committed));
-            };
-            self.checked_parent(context, reader)
-                .map_err(|(reason, private)| (reason, format!("{committed}; unfinalized: {private}")))
-        })
+    /// The committed parent, else, when allowed, a private execution of it;
+    /// and whether it is the committed one.
+    fn parent_or_private(&self, context: ProposalContext, private: bool) -> std::result::Result<(AuthorizedParent, bool), Unauthorized> {
+        match self.checked_parent(context, &self.read_parent) {
+            Ok(parent) => Ok((parent, true)),
+            Err((reason, committed)) => {
+                let Some(reader) = self.read_private_parent.as_ref().filter(|_| private) else {
+                    return Err((reason, committed));
+                };
+                self.checked_parent(context, reader)
+                    .map(|parent| (parent, false))
+                    .map_err(|(reason, private)| (reason, format!("{committed}; unfinalized: {private}")))
+            }
+        }
     }
 
     fn checked_parent(&self, context: ProposalContext, reader: &ParentReader) -> std::result::Result<AuthorizedParent, Unauthorized> {
@@ -403,7 +408,7 @@ impl GlobalProposer for HandoffProposer {
             let waits = self.parent_waits.lock().unwrap();
             waits.0 == context.view && waits.1 >= PARENT_WAITS
         };
-        let parent = match self.parent_or_private(context, waited) {
+        let (parent, committed) = match self.parent_or_private(context, waited) {
             Ok(parent) => parent,
             Err((reason, detail)) => {
                 if let Some(sealed) = self.recognised_seal(context) {
@@ -415,13 +420,24 @@ impl GlobalProposer for HandoffProposer {
         };
         *self.parent_waits.lock().unwrap() = (context.view, 0);
         if let Some(request) = parent.closing_request {
-            let seal = Seal {
-                request,
-                session: self.session_id,
-                view: context.view,
-                checkpoint: parent.checkpoint,
-            };
-            return Some((digest_from_identity(seal.digest()), seal.encode()));
+            // Seal only a checkpoint that finalized on its own (a committed
+            // parent: one a finalized descendant made final is never the one
+            // selected). A seal finalizes a notarized parent with no
+            // certificate of its own, which no proof or drain carried to
+            // GLOBAL, so GLOBAL refused the seal until it fenced the session
+            // (eight sessions, 2026-10-15). Extend it with data instead: that
+            // frame's finalization makes it final, and a later view seals
+            // (decided 2026-10-16).
+            if committed {
+                let seal = Seal {
+                    request,
+                    session: self.session_id,
+                    view: context.view,
+                    checkpoint: parent.checkpoint,
+                };
+                return Some((digest_from_identity(seal.digest()), seal.encode()));
+            }
+            self.note(Step::Propose, context, "seal waits for a finalized checkpoint; proposing data", String::new());
         }
         let (digest, bytes) = self.inner.propose_with_context(context)?;
         // The data proposer cannot originate a seal outside the authorized path.
@@ -438,7 +454,12 @@ impl GlobalProposer for HandoffProposer {
     /// checked at once.
     fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
         if Seal::is_encoding(bytes) {
-            return None;
+            // A seal's checkpoint must have finalized here first (see
+            // `propose_with_context`); it does moments after the view opens.
+            let unfinalized = self.selected_seal(context).is_none()
+                && self.checked_parent(context, &self.read_parent).is_err()
+                && self.recognised_seal(context).is_none();
+            return unfinalized.then_some(std::time::Duration::from_millis(250));
         }
         self.inner.verify_delay(context, bytes)
     }
@@ -458,7 +479,7 @@ impl GlobalProposer for HandoffProposer {
         if let Some(sealed) = self.selected_seal(context) {
             return self.verify_reseal(context, &sealed, digest, &bytes);
         }
-        let parent = match self.parent_or_private(context, true) {
+        let (parent, committed) = match self.parent_or_private(context, true) {
             Ok(parent) => parent,
             Err((reason, detail)) => {
                 if let Some(sealed) = self.recognised_seal(context) {
@@ -504,6 +525,14 @@ impl GlobalProposer for HandoffProposer {
                     seal.checkpoint.frame, seal.checkpoint.view, parent.checkpoint.frame, parent.checkpoint.view,
                     seal.checkpoint.state_roots == parent.checkpoint.state_roots,
                 ));
+            }
+            // A seal of a checkpoint that has not finalized here would finalize
+            // it with no certificate of its own (see `propose_with_context`).
+            if valid && !committed {
+                self.note(Step::Verify, context, "seal of a checkpoint not finalized", format!(
+                    "checkpoint frame {} view {}", parent.checkpoint.frame, parent.checkpoint.view,
+                ));
+                return false;
             }
             return valid;
         }

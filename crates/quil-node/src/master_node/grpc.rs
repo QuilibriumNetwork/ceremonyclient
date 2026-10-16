@@ -879,8 +879,8 @@ pub(crate) fn spawn_all(
                     // The submitter cannot read this log, so the reply says
                     // why, with this node's executed frame against its head:
                     // a node still executing older frames judges shard
-                    // addresses and ranks by its own state. A full mempool or
-                    // a frame it cannot verify yet asks for a retry.
+                    // addresses and ranks by its own state. A full mempool
+                    // asks for a retry.
                     let (executed, head) = (submit_cf.materialized(), submit_cf.effective());
                     tracing::warn!(
                         peer = %auth.peer_id,

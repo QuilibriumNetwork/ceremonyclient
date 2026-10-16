@@ -713,6 +713,46 @@ fn an_unmaterialized_parent_is_read_privately_after_the_leader_waits_and_at_once
     assert!(!plain.verify_with_context(ctx, digest, Some(bytes)));
 }
 
+/// A seal finalizes a notarized checkpoint with no certificate of its own,
+/// which GLOBAL could then never execute (eight sessions refused until the
+/// fence, 2026-10-15). A closing session's leader extends such a parent with
+/// data; a voter waits for the checkpoint to finalize before voting for its
+/// seal, and seals of a finalized one go through as before.
+#[test]
+fn a_closing_session_seals_only_a_checkpoint_that_finalized() {
+    let (session, _) = session();
+    let mut data = genesis(&session);
+    data.closing_request = Some([8; 32]);
+    data.checkpoint.frame += 1;
+    data.checkpoint.view = 5;
+    data.checkpoint.digest = [9; 32];
+    let committed = Arc::new(Mutex::new(None));
+    let private = Arc::new(Mutex::new(Some(data.clone())));
+    let member = || HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(committed.clone()))
+        .unwrap()
+        .with_private_reader(Some(reader(private.clone())));
+    let (leader, voter) = (member(), member());
+    let ctx = context(&session, &data, 6);
+    let seal = Seal { request: [8; 32], session: session.id().unwrap(), view: 6, checkpoint: data.checkpoint.clone() };
+    let (seal_digest, seal_bytes) = (Digest(seal.digest()), seal.encode());
+
+    let mut built = None;
+    for _ in 0..20 {
+        built = leader.propose_with_context(ctx);
+        if built.is_some() { break; }
+    }
+    let (digest, bytes) = built.expect("the leader proposes after its waits");
+    assert!(!Seal::is_encoding(&bytes), "data, not a seal of an unfinalized checkpoint");
+    assert!(voter.verify_with_context(ctx, digest, Some(bytes)), "the data extending it is voted for");
+    assert!(voter.verify_or_defer(ctx, seal_digest, Some(seal_bytes.clone())).is_err(), "the voter waits");
+    assert!(!voter.verify_with_context(ctx, seal_digest, Some(seal_bytes.clone())));
+
+    *committed.lock().unwrap() = Some(data);
+    let (digest, bytes) = leader.propose_with_context(ctx).expect("a finalized checkpoint is sealed at once");
+    assert_eq!((digest, bytes.clone()), (seal_digest, seal_bytes));
+    assert_eq!(voter.verify_or_defer(ctx, digest, Some(bytes)), Ok(true));
+}
+
 #[test]
 fn a_generation_zero_session_extends_its_certified_legacy_tip() {
     let (mut session, _) = session();
@@ -780,8 +820,13 @@ fn a_seal_of_private_data_can_be_resealed_without_materializing_its_checkpoint()
         built = proposer.propose_with_context(ctx);
         if built.is_some() { break; }
     }
-    let (digest, bytes) = built.expect("the existing private-parent path produces a seal");
-    assert_eq!(Seal::decode(&bytes).unwrap().checkpoint, data.checkpoint);
+    // This leader extends private data with data, not a seal (decided
+    // 2026-10-16); an older leader sealed it, and that seal must still be
+    // re-sealable.
+    let (_, bytes) = built.expect("the private-parent path proposes");
+    assert!(!Seal::is_encoding(&bytes), "no seal of an unfinalized checkpoint");
+    let older = Seal { request: [8; 32], session: session.id().unwrap(), view: 6, checkpoint: data.checkpoint.clone() };
+    let (digest, bytes) = (Digest(older.digest()), older.encode());
     blocks.seal(digest, bytes);
     let above = ProposalContext { view: 8, parent_view: 6, parent: digest, ..ctx };
     let (digest, bytes) = proposer.propose_with_context(above)
