@@ -797,6 +797,7 @@ pub(crate) fn spawn_all(
             self.0.get_latest_global_frame().map_err(|e| e.to_string())
         }
         fn get_frame(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
+            refuse_pruned_requests(&self.0, n)?;
             self.0.get_global_frame(n).map_err(|e| e.to_string())
         }
         /// Assemble the full proposal for frame `n` from the clock store, mirroring
@@ -814,7 +815,16 @@ pub(crate) fn spawn_all(
             // some replicas produced but never committed) is invisible to sync
             // and the chain can only be unstuck manually. See
             // `archive_sync::load_committed_or_tip_candidate`.
+            refuse_pruned_requests(&self.0, n)?;
             super::archive_sync::reconstruct_local_proposal(self.0.as_ref(), n)
+        }
+    }
+    // A frame whose request bodies were pruned is only a header here; never
+    // hand it to a peer as if it were complete.
+    fn refuse_pruned_requests(store: &quil_store::RocksClockStore, n: u64) -> Result<(), String> {
+        match store.global_requests_retained_from() {
+            Some(from) if n != 0 && n < from => Err(format!("frame {n} requests are not retained (kept from {from})")),
+            _ => Ok(()),
         }
     }
     // Submit handler

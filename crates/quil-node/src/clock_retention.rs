@@ -8,6 +8,10 @@
 //!   (default 600), delete GLOBAL candidates `QUIL_PRUNE_CANDIDATE_MARGIN`
 //!   (default two epochs) or more below both the canonical head and the
 //!   executed cursor, at heights holding a canonical record.
+//! - `QUIL_PRUNE_GLOBAL_REQUESTS`: on a regular (non-archive) node, every
+//!   `QUIL_PRUNE_INTERVAL_SECS`, delete the request bodies of global frames
+//!   more than `QUIL_PRUNE_GLOBAL_REQUESTS_KEEP` (default and minimum two
+//!   days of frames) below the head. Headers are kept.
 //! - `QUIL_SNAPSHOT_PINNED_MAX=<n>`: keep store snapshots only on the newest
 //!   `n` (default 64, at least 16; `off` also disables it) published
 //!   generations.
@@ -22,6 +26,9 @@ const STAGED_STEP: usize = 10_000;
 const CANDIDATE_STEP: usize = 5_000;
 /// Never closer to the head than this, whatever is configured.
 const MIN_CANDIDATE_MARGIN: u64 = 64;
+/// Request bodies a regular node keeps: its gap backfill window
+/// (two days of frames), which also covers the frame cache and gossip drain.
+const MIN_REQUEST_KEEP: u64 = 2 * 1440;
 
 fn setting(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
@@ -80,6 +87,35 @@ pub(crate) fn spawn_candidate_pruner(clock: &Arc<quil_store::RocksClockStore>, l
     });
     if let Err(error) = spawned {
         warn!(%error, "GLOBAL candidate pruning not started");
+    }
+}
+
+/// `QUIL_PRUNE_GLOBAL_REQUESTS` (default on): on a node that neither executes
+/// GLOBAL frames nor serves their history, prune old request bodies every
+/// interval until the store is dropped. The caller decides that role.
+pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, label: String) {
+    if !enabled("QUIL_PRUNE_GLOBAL_REQUESTS") {
+        return;
+    }
+    let clock: Weak<quil_store::RocksClockStore> = Arc::downgrade(clock);
+    let keep = setting("QUIL_PRUNE_GLOBAL_REQUESTS_KEEP").unwrap_or(MIN_REQUEST_KEEP).max(MIN_REQUEST_KEEP);
+    let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
+    let spawned = std::thread::Builder::new().name(format!("request-prune-{label}")).spawn(move || {
+        info!(store = %label, keep, "GLOBAL request body pruning enabled");
+        loop {
+            std::thread::sleep(interval);
+            let Some(store) = clock.upgrade() else { return };
+            let started = std::time::Instant::now();
+            match store.prune_global_frame_requests(keep) {
+                Ok(pass) if pass.frames > 0 => info!(store = %label, frames = pass.frames,
+                    retained_from = pass.retained_from, secs = started.elapsed().as_secs(), "pruned GLOBAL request bodies"),
+                Ok(_) => {}
+                Err(error) => warn!(store = %label, %error, "GLOBAL request prune failed; retrying next pass"),
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        warn!(%error, "GLOBAL request pruning not started");
     }
 }
 
