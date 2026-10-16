@@ -540,6 +540,55 @@ pub fn set_seal_checkpoint_drain_frame_for_thread(frame: Option<u64>) {
     SEAL_CHECKPOINT_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
 }
 
+/// From this GLOBAL frame a fence's membership successor takes the shard's
+/// eligible provers at the fence instead of the committee its request fixed
+/// four epochs earlier (`schedule::fence_stalled_sources`). That committee
+/// had mostly moved on, so the successor could not reach quorum; and the
+/// same pass found it unlike current eligibility and asked it to close at
+/// once. It never sealed, was fenced again, and so on (2026-10-16, sixteen
+/// sessions of one regular node). Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame.
+/// Mainnet: 891,360, an epoch boundary (decided 2026-10-16);
+/// `QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME` elsewhere, never by default.
+pub const MAINNET_FENCED_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = Some(891_360);
+
+static FENCED_SUCCESSOR_ELIGIBILITY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn fenced_successor_eligibility_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_FENCED_SUCCESSOR_ELIGIBILITY_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's fenced successor eligibility frame from its network,
+/// and return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_fenced_successor_eligibility_frame(network: u8) -> u64 {
+    *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
+        fenced_successor_eligibility_frame_for(network,
+            std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().as_deref())
+    })
+}
+
+pub fn fenced_successor_eligibility_frame() -> u64 {
+    if let Some(frame) = FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
+        std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the fenced successor eligibility frame for the calling thread only (tests).
+pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
+    FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,
@@ -1127,6 +1176,21 @@ pub fn apply_submission(
 /// Authorize the successors once every source has ended, by its seal or by a
 /// GLOBAL fence. False while a source is still closing, or once activated.
 fn activate(state: &HypergraphState, frame: u64, request: &Request) -> Result<bool> {
+    activate_with(state, frame, request, None)
+}
+
+/// [`activate`], with `members` (when given) replacing the committee of the
+/// request's one target: a fence's membership successor
+/// (`schedule::fence_stalled_sources`).
+pub(crate) fn activate_with(
+    state: &HypergraphState,
+    frame: u64,
+    request: &Request,
+    members: Option<Vec<Vec<u8>>>,
+) -> Result<bool> {
+    if members.is_some() && request.targets.len() != 1 {
+        return Err(invalid("replacement members need a request with one target"));
+    }
     {
         let request_id = request.id()?;
         if read(state, b"activated", &request_id)?.is_some() {
@@ -1182,7 +1246,7 @@ fn activate(state: &HypergraphState, frame: u64, request: &Request) -> Result<bo
                 genesis: quil_crypto::poseidon::hash_bytes_to_32(&output)?,
                 base_frame,
                 authorization,
-                members: target.committee.members.clone(),
+                members: members.clone().unwrap_or_else(|| target.committee.members.clone()),
             };
             let id = create_session(state, frame, &next)?;
             // The authorization names the complete source partition; the new

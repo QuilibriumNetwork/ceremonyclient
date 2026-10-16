@@ -1557,9 +1557,9 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     assert!(verify(&state, &beyond, &beyond_cert).unwrap().is_some(), "still closing: not yet bounded");
 
     let due = 2 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()]).unwrap(), 0, "not before the timeout");
+    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()], None).unwrap(), 0, "not before the timeout");
     assert!(!is_fenced(&state, &id).unwrap());
-    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
     commit(&state, due);
     assert!(is_fenced(&state, &id).unwrap());
     assert!(matches!(status(&state, &id).unwrap(), Status::Closed(_)));
@@ -1577,7 +1577,7 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     let late = submission(&request, 0, &keys, 6);
     record_session_tip(&state, due, &id, &late.seal.checkpoint).unwrap();
     assert!(super::apply_submission(&state, due + 1, &late).is_err());
-    assert_eq!(schedule::fence_stalled_sources(&state, due + 8, &[filter.clone()]).unwrap(), 0);
+    assert_eq!(schedule::fence_stalled_sources(&state, due + 8, &[filter.clone()], None).unwrap(), 0);
 
     // The authorization commits to the fence, not to any seal of that checkpoint.
     let db2 = quil_store::RocksDb::open_in_memory().unwrap();
@@ -1594,6 +1594,59 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     assert_ne!(head(&sealed_state, &filter).unwrap().unwrap().authorization, successor.authorization);
 }
 
+/// A fence's membership successor takes its shard's eligible provers at the
+/// fence, not the committee its request fixed four epochs earlier, so the
+/// same pass's reconciliation leaves it running instead of asking it to close
+/// at once (2026-10-16: one node's sixteen sessions, fenced again and again,
+/// sat at view 1 below quorum). Before the activation frame, with nobody
+/// eligible, or with the request's committee still eligible, the request's
+/// committee stands.
+#[test]
+fn a_fenced_membership_successor_takes_the_eligible_committee() {
+    let filter = vec![0x6d; 32];
+    let filters = vec![filter.clone()];
+    let (old, requested, eligible_now) = (keys(), keys(), keys());
+    let due = 4 + fence_timeout();
+    let fence = |activation: u64, eligible_at_fence: &[FalconPrivateKey]| {
+        set_fenced_successor_eligibility_frame_for_thread(Some(activation));
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let (_store, state) = make_state(&db);
+        commit(&state, 1);
+        assert_eq!(schedule::reconcile_membership(&state, 2, &policy(), &filters, &scan_of(&[(&filter, &old)])).unwrap(), 1);
+        commit(&state, 2);
+        assert_eq!(schedule::reconcile_membership(&state, 4, &policy(), &filters, &scan_of(&[(&filter, &requested)])).unwrap(), 1);
+        commit(&state, 4);
+        let scan = scan_of(&[(&filter, eligible_at_fence)]);
+        let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> { Ok(schedule::desired_members(&scan, filter, due)) };
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &filters, Some(&mut eligible)).unwrap(), 1);
+        let rescheduled = schedule::reconcile_membership(&state, due, &policy(), &filters, &scan).unwrap();
+        commit(&state, due);
+        let successor = head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.generation, 2);
+        let closing = matches!(status(&state, &successor.id().unwrap()).unwrap(), Status::Sealing(_));
+        (successor.members, closing, rescheduled)
+    };
+    assert_eq!(fence(u64::MAX, &eligible_now), (members(&requested), true, 1),
+        "before activation: the request's committee, asked at once to close");
+    assert_eq!(fence(due, &eligible_now), (members(&eligible_now), false, 0));
+    assert_eq!(fence(due, &[]), (members(&requested), false, 0), "nobody eligible");
+    assert_eq!(fence(due, &requested), (members(&requested), false, 0), "still eligible");
+}
+
+/// Fenced membership successors from current eligibility are GLOBAL
+/// consensus: mainnet starts at a fixed epoch boundary whatever the
+/// environment says; other networks only when set.
+#[test]
+fn fenced_successor_eligibility_activates_only_at_a_scheduled_frame() {
+    assert_eq!(fenced_successor_eligibility_frame_for(0, None), 891_360);
+    assert_eq!(fenced_successor_eligibility_frame_for(0, Some("7")), 891_360);
+    assert_eq!(891_360 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, Some("7")), 7);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, None), u64::MAX);
+}
+
 /// A stalled session GLOBAL never executed a frame of is fenced at its base
 /// and succeeded. With a same-filter predecessor the fence carries that
 /// predecessor's certified roots; a first session (like a split or merge
@@ -1608,8 +1661,8 @@ fn a_stalled_session_without_a_tip_is_fenced_at_its_base() {
     initialize(&state, 1, &first).unwrap();
     let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
     let due = 2 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()]).unwrap(), 0, "not before the timeout");
-    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1, "a first session without a tip");
+    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()], None).unwrap(), 0, "not before the timeout");
+    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1, "a first session without a tip");
     assert!(is_fenced(&state, &first.id().unwrap()).unwrap());
     let fence = closed_checkpoint(&state, &first.id().unwrap()).unwrap().unwrap();
     assert_eq!((fence.frame, fence.view, fence.digest), (first.base_frame, 0, first.genesis));
@@ -1629,7 +1682,7 @@ fn a_stalled_session_without_a_tip_is_fenced_at_its_base() {
     let second = head(&state, &filter).unwrap().unwrap();
     let second_request = schedule(&state, 4, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
     let later = 4 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, later, &[filter.clone()]).unwrap(), 1);
+    assert_eq!(schedule::fence_stalled_sources(&state, later, &[filter.clone()], None).unwrap(), 1);
     let fence = closed_checkpoint(&state, &second.id().unwrap()).unwrap().unwrap();
     assert_eq!((fence.frame, fence.digest), (second.base_frame, second.genesis));
     assert_eq!(fence.state_roots, [[0x40; 32], [0x41; 32], [0x42; 32], [0x43; 32]], "the predecessor's sealed roots");
@@ -1655,7 +1708,11 @@ fn a_merge_activates_from_one_sealed_and_one_fenced_source() {
     assert!(!apply_submission(&state, 3, &submission(&request, sealed_index, &keys, 5)).unwrap());
     record_session_tip(&state, 3, &right.id().unwrap(), &tip(8, 11, [0x88; 32])).unwrap();
     let filters = vec![left_filter.clone(), right_filter.clone()];
-    assert_eq!(schedule::fence_stalled_sources(&state, 2 + fence_timeout(), &filters).unwrap(), 1, "only the unsealed source");
+    // A merge's successor keeps the committee its request authorized.
+    set_fenced_successor_eligibility_frame_for_thread(Some(0));
+    let mut eligible = |_: &[u8]| -> Result<Vec<Vec<u8>>> { panic!("a merge's fence read eligibility") };
+    assert_eq!(schedule::fence_stalled_sources(&state, 2 + fence_timeout(), &filters, Some(&mut eligible)).unwrap(), 1,
+        "only the unsealed source");
     assert!(!is_fenced(&state, &left.id().unwrap()).unwrap());
     assert!(is_fenced(&state, &right.id().unwrap()).unwrap());
     assert!(schedule::activated(&state, &request.id().unwrap()).unwrap());

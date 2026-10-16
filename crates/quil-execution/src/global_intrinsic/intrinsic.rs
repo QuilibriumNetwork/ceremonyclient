@@ -3439,9 +3439,22 @@ impl GlobalIntrinsic {
         timing.filters = filters.len();
         timing.lap("grid filters");
         // Closing sessions that never sealed are fenced first, so a successor
-        // they authorize is visible to the reconciliation below.
+        // they authorize is visible to the reconciliation below. A fenced
+        // membership successor takes the eligibility that reconciliation
+        // compares against: the same scan, read only once a fence needs it.
+        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
+        let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+            if scanned.is_none() {
+                scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+            }
+            Ok(scanned.as_ref().map_or_else(Vec::new, |scan| {
+                super::handoff::schedule::desired_members(scan, filter, frame_number)
+            }))
+        };
         let checkpoint = state.changeset_len();
-        if let Err(error) = super::handoff::schedule::fence_stalled_sources(state, frame_number, &filters) {
+        if let Err(error) = super::handoff::schedule::fence_stalled_sources(
+            state, frame_number, &filters, Some(&mut eligible))
+        {
             if !matches!(error, QuilError::InvalidArgument(_)) {
                 return Err(error);
             }
@@ -3479,7 +3492,10 @@ impl GlobalIntrinsic {
         {
             return Ok(());
         }
-        let mut scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+        let mut scan = match scanned {
+            Some(scan) => scan,
+            None => crate::prover_registry::CommittedProverScan::try_scan(hg)?,
+        };
         timing.allocations = Some(scan.allocations.len());
         timing.lap("prover scan");
         // A flag day that discards legacy history prepares the prover tree

@@ -327,8 +327,8 @@ fn a_generation_zero_that_never_seals_is_fenced_at_its_executed_tip() {
     commit(state, 9);
 
     let due = 8 + schedule::FENCE_AFTER_EPOCHS * epoch_length();
-    assert_eq!(schedule::fence_stalled_sources(state, due - 1, &[filter.clone()]).unwrap(), 0, "not before the timeout");
-    assert_eq!(schedule::fence_stalled_sources(state, due, &[filter.clone()]).unwrap(), 1);
+    assert_eq!(schedule::fence_stalled_sources(state, due - 1, &[filter.clone()], None).unwrap(), 0, "not before the timeout");
+    assert_eq!(schedule::fence_stalled_sources(state, due, &[filter.clone()], None).unwrap(), 1);
     commit(state, due);
     assert!(is_fenced(state, &id).unwrap());
     let fence = closed_checkpoint(state, &id).unwrap().unwrap();

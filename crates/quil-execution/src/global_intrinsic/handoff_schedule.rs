@@ -26,7 +26,7 @@ use quil_types::error::{QuilError, Result};
 use quil_types::store::{PendingShardChange, ShardChangeKind};
 
 use super::{
-    activate, head, initialize, invalid, origins, read, request, schedule, seal_key, session_tip,
+    activate_with, head, initialize, invalid, origins, read, request, schedule, seal_key, session_tip,
     status, write, DesiredCommittee, Records, Status,
 };
 use crate::hypergraph_state::HypergraphState;
@@ -401,7 +401,17 @@ pub const FENCE_AFTER_EPOCHS: u64 = 4;
 /// successor's members take the state from an archive and authenticate it
 /// against the session's origins where those were sealed. Leaving such a
 /// session closing would strand its shard for good.
-pub fn fence_stalled_sources(state: &HypergraphState, frame: u64, filters: &[Vec<u8>]) -> Result<usize> {
+///
+/// From [`super::fenced_successor_eligibility_frame`], a membership
+/// successor the fence authorizes takes `eligible`'s committee for its shard
+/// (the committed eligibility the same pass reconciles against), not the one
+/// its request fixed when it was scheduled ([`fenced_committee`]).
+pub fn fence_stalled_sources(
+    state: &HypergraphState,
+    frame: u64,
+    filters: &[Vec<u8>],
+    mut eligible: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>>,
+) -> Result<usize> {
     let timeout = FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames());
     let mut fenced = 0;
     for filter in filters {
@@ -459,12 +469,50 @@ pub fn fence_stalled_sources(state: &HypergraphState, frame: u64, filters: &[Vec
             "committee handoff: closing session did not seal in time; fenced at its executed tip"
         );
         fenced += 1;
-        if activate(state, frame, &pending)? {
+        let members = match eligible.as_deref_mut() {
+            Some(eligible) if frame >= super::fenced_successor_eligibility_frame() => {
+                fenced_committee(&pending, eligible)?
+            }
+            _ => None,
+        };
+        if activate_with(state, frame, &pending, members)? {
             tracing::info!(frame, request = hex::encode(request_id),
                 "committee handoff: successors authorized from fenced sources");
         }
     }
     Ok(fenced)
+}
+
+/// The committee a fence's membership successor takes: its shard's eligible
+/// provers now. Its request fixed the committee when it was scheduled, four
+/// epochs earlier, from provers that have since mostly moved on, so it could
+/// not reach quorum; and the same pass's reconciliation found it unlike
+/// current eligibility and asked it to close at once (decided 2026-10-16).
+/// `None` keeps the request's committee: a split's or merge's, one whose
+/// shard has no valid eligible committee now, or one that still matches.
+fn fenced_committee(
+    request: &super::Request,
+    eligible: &mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let ([source], [target]) = (request.sources.as_slice(), request.targets.as_slice()) else {
+        return Ok(None);
+    };
+    if target.committee.filter != source.filter || !request.vacant.is_empty() {
+        return Ok(None);
+    }
+    let members = eligible(&source.filter)?;
+    let valid = Session {
+        chain_id: source.chain_id,
+        filter: source.filter.clone(),
+        generation: target.generation,
+        genesis: [0; 32],
+        base_frame: 0,
+        authorization: [0; 32],
+        members: members.clone(),
+    }
+    .validate()
+    .is_ok();
+    Ok((valid && members != target.committee.members).then_some(members))
 }
 
 /// Create first sessions and schedule membership successors for `filters` (the

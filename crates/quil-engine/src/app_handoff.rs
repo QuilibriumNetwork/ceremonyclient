@@ -1189,7 +1189,7 @@ mod successor_tests {
             vec![DesiredCommittee { filter: left.clone(), members: members.clone() }]).unwrap();
         commit(&global, &state, 5);
         let due = 5 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[left.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[left.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         assert!(schedule::activated(&CommittedView::capture(&global).unwrap(), &change.id().unwrap()).unwrap());
         assert_ne!(handoff::head(&state, &left).unwrap().unwrap().id().unwrap(), stalled.id().unwrap());
@@ -1204,7 +1204,7 @@ mod successor_tests {
             vec![DesiredCommittee { filter: right.clone(), members }]).unwrap();
         commit(&global, &state, due + 1);
         let later = due + 1 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, later, &[right.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, later, &[right.clone()], None).unwrap(), 1);
         commit(&global, &state, later);
         assert!(origin_anchors(&global, &right).unwrap().is_empty(), "a source fenced after it ran");
     }
@@ -1339,7 +1339,7 @@ mod successor_tests {
         handoff::record_session_tip(&state, 4, &source.id().unwrap(),
             &Checkpoint { frame: 3, view: 5, digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
         let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         assert!(handoff::is_fenced(&CommittedView::capture(&global).unwrap(), &source.id().unwrap()).unwrap());
         assert!(schedule::activated(&CommittedView::capture(&global).unwrap(), &request.id().unwrap()).unwrap());
@@ -1435,7 +1435,7 @@ mod successor_tests {
         handoff::record_session_tip(&state, 4, &source.id().unwrap(),
             &Checkpoint { frame: 3, view: 5, digest: fenced_digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
         let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert!(successor_state_matches(&global, &shard, &clock, &successor).is_err(), "wedged past the fence");
