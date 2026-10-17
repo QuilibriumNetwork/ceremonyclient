@@ -1614,10 +1614,20 @@ impl ProverLifecycle {
         // while the round-trip is in flight. This runs regardless of coverage
         // halts: a prover maintaining its own storage commitment is never the
         // cause of a halt and must not be evicted for one.
+        //
+        // Only a filter a worker is bound to renews (decided 2026-10-17). A
+        // seat nothing serves casts no votes and submits no openings. An
+        // unbound seat due for renewal is already left by the orphan sweep
+        // below, but one recovering from a missed renewal or a rejected leave
+        // was renewed unbound from the master's own store, and a leave the
+        // chain rejected put it back into recovery, so it could stay eligible
+        // for committees it never voted in (2026-10-17, sessions whose silent
+        // members exceeded a third). It lapses to `ExpiredEpoch` instead,
+        // which removes it from committee eligibility. The allocator binds
+        // free workers to recovering allocations, which then renew here; one
+        // still unbound after the grace is left by the orphan sweep.
         let renewal_filters: Vec<Vec<u8>> = expired_epoch_filters.into_iter()
-            .filter(|f| active_filters.contains(f)
-                || recovery_filters.contains(f)
-                || worker_bound_filters.contains(f))
+            .filter(|f| worker_bound_filters.contains(f))
             .collect();
         if !renewal_filters.is_empty() {
             // Never renew an abandoned orphan we may propose leaving below.
@@ -3880,7 +3890,13 @@ mod proposal_loop_tests {
             for frame in [725, 1439] {
                 lc.set_prover_root_verified_frame(frame);
                 let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
-                assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+                // Renewal waits for the allocator to bind a worker (an idle
+                // one is bound to a recovering allocation); the grace holds
+                // cleanup off either way.
+                assert_eq!(
+                    actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
+                    initially_bound, "{actions:?}",
+                );
                 assert_eq!(count_proposed_leaves(&actions), 0,
                     "a delayed bootstrap renewal must not race cleanup: {actions:?}");
             }
@@ -3928,7 +3944,7 @@ mod proposal_loop_tests {
     }
 
     #[test]
-    fn rejected_leave_renews_before_orphan_cleanup_and_grace_is_bounded() {
+    fn rejected_leave_grace_holds_orphan_cleanup_and_is_bounded() {
         let address = vec![0xCD; 32];
         let held = filter_bytes(0xA1);
         let wm = Arc::new(ConfigurableWorkerManager::new());
@@ -3944,7 +3960,9 @@ mod proposal_loop_tests {
         for frame in [725, 1439] {
             lc.set_prover_root_verified_frame(frame);
             let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
-            assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+            // Unbound: no renewal until the allocator binds a worker, and the
+            // grace holds cleanup off.
+            assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
             assert_eq!(count_proposed_leaves(&actions), 0,
                 "renewal must not race orphan cleanup after rejecting a leave; actions={actions:?}");
         }
