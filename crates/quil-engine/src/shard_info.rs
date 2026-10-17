@@ -56,6 +56,8 @@ pub struct ShardEntry {
     pub ring: Option<u8>,
     pub materialized_frame: u64,
     pub latest_frame: u64,
+    /// The shard's provers by lifecycle phase at the frame.
+    pub prover_counts: quil_types::consensus::PhaseCounts,
 }
 
 /// Raw shard size info returned by the size-fetching callbacks.
@@ -304,6 +306,16 @@ where
             let live: Vec<_> = prs.iter().filter(|p| p.allocations.iter()
                 .any(|a| a.confirmation_filter == bp && a.is_live(frame_number))).collect();
             let in_candidates = live.iter().any(|p| p.address == self_address);
+            // One phase per prover: a stale record on the same filter yields none.
+            let mut prover_counts = quil_types::consensus::PhaseCounts::default();
+            for p in &prs {
+                if let Some(phase) = p.allocations.iter()
+                    .filter(|a| a.confirmation_filter == bp)
+                    .find_map(|a| a.phase(frame_number))
+                {
+                    prover_counts.add(phase);
+                }
+            }
             let real_is_alloc = is_alloc || in_candidates;
             let estimate = prover_registry.get_reward_ring_estimate(
                 self_address, &bp, frame_number).ok().flatten();
@@ -320,6 +332,7 @@ where
                 ring,
                 materialized_frame: shard.materialized_frame,
                 latest_frame: shard.latest_frame,
+                prover_counts,
             });
         }
     }
@@ -405,6 +418,7 @@ where
                 data_shards: entry.data_shards,
                 materialized_frame: entry.materialized_frame,
                 latest_frame: entry.latest_frame,
+                prover_counts: Some(entry.prover_counts),
             }
         })
         .collect();

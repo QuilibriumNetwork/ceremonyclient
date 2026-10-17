@@ -594,6 +594,60 @@ impl ProverAllocationInfo {
     }
 }
 
+/// Where an allocation stands at a frame, by effective status, with a
+/// confirmed join or leave told apart from an undecided one: a confirmed join
+/// is activating until the next boundary, a confirmed leave departing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationPhase {
+    Joining,
+    Activating,
+    Active,
+    Paused,
+    Leaving,
+    Departing,
+}
+
+impl ProverAllocationInfo {
+    /// The allocation's [`AllocationPhase`] at `frame`; `None` when it is
+    /// expired, rejected, kicked, historic or unknown.
+    pub fn phase(&self, frame: u64) -> Option<AllocationPhase> {
+        Some(match self.effective_status(frame) {
+            EffectiveStatus::Joining if self.join_confirm_frame_number > 0 => AllocationPhase::Activating,
+            EffectiveStatus::Joining => AllocationPhase::Joining,
+            EffectiveStatus::Active => AllocationPhase::Active,
+            EffectiveStatus::Paused => AllocationPhase::Paused,
+            EffectiveStatus::Leaving if self.leave_confirm_frame_number > 0 => AllocationPhase::Departing,
+            EffectiveStatus::Leaving => AllocationPhase::Leaving,
+            _ => return None,
+        })
+    }
+}
+
+/// A shard's provers counted by [`AllocationPhase`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseCounts {
+    pub joining: u32,
+    pub activating: u32,
+    pub active: u32,
+    pub paused: u32,
+    pub leaving: u32,
+    pub departing: u32,
+}
+
+impl PhaseCounts {
+    pub fn add(&mut self, phase: AllocationPhase) {
+        let count = match phase {
+            AllocationPhase::Joining => &mut self.joining,
+            AllocationPhase::Activating => &mut self.activating,
+            AllocationPhase::Active => &mut self.active,
+            AllocationPhase::Paused => &mut self.paused,
+            AllocationPhase::Leaving => &mut self.leaving,
+            AllocationPhase::Departing => &mut self.departing,
+        };
+        *count += 1;
+    }
+}
+
 /// Complete prover information.
 #[derive(Debug, Clone)]
 pub struct ProverInfo {
@@ -907,6 +961,8 @@ pub struct ShardDetail {
     pub data_shards: u64,
     pub materialized_frame: u64,
     pub latest_frame: u64,
+    /// The shard's provers by lifecycle phase; `None` when not computed.
+    pub prover_counts: Option<PhaseCounts>,
 }
 
 /// Provides shard-level info.
@@ -950,6 +1006,39 @@ pub(crate) mod epoch_tests {
 
     pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
         EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Each live allocation has one phase, a confirmed join or leave its own,
+    /// and expired allocations none; counts add them up per shard.
+    #[test]
+    fn allocations_count_by_phase() {
+        let _guard = epoch_length_guard();
+        let e = EPOCH_LENGTH_FRAMES;
+        let frame = 10 * e + 5;
+        let with = |status, f: &dyn Fn(&mut ProverAllocationInfo)| {
+            let mut a = active_alloc(vec![7], 10);
+            a.status = status;
+            f(&mut a);
+            a
+        };
+        let allocations = [
+            with(ProverStatus::Joining, &|a| a.join_frame_number = 10 * e),
+            with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1),
+            with(ProverStatus::Active, &|_| {}),
+            with(ProverStatus::Active, &|_| {}),
+            with(ProverStatus::Paused, &|_| {}),
+            with(ProverStatus::Leaving, &|a| a.leave_frame_number = 10 * e),
+            with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; }),
+            with(ProverStatus::Joining, &|a| a.join_frame_number = 2 * e),
+            with(ProverStatus::Active, &|a| a.epoch = 8),
+        ];
+        let mut counts = PhaseCounts::default();
+        for a in &allocations {
+            if let Some(phase) = a.phase(frame) {
+                counts.add(phase);
+            }
+        }
+        assert_eq!(counts, PhaseCounts { joining: 1, activating: 1, active: 2, paused: 1, leaving: 1, departing: 1 });
     }
 
     fn active_alloc(filter: Vec<u8>, epoch: u64) -> ProverAllocationInfo {

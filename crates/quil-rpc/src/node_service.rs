@@ -1310,6 +1310,10 @@ impl NodeService for NodeRpcServer {
                 materialized_frame: d.materialized_frame,
                 latest_frame: d.latest_frame,
                 global_head: global_heads.get(i).cloned().flatten(),
+                prover_counts: d.prover_counts.map(|c| node::ShardProverCounts {
+                    joining: c.joining, activating: c.activating, active: c.active,
+                    paused: c.paused, leaving: c.leaving, departing: c.departing,
+                }),
             });
         }
 
@@ -1923,6 +1927,7 @@ mod shard_world_size_tests {
                 filter: vec![id], shard_size: BigInt::from(1000 * u32::from(id)),
                 active_provers: 8, ring: 0, ring_known: id == 1, estimated_reward: BigInt::from(7),
                 is_allocated: id == 1, data_shards: 1, materialized_frame: 10, latest_frame: 10,
+                prover_counts: None,
             }).collect();
             Ok((details, 10000, BigInt::from(100), 10, BigInt::from(3000)))
         }
