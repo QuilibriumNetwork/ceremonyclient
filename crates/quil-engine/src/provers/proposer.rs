@@ -643,14 +643,15 @@ pub fn decide_joins(
         }
     }
 
-    // availableWorkers cap (Go `proposer.go:518-531`): only applied when
-    // no rejections — Go submits reject XOR confirm in a single
-    // DecideAllocations call, so the cap is consulted only on the
-    // confirm path. `pending` is registry iteration order, which is
-    // incidental. Rank confirmations before truncating, using the same
-    // halt-risk-first then reward order as `plan_and_allocate`, so scarce
-    // worker slots are committed to the most useful shards.
-    if reject.is_empty() && !confirm.is_empty() && available_workers != usize::MAX {
+    // availableWorkers cap (Go `proposer.go:518-531`). Rank confirmations
+    // before truncating, using the same halt-risk-first then reward order as
+    // `plan_and_allocate`, so scarce worker slots are committed to the most
+    // useful shards. `pending` is registry iteration order, which is
+    // incidental. The cap applies whether or not other joins were rejected,
+    // and the joins above it are rejected: a join neither confirmed nor
+    // rejected in its confirm epoch lapses and blocks a re-join of its
+    // shard for 720 frames.
+    if !confirm.is_empty() && available_workers != usize::MAX {
         confirm.sort_by(|a, b| {
             let rank = |filter: &Vec<u8>| {
                 let key = hex::encode(filter);
@@ -668,10 +669,8 @@ pub fn decide_joins(
                 .then_with(|| b_score.cmp(&a_score))
                 .then_with(|| a.cmp(b))
         });
-        if available_workers == 0 {
-            confirm.clear();
-        } else if confirm.len() > available_workers {
-            confirm.truncate(available_workers);
+        if confirm.len() > available_workers {
+            reject.extend(confirm.split_off(available_workers));
         }
     }
 
@@ -1647,7 +1646,8 @@ mod tests {
     }
 
     /// When no rejections, confirms cap at `available_workers`.
-    /// `0` workers → drop all confirms; `N` workers → truncate to N.
+    /// `0` workers → reject every join; `N` workers → confirm N, reject the
+    /// rest.
     #[test]
     fn decide_joins_caps_confirms_by_available_workers() {
         let shards = vec![
@@ -1657,20 +1657,20 @@ mod tests {
         ];
         let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
 
-        // available_workers = 0 → all confirms dropped.
+        // available_workers = 0 → every join rejected.
         let (reject0, confirm0) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
         );
-        assert!(reject0.is_empty());
+        assert_eq!(reject0.len(), 3, "no workers → every join rejected");
         assert!(confirm0.is_empty(), "no workers → no confirms");
 
-        // available_workers = 1 → exactly 1 confirm.
+        // available_workers = 1 → exactly 1 confirm, the others rejected.
         let (reject1, confirm1) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 1,
         );
-        assert!(reject1.is_empty());
+        assert_eq!(reject1.len(), 2);
         assert_eq!(confirm1.len(), 1);
 
         // usize::MAX disables the cap (parity with prior behavior).
@@ -1697,9 +1697,27 @@ mod tests {
             DEFAULT_UNITS, Strategy::RewardGreedy, 1,
         );
 
-        assert!(reject.is_empty());
+        assert_eq!(reject, vec![vec![0x02], vec![0x01]], "the others are rejected, not left to lapse");
         assert_eq!(confirm, vec![vec![0x03]],
             "highest-reward shard wins the only slot");
+    }
+
+    /// A join rejected on score does not lift the worker cap from the rest.
+    #[test]
+    fn decide_joins_caps_confirms_when_another_join_is_rejected() {
+        let shards = vec![
+            make_shard(vec![0x01], 10_000, 0, 1),
+            make_shard(vec![0x02], 300_000, 0, 1),
+            make_shard(vec![0x03], 300_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+        let (reject, confirm) = decide_joins(
+            &shards, &pending, 50_000, &BigInt::from(610_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 1,
+        );
+        assert_eq!(confirm.len(), 1, "one worker: {confirm:?}");
+        assert_eq!(reject.len(), 2, "the low score and the one above the cap: {reject:?}");
+        assert!(reject.contains(&vec![0x01]));
     }
 
     // In score order every freed worker goes to the same empty shard.
