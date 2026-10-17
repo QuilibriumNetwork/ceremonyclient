@@ -1973,6 +1973,12 @@ impl ProverLifecycle {
             .collect();
 
         if !ready_join_filters.is_empty() {
+            // Judge split-away joins by the proposals' shard view. A regular
+            // node keeps its genesis grid, so the raw grid still names the
+            // children of a parent the archives report; proposals drop those
+            // rows, and every join they proposed for such a parent was
+            // rejected here at the next epoch.
+            let known_shards = known_shard_filters(&current_summaries, &shard_sizes_snapshot, &proposal_grid);
             // A pending join on a shard that has since split, or has retired,
             // is rejected: the chain no longer confirms it, and it holds a
             // worker until it lapses.
@@ -2037,6 +2043,10 @@ impl ProverLifecycle {
                 auto_capacity,
             );
 
+            for filter in &split_away {
+                info!(filter = %hex::encode(filter), retired = retired.contains(filter),
+                    "join decision: pending join rejected, its shard has split or retired");
+            }
             let mut combined_reject = split_away;
             combined_reject.extend(manual_reject);
             combined_reject.extend(auto_reject);
@@ -6315,9 +6325,61 @@ mod proposal_loop_tests {
             txn.commit().unwrap();
         }
         lifecycle.set_shards_store(shards);
+        // The archives report the children too, once their sizes refresh.
+        lifecycle.set_remote_shard_sizes([false, true].into_iter().map(|bit| {
+            (quil_forest::shard_prefix_to_filter(&app, &quil_forest::bit_path_to_prefix(&[bit])), 64u64)
+        }).collect());
         let actions = evaluate();
         assert!(count_reject_filters(&actions).contains(&root), "{actions:?}");
         assert!(!count_confirms(&actions).contains(&root), "{actions:?}");
+    }
+
+    /// The local grid alone does not split a shard the archives report: a
+    /// regular node keeps its genesis grid after the network merges it back,
+    /// and the planner proposes joins for the reported parent.
+    #[test]
+    fn a_pending_join_on_a_reported_parent_of_stale_grid_rows_is_confirmed() {
+        use quil_types::store::{KvDb as _, ShardInfo, ShardsStore};
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let app = [0x13u8; 32];
+        let root = app.to_vec();
+        wm.add(WorkerInfo {
+            core_id: 1, filter: root.clone(), available_storage: 0, total_storage: 0,
+            manually_managed: false, pending_filter_frame: 0, allocated: false,
+        });
+        reg.set_prover(prover(address.clone(), vec![alloc(root.clone(), ProverStatus::Joining, 50)]));
+        let mut status_counts = HashMap::new();
+        status_counts.insert(ProverStatus::Joining, 1);
+        reg.set_summaries(vec![ProverShardSummary { filter: root.clone(), status_counts, total_size: 5 }]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(800);
+
+        let evaluate = || lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(count_confirms(&evaluate()).contains(&root), "a live root's join is confirmed");
+
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+        let mut grid = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        grid.extend_from_slice(&app);
+        for bit in [false, true] {
+            let txn = db.new_batch(false).unwrap();
+            shards.put_app_shard(txn.as_ref(), &ShardInfo {
+                shard_key: grid.clone(), prefix: quil_forest::bit_path_to_prefix(&[bit]),
+                size: vec![], data_shards: 0, commitment: vec![],
+            }).unwrap();
+            txn.commit().unwrap();
+        }
+        lifecycle.set_shards_store(shards);
+        lifecycle.set_remote_shard_sizes(HashMap::from([(root.clone(), 64u64)]));
+        let actions = evaluate();
+        assert!(count_confirms(&actions).contains(&root), "{actions:?}");
+        assert!(!count_reject_filters(&actions).contains(&root), "{actions:?}");
     }
 
     // Every joiner of a halt-risk shard confirms regardless of score, though
