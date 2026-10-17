@@ -2048,11 +2048,16 @@ impl ProverRegistryTrait for SharedProverRegistry {
                 reward_rings.insert(filter.clone(), estimate);
             }
             // Clone addresses, not complete peer records and cryptographic keys.
-            let active = guard.get_provers_by_status(&filter, ProverStatus::Active)
-                .into_iter().map(|p| p.address.clone()).collect();
-            let leaving = guard.get_provers_by_status(&filter, ProverStatus::Leaving)
-                .into_iter().map(|p| p.address.clone()).collect();
-            members.insert(filter, LifecycleMembers { active, leaving });
+            let mut shard = LifecycleMembers::default();
+            for status in [ProverStatus::Active, ProverStatus::Leaving] {
+                for p in guard.get_provers_by_status(&filter, status) {
+                    if let Some(alloc) = p.allocations.iter().find(|a| a.confirmation_filter == filter && a.status == status) {
+                        shard.add(p.address.clone(), alloc, frame);
+                    }
+                }
+            }
+            shard.sort();
+            members.insert(filter, shard);
         }
         Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
     }

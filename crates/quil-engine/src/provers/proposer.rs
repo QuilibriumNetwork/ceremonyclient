@@ -890,15 +890,17 @@ pub fn halt_risk_swap_demand(unallocated_shards: &[ShardDescriptor], free_worker
         .saturating_sub(free_workers)
 }
 
-/// Whether `me` is one of the leaving provers `filter` can release while
-/// keeping `HALT_RISK_PROVER_COUNT + 1` members. The chain counts a leaving
-/// prover until it departs, so its floor does not stop every leaver of a
-/// shard confirming in the same epoch. Every node orders the leavers the
-/// same way, by `sha256(address ‖ filter)`, and only the first `spare`
-/// depart.
-pub fn chosen_to_depart(me: &[u8], filter: &[u8], active: usize, leaving: &[Vec<u8>]) -> bool {
+/// Whether `me` is one of the undecided `leaving` provers `filter` can
+/// release while keeping `HALT_RISK_PROVER_COUNT + 1` members, given the
+/// `staying` members it keeps after the boundary regardless
+/// ([`quil_types::consensus::LifecycleMembers::staying`]: confirmed leavers
+/// are in neither). The chain counts a leaving prover until it departs, so
+/// its floor does not stop every leaver of a shard confirming in the same
+/// epoch. Every node orders the leavers the same way, by
+/// `sha256(address ‖ filter)`, and only the first `spare` depart.
+pub fn chosen_to_depart(me: &[u8], filter: &[u8], staying: usize, leaving: &[Vec<u8>]) -> bool {
     use sha2::Digest;
-    let spare = (active + leaving.len()).saturating_sub(HALT_RISK_PROVER_COUNT as usize + 1);
+    let spare = (staying + leaving.len()).saturating_sub(HALT_RISK_PROVER_COUNT as usize + 1);
     let mut order: Vec<([u8; 32], &Vec<u8>)> = leaving
         .iter()
         .map(|address| (sha2::Sha256::digest([address.as_slice(), filter].concat()).into(), address))
