@@ -60,6 +60,11 @@ pub struct ShardDescriptor {
     /// `active ≤ 3 && size > 0` were invisible to the halt-risk
     /// bucket because joiners pushed `active+joining` above 3).
     pub active_count: u64,
+    /// Confirmed joins that become members at the next epoch boundary. Unlike
+    /// a pending join, one cannot lapse or be withheld, so the shard counts it
+    /// as covered when deciding whether its pending joins bypass the score
+    /// threshold. Zero where not computed.
+    pub activating_count: u64,
 }
 
 /// Provers-per-shard ceiling that classifies a shard as halt-risk.
@@ -630,9 +635,12 @@ pub fn decide_joins(
                 // any agreed order of who goes first is one a malicious
                 // joiner can grind its address into and then never confirm.
                 // `halt_risk_unstaffed` keeps the joins themselves to need.
+                // Confirmed joins count: they become members at the boundary
+                // and cannot be withheld, so a shard they lift above the
+                // threshold is no longer at halt risk.
                 let halt_risk = desc_by_hex
                     .get(&key)
-                    .is_some_and(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT);
+                    .is_some_and(|d| d.size > 0 && d.active_count + d.activating_count <= HALT_RISK_PROVER_COUNT);
 
                 if halt_risk || *score >= threshold {
                     confirm.push(p.clone());
@@ -1193,8 +1201,8 @@ mod tests {
     #[test]
     fn score_data_greedy_by_size() {
         let shards = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
-            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16, activating_count: 0 },
+            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16, activating_count: 0 },
         ];
         let scores = score_shards(
             &shards,
@@ -1228,7 +1236,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-            active_count: 16,        };
+            active_count: 16,
+            activating_count: 0,        };
         let small_low_ring = ShardDescriptor {
             filter: vec![0xBB],
             size: 10_000,
@@ -1236,7 +1245,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-            active_count: 16,        };
+            active_count: 16,
+            activating_count: 0,        };
         let shards = vec![big_high_ring, small_low_ring];
         let basis = BigInt::from(1u64) << 50;
         let world_bytes = BigInt::from(1u64) << 30;
@@ -1280,7 +1290,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-            active_count: 16,        };
+            active_count: 16,
+            activating_count: 0,        };
         let small = ShardDescriptor {
             filter: vec![0xBB],
             size: 10_000,
@@ -1288,7 +1299,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-            active_count: 16,        };
+            active_count: 16,
+            activating_count: 0,        };
         let shards = vec![big, small];
         let basis = BigInt::from(1u64) << 50;
         let world_bytes = BigInt::from(1u64) << 30;
@@ -1326,7 +1338,7 @@ mod tests {
     #[test]
     fn plan_leaves_empty_when_no_unallocated() {
         let allocated = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16, activating_count: 0 },
         ];
         let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0, &std::collections::HashSet::<Vec<u8>>::new());
         assert!(result.is_empty());
@@ -1344,6 +1356,7 @@ mod tests {
             active_on_ring: 1,
             total_active_joining: 16,
             active_count: 16,
+            activating_count: 0,
         }
     }
 
@@ -1375,7 +1388,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 8,
-            active_count: 8,        };
+            active_count: 8,
+            activating_count: 0,        };
         let halt_risk = ShardDescriptor {
             filter: vec![2],
             size: 1_000_000,
@@ -1383,7 +1397,8 @@ mod tests {
             shards: 1,
             active_on_ring: 4,
             total_active_joining: 3,
-            active_count: 3,        };
+            active_count: 3,
+            activating_count: 0,        };
         let result = plan_and_allocate(
             &[healthy, halt_risk],
             50_000,
@@ -1410,7 +1425,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 8,
-            active_count: 8,        };
+            active_count: 8,
+            activating_count: 0,        };
         let halt_a = ShardDescriptor {
             filter: vec![1],
             size: 500_000,
@@ -1418,7 +1434,8 @@ mod tests {
             shards: 1,
             active_on_ring: 2,
             total_active_joining: 1,
-            active_count: 1,        };
+            active_count: 1,
+            activating_count: 0,        };
         let halt_b = ShardDescriptor {
             filter: vec![2],
             size: 700_000,
@@ -1426,7 +1443,8 @@ mod tests {
             shards: 1,
             active_on_ring: 3,
             total_active_joining: 2,
-            active_count: 2,        };
+            active_count: 2,
+            activating_count: 0,        };
         let result = plan_and_allocate(
             &[healthy, halt_a, halt_b],
             50_000,
@@ -1460,7 +1478,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 1,
-            active_count: 1,        };
+            active_count: 1,
+            activating_count: 0,        };
         let normal = ShardDescriptor {
             filter: vec![2],
             size: 100_000,
@@ -1468,7 +1487,8 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-            active_count: 16,        };
+            active_count: 16,
+            activating_count: 0,        };
         let result = plan_and_allocate(
             &[zero_halt, normal],
             50_000,
@@ -1522,6 +1542,7 @@ mod tests {
                     active_on_ring: 0,
                     total_active_joining: 0,
                     active_count: 0,
+                    activating_count: 0,
                 }
             })
             .collect();
@@ -1731,6 +1752,7 @@ mod tests {
             .map(|b| ShardDescriptor {
                 total_active_joining: 0,
                 active_count: 0,
+                activating_count: 0,
                 ..make_shard(vec![b], 100_000 * b as u64, 0, 1)
             })
             .chain([make_shard(vec![0x10], 10_000_000, 1, 1)])
@@ -1764,6 +1786,7 @@ mod tests {
             active_on_ring: 1,
             total_active_joining: total,
             active_count: active,
+            activating_count: 0,
         };
         let healthy = shard(0xBB, 10_000_000, 8, 8);
         let pick = |candidate: ShardDescriptor| {
@@ -1805,6 +1828,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk (≤ HALT_RISK_PROVER_COUNT)
                 active_count: 2,
+                activating_count: 0,
             },
             ShardDescriptor {
                 filter: vec![0xBB],
@@ -1813,7 +1837,8 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 16,
-                active_count: 16,            },
+                active_count: 16,
+                activating_count: 0,            },
         ];
         let pending = vec![vec![0xAA]];
         let (reject, confirm) = decide_joins(
@@ -1823,6 +1848,24 @@ mod tests {
         assert!(reject.is_empty(),
             "halt-risk pending should bypass the 67% threshold; got reject={reject:?}");
         assert_eq!(confirm, vec![vec![0xAA]]);
+    }
+
+    /// Confirmed joins staff a shard: once its Active members and confirmed
+    /// joins exceed the halt-risk count, a pending join there is judged by
+    /// score like any other, while one confirmed join that leaves the shard
+    /// at the count keeps the bypass.
+    #[test]
+    fn decide_joins_counts_confirmed_joins_against_the_halt_risk_bypass() {
+        let shards = |activating_count| vec![
+            ShardDescriptor { filter: vec![0xAA], size: 5_000, ring: 0, shards: 1, active_on_ring: 1,
+                total_active_joining: 2 + activating_count, active_count: 2, activating_count },
+            ShardDescriptor { filter: vec![0xBB], size: 500_000, ring: 0, shards: 1, active_on_ring: 1,
+                total_active_joining: 16, active_count: 16, activating_count: 0 },
+        ];
+        let decide = |activating_count| decide_joins(&shards(activating_count), &[vec![0xAA]], 50000,
+            &BigInt::from(600_000), DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX);
+        assert_eq!(decide(1), (Vec::new(), vec![vec![0xAA]]), "two Active and one confirmed join: still halt risk");
+        assert_eq!(decide(2), (vec![vec![0xAA]], Vec::new()), "four members at the boundary: judged by score");
     }
 
     /// Halt-risk bypass requires size > 0 — a halt-risk-by-prover-count
@@ -1839,6 +1882,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2, // halt-risk by count
                 active_count: 2,
+                activating_count: 0,
             },
             ShardDescriptor {
                 filter: vec![0xBB],
@@ -1847,7 +1891,8 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 16,
-                active_count: 16,            },
+                active_count: 16,
+                activating_count: 0,            },
         ];
         let pending = vec![vec![0xAA]];
         let (reject, confirm) = decide_joins(
@@ -1866,7 +1911,7 @@ mod tests {
     fn swap_demand_counts_only_halt_risk_shards_their_joins_leave_short() {
         let shard = |filter: u8, active: u64, total: u64| ShardDescriptor {
             filter: vec![filter], size: 1_000, ring: 0, shards: 1, active_on_ring: 1,
-            total_active_joining: total, active_count: active,
+            total_active_joining: total, active_count: active, activating_count: 0,
         };
         let short = shard(0xB0, 1, 2);
         let staffed = shard(0xB1, 1, 40);
@@ -1903,7 +1948,8 @@ mod tests {
         let unallocated = vec![
             make_shard(vec![0xB1], 500_000, 0, 1),
             ShardDescriptor {
-                active_count: 2, total_active_joining: 2,
+                active_count: 2,
+                activating_count: 0, total_active_joining: 2,
                 ..make_shard(vec![0xB2], 90_000, 0, 1)
             },
         ];
@@ -1921,9 +1967,9 @@ mod tests {
     fn paired_leaves_use_the_allocators_per_node_spread() {
         let allocated = vec![make_shard(vec![0xA1], 50_000, 0, 1)];
         let unallocated = vec![
-            ShardDescriptor { active_count: 2, total_active_joining: 2,
+            ShardDescriptor { active_count: 2, activating_count: 0, total_active_joining: 2,
                 ..make_shard(vec![0xB1], 90_000, 0, 1) },
-            ShardDescriptor { active_count: 2, total_active_joining: 2,
+            ShardDescriptor { active_count: 2, activating_count: 0, total_active_joining: 2,
                 ..make_shard(vec![0xB2], 200_000, 0, 1) },
         ];
         let mut outcomes = std::collections::HashSet::new();
@@ -1988,7 +2034,7 @@ mod tests {
             make_shard(vec![0xB1], 500_000, 0, 1),
             ShardDescriptor {
                 filter: vec![0xB2], size: 90_000, ring: 0, shards: 1,
-                active_on_ring: 1, total_active_joining: 2, active_count: 2,
+                active_on_ring: 1, total_active_joining: 2, active_count: 2, activating_count: 0,
             },
         ];
         let replacements = plan_score_replacements(
@@ -2111,6 +2157,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk
                 active_count: 2,
+                activating_count: 0,
             },
         ];
         let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
@@ -2139,6 +2186,7 @@ mod tests {
             // it halt-risk.
             total_active_joining: HALT_RISK_PROVER_COUNT + 1,
             active_count: HALT_RISK_PROVER_COUNT + 1,
+            activating_count: 0,
         }];
         let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
         let filters = plan_leaves(
@@ -2171,6 +2219,7 @@ mod tests {
             active_on_ring: 1,
             total_active_joining: 2,
             active_count: 2,
+            activating_count: 0,
         }];
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
@@ -2201,6 +2250,7 @@ mod tests {
             active_on_ring: 1,
             total_active_joining: 2,
             active_count: 2,
+            activating_count: 0,
         }];
         let plan = |releasable: &dyn Fn(&[u8]) -> bool| plan_leaves_releasing(
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
@@ -2241,6 +2291,7 @@ mod tests {
             active_on_ring: 1,
             total_active_joining: 2,
             active_count: 2,
+            activating_count: 0,
         }];
         // 1 free worker covers the 1 waiting halt-risk shard.
         let filters = plan_leaves(
@@ -2272,6 +2323,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2,
                 active_count: 2,
+                activating_count: 0,
             },
             // Non-halt-risk, low-scoring active — leave candidate.
             make_shard(vec![0xA2], 30_000, 4, 1),
@@ -2303,6 +2355,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2, // halt-risk: protected
                 active_count: 2,
+                activating_count: 0,
             },
             make_shard(vec![0xBB], 30_000, 4, 1), // non-halt-risk, low score
         ];
@@ -2403,6 +2456,7 @@ mod tests {
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk
                 active_count: 2,
+                activating_count: 0,
             },
             make_shard(vec![0xBB], 500_000, 0, 1),
         ];
@@ -2450,7 +2504,7 @@ mod reward_arithmetic_tests {
         for (shards, expected) in [(1, 100), (2, 70), (3, 57), (5, 44), (7, 37)] {
             let shard = ShardDescriptor {
                 filter: vec![1], size: 100, ring: 0, shards,
-                active_on_ring: 8, total_active_joining: 8, active_count: 8,
+                active_on_ring: 8, total_active_joining: 8, active_count: 8, activating_count: 0,
             };
             let scored = score_shards(&[shard], &1600.into(), &100.into(), Strategy::RewardGreedy);
             assert_eq!(scored[0].score, BigInt::from(expected));
@@ -2458,7 +2512,7 @@ mod reward_arithmetic_tests {
         }
         let shard = ShardDescriptor {
             filter: vec![1], size: 1, ring: 0, shards: 2,
-            active_on_ring: 8, total_active_joining: 8, active_count: 8,
+            active_on_ring: 8, total_active_joining: 8, active_count: 8, activating_count: 0,
         };
         assert_eq!(score_shards(&[shard], &229.into(), &10.into(), Strategy::RewardGreedy)[0].score, BigInt::from(1));
     }

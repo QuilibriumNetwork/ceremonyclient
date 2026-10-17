@@ -2094,6 +2094,9 @@ impl ProverLifecycle {
                     decide_candidates.push(d.clone());
                 }
             }
+            for d in &mut decide_candidates {
+                d.activating_count = membership.get(&d.filter).map_or(0, |m| m.activating.len() as u64);
+            }
             let (auto_reject, auto_confirm) = proposer::decide_joins(
                 &decide_candidates,
                 &auto_ready,
@@ -2961,6 +2964,7 @@ fn build_proposal_descriptors(
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
             active_count: active as u64,
+            activating_count: 0,
         });
         seen.insert(s.filter.clone());
     }
@@ -3002,6 +3006,7 @@ fn build_proposal_descriptors(
             // bucket-by-halt-risk pass picks these first.
             total_active_joining: 0,
             active_count: 0,
+            activating_count: 0,
         });
     }
     out
@@ -3042,6 +3047,7 @@ fn build_decide_descriptors(
             active_on_ring: ri.active_on_current_ring,
             total_active_joining: total as u64,
             active_count: active as u64,
+            activating_count: 0,
         })
     }).collect()
 }
@@ -3858,7 +3864,7 @@ mod proposal_loop_tests {
             status_counts: HashMap::from([(ProverStatus::Active, 3),
                 (ProverStatus::Joining, 20), (ProverStatus::Leaving, 7)]) };
         let descriptor = ShardDescriptor { filter, size: 1000, ring: 0, shards: 2,
-            active_on_ring: 3, total_active_joining: 23, active_count: 3 };
+            active_on_ring: 3, total_active_joining: 23, active_count: 3, activating_count: 0 };
         let evidence = priority_evidence(&descriptor, Some(&summary), Some(&allocation),
             frame, 10, &30.into(), None);
         assert_eq!(evidence.active, 3);
