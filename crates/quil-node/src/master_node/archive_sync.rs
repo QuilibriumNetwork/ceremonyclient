@@ -1497,6 +1497,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     );
                     return;
                 }
+                // Frames the poller fetches never pass the gossip receive
+                // path, so match own operations here too.
+                quil_engine::own_prover_ops::tracker().observe_frame(frame_num, &frame.requests);
                 cf_for_poller.observe(frame_num);
                 lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
 
