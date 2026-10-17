@@ -8,7 +8,7 @@ use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAll
 
 use super::epoch::{
     action_hints, compute_effective_status, confirmed_phase, epoch_for_frame, epoch_len, AllocationTiming,
-    ThresholdUnit,
+    ThresholdClock, ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
 
@@ -91,14 +91,15 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             confirmed_phase(&t, eff, epoch_length).map_or(eff.label(), |(name, _)| name)
         );
 
-        // Same vocabulary as the `manage` TUI's Next/Default Action columns.
+        // Same vocabulary as the `manage` TUI's Next/Default Action columns:
+        // frames left from the received frame, without a time estimate.
         let (next, default) = action_hints(&t, eff, epoch_length, current_frame, next_boundary);
         if !next.is_empty() || !default.is_empty() {
-            let unit = ThresholdUnit::Frames;
+            let (unit, clock) = (ThresholdUnit::Relative, ThresholdClock { frame: current_frame, seconds_per_frame: None });
             println!(
                 "      Next Action: {}  Default Action: {}",
-                next.render(unit, epoch_length),
-                default.render(unit, epoch_length)
+                next.render(unit, clock),
+                default.render(unit, clock)
             );
         }
 

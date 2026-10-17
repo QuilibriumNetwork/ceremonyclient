@@ -13,7 +13,7 @@ use quil_types::proto::node::{
 
 use super::super::epoch::{
     action_hints, compute_effective_status, confirmed_phase, epoch_len, ActionHint, AllocationTiming, ConfirmWindow,
-    EffectiveStatus, ThresholdUnit, WindowState,
+    EffectiveStatus, ThresholdClock, ThresholdUnit, WindowState,
 };
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
@@ -43,6 +43,9 @@ pub const AVAIL_PROVER_PHASES_COL: usize = 12;
 pub const HALT_RISK_PROVER_COUNT: u32 = 3;
 
 pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
+/// The Global KPI's fields, in printed order; picker names, and the expanded
+/// labels the KPI prints.
+pub const GLOBAL_FIELD_NAMES: &[&str] = &["  frame", "  epoch", "  next boundary"];
 pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): 10s/frame"];
 
 pub const TOP_KPI_NAMES: &[&str] = &["Peer ID", "Strategy", "Seniority", "Global", "Global interval", "World size", "RPC"];
@@ -111,7 +114,8 @@ pub const ALLOC_REWARD_WIDTH: usize = 12;
 pub const WORKER_WIDTH: usize = 7;
 pub const STATUS_WIDTH: usize = 12;
 pub const MODE_WIDTH: usize = 4;
-// Widest values: `(reject|confirm)@f<8 digits>` and `activate@f<8 digits>`.
+// Widest absolute values: `(reject|confirm)@f<8 digits>` and `activate@f<8 digits>`;
+// the fixed layout grows them for expanded relative estimates.
 pub const NEXT_ACTION_WIDTH: usize = 26;
 pub const DEFAULT_ACTION_WIDTH: usize = 18;
 
@@ -309,6 +313,8 @@ pub struct Model {
     pub reward_windows: u8,
     pub interval_windows: u8,
     pub global_interval_windows: u8,
+    /// Bit mask of the shown [`GLOBAL_FIELD_NAMES`].
+    pub global_fields: u8,
     pub global_last_advance: Option<std::time::Instant>,
     /// Disruptive command and exact selected allocation identities/statuses.
     pub operation_confirmation: Option<(char, Vec<(String, u32, i64, bool)>)>,
@@ -500,6 +506,7 @@ impl Model {
             reward_windows: 7,
             interval_windows: 3,
             global_interval_windows: 3,
+            global_fields: 7,
             compact_units: true,
             refresh_seconds: 15,
             alloc_sort_col: 11, // Worker column
@@ -551,6 +558,19 @@ impl Model {
     }
     pub fn interval_mask(&self) -> u8 { let mask = self.interval_windows & 3; if mask == 0 { 1 } else { mask } }
     pub fn global_interval_mask(&self) -> u8 { let mask = self.global_interval_windows & 3; if mask == 0 { 1 } else { mask } }
+    pub fn global_field_mask(&self) -> u8 { let mask = self.global_fields & 7; if mask == 0 { 1 } else { mask } }
+    /// Measured mean seconds per received GLOBAL frame: the 60m window when it
+    /// has advances, else the 24h one; `None` without a fresh measurement.
+    pub fn global_seconds_per_frame(&self) -> Option<f64> {
+        let cadence = self.node_global_cadence.as_ref()?;
+        [false, true].into_iter().find_map(|day| self.cadence_window(cadence, day)
+            .filter(|w| w.advanced_frames > 0).map(|w| w.observed_seconds as f64 / w.advanced_frames as f64))
+    }
+    /// What Next/Default Action thresholds count from; expanded mode adds the
+    /// `~` time estimate.
+    pub fn threshold_clock(&self) -> ThresholdClock {
+        ThresholdClock { frame: self.epoch_frame(), seconds_per_frame: if self.compact_actions { None } else { self.global_seconds_per_frame() } }
+    }
     pub fn global_interval_labels(&self) -> String {
         ["60m", "24h"].iter().enumerate().filter(|(i, _)| self.global_interval_mask() & (1 << i) != 0).map(|(_, label)| *label).collect::<Vec<_>>().join("/")
     }
@@ -950,8 +970,8 @@ impl Model {
         }
         let asc = self.alloc_sort_asc;
         let sel = &self.alloc_selected;
-        let unit = self.threshold_unit;
-        let el = self.epoch_length;
+        // Thresholds sort by verb, then frame, whichever way they are displayed.
+        let hint_order = |a: &ActionHint, b: &ActionHint| a.label.cmp(&b.label).then(a.at_frame.cmp(&b.at_frame));
         rows.sort_by(|a, b| {
             let ord = match col {
                 0 => sel.contains(&a.filter_key).cmp(&sel.contains(&b.filter_key)),
@@ -970,14 +990,8 @@ impl Model {
                 17 => prover_phase_order(a.prover_counts.as_ref()).cmp(&prover_phase_order(b.prover_counts.as_ref())),
                 11 => a.worker_id.cmp(&b.worker_id), 12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
-                14 => a
-                    .next_action
-                    .render(unit, el)
-                    .cmp(&b.next_action.render(unit, el)),
-                15 => a
-                    .default_action
-                    .render(unit, el)
-                    .cmp(&b.default_action.render(unit, el)),
+                14 => hint_order(&a.next_action, &b.next_action),
+                15 => hint_order(&a.default_action, &b.default_action),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc {
@@ -1190,8 +1204,25 @@ impl Model {
     pub fn visibility_column_index(&self, index: usize) -> Option<usize> {
         self.picker_column(index).filter(|(_, child)| *child == 0).map(|(col, _)| col)
     }
+    /// The top-header picker row `index` as its KPI and child number; child 0
+    /// is the KPI itself.
+    pub fn top_picker_item(index: usize) -> Option<(&'static str, usize)> {
+        let mut row = 0;
+        for &name in TOP_KPI_NAMES {
+            let children = top_kpi_children(name).len();
+            if index <= row + children { return Some((name, index - row)); }
+            row += children + 1;
+        }
+        None
+    }
+    /// The Global KPI field at top-header picker row `index`.
+    pub fn visibility_global_field(&self, section: usize, index: usize) -> Option<usize> {
+        match Self::top_picker_item(index) { Some(("Global", child)) if section == 1 && child > 0 => Some(child - 1), _ => None }
+    }
     pub fn visibility_interval_window(&self, section: usize, index: usize) -> Option<(bool, usize)> {
-        if section == 1 && (5..7).contains(&index) { return Some((true, index - 5)); }
+        if section == 1 {
+            return match Self::top_picker_item(index) { Some(("Global interval", child)) if child > 0 => Some((true, child - 1)), _ => None };
+        }
         if section == 0 {
             let (col, child) = self.picker_column(index)?;
             if col == (if self.focus.is_alloc() { 16 } else { 11 }) && child > 0 { return Some((false, child - 1)); }
@@ -1312,7 +1343,7 @@ impl Model {
         match section {
             4 => NOTICE_KPI_NAMES.to_vec(),
             3 => AVAIL_KPI_NAMES.to_vec(),
-            1 => TOP_KPI_NAMES.iter().flat_map(|&name| if name == "Global interval" { vec![name, INTERVAL_WINDOW_NAMES[0], INTERVAL_WINDOW_NAMES[1]] } else { vec![name] }).collect(),
+            1 => TOP_KPI_NAMES.iter().flat_map(|&name| std::iter::once(name).chain(top_kpi_children(name).iter().copied())).collect(),
             2 => ALLOC_KPI_NAMES.iter().flat_map(|&name| if name == "Reward" { std::iter::once(name).chain(REWARD_ESTIMATE_NAMES.iter().copied()).collect::<Vec<_>>() } else { vec![name] }).collect(),
             _ => {
                 let names = if self.focus.is_alloc() { &ALLOC_COL_NAMES[..] } else { &AVAIL_COL_NAMES[..] };
@@ -1328,12 +1359,22 @@ impl Model {
 
     pub fn visibility_item_visible_in(&self, section: usize, index: usize) -> bool {
         if let Some((global, window)) = self.visibility_interval_window(section, index) { (if global { self.global_interval_mask() } else { self.interval_mask() }) & (1 << window) != 0 }
+        else if let Some(field) = self.visibility_global_field(section, index) { self.global_field_mask() & (1 << field) != 0 }
         else if let Some(window) = self.visibility_reward_window(section, index) { self.reward_mask() & (1 << window) != 0 }
         else if section == 0 { self.visibility_column_index(index).is_some_and(|col| self.column_visible(col)) }
         else { self.visibility_names_for(section).get(index).is_some_and(|name| self.header_kpi_visible(name)) }
     }
 
 
+}
+
+/// The picker sub-items nested beneath a top-header KPI.
+fn top_kpi_children(name: &str) -> &'static [&'static str] {
+    match name {
+        "Global" => GLOBAL_FIELD_NAMES,
+        "Global interval" => INTERVAL_WINDOW_NAMES,
+        _ => &[],
+    }
 }
 
 // ── Row value accessors (for filtering + sorting) ────────────────────────
@@ -1458,11 +1499,12 @@ mod readability_tests {
         let eff = compute_effective_status(&t, current_frame, EL);
         let next_boundary = (current_frame / EL + 1) * EL;
         let (n, d) = action_hints(&t, eff, EL, current_frame, next_boundary);
-        (n.render(unit, EL), d.render(unit, EL))
+        let clock = ThresholdClock { frame: current_frame, seconds_per_frame: None };
+        (n.render(unit, clock), d.render(unit, clock))
     }
 
     fn hints(a: &ShardAllocationInfo, current_frame: u64) -> (String, String) {
-        hints_in(a, current_frame, ThresholdUnit::Frames)
+        hints_in(a, current_frame, ThresholdUnit::Absolute)
     }
 
     #[test]
@@ -1489,16 +1531,17 @@ mod readability_tests {
         let mut a = alloc(raw_status::JOINING);
         a.join_frame_number = 1117 * EL + 10;
         assert_eq!(
-            hints_in(&a, 1117 * EL + 100, ThresholdUnit::Epochs),
+            hints_in(&a, 1117 * EL + 100, ThresholdUnit::Relative),
             (
-                "(reject|confirm)@e1118".to_string(),
-                "expire@e1119".to_string()
+                "(reject|confirm) in 620f".to_string(),
+                "expire in 1340f".to_string()
             )
         );
         // An unbounded hint is unit-independent.
         let free = ActionHint::text("(pause|leave)");
-        assert_eq!(free.render(ThresholdUnit::Epochs, EL), "(pause|leave)");
-        assert_eq!(free.render(ThresholdUnit::Frames, EL), "(pause|leave)");
+        let clock = ThresholdClock { frame: 1117 * EL, seconds_per_frame: Some(10.0) };
+        assert_eq!(free.render(ThresholdUnit::Relative, clock), "(pause|leave)");
+        assert_eq!(free.render(ThresholdUnit::Absolute, clock), "(pause|leave)");
     }
 
     #[test]
