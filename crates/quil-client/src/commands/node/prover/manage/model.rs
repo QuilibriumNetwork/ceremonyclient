@@ -8,7 +8,7 @@ use super::super::local_execution::{execution_label, local_execution_state, stat
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, WorkerInfoResponse,
+    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardProverCounts, WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -18,16 +18,29 @@ use super::super::epoch::{
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
-pub const ALLOC_COL_NAMES: [&str; 17] = [
+pub const ALLOC_COL_NAMES: [&str; 18] = [
     "Select", "Filter", "Provers", "Ring", "Size [GB]", "Shards", "LocalMat", "PeerHead", "GlobalHead", "Execution",
-    "Reward [~Q/d]", "Worker", "Status", "Mode", "NextAction", "DefaultAction", "Interval [s]",
+    "Reward [~Q/d]", "Worker", "Status", "Mode", "NextAction", "DefaultAction", "Interval [s]", "ProverPhases",
 ];
-pub const AVAIL_COL_NAMES: [&str; 12] =
-    ["Select", "Filter", "Provers", "Ring", "Size [GB]", "Shards", "PeerMat", "PeerHead", "GlobalHead", "PeerState", "Reward [~Q/d]", "Interval [s]"];
+pub const AVAIL_COL_NAMES: [&str; 13] = ["Select", "Filter", "Provers", "Ring", "Size [GB]", "Shards", "PeerMat", "PeerHead",
+    "GlobalHead", "PeerState", "Reward [~Q/d]", "Interval [s]", "ProverPhases"];
 
-// Keep the new measurement beside its committed source without renumbering action columns.
-pub const ALLOC_DISPLAY_COLS: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
-pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 9, 10];
+// Keep the new measurement beside its committed source without renumbering action columns,
+// and ProverPhases beside the Provers count it breaks down.
+pub const ALLOC_DISPLAY_COLS: &[usize] = &[0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
+pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 11, 9, 10];
+
+/// The optional ProverPhases column in each panel; one visibility setting,
+/// keyed by the allocations index, covers both. Hidden until the picker
+/// enables it.
+pub const ALLOC_PROVER_PHASES_COL: usize = 17;
+pub const AVAIL_PROVER_PHASES_COL: usize = 12;
+
+/// Provers-per-shard ceiling at or under which a shard holding data is at
+/// halt risk: losing one prover risks its quorum. Mirrors quil-engine's
+/// `provers::proposer::HALT_RISK_PROVER_COUNT`, which the client cannot
+/// import.
+pub const HALT_RISK_PROVER_COUNT: u32 = 3;
 
 pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): 10s/frame"];
@@ -102,7 +115,8 @@ pub const MODE_WIDTH: usize = 4;
 pub const NEXT_ACTION_WIDTH: usize = 26;
 pub const DEFAULT_ACTION_WIDTH: usize = 18;
 
-// 16 spaces between 17 columns, 2 external borders, 1-char sort arrow.
+// 16 spaces between 17 columns, 2 external borders, 1-char sort arrow;
+// the optional ProverPhases column adds its own width when shown.
 pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + PROVERS_WIDTH
     + RING_WIDTH
@@ -117,7 +131,8 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + 16 + 12
     + 2
     + 1;
-// 11 spaces between 12 columns, 2 external borders, 1-char sort arrow.
+// 11 spaces between 12 columns, 2 external borders, 1-char sort arrow;
+// ProverPhases likewise.
 pub const AVAIL_FIXED_WIDTH: usize =
     SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + HEAD_WIDTH + GLOBAL_HEAD_WIDTH + STATE_WIDTH + REWARD_WIDTH + 11 + 12 + 2 + 1;
 
@@ -142,6 +157,9 @@ pub struct AllocationRow {
     pub status_name: String,
     pub ring: u32,
     pub active_provers: u32,
+    /// The shard's provers by lifecycle phase; `None` when the node did not
+    /// report them (older server, or no shard-info row).
+    pub prover_counts: Option<ShardProverCounts>,
     pub shard_size: BigInt,
     pub data_shards: u64,
     pub materialized_frame: u64,
@@ -202,6 +220,8 @@ pub struct ShardRow {
     pub filter_key: String,
     pub filter_hex: String,
     pub active_provers: u32,
+    /// As [`AllocationRow::prover_counts`].
+    pub prover_counts: Option<ShardProverCounts>,
     pub ring: u32,
     pub shard_size: BigInt,
     pub data_shards: u64,
@@ -476,6 +496,7 @@ impl Model {
             compact_actions: true,
             alloc_column_order: ALLOC_DISPLAY_COLS.to_vec(),
             avail_column_order: AVAIL_DISPLAY_COLS.to_vec(),
+            hidden_columns: [ALLOC_PROVER_PHASES_COL].into_iter().collect(),
             reward_windows: 7,
             interval_windows: 3,
             global_interval_windows: 3,
@@ -733,6 +754,7 @@ impl Model {
                 status_name,
                 ring: UNKNOWN_REWARD_RING,
                 active_provers: 0,
+                prover_counts: None,
                 shard_size: BigInt::from(0),
                 data_shards: 0,
                 materialized_frame: 0,
@@ -756,6 +778,7 @@ impl Model {
                 row.ring = reward_ring(info);
                 row.allocation_reason = info.allocation_reason.clone();
                 row.active_provers = info.active_provers;
+                row.prover_counts = info.prover_counts.clone();
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
@@ -788,6 +811,7 @@ impl Model {
                         status_name: if idle { "idle" } else { "bound" }.to_string(),
                         ring: UNKNOWN_REWARD_RING,
                         active_provers: 0,
+                        prover_counts: None,
                         shard_size: BigInt::from(0),
                         data_shards: 0,
                         materialized_frame: 0,
@@ -823,6 +847,7 @@ impl Model {
                     filter_key: filter_hex.clone(),
                     filter_hex,
                     active_provers: s.active_provers,
+                    prover_counts: s.prover_counts.clone(),
                     ring: reward_ring(s),
                     shard_size: BigInt::from_bytes_be(Sign::Plus, &s.shard_size),
                     data_shards: s.data_shards,
@@ -941,6 +966,8 @@ impl Model {
                 9 => self.allocation_execution_state(a).cmp(self.allocation_execution_state(b)),
                 10 => self.daily_reward(&a.estimated_reward, &a.filter, self.reward_mask().trailing_zeros() as usize).cmp(&self.daily_reward(&b.estimated_reward, &b.filter, self.reward_mask().trailing_zeros() as usize)),
                 16 => self.app_interval(&a.filter).partial_cmp(&self.app_interval(&b.filter)).unwrap_or(std::cmp::Ordering::Equal),
+                // ALLOC_PROVER_PHASES_COL; the sort column is an i32.
+                17 => prover_phase_order(a.prover_counts.as_ref()).cmp(&prover_phase_order(b.prover_counts.as_ref())),
                 11 => a.worker_id.cmp(&b.worker_id), 12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
                 14 => a
@@ -984,6 +1011,8 @@ impl Model {
                 9 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
                 10 => self.daily_reward(&a.estimated_reward, &a.filter, self.reward_mask().trailing_zeros() as usize).cmp(&self.daily_reward(&b.estimated_reward, &b.filter, self.reward_mask().trailing_zeros() as usize)),
                 11 => self.app_interval(&a.filter).partial_cmp(&self.app_interval(&b.filter)).unwrap_or(std::cmp::Ordering::Equal),
+                // AVAIL_PROVER_PHASES_COL; the sort column is an i32.
+                12 => prover_phase_order(a.prover_counts.as_ref()).cmp(&prover_phase_order(b.prover_counts.as_ref())),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc {
@@ -1128,7 +1157,7 @@ impl Model {
     }
 
     pub fn column_visibility_key(&self, col: usize) -> usize {
-        if !self.focus.is_alloc() && col == 11 { 16 } else { col }
+        if self.focus.is_alloc() { col } else { avail_visibility_key(col) }
     }
 
     pub fn alloc_column_visible(&self, col: usize) -> bool {
@@ -1136,7 +1165,7 @@ impl Model {
     }
 
     pub fn avail_column_visible(&self, col: usize) -> bool {
-        col < 2 || !self.hidden_columns.contains(&if col == 11 { 16 } else { col })
+        col < 2 || !self.hidden_columns.contains(&avail_visibility_key(col))
     }
 
     pub fn column_visible(&self, col: usize) -> bool {
@@ -1374,6 +1403,35 @@ pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
         (_, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
     }
+}
+
+/// An available-panel column's visibility key: the allocations index of
+/// the same field, so both panels share one setting.
+fn avail_visibility_key(col: usize) -> usize {
+    match col {
+        11 => 16,
+        AVAIL_PROVER_PHASES_COL => ALLOC_PROVER_PHASES_COL,
+        _ => col,
+    }
+}
+
+/// Provers that serve the shard after the next epoch boundary: active ones
+/// and confirmed joins. Departing provers are counted apart and leave at it.
+pub fn serving_after_boundary(counts: &ShardProverCounts) -> u32 {
+    counts.active.saturating_add(counts.activating)
+}
+
+/// Halt risk by count: the shard holds data and at most
+/// [`HALT_RISK_PROVER_COUNT`] of its provers are active or activating.
+/// Unreported counts establish nothing.
+pub fn prover_halt_risk(counts: Option<&ShardProverCounts>, size: &BigInt) -> bool {
+    counts.is_some_and(|c| size.sign() == Sign::Plus && serving_after_boundary(c) <= HALT_RISK_PROVER_COUNT)
+}
+
+/// ProverPhases sorts by the provers serving after the next boundary, then
+/// by active ones; unreported counts sort first ascending.
+fn prover_phase_order(counts: Option<&ShardProverCounts>) -> Option<(u32, u32)> {
+    counts.map(|c| (serving_after_boundary(c), c.active))
 }
 
 #[cfg(test)]
@@ -1633,6 +1691,28 @@ mod tests {
             last_received_frame: 2_160,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn prover_phase_counts_reach_allocation_and_available_rows() {
+        use quil_types::proto::node::{ShardProverCounts, ShardRewardInfo};
+        let counts = ShardProverCounts { joining: 3, activating: 1, active: 12, paused: 0, leaving: 2, departing: 1 };
+        let mut shards = shard_info(vec![0xab], 1);
+        shards.shards[0].prover_counts = Some(counts.clone());
+        shards.shards.push(ShardRewardInfo { ring_known: Some(true), filter: vec![0xcd], prover_counts: Some(counts.clone()), ..Default::default() });
+        // An older server leaves the counts absent.
+        shards.shards.push(ShardRewardInfo { ring_known: Some(true), filter: vec![0xef], active_provers: 4, ..Default::default() });
+        let mut model = Model::new();
+        model.process_refresh_data(Some(node_info(allocation(vec![0xab], 3))), Some(shards), None);
+        assert_eq!(model.allocations.len(), 1);
+        assert_eq!(model.allocations[0].prover_counts, Some(counts.clone()));
+        let available = |filter: u8| model.available.iter().find(|row| row.filter == vec![filter]).unwrap().prover_counts.clone();
+        assert_eq!(available(0xcd), Some(counts));
+        assert_eq!(available(0xef), None, "absent counts are not zero counts");
+        // An allocation without a shard-info row has none either.
+        let mut model = Model::new();
+        model.process_refresh_data(Some(node_info(allocation(vec![0x01], 3))), Some(GetShardInfoResponse::default()), None);
+        assert_eq!(model.allocations[0].prover_counts, None);
     }
 
     #[test]
