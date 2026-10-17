@@ -7216,6 +7216,11 @@ pub(crate) fn accumulator_field(
         return Some(Vec::new());
     }
     let last = materialized_accumulator_digest(outflows, clock_store, filter, frame_number - 1)?;
+    // An empty report is never carried, whatever the window holds: a member
+    // that resumed from a certified floor has no earlier records to read.
+    if last.is_empty() {
+        return Some(Vec::new());
+    }
     // Newest first, stopping at the first difference: that alone decides.
     let mut earlier = Vec::new();
     for back in 2..=accumulator_header::CARRY_WINDOW_FRAMES + 1 {
@@ -7937,6 +7942,12 @@ mod tests {
         let fresh = FrameOutflows::default();
         record_frame_accumulator(&fresh, &clock, &other_filter, 41, &b);
         assert!(accumulator_field(&fresh, &clock, &other_filter, 42).is_none());
+        // An empty previous report is never carried, so its field is known
+        // without the window: a member resumed from a certified floor.
+        let floor_filter = [filter.clone(), vec![0x02]].concat();
+        record_frame_accumulator(&fresh, &clock, &floor_filter, HEARTBEAT_FRAMES + 9, &[]);
+        assert_eq!(accumulator_field(&fresh, &clock, &floor_filter, HEARTBEAT_FRAMES + 10), Some(Vec::new()));
+        assert_eq!(accumulator_field(&fresh, &clock, &floor_filter, 2 * HEARTBEAT_FRAMES + 1), None, "an unknown previous frame stays unknown");
     }
 
     #[test]
