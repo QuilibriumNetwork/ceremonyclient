@@ -408,6 +408,20 @@ message ShardRewardInfo {
   // Recorded local proposal intent; absent on older servers or without history.
   optional string allocation_reason = 14;
   FrameCadence frame_cadence = 15;
+  // The shard's provers by lifecycle phase at frame_number; absent on older
+  // servers.
+  ShardProverCounts prover_counts = 16;
+}
+
+// Provers of a shard by effective lifecycle phase: a confirmed join counts as
+// activating until the next epoch boundary, a confirmed leave as departing.
+message ShardProverCounts {
+  uint32 joining = 1;
+  uint32 activating = 2;
+  uint32 active = 3;
+  uint32 paused = 4;
+  uint32 leaving = 5;
+  uint32 departing = 6;
 }
 
 message GetShardInfoRequest {
