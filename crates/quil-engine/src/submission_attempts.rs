@@ -22,6 +22,16 @@ pub(crate) struct SubmissionAttempt {
 }
 
 impl SubmissionAttempts {
+    /// Whether a local operation still owns `filter` at `frame`: one in
+    /// flight, or a publication of this epoch inside its retry fence.
+    pub(crate) fn owned(&self, filter: &[u8], frame: u64) -> bool {
+        let epoch = quil_types::consensus::epoch_for_frame(frame);
+        self.0.lock().is_ok_and(|attempts| attempts.iter().any(|((e, owned), a)| {
+            owned.as_slice() == filter
+                && (a.in_flight || (*e == epoch && frame.saturating_sub(a.frame) < RETRY_FRAMES))
+        }))
+    }
+
     pub(crate) fn begin(
         self: &Arc<Self>,
         filters: &[Vec<u8>],
@@ -141,6 +151,17 @@ mod tests {
         assert!(attempts.begin(&[vec![1]], 1440).is_none());
         drop(running);
         assert!(attempts.begin(&[vec![1]], 1440).is_some());
+    }
+
+    #[test]
+    fn ownership_covers_running_and_fenced_attempts() {
+        let attempts = Arc::new(SubmissionAttempts::default());
+        let running = attempts.begin(&[vec![1]], 10).unwrap();
+        assert!(attempts.owned(&[1], 2000), "a running attempt owns its filter across epochs");
+        assert!(!attempts.owned(&[2], 10));
+        running.published(20);
+        assert!(attempts.owned(&[1], 49));
+        assert!(!attempts.owned(&[1], 50), "the fence ends ownership");
     }
 
     #[test]
