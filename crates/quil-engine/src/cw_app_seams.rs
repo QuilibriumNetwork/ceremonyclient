@@ -1403,6 +1403,9 @@ pub fn restart_finalization(
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
 /// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
 pub struct AppConsensusCwHandle {
+    /// Declared first so it drops first: the shutdown flag is set before the
+    /// inbound senders close, and the host reports a requested stop.
+    _stop_on_drop: StopOnDrop,
     pub inbound: [tokio::sync::mpsc::UnboundedSender<
         quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
     >; 3],
@@ -1422,6 +1425,16 @@ pub struct AppConsensusCwHandle {
     pub finalized: Arc<std::sync::atomic::AtomicBool>,
     thread: std::thread::JoinHandle<()>,
     outbound_task: tokio::task::JoinHandle<()>,
+}
+
+/// Sets a host's shutdown flag when its handle is dropped without
+/// `shutdown_and_join`, as when the owning runtime is torn down.
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl AppConsensusCwHandle {
@@ -1745,6 +1758,7 @@ pub fn activate_app_consensus_cw(
     };
 
     Ok(AppConsensusCwHandle {
+        _stop_on_drop: StopOnDrop(shutdown.clone()),
         inbound,
         ingest_block,
         shutdown,
@@ -1780,6 +1794,7 @@ mod tests {
             })
         };
         let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
             shutdown,
@@ -1794,6 +1809,36 @@ mod tests {
         release_tx.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), joining).await.unwrap().unwrap().unwrap();
         assert!(stopped.load(Ordering::Acquire));
+    }
+
+    /// A handle dropped without `shutdown_and_join` (its runtime torn down at
+    /// process stop) asks its host to stop before closing the host's inputs,
+    /// so the host reports a requested stop rather than a failure.
+    #[tokio::test]
+    async fn a_dropped_handle_requests_the_stop_before_closing_inputs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let observer = {
+            let flag = shutdown.clone();
+            std::thread::spawn(move || {
+                assert!(rx.blocking_recv().is_none());
+                flag.load(Ordering::Acquire)
+            })
+        };
+        let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
+            inbound: [tx, tokio::sync::mpsc::unbounded_channel().0, tokio::sync::mpsc::unbounded_channel().0],
+            ingest_block: Arc::new(|_| {}),
+            shutdown: shutdown.clone(),
+            adopted_genesis: None,
+            finalized: Default::default(),
+            thread: std::thread::spawn(|| {}),
+            outbound_task: tokio::spawn(std::future::pending()),
+        };
+        assert!(!shutdown.load(Ordering::Acquire));
+        drop(handle);
+        assert!(observer.join().unwrap(), "inputs closed before the stop was requested");
     }
 
     /// Certify `header` (its output digest at its rank) by `signer` alone.
@@ -1869,10 +1914,12 @@ mod tests {
     async fn a_host_that_returns_unasked_is_dead() {
         use std::sync::atomic::AtomicBool;
         let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown = Arc::new(AtomicBool::new(false));
         let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             adopted_genesis: None,
             finalized: Default::default(),
             thread: std::thread::spawn(move || { let _ = exit_rx.recv(); }),
