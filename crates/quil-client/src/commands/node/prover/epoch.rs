@@ -84,6 +84,23 @@ pub fn epoch_start_frame(epoch: u64, epoch_length: u64) -> u64 {
     epoch * epoch_len(epoch_length)
 }
 
+/// The name and boundary frame of a confirmed join or leave that has not
+/// reached its epoch boundary: `activating` joins its committee at the
+/// boundary, `departing` keeps serving until it. Both read as joining or
+/// leaving in [`EffectiveStatus`]; `None` for anything else.
+pub fn confirmed_phase(
+    t: &AllocationTiming,
+    eff: EffectiveStatus,
+    epoch_length: u64,
+) -> Option<(&'static str, u64)> {
+    let boundary = |confirm: u64| epoch_start_frame(epoch_for_frame(confirm, epoch_length) + 1, epoch_length);
+    match eff {
+        EffectiveStatus::Joining if t.join_confirm_frame > 0 => Some(("activating", boundary(t.join_confirm_frame))),
+        EffectiveStatus::Leaving if t.leave_confirm_frame > 0 => Some(("departing", boundary(t.leave_confirm_frame))),
+        _ => None,
+    }
+}
+
 /// Fields of a shard allocation relevant to lifecycle timing.
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationTiming<'a> {
@@ -349,6 +366,28 @@ fn confirm_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A join or leave reads as activating or departing from its confirm until
+    /// the next epoch boundary, and the boundary is the first frame after it.
+    #[test]
+    fn confirmed_joins_activate_and_confirmed_leaves_depart_at_the_boundary() {
+        let timing = |raw_status, join_confirm_frame, leave_confirm_frame| AllocationTiming {
+            raw_status,
+            filter: &[0xab],
+            join_frame: 1_500,
+            join_confirm_frame,
+            leave_frame: 1_500,
+            leave_confirm_frame,
+            epoch: 3,
+        };
+        let phase = |t: AllocationTiming, frame| confirmed_phase(&t, compute_effective_status(&t, frame, 720), 720);
+        assert_eq!(phase(timing(raw_status::JOINING, 0, 0), 1_600), None);
+        assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_200), Some(("activating", 2_880)));
+        assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_880), None);
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 0), 1_600), None);
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_200), Some(("departing", 2_880)));
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_880), None);
+    }
 
     fn timing(status: u32) -> AllocationTiming<'static> {
         AllocationTiming {

@@ -53,8 +53,8 @@ fn ring_color(ring: u32) -> Color {
 fn status_color(name: &str) -> Color {
     match name.to_lowercase().as_str() {
         "active" => SUCCESS,
-        "joining" => PRIMARY,
-        "bound" | "leaving" | "paused" | "re-confirm!" | "expiredjoin" | "expiredleave" => WARNING,
+        "joining" | "activating" => PRIMARY,
+        "bound" | "leaving" | "departing" | "paused" | "re-confirm!" | "expiredjoin" | "expiredleave" => WARNING,
         "rejected" | "kicked" => ERROR,
         _ => HELP,
     }
@@ -576,9 +576,10 @@ fn worker_counts_line(m: &Model) -> Line<'static> {
 }
 
 /// Row status, then its compact and expanded label in the `Status` KPI.
-const STATUS_KPI_LABELS: [(&str, &str, &str); 12] = [
+const STATUS_KPI_LABELS: [(&str, &str, &str); 14] = [
     ("active", "active", "active"), ("paused", "paused", "paused"),
-    ("joining", "join", "joining"), ("leaving", "leave", "leaving"),
+    ("joining", "join", "joining"), ("activating", "activ", "activating"),
+    ("leaving", "leave", "leaving"), ("departing", "depart", "departing"),
     ("bound", "bound", "bound"), ("idle", "idle", "idle"),
     ("expiredJoin", "join expired", "expired joining"),
     ("expiredLeave", "leave expired", "expired leaving"),
@@ -788,7 +789,7 @@ fn warning_slot(text: &str, color_coding: bool) -> String {
 }
 
 pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
-    if !matches!(a.status_name.as_str(), "joining" | "leaving") { return a.status_name.clone(); }
+    if !matches!(a.status_name.as_str(), "joining" | "activating" | "leaving" | "departing") { return a.status_name.clone(); }
     let (symbol, name) = match a.allocation_reason.as_deref() {
         Some("$") => ("$", "reward"), Some("H") => ("H", "halt risk"),
         Some("S") => ("S", "split"), Some("G") => ("G", "merge"), Some("T") => ("T", "retired"),
@@ -1056,7 +1057,7 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
         "Worker bound; no live allocation reported. "
     } else { "" };
     let Some(execution) = a.execution.as_ref() else {
-        if a.status_name == "joining" { return peer_materialization_detail(a.materialized_frame, a.latest_frame); }
+        if matches!(a.status_name.as_str(), "joining" | "activating") { return peer_materialization_detail(a.materialized_frame, a.latest_frame); }
         return Line::from(Span::styled(format!("{binding_detail}Local execution details unavailable"),
             Style::new().fg(if binding_detail.is_empty() { HELP } else { WARNING })));
     };
@@ -2211,6 +2212,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Status", "Allocations rows by effective protocol status, including unassigned, bound and idle rows; ignores filters. Compact shows nonzero counts only. Compact / expanded labels:"),
         item("`active`, `paused`, `rejected`, `kicked`: rows with that status; `active` does not prove execution progress"),
         item("`join` / `joining`, `leave` / `leaving`: pending joins and leaves"),
+        item("`activ` / `activating`, `depart` / `departing`: confirmed joins and leaves until the next epoch boundary"),
         item("`join expired` / `expired joining`, `leave expired` / `expired leaving`: confirm window missed (`expiredJoin`, `expiredLeave`)"),
         item("`reconfirm`: stale but recoverable epoch (`re-confirm!`)"),
         item("`bound`, `idle`: worker rows (see the Status column)"),
@@ -2264,12 +2266,14 @@ fn help_items() -> Vec<HelpItem> {
         kv("Worker", "Core the allocation is bound to; `-1` means none is bound"),
         kv("Status", "Effective protocol status of the row:"),
         item("`joining`, `active`, `paused`, `leaving`, `rejected`, `kicked`: protocol status"),
+        item("`activating`: join confirmed; it joins its committee at the next epoch boundary"),
+        item("`departing`: leave confirmed; it keeps serving until the next epoch boundary"),
         item("`expiredJoin` / `expiredLeave`: confirm window missed"),
         item("`re-confirm!`: the allocation's epoch is stale but recoverable"),
         item("`bound`: a worker bound to a filter with no live allocation row, usually because a closing session it still belongs to keeps it until that session seals or GLOBAL fences it; it is then released for a waiting allocation. Shown with its local execution, excluded from rewards"),
         item("`idle`: a worker with no filter; every reported worker remains visible alongside unassigned allocations"),
         item("`unknown`: a raw allocation status this client cannot classify"),
-        item("`joining(…)` / `leaving(…)`: the recorded local reason, a symbol in compact mode and a name in expanded: `$` reward, `H` halt risk, `S` split, `G` merge, `T` retired, `E` empty, `C` capacity, `O` orphan, `M` manual, `D` data, `?` unavailable history; current counts never establish history"),
+        item("`joining(…)` / `activating(…)` / `leaving(…)` / `departing(…)`: the recorded local reason, a symbol in compact mode and a name in expanded: `$` reward, `H` halt risk, `S` split, `G` merge, `T` retired, `E` empty, `C` capacity, `O` orphan, `M` manual, `D` data, `?` unavailable history; current counts never establish history"),
         kv("Mode", "Worker management; ‹Ctrl+O› toggles:"),
         item("`a`: automatic"),
         item("`m`: manual"),
@@ -2775,7 +2779,7 @@ mod tests {
         for ring in [0, 1, 2, 3, 4, 100, UNKNOWN_REWARD_RING] {
             assert_ne!(ring_color(ring), ERROR);
         }
-        for status in ["active", "joining", "leaving", "paused", "re-confirm!"] {
+        for status in ["active", "joining", "activating", "leaving", "departing", "paused", "re-confirm!"] {
             assert_ne!(status_color(status), ERROR);
         }
         assert_ne!(mode_color("m"), ERROR);
