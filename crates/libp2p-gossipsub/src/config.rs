@@ -58,6 +58,10 @@ pub enum ValidationMode {
 pub enum Version {
     V1_0,
     V1_1,
+    /// QUILIBRIUM: a custom protocol id whose peers speak gossipsub 1.2
+    /// (IDONTWANT). Upstream 0.49 maps a custom id only to 1.0 or 1.1, and
+    /// IDONTWANT is sent only to 1.2 peers.
+    V1_2,
 }
 
 /// Defines the overall configuration for mesh parameters and max transmit sizes
@@ -614,6 +618,7 @@ impl ConfigBuilder {
                 self.config.protocol.protocol_ids = vec![ProtocolId {
                     protocol,
                     kind: match custom_id_version {
+                        Version::V1_2 => PeerKind::Gossipsubv1_2,
                         Version::V1_1 => PeerKind::Gossipsubv1_1,
                         Version::V1_0 => PeerKind::Gossipsub,
                     },
@@ -1291,6 +1296,22 @@ mod test {
 
         assert_eq!(protocol_ids[0].protocol, "/purple");
         assert_eq!(protocol_ids[0].kind, PeerKind::Gossipsub);
+    }
+
+    /// QUILIBRIUM: a custom protocol id can be classified as gossipsub 1.2.
+    #[test]
+    fn create_config_with_custom_protocol_id_v1_2() {
+        let protocol_config = ConfigBuilder::default()
+            .protocol_id("/purple", Version::V1_2)
+            .build()
+            .unwrap()
+            .protocol_config();
+
+        let protocol_ids = protocol_config.protocol_info();
+
+        assert_eq!(protocol_ids.len(), 1);
+        assert_eq!(protocol_ids[0].protocol, "/purple");
+        assert_eq!(protocol_ids[0].kind, PeerKind::Gossipsubv1_2);
     }
 
     fn get_gossipsub_message() -> Message {

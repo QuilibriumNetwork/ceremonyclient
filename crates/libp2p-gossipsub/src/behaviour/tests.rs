@@ -5365,22 +5365,84 @@ fn sends_idontwant() {
         validated: true,
     };
     gs.handle_received_message(message.clone(), &local_id);
-    assert_eq!(
-        receivers
-            .into_iter()
-            .fold(0, |mut idontwants, (peer_id, c)| {
-                let non_priority = c.non_priority.get_ref();
-                while !non_priority.is_empty() {
-                    if let Ok(RpcOut::IDontWant(_)) = non_priority.try_recv() {
-                        assert_ne!(peer_id, peers[1]);
-                        idontwants += 1;
-                    }
-                }
-                idontwants
-            }),
-        3,
-        "IDONTWANT was not sent"
-    );
+    // QUILIBRIUM: counted on both queues (IDONTWANT is sent with priority).
+    let (idontwants, _) = count_control_msgs(receivers, |peer_id, rpc| {
+        let idontwant = matches!(rpc, RpcOut::IDontWant(_));
+        if idontwant {
+            assert_ne!(*peer_id, peers[1]);
+        }
+        idontwant
+    });
+    assert_eq!(idontwants, 3, "IDONTWANT was not sent");
+}
+
+/// QUILIBRIUM: IDONTWANT is sent for the first copy of a message only; a
+/// duplicate would repeat the same IDONTWANT to every mesh peer.
+#[test]
+fn sends_idontwant_for_the_first_copy_only() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+
+    let message = RawMessage {
+        source: Some(peers[1]),
+        data: vec![12u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    let is_idontwant = |_: &PeerId, rpc: &RpcOut| matches!(rpc, RpcOut::IDontWant(_));
+
+    gs.handle_received_message(message.clone(), &PeerId::random());
+    let (first, receivers) = count_control_msgs(receivers, is_idontwant);
+    assert_eq!(first, 3, "the first copy must send IDONTWANT");
+
+    gs.handle_received_message(message.clone(), &peers[2]);
+    gs.handle_received_message(message, &peers[3]);
+    let (duplicates, _) = count_control_msgs(receivers, is_idontwant);
+    assert_eq!(duplicates, 0, "a duplicate must not send IDONTWANT again");
+}
+
+/// QUILIBRIUM: IDONTWANT goes on the priority queue, ahead of queued forwards.
+#[test]
+fn sends_idontwant_with_priority() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+
+    let message = RawMessage {
+        source: Some(peers[1]),
+        data: vec![12u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    gs.handle_received_message(message, &PeerId::random());
+
+    let (mut prioritized, mut queued) = (0, 0);
+    for (_, c) in receivers {
+        while let Ok(rpc) = c.priority.get_ref().try_recv() {
+            prioritized += usize::from(matches!(rpc, RpcOut::IDontWant(_)));
+        }
+        while let Ok(rpc) = c.non_priority.get_ref().try_recv() {
+            queued += usize::from(matches!(rpc, RpcOut::IDontWant(_)));
+        }
+    }
+    assert_eq!((prioritized, queued), (3, 0));
 }
 
 #[test]
@@ -5407,22 +5469,10 @@ fn doesnt_sends_idontwant_for_lower_message_size() {
     };
 
     gs.handle_received_message(message.clone(), &local_id);
-    assert_eq!(
-        receivers
-            .into_iter()
-            .fold(0, |mut idontwants, (peer_id, c)| {
-                let non_priority = c.non_priority.get_ref();
-                while !non_priority.is_empty() {
-                    if let Ok(RpcOut::IDontWant(_)) = non_priority.try_recv() {
-                        assert_ne!(peer_id, peers[1]);
-                        idontwants += 1;
-                    }
-                }
-                idontwants
-            }),
-        0,
-        "IDONTWANT was sent"
-    );
+    // QUILIBRIUM: counted on both queues (IDONTWANT is sent with priority).
+    let (idontwants, _) =
+        count_control_msgs(receivers, |_, rpc| matches!(rpc, RpcOut::IDontWant(_)));
+    assert_eq!(idontwants, 0, "IDONTWANT was sent");
 }
 
 /// Test that a node doesn't send IDONTWANT messages to the mesh peers
@@ -5442,7 +5492,8 @@ fn doesnt_send_idontwant() {
 
     let message = RawMessage {
         source: Some(peers[1]),
-        data: vec![12],
+        // QUILIBRIUM: above the size threshold, so only the peer kind stops it.
+        data: vec![12u8; 1024],
         sequence_number: Some(0),
         topic: topic_hashes[0].clone(),
         signature: None,
@@ -5450,21 +5501,11 @@ fn doesnt_send_idontwant() {
         validated: true,
     };
     gs.handle_received_message(message.clone(), &local_id);
-    assert_eq!(
-        receivers
-            .into_iter()
-            .fold(0, |mut idontwants, (peer_id, c)| {
-                let non_priority = c.non_priority.get_ref();
-                while !non_priority.is_empty() {
-                    if matches!(non_priority.try_recv(), Ok(RpcOut::IDontWant(_)) if peer_id != peers[1]) {
-                        idontwants += 1;
-                    }
-                }
-                idontwants
-            }),
-        0,
-        "IDONTWANT were sent"
-    );
+    // QUILIBRIUM: counted on both queues (IDONTWANT is sent with priority).
+    let (idontwants, _) = count_control_msgs(receivers, |peer_id, rpc| {
+        matches!(rpc, RpcOut::IDontWant(_)) && *peer_id != peers[1]
+    });
+    assert_eq!(idontwants, 0, "IDONTWANT were sent");
 }
 
 /// Test that a node doesn't forward a messages to the mesh peers

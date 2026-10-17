@@ -89,6 +89,13 @@ impl Sender {
             | RpcOut::Prune(_)
             | RpcOut::Subscribe(_)
             | RpcOut::Unsubscribe(_) => &self.priority_sender,
+            // QUILIBRIUM: an IDONTWANT only helps if it reaches the peer before
+            // the peer sends the message, so it does not wait behind queued
+            // forwards. A peer whose priority queue is already backed up gets
+            // it on the bounded queue as before.
+            RpcOut::IDontWant(_) if self.priority_sender.len() < self.priority_cap => {
+                &self.priority_sender
+            }
             RpcOut::Forward { .. } | RpcOut::IHave(_) | RpcOut::IWant(_) | RpcOut::IDontWant(_) => {
                 &self.non_priority_sender
             }
@@ -191,5 +198,36 @@ impl Stream for Receiver {
         }
         // Then we poll the non priority.
         Pin::new(&mut self.non_priority).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        types::{Graft, IDontWant},
+        MessageId, TopicHash,
+    };
+
+    /// QUILIBRIUM: IDONTWANT goes on the priority queue until that queue holds
+    /// `priority_cap` messages, then on the bounded queue.
+    #[test]
+    fn idontwant_is_prioritized_until_the_priority_queue_backs_up() {
+        let sender = Sender::new(4);
+        let idontwant = || {
+            RpcOut::IDontWant(IDontWant {
+                message_ids: vec![MessageId::new(&[1])],
+            })
+        };
+        let graft = RpcOut::Graft(Graft {
+            topic_hash: TopicHash::from_raw("topic"),
+        });
+
+        sender.send_message(idontwant()).unwrap();
+        sender.send_message(graft).unwrap();
+        sender.send_message(idontwant()).unwrap();
+
+        assert_eq!(sender.priority_sender.len(), 2);
+        assert_eq!(sender.non_priority_sender.len(), 1);
     }
 }

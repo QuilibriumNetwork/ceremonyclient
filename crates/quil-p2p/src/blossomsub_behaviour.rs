@@ -687,9 +687,14 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
 fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Config {
     let mut builder = gossipsub::ConfigBuilder::default();
     builder
+        // Gossipsub 1.2: IDONTWANT is sent only to peers of that kind, and a
+        // custom protocol id's kind is ours to set (both ends negotiate the
+        // same id). Every build receives and honours IDONTWANT whatever kind
+        // it gave us, and a decoder without the field skips it, so an older
+        // peer is suppressed by our IDONTWANTs while it sends us none.
         .protocol_id(
             crate::protocol::protocol_id_for_network(network),
-            gossipsub::Version::V1_1,
+            gossipsub::Version::V1_2,
         )
         .history_length(params.history_length)
         .history_gossip(params.history_gossip)
@@ -877,6 +882,86 @@ mod propagation_tests {
         assert!(
             ok,
             "both leaves must receive the hub's published message (published={published}, a={a_got}, b={b_got})"
+        );
+    }
+    /// IDONTWANT received, from gossipsub's own counter in `swarm`'s registry.
+    fn idontwants_received(swarm: &Swarm<BlossomSubBehaviour>) -> u64 {
+        crate::metrics::render(&swarm.behaviour().metrics_registry())
+            .lines()
+            .find_map(|line| line.strip_prefix("gossipsub_idontwant_msgs_total "))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Relays that hold a large message tell each other with IDONTWANT. The
+    /// hub flood-publishes to both relays, which are in each other's mesh; a
+    /// relay's first copy sends IDONTWANT to its other mesh peer, so at least
+    /// one relay receives one. With the protocol classified as gossipsub 1.1
+    /// none was ever sent (2026-10-17 field capture: zero IDONTWANT).
+    #[tokio::test]
+    async fn relays_exchange_idontwant_for_large_messages() {
+        let bitmask = vec![0x80u8];
+        let payload = vec![7u8; 4096];
+
+        let mut hub = build_swarm();
+        let mut relay_a = build_swarm();
+        let mut relay_b = build_swarm();
+        let (a_id, b_id) = (*relay_a.local_peer_id(), *relay_b.local_peer_id());
+
+        for swarm in [&mut hub, &mut relay_a, &mut relay_b] {
+            swarm.behaviour_mut().subscribe(bitmask.clone());
+        }
+        hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        relay_a
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("listen");
+        let hub_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
+                break address;
+            }
+        };
+        let a_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay_a.select_next_some().await {
+                break address;
+            }
+        };
+        relay_a.dial(hub_addr.clone()).expect("relay_a dial");
+        relay_b.dial(hub_addr).expect("relay_b dial");
+        relay_b.dial(a_addr).expect("relay_b dial relay_a");
+
+        let mut published = false;
+        let ok = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                tokio::select! {
+                    _ = hub.select_next_some() => {}
+                    _ = relay_a.select_next_some() => {}
+                    _ = relay_b.select_next_some() => {}
+                }
+                if !published
+                    && hub.behaviour().peer_subscribed_to(&a_id, &bitmask)
+                    && hub.behaviour().peer_subscribed_to(&b_id, &bitmask)
+                    && relay_a.behaviour().mesh_peers(&bitmask) >= 2
+                    && relay_b.behaviour().mesh_peers(&bitmask) >= 2
+                {
+                    published = hub
+                        .behaviour_mut()
+                        .publish(bitmask.clone(), payload.clone())
+                        .is_ok();
+                }
+                if published && idontwants_received(&relay_a) + idontwants_received(&relay_b) > 0 {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            ok,
+            "a relay must receive IDONTWANT (published={published}, a={}, b={})",
+            idontwants_received(&relay_a),
+            idontwants_received(&relay_b)
         );
     }
 }

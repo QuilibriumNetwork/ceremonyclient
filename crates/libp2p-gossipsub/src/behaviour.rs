@@ -1833,7 +1833,11 @@ where
         let msg_id = self.config.message_id(&message);
 
         // Broadcast IDONTWANT messages
-        if raw_protobuf_len > self.config.idontwant_message_size_threshold() {
+        // QUILIBRIUM: only for the first copy. A duplicate's IDONTWANT would
+        // repeat, to every mesh peer, the one the first copy already sent.
+        if raw_protobuf_len > self.config.idontwant_message_size_threshold()
+            && !self.duplicate_cache.contains(&msg_id)
+        {
             let recipient_peers = self
                 .mesh
                 .get(&message.topic)
