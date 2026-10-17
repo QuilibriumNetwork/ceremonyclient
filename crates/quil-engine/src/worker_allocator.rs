@@ -595,6 +595,25 @@ impl WorkerAllocator {
             return Ok(());
         }
         let staged = changes()?;
+        // A regular node never consumes staged changes, so a change whose
+        // shards are all gone would protect their payload forever. Retained
+        // historic, rejected or kicked slots do not hold a shard.
+        let held: std::collections::HashSet<Vec<u8>> = if staged.is_empty() {
+            Default::default()
+        } else {
+            self.prover_registry.get_all_active_app_shard_provers()?
+                .into_iter()
+                .flat_map(|p| p.allocations)
+                .filter(|a| matches!(a.status, ProverStatus::Joining | ProverStatus::Active
+                    | ProverStatus::Paused | ProverStatus::Leaving))
+                .map(|a| a.confirmation_filter)
+                .chain(workers.iter().map(|w| w.filter.clone()))
+                .filter(|f| !f.is_empty())
+                .collect()
+        };
+        let staged: Vec<_> = staged.into_iter()
+            .filter(|c| std::iter::once(&c.parent).chain(c.children.iter()).any(|f| held.contains(f)))
+            .collect();
         for worker in workers.iter().filter(|w| due.contains(&w.core_id)) {
             let application = &worker.filter[..worker.filter.len().min(32)];
             let mut keep = vec![worker.filter.clone()];
@@ -2808,5 +2827,28 @@ mod tests {
         alloc.schedule_payload_eviction(t0 + minutes(130)).unwrap();
         assert_eq!(wm.evictions().len(), 3);
         assert!(wm.evictions()[2].1.contains(&filter(7, 0xc0)));
+    }
+
+    /// A staged change protects its shards only while a prover or worker holds
+    /// one of them.
+    #[test]
+    fn payload_eviction_ignores_staged_changes_of_shards_nobody_holds() {
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let filter = |tail: u8| { let mut f = vec![7; 32]; f.extend([0, 1, tail]); f };
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add_with_filter(1, filter(0x00));
+        let mut prover = prover_with_active(&[filter(0x60), filter(0x40)], 100);
+        prover.allocations[1].status = ProverStatus::Historic;
+        let reg = Arc::new(TestProverRegistry::with_provers(vec![prover]));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let split = |parent: u8| PendingShardChange { kind: ShardChangeKind::Split, parent: filter(parent),
+            children: vec![filter(parent + 1), filter(parent + 2)], effective_epoch: 9, proposed_frame: 1 };
+        let staged = vec![split(0x40), split(0x60)];
+        alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
+        let t0 = std::time::Instant::now();
+        alloc.schedule_payload_eviction(t0).unwrap();
+        alloc.schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE).unwrap();
+        assert_eq!(wm.evictions(), vec![(1, vec![filter(0x00), filter(0x60), filter(0x61), filter(0x62)])],
+            "a change of shards nobody holds protects nothing");
     }
 }
