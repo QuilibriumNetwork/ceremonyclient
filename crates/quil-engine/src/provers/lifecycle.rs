@@ -813,18 +813,23 @@ impl ProverLifecycle {
     /// `gone_shard_leaves_await_sync`.
     pub fn hold_gone_shard_leaves_for_sync(&self) {
         self.gone_shard_leaves_await_sync.store(true, Ordering::SeqCst);
+        // Such a registry also shows a landed join only after a sync.
+        self.allocator.hold_pending_joins_for_registry_sync();
     }
 
     /// A prover-tree sync is starting; pass the returned number to
     /// [`Self::note_registry_synced`] once the registry is refreshed from it.
     pub fn begin_registry_sync(&self) -> u64 {
-        self.registry_syncs_begun.fetch_add(1, Ordering::SeqCst) + 1
+        let sync = self.registry_syncs_begun.fetch_add(1, Ordering::SeqCst) + 1;
+        self.allocator.note_registry_sync_begun(sync, self.current_frame.effective());
+        sync
     }
 
     /// The registry now reflects the sync [`Self::begin_registry_sync`]
     /// numbered `sync`.
     pub fn note_registry_synced(&self, sync: u64) {
         self.registry_synced_through.fetch_max(sync, Ordering::SeqCst);
+        self.allocator.note_registry_synced(sync);
     }
 
     /// The gone shards a leave may be proposed off now, and how many wait
@@ -6473,6 +6478,40 @@ mod proposal_loop_tests {
         assert!(!leaves().contains(&parent), "nor one still running");
         lifecycle.note_registry_synced(later);
         assert!(leaves().contains(&parent), "a registry synced since still holds it there: the split did not move it");
+    }
+
+    /// A regular node's registry shows a landed join only with the next
+    /// prover-tree sync, five minutes apart. The join's worker stays reserved
+    /// until a sync begun after the join's inclusion has refreshed the
+    /// registry; freed after `PROPOSAL_TIMEOUT_FRAMES` alone, it was proposed
+    /// for a second shard 11 frames after the first in every epoch.
+    #[test]
+    fn a_proposed_join_holds_its_worker_until_a_registry_sync_begun_since() {
+        use crate::worker_allocator::PROPOSAL_TIMEOUT_FRAMES;
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.hold_gone_shard_leaves_for_sync();
+        let proposed = 100u64;
+        wm.set_pending_filter_frame(1, proposed).unwrap();
+        let pending = |frame: u64| {
+            lifecycle.allocator.on_new_frame(frame).unwrap();
+            wm.range_workers().unwrap()[0].pending_filter_frame
+        };
+        let timed_out = proposed + PROPOSAL_TIMEOUT_FRAMES + 1;
+
+        lifecycle.current_frame.observe(proposed + 1);
+        let before = lifecycle.begin_registry_sync();
+        lifecycle.note_registry_synced(before);
+        assert_eq!(pending(timed_out), proposed, "a sync anchored before the join's inclusion cannot show it");
+        lifecycle.current_frame.observe(proposed + 2);
+        let since = lifecycle.begin_registry_sync();
+        assert_eq!(pending(timed_out + 1), proposed, "nor one still running");
+        lifecycle.note_registry_synced(since);
+        assert_eq!(pending(timed_out + 2), 0, "a registry synced since without the join frees the worker");
     }
 
     #[test]

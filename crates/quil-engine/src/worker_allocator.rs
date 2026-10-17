@@ -234,6 +234,10 @@ pub fn apply_config_worker_filters(
 
 /// Proposal never landed in the registry within this many frames → clear.
 pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
+/// Ceiling on holding a proposal's worker for a registry sync (see
+/// `WorkerAllocator::hold_pending_joins_for_registry_sync`), so failing
+/// syncs cannot pin it: about three five-minute syncs.
+pub const PROPOSAL_SYNC_CEILING_FRAMES: u64 = 60;
 /// Pending join/leave not confirmed within this many frames → clear.
 pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
 // Confirm window lives on `ProverLifecycle` so testnet bootstraps can
@@ -477,6 +481,12 @@ pub struct WorkerAllocator {
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
     last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
+    /// See `hold_pending_joins_for_registry_sync`.
+    pending_joins_await_sync: std::sync::atomic::AtomicBool,
+    /// Frame at which each running prover-tree sync began.
+    registry_syncs_running: std::sync::Mutex<HashMap<u64, u64>>,
+    /// Latest begin frame of a sync that has refreshed the registry.
+    registry_synced_from_frame: std::sync::atomic::AtomicU64,
     /// Once-guard for the prover-reset-v3 worker-filter reset (mainnet frame
     /// 747_000). Fires exactly at that frame in `on_new_frame`, clearing every
     /// AUTO-managed worker's persisted deep filter so re-join lands on the clean
@@ -549,6 +559,9 @@ impl WorkerAllocator {
             last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
+            pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
+            registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
+            registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
@@ -692,6 +705,42 @@ impl WorkerAllocator {
     /// the next 4 frames are cooled down.
     pub fn set_last_join_attempt(&self, frame_number: u64) {
         self.record_attempt(Cooldown::Join, frame_number);
+    }
+
+    /// For a node whose registry shows a landed join only after the next
+    /// prover-tree sync (every five minutes, about 20 frames on mainnet):
+    /// keep a proposal's worker reserved past `PROPOSAL_TIMEOUT_FRAMES` until
+    /// a sync begun after the join's inclusion has refreshed the registry.
+    /// Freed earlier, the worker is proposed for a second shard while the
+    /// first join is still on its way.
+    pub fn hold_pending_joins_for_registry_sync(&self) {
+        self.pending_joins_await_sync.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A prover-tree sync numbered `sync` began at `frame_number`.
+    pub fn note_registry_sync_begun(&self, sync: u64, frame_number: u64) {
+        if let Ok(mut running) = self.registry_syncs_running.lock() {
+            running.insert(sync, frame_number);
+        }
+    }
+
+    /// The registry now reflects the prover-tree sync numbered `sync`.
+    pub fn note_registry_synced(&self, sync: u64) {
+        let Ok(mut running) = self.registry_syncs_running.lock() else { return };
+        if let Some(frame) = running.remove(&sync) {
+            self.registry_synced_from_frame.fetch_max(frame, std::sync::atomic::Ordering::SeqCst);
+        }
+        running.retain(|later, _| *later > sync);
+    }
+
+    /// Whether a join proposed at `pending_frame` (included at the next
+    /// frame) may still appear with the next registry sync. A sync anchors
+    /// at the frame before its begin frame.
+    fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
+        pending_frame > 0
+            && self.pending_joins_await_sync.load(std::sync::atomic::Ordering::SeqCst)
+            && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
+            && self.registry_synced_from_frame.load(std::sync::atomic::Ordering::SeqCst) <= pending_frame + 1
     }
 
     /// Publish the lifecycle's per-filter ranking for `frame_number`.
@@ -920,6 +969,7 @@ impl WorkerAllocator {
                 if worker.pending_filter_frame > 0
                     && frame_number
                         > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
+                    && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                 {
                     // Warn, not info — silent failures are exactly the
                     // class of bug this telemetry needs to surface. A
@@ -965,7 +1015,8 @@ impl WorkerAllocator {
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
                 // elapsed) so we don't cancel a legitimately pending bind.
-                let pending_in_flight = worker.pending_filter_frame > 0
+                let pending_in_flight = self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
+                    || worker.pending_filter_frame > 0
                     && frame_number
                         <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
                 if !f_resolvable && !pending_in_flight {
@@ -1143,6 +1194,7 @@ impl WorkerAllocator {
                     }
                     if worker.pending_filter_frame > 0
                         && frame_number > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
+                        && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1812,6 +1864,30 @@ mod tests {
             "stuck pending-join marker must be cleared so the worker is free \
              again and the lifecycle can re-propose"
         );
+    }
+
+    /// Held for a registry sync, a stuck marker still clears at the ceiling,
+    /// so failing syncs cannot pin the worker.
+    #[test]
+    fn a_marker_held_for_a_registry_sync_clears_at_the_ceiling() {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: false,
+        });
+        let alloc = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::new()), vec![0xAAu8; 32]);
+        alloc.hold_pending_joins_for_registry_sync();
+        let pending = |frame: u64| {
+            alloc.on_new_frame(frame).unwrap();
+            wm.range_workers().unwrap()[0].pending_filter_frame
+        };
+        assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES), 100, "no sync has refreshed the registry since");
+        assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
     }
 
     #[test]
