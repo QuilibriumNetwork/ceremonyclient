@@ -317,7 +317,8 @@ pub(crate) fn build_thread_worker_hypergraph(
         );
     }
     initialize_worker_size_accounting(&crdt, &db.inner().path().display().to_string());
-    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+    // A worker store serves no history.
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env(false)) {
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, db.inner().path().display().to_string());
     }
     let label = db.inner().path().display().to_string();
