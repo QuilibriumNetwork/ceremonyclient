@@ -73,10 +73,10 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
     match cmd {
         NodeCommand::Prover { command } => prover::run(global, command).await,
         NodeCommand::Config { command } => nodeconfig::run(global, command),
-        NodeCommand::Log { command } => log::run(command),
+        NodeCommand::Log { command } => log::run(global, command),
         NodeCommand::Info { config } => info(global, config.as_deref()),
         NodeCommand::Service { action } => service::run(action),
-        NodeCommand::Clean { all, logs, node } => clean(*all, *logs, *node),
+        NodeCommand::Clean { all, logs, node } => clean(&global, *all, *logs, *node),
         NodeCommand::Install { version } => lifecycle::install(version.as_deref()).await,
         NodeCommand::Update { version, restart } => {
             lifecycle::update(version.as_deref(), *restart).await
@@ -88,26 +88,15 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
 }
 
 /// `qclient node clean` — remove old logs / old node versions.
-fn clean(all: bool, logs: bool, node: bool) -> anyhow::Result<()> {
+fn clean(global: &GlobalArgs, all: bool, logs: bool, node: bool) -> anyhow::Result<()> {
     if !all && !logs && !node {
         anyhow::bail!("specify --all, --logs, and/or --node");
     }
     if all || logs {
-        let dir = std::path::Path::new(crate::system::LOG_PATH);
-        let mut removed = 0;
-        if dir.exists() {
-            for entry in std::fs::read_dir(dir)? {
-                let path = entry?.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                // Rotated logs only (keep the live .log).
-                if name.ends_with(".log.gz") || (name.contains(".log.") && !name.ends_with(".log")) {
-                    if std::fs::remove_file(&path).is_ok() {
-                        removed += 1;
-                    }
-                }
-            }
+        // Without a resolvable node config there are no log files to find.
+        if let Err(e) = log::clean(global) {
+            eprintln!("skipping logs: {e}");
         }
-        println!("Removed {removed} old log file(s) from {}", dir.display());
     }
     if all || node {
         let data = crate::system::node_data_path();
