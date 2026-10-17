@@ -49,6 +49,7 @@ pub mod thread_worker;
 pub mod time_reel;
 pub mod prover_message_transport;
 pub mod prover_pipeline;
+pub mod own_prover_ops;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;

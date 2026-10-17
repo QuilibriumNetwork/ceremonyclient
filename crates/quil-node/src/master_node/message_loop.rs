@@ -1178,6 +1178,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             );
                                             continue;
                                         }
+                                        quil_engine::own_prover_ops::tracker().observe_frame(frame_num, &frame.requests);
 
                                         // An archive with atomic finalization keeps the
                                         // authenticated frame as a durable certified

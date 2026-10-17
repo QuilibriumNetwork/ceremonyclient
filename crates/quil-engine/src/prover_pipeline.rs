@@ -872,8 +872,12 @@ impl ProverPipeline {
     }
 
     async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+        let tracked = inner_bytes.clone();
         let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
-        self.transport.publish_prover_bundle(bundle_bytes).await
+        self.transport.publish_prover_bundle(bundle_bytes).await?;
+        let frame = self.current_frame.as_ref().map_or(0, |frame| frame.effective());
+        crate::own_prover_ops::tracker().submitted(&tracked, frame);
+        Ok(())
     }
 
     /// Loop a self-generated op into the LOCAL mempool (the same collector the
