@@ -480,6 +480,9 @@ pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
     /// the gossip and poller callers. No network work runs under this lock.
     evaluation_lock: std::sync::Mutex<()>,
+    /// Whether evaluations keep failing: a failed evaluation decides no
+    /// joins, confirms or leaves for its frame.
+    evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
     pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
@@ -637,6 +640,8 @@ impl ProverLifecycle {
             allocation_reasons: super::allocation_reasons::AllocationReasons::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
+            // Evaluated once per GLOBAL frame: three failed frames in a row.
+            evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             current_frame,
@@ -1178,7 +1183,36 @@ impl ProverLifecycle {
     /// effect per affected prover address per frame.
     ///
     /// `difficulty` must be the current frame's difficulty (used in PoMW basis).
+    ///
+    /// Logs an outage while evaluations keep failing.
     pub fn evaluate(
+        &self,
+        frame_number: u64,
+        difficulty: u64,
+        registry: &dyn ProverRegistry,
+        worker_manager: &dyn WorkerManager,
+    ) -> Result<Vec<LifecycleAction>> {
+        use crate::outage::OutageEvent;
+        let result = self.evaluate_frame(frame_number, difficulty, registry, worker_manager);
+        let event = self.evaluation_outage.lock()
+            .map(|mut outage| outage.observe(std::time::Instant::now(), result.is_ok()))
+            .unwrap_or(None);
+        let error = result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        match event {
+            Some(OutageEvent::Began) => tracing::warn!(frame = frame_number, error = %error,
+                scope = "local", action = "report",
+                "prover lifecycle evaluation failing; no joins, confirms or leaves are decided until it succeeds"),
+            Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(frame = frame_number, secs,
+                failures, error = %error, scope = "local", action = "report",
+                "prover lifecycle evaluation still failing"),
+            Some(OutageEvent::Ended { secs, failures }) => tracing::info!(frame = frame_number, secs,
+                failures, "prover lifecycle evaluation recovered"),
+            None => {}
+        }
+        result
+    }
+
+    fn evaluate_frame(
         &self,
         frame_number: u64,
         difficulty: u64,
@@ -3744,6 +3778,50 @@ mod proposal_loop_tests {
         assert!(missing.stored_ring.is_none());
         assert!(missing.allocation_epoch.is_none());
         assert_eq!(missing.ring_source, "summary_tail");
+    }
+
+    /// A worker manager whose workers cannot be listed, so every evaluation
+    /// fails once past its readiness gates.
+    struct UnlistableWorkers;
+
+    impl WorkerManager for UnlistableWorkers {
+        fn set_worker_filter(&self, _: u32, _: &[u8], _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn deallocate_worker(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+            Err(quil_types::error::QuilError::Store("workers unreadable".into()))
+        }
+        fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Evaluations that keep failing decide no joins, confirms or leaves; the
+    /// operator sees one warning once three frames in a row failed, with the
+    /// frame and the error, not one line per frame.
+    #[test]
+    fn failing_evaluations_warn_once_after_three_frames() {
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        for frame in 100..106 {
+            lc.set_prover_root_verified_frame(frame);
+            assert!(lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).is_err());
+        }
+        let warns = logs.lines_with("prover lifecycle evaluation failing");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("frame=102") && warns[0].contains("workers unreadable"), "{}", warns[0]);
+        assert!(warns[0].contains("scope") && warns[0].contains("report"), "{}", warns[0]);
     }
 
     #[test]

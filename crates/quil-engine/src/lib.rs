@@ -9,6 +9,7 @@ pub mod app_shard_cache;
 pub mod app_shard_metadata;
 pub mod app_types;
 pub mod multi_proof_cache;
+pub mod outage;
 pub mod committee;
 pub mod consensus_metrics;
 pub mod consensus_types;
