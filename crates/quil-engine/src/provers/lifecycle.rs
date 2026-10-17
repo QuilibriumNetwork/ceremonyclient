@@ -1013,57 +1013,21 @@ impl ProverLifecycle {
         }
     }
 
-    /// Port of Go's `selectExcessPendingFilters` at
-    /// `worker_allocator.go:1319-1385`. Returns filters that should be
-    /// force-rejected because the number of non-expired pending joins
-    /// exceeds our worker capacity minus active allocations.
-    ///
-    /// Go uses `config.Engine.DataWorkerCount` for capacity; we use the
-    /// total worker count (`workers.len()`) which is equivalent since
-    /// workers are provisioned from `data_worker_count`.
-    ///
-    /// Mirrors Go's `rand.Shuffle(pending)` so each node submits an
-    /// independent random subset of excess filters — over time this
-    /// converges every shard's pending list back to capacity without
-    /// any single shard being preferentially rejected.
+    /// Go's `selectExcessPendingFilters` (`worker_allocator.go:1319-1385`)
+    /// force-rejects a random subset of pending joins above the worker
+    /// capacity. Here it selects none: the chain admits a reject of
+    /// a Joining allocation only in its confirm epoch (`validate_confirm_timing`),
+    /// sooner it refuses it, and in that epoch `decide_joins` already rejects
+    /// every pending join above the free-worker cap in rank order. A random
+    /// pick here could reject the join the decision keeps, since a reject
+    /// outranks a confirm in the compiled plan.
     fn select_excess_pending_filters(
         &self,
-        active_filters: &[Vec<u8>],
-        joining_filters: &[(Vec<u8>, u64)],
-        worker_capacity: usize,
+        _active_filters: &[Vec<u8>],
+        _joining_filters: &[(Vec<u8>, u64)],
+        _worker_capacity: usize,
     ) -> Vec<Vec<u8>> {
-        if worker_capacity == 0 {
-            return Vec::new();
-        }
-
-        let active = active_filters.len();
-        let last_observed = self.current_frame.effective();
-
-        let mut pending: Vec<Vec<u8>> = joining_filters.iter()
-            .filter(|(filter, join_frame)| {
-                if filter.is_empty() { return false; }
-                // Skip expired joins — implicitly rejected. Uses
-                // the same grace constant as `effective_status`.
-                last_observed
-                    <= *join_frame
-                        + quil_types::consensus::ALLOCATION_GRACE_FRAMES
-            })
-            .map(|(f, _)| f.clone())
-            .collect();
-
-        let allowed = worker_capacity.saturating_sub(active);
-        if pending.len() <= allowed {
-            return Vec::new();
-        }
-
-        let excess = pending.len() - allowed;
-        // Random shuffle — matches Go's `rand.Shuffle(pending)` at
-        // worker_allocator.go:1380-1382.
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        pending.shuffle(&mut rng);
-        pending.truncate(excess);
-        pending
+        Vec::new()
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
@@ -4283,8 +4247,12 @@ mod proposal_loop_tests {
         );
     }
 
+    /// The chain refuses a reject of a Joining allocation before the epoch
+    /// after the join, so excess joins are rejected only then, by the
+    /// decision: on mainnet a regular node re-sent such a refused reject every
+    /// four frames for the rest of the join's epoch.
     #[test]
-    fn excess_pending_joins_get_rejected() {
+    fn excess_pending_joins_get_rejected_in_their_confirm_epoch() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
         let reg = Arc::new(ConfigurableRegistry::new());
@@ -4315,13 +4283,24 @@ mod proposal_loop_tests {
             reg.clone() as Arc<dyn ProverRegistry>,
         );
         lifecycle.set_prover_root_verified_frame(100);
-
+        lifecycle.current_frame.observe(100);
         let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
-        let rejected = count_rejects(&actions);
-        assert_eq!(
-            rejected, 3,
-            "expected 3 excess pending joins rejected (capacity=2, active=1, allowed=1, pending=4 → excess=3); got {} in {:?}",
-            rejected, actions
+        assert_eq!(count_rejects(&actions), 0, "the chain refuses rejects in the join's own epoch: {actions:?}");
+
+        let confirm_epoch = quil_types::consensus::epoch_length_frames();
+        lifecycle.set_prover_root_verified_frame(confirm_epoch);
+        lifecycle.current_frame.observe(confirm_epoch);
+        let actions = lifecycle.evaluate(confirm_epoch, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let rejected: std::collections::HashSet<Vec<u8>> = actions.iter()
+            .filter_map(|a| match a {
+                LifecycleAction::RejectJoins { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            rejected.len() >= 3,
+            "capacity=2, active=1, allowed=1, pending=4 → at least 3 rejected in the confirm epoch; got {rejected:?} in {actions:?}"
         );
     }
 
@@ -6008,8 +5987,12 @@ mod proposal_loop_tests {
             actions
         );
 
-        lifecycle.set_prover_root_verified_frame(100);
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        // Synced in the joins' confirm epoch, where the chain admits their
+        // confirms and rejects.
+        let confirm_epoch = quil_types::consensus::epoch_length_frames();
+        lifecycle.current_frame.observe(confirm_epoch);
+        lifecycle.set_prover_root_verified_frame(confirm_epoch);
+        let actions = lifecycle.evaluate(confirm_epoch, 1, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(
             !actions.is_empty(),
             "actions should emit once tree is synced; got empty"
