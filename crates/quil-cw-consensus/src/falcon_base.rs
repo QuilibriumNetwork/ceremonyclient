@@ -77,13 +77,26 @@ macro_rules! byte_array_newtype {
     };
 }
 
+/// `Debug` of a key or signature: its type and the eight bytes after the
+/// constant Falcon header byte, in hex. Peers are logged with `Debug` (for
+/// example by every blocked consensus message), and the derived form printed
+/// all 897 key bytes as decimals, about 3.5 KB per line; `Display` still
+/// gives the full hex.
+fn fmt_fingerprint(name: &str, bytes: &[u8], f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "{name}(")?;
+    for b in bytes.iter().skip(1).take(8) {
+        write!(f, "{:02x}", b)?;
+    }
+    write!(f, "…)")
+}
+
 /// Falcon-512 signature (666 bytes), encoded as the bare 666 bytes.
 ///
 /// Held on the heap and shared by clones. Simplex reserves vote slots by
 /// quorum and committee size for every tracked view, and copies each vote
 /// into several of them; with the 666 bytes inline every slot, used or not,
 /// cost the full signature, and every copy duplicated it.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct FalconSignature(Arc<[u8; FALCON_SIGNATURE_LEN]>);
 
@@ -128,14 +141,25 @@ impl core::fmt::Display for FalconSignature {
         Ok(())
     }
 }
+impl core::fmt::Debug for FalconSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fmt_fingerprint("FalconSignature", &self.0[..], f)
+    }
+}
 impl commonware_cryptography::Signature for FalconSignature {}
 
 /// Falcon-512 public (verifying) key (897 bytes).
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct FalconPublicKey([u8; FALCON_PUBLIC_KEY_LEN]);
 
 byte_array_newtype!(FalconPublicKey, FALCON_PUBLIC_KEY_LEN);
+
+impl core::fmt::Debug for FalconPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fmt_fingerprint("FalconPublicKey", &self.0, f)
+    }
+}
 
 impl FalconPublicKey {
     /// Build from raw 897-byte Falcon public-key bytes (e.g. a committee
@@ -284,6 +308,21 @@ mod tests {
     use super::*;
     use commonware_cryptography::{Signer, Verifier};
     use commonware_utils::test_rng;
+
+    /// `Debug` names a key or signature in one short token that tells
+    /// peers apart; `Display` keeps the full hex.
+    #[test]
+    fn debug_prints_a_short_fingerprint() {
+        let sk = FalconPrivateKey::random(test_rng());
+        let pk = sk.public_key();
+        let other = FalconPrivateKey::random(test_rng()).public_key();
+        let debug = format!("{pk:?}");
+        assert!(debug.starts_with("FalconPublicKey(") && debug.len() < 40, "{debug}");
+        assert_ne!(debug, format!("{other:?}"));
+        assert_eq!(format!("{pk}").len(), 2 * FALCON_PUBLIC_KEY_LEN);
+        let sig = format!("{:?}", sk.sign(b"global", b"message"));
+        assert!(sig.starts_with("FalconSignature(") && sig.len() < 40, "{sig}");
+    }
 
     #[test]
     fn sign_verify_roundtrip_via_commonware_traits() {
