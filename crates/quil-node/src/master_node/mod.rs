@@ -24,6 +24,10 @@ pub(crate) mod direct_delivery;
 pub(crate) mod reward_proofs;
 pub(crate) mod historical_committees;
 
+/// How long shutdown waits for the worker threads to stop before the
+/// process arms its forced-exit watchdog.
+const WORKER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
     config: &quil_config::Config,
@@ -1591,6 +1595,16 @@ pub(crate) async fn start(
     // ---------------------------------------------------------------
     let reason = sup.run().await;
     info!("master node shutting down");
+
+    // Stop the worker threads before returning: each closes its own stores
+    // as it ends, and process exit must not race that teardown.
+    let stopping = worker_manager.clone();
+    match tokio::task::spawn_blocking(move || stopping.shutdown(WORKER_SHUTDOWN_GRACE)).await {
+        Ok(running) if running.is_empty() => info!("worker threads stopped"),
+        Ok(running) => warn!(?running, grace_secs = WORKER_SHUTDOWN_GRACE.as_secs(),
+            "worker threads still running at the shutdown deadline"),
+        Err(error) => warn!(%error, "worker shutdown task failed"),
+    }
 
     // Release retained RocksDB snapshots before teardown so they don't
     // pin superseded versions past the DB's life. Drop would eventually

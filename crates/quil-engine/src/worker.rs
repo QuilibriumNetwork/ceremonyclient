@@ -77,6 +77,14 @@ pub trait WorkerManager: Send + Sync {
         let _ = (core_id, allocated);
         Ok(())
     }
+
+    /// Stop every worker and wait up to `deadline` for each to finish,
+    /// returning the core ids still running then. Managers whose workers
+    /// are separate processes have nothing to wait for.
+    fn shutdown(&self, deadline: std::time::Duration) -> Vec<u32> {
+        let _ = deadline;
+        Vec::new()
+    }
 }
 
 /// Information about a worker process.

@@ -334,6 +334,25 @@ impl ThreadWorkerManager {
         *self.worker_store.lock().unwrap() = Some(store);
     }
 
+    /// Cancel every worker thread and join each one that finishes within
+    /// `deadline`, returning the core ids of those still running then. A
+    /// worker closes its own RocksDB stores as its thread ends; returning
+    /// from `main` first lets process exit destroy RocksDB's static state
+    /// under that thread, which aborts ("pthread lock: Invalid argument").
+    pub fn shutdown_workers(&self, deadline: std::time::Duration) -> Vec<u32> {
+        let handles: Vec<(u32, JoinHandle<()>)> = self
+            .workers
+            .lock()
+            .unwrap()
+            .values_mut()
+            .filter_map(|w| {
+                w.cancel.cancel();
+                w.handle.take().map(|handle| (w.core_id, handle))
+            })
+            .collect();
+        join_within(handles, deadline)
+    }
+
     /// Returns persisted worker state for the given core, when a
     /// store is wired and an entry exists.
     pub fn load_persisted(
@@ -1144,6 +1163,10 @@ impl WorkerManager for ThreadWorkerManager {
         self.mutate(core_id, |w| w.allocated = allocated);
         Ok(())
     }
+
+    fn shutdown(&self, deadline: std::time::Duration) -> Vec<u32> {
+        self.shutdown_workers(deadline)
+    }
 }
 
 /// Capture the persistable subset of a `WorkerState` while we hold
@@ -1166,9 +1189,67 @@ fn snapshot_state(w: &WorkerState) -> WorkerState {
     }
 }
 
+/// Join each thread that finishes within `deadline`; return the ids of the
+/// rest, which are left detached.
+fn join_within(mut handles: Vec<(u32, JoinHandle<()>)>, deadline: std::time::Duration) -> Vec<u32> {
+    let started = std::time::Instant::now();
+    loop {
+        let (finished, running): (Vec<_>, Vec<_>) = handles.into_iter().partition(|(_, h)| h.is_finished());
+        for (core_id, handle) in finished {
+            if handle.join().is_err() {
+                warn!(core_id, "worker thread panicked while stopping");
+            }
+        }
+        handles = running;
+        if handles.is_empty() || started.elapsed() >= deadline {
+            return handles.into_iter().map(|(core_id, _)| core_id).collect();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_within_waits_for_finishing_threads_and_reports_the_rest() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = closed.clone();
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let running = join_within(vec![(1, slow), (2, stuck)], std::time::Duration::from_secs(1));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst), "a thread finishing within the deadline is joined");
+        assert_eq!(running, vec![2], "a thread still running at the deadline is reported");
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn shutdown_workers_stops_and_joins_every_worker() {
+        let mgr = ThreadWorkerManager::new();
+        let _rx = mgr.take_master_rx().unwrap();
+        mgr.allocate_worker(1, b"test-filter").unwrap();
+        mgr.allocate_worker(2, b"other-filter").unwrap();
+        let running = tokio::task::spawn_blocking(move || mgr.shutdown_workers(std::time::Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(running.is_empty(), "workers still running: {running:?}");
+        #[cfg(target_os = "linux")]
+        {
+            let names: Vec<String> = std::fs::read_dir("/proc/self/task").unwrap()
+                .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+                .map(|name| name.trim().to_string())
+                .collect();
+            assert!(!names.iter().any(|name| name == "worker-1" || name == "worker-2"),
+                "a joined worker thread is gone: {names:?}");
+        }
+    }
 
     #[test]
     fn worker_manager_construction() {
