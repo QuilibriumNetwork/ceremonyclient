@@ -4,7 +4,8 @@
 //! `<name>.<timestamp>[.gz]`) to its log directory, `logger.path` or by
 //! default `.log` under its config directory; with `path: none` it logs only
 //! to stderr, which the system service captures (the systemd journal on
-//! Linux, `node.err` under the log directory on macOS).
+//! Linux, `node.err` under the log directory on macOS). `export` writes a
+//! redacted bundle of a time window for bug reports.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +14,9 @@ use clap::Subcommand;
 
 use crate::context::GlobalArgs;
 use crate::{nodeconfig, system};
+
+pub mod export;
+pub(crate) mod redact;
 
 #[derive(Debug, Subcommand)]
 pub enum LogCommand {
@@ -28,12 +32,35 @@ pub enum LogCommand {
     },
     /// Delete rotated node logs (the live logs are kept).
     Clean,
+    /// Export a redacted node log bundle of a time window, to attach to a
+    /// bug report.
+    ///
+    /// Reads the node's log files (live and rotated, every core) or, when
+    /// the node writes none, the service journal; merges them in time
+    /// order and keeps lines of the window (at most 24 h). With --filter or
+    /// --match only matching lines are kept, plus every warn and error line
+    /// as context.
+    ///
+    /// Redaction hides your network location (IP addresses, DNS names,
+    /// multiaddrs, peer IDs), host and user names, home paths and reward
+    /// balances; equal values share a token like ip4#7c21a0b3 within one
+    /// export. Public bootstrap archive endpoints and shard filters, frame
+    /// numbers and versions are kept. It does not hide which prover you are:
+    /// your shard set and join/reward frames are on-chain and stay in the
+    /// log.
+    ///
+    /// Writes <dir>/node.log.gz, manifest.json and SHA256SUMS after a
+    /// preview you confirm by typing yes (or the global --yes), and the
+    /// token map to <dir>.map.txt, owner-readable only: keep it private and
+    /// never share it.
+    Export(export::ExportArgs),
 }
 
 pub fn run(global: GlobalArgs, cmd: &LogCommand) -> anyhow::Result<()> {
     match cmd {
         LogCommand::View { lines, follow, core } => view(&global, *lines, *follow, *core),
         LogCommand::Clean => clean(&global).map(|_| ()),
+        LogCommand::Export(args) => export::run(&global, args),
     }
 }
 
