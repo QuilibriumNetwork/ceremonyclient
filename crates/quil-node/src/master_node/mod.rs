@@ -24,6 +24,7 @@ pub(crate) mod worker_manager;
 pub(crate) mod direct_delivery;
 pub(crate) mod reward_proofs;
 pub(crate) mod historical_committees;
+pub(crate) mod global_execution;
 
 /// How long shutdown waits for the worker threads to stop before the
 /// process arms its forced-exit watchdog.

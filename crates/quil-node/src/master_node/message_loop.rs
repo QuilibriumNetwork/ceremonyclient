@@ -281,6 +281,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             std::collections::HashMap::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut global_execution = super::global_execution::GlobalExecution::default();
         // Shard CW topics this node takes direct messages on for its
         // standalone workers, kept in step with the shards they run, and
         // those whose worker lacks `DeliverShardConsensus` (an older build).
@@ -454,6 +455,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         .ok()
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
                         .unwrap_or(0);
+                    global_execution.observe(std::time::Instant::now(), cf_for_recv.materialized(), cf_for_recv.effective());
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::{EffectiveStatus, ProverRegistry};
                         match pr_for_recv.get_prover_info(&pa_for_recv) {
