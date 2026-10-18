@@ -137,6 +137,22 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     })
     .await;
     assert!(discarded.is_some(), "every member discards its legacy history at activation");
+    // A legacy host stops before the discard, but a frame it finalized just
+    // before is still in the engine's mailbox. Deliver one (from the first
+    // host, epoch 1) and wait for the engine to handle it.
+    let stale = legacy.iter().max_by_key(|f| number(f)).unwrap().encode_to_vec();
+    for worker in &harness.workers {
+        worker.handle.send(quil_engine::app_engine::AppEngineMessage::CwFinalizedFrame {
+            frame: stale.clone(),
+            cert: Vec::new(),
+            locally_verified: true,
+            implied: Vec::new(),
+            host_epoch: 1,
+        });
+        let (reply, handled) = tokio::sync::oneshot::channel();
+        worker.handle.send(quil_engine::app_engine::AppEngineMessage::CommittedTip { reply });
+        handled.await.expect("the engine handles its mailbox in order");
+    }
     for worker in &harness.workers {
         let clock = worker.clock.as_ref().unwrap();
         assert!(clock.get_latest_shard_clock_frame(&filter).is_err(), "no legacy frame remains");
