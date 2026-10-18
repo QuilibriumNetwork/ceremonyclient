@@ -60,7 +60,7 @@ impl<
         cfg.assert(&mut context);
 
         // Create batcher
-        let (batcher, batcher_mailbox) = batcher::Actor::new(
+        let (mut batcher, batcher_mailbox) = batcher::Actor::new(
             context.child("batcher"),
             batcher::Config {
                 scheme: cfg.scheme.clone(),
@@ -75,6 +75,8 @@ impl<
                 forwarding: cfg.forwarding,
             },
         );
+        // QUILIBRIUM: discard summaries name the session (batcher/discards.rs).
+        batcher.name_discards(&cfg.partition);
 
         // Create voter
         let (voter, voter_mailbox) = voter::Actor::new(
