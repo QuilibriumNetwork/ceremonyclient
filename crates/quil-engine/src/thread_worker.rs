@@ -1242,9 +1242,19 @@ mod tests {
         assert!(running.is_empty(), "workers still running: {running:?}");
         #[cfg(target_os = "linux")]
         {
+            // pthread_join returns once the kernel clears the thread's id,
+            // before it releases the task, so a joined thread can stay listed
+            // for a moment; by then it carries PF_EXITING. A thread that was
+            // never joined is still running without it.
+            const PF_EXITING: u64 = 0x4;
             let names: Vec<String> = std::fs::read_dir("/proc/self/task").unwrap()
-                .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-                .map(|name| name.trim().to_string())
+                .filter_map(|task| {
+                    let path = task.ok()?.path();
+                    let name = std::fs::read_to_string(path.join("comm")).ok()?.trim().to_string();
+                    let stat = std::fs::read_to_string(path.join("stat")).ok()?;
+                    let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
+                    (flags & PF_EXITING == 0).then_some(name)
+                })
                 .collect();
             assert!(!names.iter().any(|name| name == "worker-1" || name == "worker-2"),
                 "a joined worker thread is gone: {names:?}");
