@@ -84,6 +84,23 @@ pub fn epoch_start_frame(epoch: u64, epoch_length: u64) -> u64 {
     epoch * epoch_len(epoch_length)
 }
 
+/// The name and boundary frame of a confirmed join or leave that has not
+/// reached its epoch boundary: `activating` joins its committee at the
+/// boundary, `departing` keeps serving until it. Both read as joining or
+/// leaving in [`EffectiveStatus`]; `None` for anything else.
+pub fn confirmed_phase(
+    t: &AllocationTiming,
+    eff: EffectiveStatus,
+    epoch_length: u64,
+) -> Option<(&'static str, u64)> {
+    let boundary = |confirm: u64| epoch_start_frame(epoch_for_frame(confirm, epoch_length) + 1, epoch_length);
+    match eff {
+        EffectiveStatus::Joining if t.join_confirm_frame > 0 => Some(("activating", boundary(t.join_confirm_frame))),
+        EffectiveStatus::Leaving if t.leave_confirm_frame > 0 => Some(("departing", boundary(t.leave_confirm_frame))),
+        _ => None,
+    }
+}
+
 /// Fields of a shard allocation relevant to lifecycle timing.
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationTiming<'a> {
@@ -205,26 +222,56 @@ pub fn next_epoch_boundary(frame: u64, epoch_length: u64) -> u64 {
     epoch_start_frame(epoch_for_frame(frame, epoch_length) + 1, epoch_length)
 }
 
-/// Unit the Next/Default Action thresholds are displayed in.
+/// How the Next/Default Action thresholds are displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThresholdUnit {
+    /// Frames left from the received GLOBAL frame: `in 512f`, `now` once
+    /// reached.
     #[default]
-    Frames,
-    Epochs,
+    Relative,
+    /// The threshold frame itself: `@f897120`.
+    Absolute,
 }
 
 impl ThresholdUnit {
     pub fn toggled(self) -> Self {
         match self {
-            ThresholdUnit::Frames => ThresholdUnit::Epochs,
-            ThresholdUnit::Epochs => ThresholdUnit::Frames,
+            ThresholdUnit::Relative => ThresholdUnit::Absolute,
+            ThresholdUnit::Absolute => ThresholdUnit::Relative,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThresholdUnit::Relative => "relative",
+            ThresholdUnit::Absolute => "absolute",
+        }
+    }
+}
+
+/// What a relative threshold counts from: the received GLOBAL frame, and the
+/// measured mean seconds per GLOBAL frame that turns the frames left into a
+/// `~` time estimate. `None` shows frames only, never a guessed time.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ThresholdClock {
+    pub frame: u64,
+    pub seconds_per_frame: Option<f64>,
+}
+
+/// A forecast duration rounded to whole minutes: `<1m`, `45m`, `2h41m`.
+pub fn fmt_estimate(seconds: f64) -> String {
+    let minutes = (seconds.max(0.0) / 60.0).round() as u64;
+    match minutes {
+        0 => "<1m".into(),
+        1..=59 => format!("{minutes}m"),
+        _ => format!("{}h{:02}m", minutes / 60, minutes % 60),
     }
 }
 
 /// One lifecycle hint: a verb, and — when it is bounded — the frame it falls
 /// due at. Every threshold shown is an epoch boundary, so a single stored
-/// frame renders in either unit. An empty label means "nothing to show".
+/// frame renders either relative to the received frame or absolute. An empty
+/// label means "nothing to show".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActionHint {
     pub label: String,
@@ -254,17 +301,22 @@ impl ActionHint {
         self.label.is_empty()
     }
 
-    /// `verb@f<frame>` or `verb@e<epoch>`; the bare verb when unbounded, which
-    /// for a Next Action reads as "available now".
-    pub fn render(&self, unit: ThresholdUnit, epoch_length: u64) -> String {
-        match self.at_frame {
-            None => self.label.clone(),
-            Some(f) => match unit {
-                ThresholdUnit::Frames => format!("{}@f{}", self.label, f),
-                ThresholdUnit::Epochs => {
-                    format!("{}@e{}", self.label, epoch_for_frame(f, epoch_length))
-                }
-            },
+    /// `verb in <N>f` (with ` (~<time>)` when the clock carries an interval)
+    /// or `verb now` once reached, relative to the clock's frame; `verb@f<frame>`
+    /// when absolute. The bare verb when unbounded, which for a Next Action
+    /// reads as "available now".
+    pub fn render(&self, unit: ThresholdUnit, clock: ThresholdClock) -> String {
+        let Some(f) = self.at_frame else { return self.label.clone() };
+        if unit == ThresholdUnit::Absolute {
+            return format!("{}@f{}", self.label, f);
+        }
+        if f <= clock.frame {
+            return format!("{} now", self.label);
+        }
+        let left = f - clock.frame;
+        match clock.seconds_per_frame {
+            Some(spf) => format!("{} in {left}f (~{})", self.label, fmt_estimate(left as f64 * spf)),
+            None => format!("{} in {left}f", self.label),
         }
     }
 }
@@ -350,6 +402,28 @@ fn confirm_hints(
 mod tests {
     use super::*;
 
+    /// A join or leave reads as activating or departing from its confirm until
+    /// the next epoch boundary, and the boundary is the first frame after it.
+    #[test]
+    fn confirmed_joins_activate_and_confirmed_leaves_depart_at_the_boundary() {
+        let timing = |raw_status, join_confirm_frame, leave_confirm_frame| AllocationTiming {
+            raw_status,
+            filter: &[0xab],
+            join_frame: 1_500,
+            join_confirm_frame,
+            leave_frame: 1_500,
+            leave_confirm_frame,
+            epoch: 3,
+        };
+        let phase = |t: AllocationTiming, frame| confirmed_phase(&t, compute_effective_status(&t, frame, 720), 720);
+        assert_eq!(phase(timing(raw_status::JOINING, 0, 0), 1_600), None);
+        assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_200), Some(("activating", 2_880)));
+        assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_880), None);
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 0), 1_600), None);
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_200), Some(("departing", 2_880)));
+        assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_880), None);
+    }
+
     fn timing(status: u32) -> AllocationTiming<'static> {
         AllocationTiming {
             raw_status: status,
@@ -392,6 +466,51 @@ mod tests {
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredJoining
         );
+    }
+
+    /// Relative thresholds count down from the received frame, read `now` once
+    /// reached, and add a `~` estimate only when an interval is measured;
+    /// absolute ones print the frame.
+    #[test]
+    fn thresholds_render_relative_absolute_and_now() {
+        let renew = ActionHint::at("renew", 897_120);
+        let clock = |frame, seconds_per_frame| ThresholdClock { frame, seconds_per_frame };
+        assert_eq!(renew.render(ThresholdUnit::Relative, clock(896_608, None)), "renew in 512f");
+        assert_eq!(renew.render(ThresholdUnit::Relative, clock(896_608, Some(18.87))), "renew in 512f (~2h41m)");
+        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_119, Some(10.0))), "renew in 1f (~<1m)");
+        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_120, Some(10.0))), "renew now");
+        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_200, None)), "renew now");
+        assert_eq!(renew.render(ThresholdUnit::Absolute, clock(896_608, Some(18.87))), "renew@f897120");
+        let free = ActionHint::text("(pause|leave)");
+        for unit in [ThresholdUnit::Relative, ThresholdUnit::Absolute] {
+            assert_eq!(free.render(unit, clock(896_608, Some(10.0))), "(pause|leave)");
+        }
+        assert_eq!(ThresholdUnit::default(), ThresholdUnit::Relative);
+        assert_eq!(ThresholdUnit::Relative.toggled(), ThresholdUnit::Absolute);
+        assert_eq!(ThresholdUnit::Absolute.toggled(), ThresholdUnit::Relative);
+    }
+
+    #[test]
+    fn estimates_round_to_whole_minutes() {
+        assert_eq!(fmt_estimate(0.0), "<1m");
+        assert_eq!(fmt_estimate(29.0), "<1m");
+        assert_eq!(fmt_estimate(30.0), "1m");
+        assert_eq!(fmt_estimate(45.0 * 60.0), "45m");
+        assert_eq!(fmt_estimate(59.0 * 60.0 + 29.0), "59m");
+        assert_eq!(fmt_estimate(60.0 * 60.0), "1h00m");
+        assert_eq!(fmt_estimate(2.0 * 3600.0 + 41.0 * 60.0 + 10.0), "2h41m");
+        assert_eq!(fmt_estimate(26.0 * 3600.0 + 5.0 * 60.0), "26h05m");
+    }
+
+    /// The next boundary is the first frame of the following epoch, from an
+    /// epoch's first frame through its last.
+    #[test]
+    fn next_boundary_from_an_epochs_first_and_last_frame() {
+        assert_eq!(next_epoch_boundary(1_440, 720), 2_160);
+        assert_eq!(next_epoch_boundary(2_159, 720), 2_160);
+        assert_eq!(next_epoch_boundary(2_160, 720), 2_880);
+        assert_eq!(next_epoch_boundary(0, 0), DEFAULT_EPOCH_LENGTH_FRAMES);
+        assert_eq!(next_epoch_boundary(119, 60), 120);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -130,6 +130,103 @@ async fn event_loop(
         terminal.draw(|f| view::draw(f, &mut model))?;
     }
     Ok(())
+}
+
+/// Options of a one-shot render: see [`render`].
+pub struct RenderOptions {
+    pub width: u16,
+    pub height: u16,
+    /// Keys applied before drawing, e.g. `n`, `Tab`, `Down`, `Ctrl+o`.
+    pub keys: Vec<String>,
+    /// Draw with colors on; when false, warnings carry the colorless `!`.
+    pub color: bool,
+    /// How long to wait for the node's answers.
+    pub timeout: Duration,
+}
+
+/// `qclient node prover manage --render`: fetch the node's data once, apply
+/// the given keys, draw one frame and print it as plain text. Read-only: the
+/// commands keys or results would start (joins, lifecycle operations, worker
+/// changes, follow-up checks) are dropped and reported on stderr.
+pub async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
+    let client = pc.connect().await?;
+    let km = pc.key_manager.clone();
+    let mut model = Model::new();
+    model.color_coding = opts.color;
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    spawn_action(&client, &km, &tx, &RefreshState::default(), Cmd::Fetch);
+    let deadline = tokio::time::Instant::now() + opts.timeout;
+    let mut dropped = Vec::new();
+    // One node, shard and reward answer each.
+    let mut pending = 3;
+    while pending > 0 {
+        let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            eprintln!("render: {pending} of 3 node answers missing after {}s", opts.timeout.as_secs());
+            break;
+        };
+        if matches!(msg, Msg::RewardRefresh(_) | Msg::ShardRefresh(_) | Msg::DataRefresh { .. }) {
+            pending -= 1;
+        }
+        dropped.extend(apply_msg(&mut model, msg).into_iter().filter(|cmd| !matches!(cmd, Cmd::Fetch)));
+    }
+    for key in &opts.keys {
+        dropped.extend(handle_key(&mut model, parse_key(key)?).into_iter().filter(|cmd| !matches!(cmd, Cmd::Fetch)));
+    }
+    for cmd in &dropped {
+        eprintln!("render: not run (read-only): {}", command_name(cmd));
+    }
+    print!("{}", view::render_text(&mut model, opts.width, opts.height));
+    Ok(())
+}
+
+/// `qclient node prover manage --help-text`: the TUI's help as plain text.
+pub fn help_text(width: u16) -> String {
+    view::help_text(width)
+}
+
+/// A key name for `--keys`: a character, `Tab`, `BackTab`, `Enter`, `Esc`,
+/// `Space`, `Backspace`, arrows, `PageUp`/`PageDown`, `Home`/`End`, optionally
+/// prefixed with `Ctrl+`.
+fn parse_key(name: &str) -> anyhow::Result<KeyEvent> {
+    let (modifiers, key) = match name.strip_prefix("Ctrl+").or_else(|| name.strip_prefix("ctrl+")) {
+        Some(key) => (KeyModifiers::CONTROL, key),
+        None => (KeyModifiers::NONE, name),
+    };
+    let code = match key {
+        "Tab" => KeyCode::Tab,
+        "BackTab" => KeyCode::BackTab,
+        "Enter" => KeyCode::Enter,
+        "Esc" => KeyCode::Esc,
+        "Space" => KeyCode::Char(' '),
+        "Backspace" => KeyCode::Backspace,
+        "Up" => KeyCode::Up,
+        "Down" => KeyCode::Down,
+        "Left" => KeyCode::Left,
+        "Right" => KeyCode::Right,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => KeyCode::Char(c),
+                _ => anyhow::bail!("unknown key `{name}`"),
+            }
+        }
+    };
+    Ok(KeyEvent::new(code, modifiers))
+}
+
+fn command_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Fetch => "refresh",
+        Cmd::Join(_) => "join",
+        Cmd::Lifecycle { .. } => "lifecycle operation",
+        Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
+        Cmd::CheckAllocation { .. } | Cmd::ScheduleAwaitCheck(_) => "allocation check",
+        Cmd::Quit => "quit",
+    }
 }
 
 struct RefreshState {
@@ -245,5 +342,19 @@ mod refresh_tests {
             Msg::ShardRefresh(Ok(Default::default()))
         });
         assert!(matches!(rx.recv().await, Some(Msg::ShardRefresh(Ok(_)))));
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn keys_parse_by_name() {
+        assert_eq!(parse_key("n").unwrap(), KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(parse_key("Tab").unwrap().code, KeyCode::Tab);
+        assert_eq!(parse_key("Ctrl+o").unwrap(), KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(parse_key("Space").unwrap().code, KeyCode::Char(' '));
+        assert!(parse_key("Hyper").is_err());
     }
 }
