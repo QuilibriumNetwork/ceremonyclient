@@ -606,6 +606,11 @@ impl WorkerOnlyNode {
             let cancel = self.cancel.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                // A failing sync leaves the worker's GLOBAL view, and with it
+                // its committee sessions, behind; three failures in a row
+                // (30 s) make it an outage.
+                let mut outage = crate::outage::Outage::begin_after(3);
+                let core_id = this.config.core_id;
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -618,7 +623,10 @@ impl WorkerOnlyNode {
                                 let anchor = {
                                     this.latest_prover_tree_anchor.lock().unwrap().clone()
                                 };
-                                match syncer.sync_prover_tree(&anchor).await {
+                                let result = syncer.sync_prover_tree(&anchor).await;
+                                log_prover_tree_sync(&mut outage, core_id, std::time::Instant::now(),
+                                    result.as_ref().err().map(ToString::to_string));
+                                match result {
                                     Ok(_) => {
                                         if let Err(error) = this.refresh_registry() {
                                             tracing::warn!(%error, "periodic prover registry refresh failed");
@@ -2177,5 +2185,56 @@ mod tests {
         // the misconfig in logs.
         let c = config_with_stream("not-a-multiaddr");
         assert_eq!(master_grpc_endpoint(&c), "http://127.0.0.1:8340");
+    }
+}
+
+/// Log the outage transitions of a worker's periodic prover-tree sync;
+/// `error` is the attempt's failure, `None` when it succeeded.
+fn log_prover_tree_sync(
+    outage: &mut crate::outage::Outage,
+    core_id: u32,
+    now: std::time::Instant,
+    error: Option<String>,
+) {
+    use crate::outage::OutageEvent;
+    let failed = error.is_some();
+    let error = error.unwrap_or_default();
+    match outage.observe(now, !failed) {
+        Some(OutageEvent::Began) => tracing::warn!(core_id, error = %error, scope = "local", action = "check",
+            "periodic prover-tree sync failing; this worker's GLOBAL view stops advancing; \
+             check its connection to the master and the master's GLOBAL sync"),
+        Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(core_id, secs, failures,
+            error = %error, scope = "local", action = "check", "periodic prover-tree sync still failing"),
+        Some(OutageEvent::Ended { secs, failures }) => tracing::info!(core_id, secs, failures,
+            "periodic prover-tree sync recovered"),
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod prover_tree_sync_log_tests {
+    use super::*;
+    use crate::outage::test_logs::CapturedLogs;
+
+    /// A sync failing three times in a row warns once, naming the worker and
+    /// the error; a success then logs the recovery with its duration.
+    #[test]
+    fn a_failing_prover_tree_sync_warns_once_then_logs_its_recovery() {
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let mut outage = crate::outage::Outage::begin_after(3);
+        for secs in [0, 10, 20, 30] {
+            log_prover_tree_sync(&mut outage, 7, at(secs), Some("master unreachable".into()));
+        }
+        let warns = logs.lines_with("prover-tree sync failing");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("core_id=7") && warns[0].contains("master unreachable"), "{}", warns[0]);
+        assert!(warns[0].contains("scope") && warns[0].contains("check"), "{}", warns[0]);
+        log_prover_tree_sync(&mut outage, 7, at(40), None);
+        let recovered = logs.lines_with("prover-tree sync recovered");
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].contains("secs=40") && recovered[0].contains("failures=4"), "{}", recovered[0]);
     }
 }

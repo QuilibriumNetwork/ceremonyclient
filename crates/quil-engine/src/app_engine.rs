@@ -24,6 +24,7 @@ use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
 
 use crate::app_types::AppShardState;
+use crate::outage::OutageEvent;
 
 #[path = "app_parent.rs"]
 mod app_parent;
@@ -2220,6 +2221,11 @@ pub struct AppConsensusEngine {
     sealed_session: Option<([u8; 32], Vec<u8>)>,
     /// When this member last published its closing certificate.
     seal_published_at: Option<std::time::Instant>,
+    /// Whether the running session's committed status is unreadable.
+    session_status_outage: crate::outage::Outage,
+    /// Whether the GLOBAL view the running session is judged by trails the
+    /// latest GLOBAL frame this node holds by more than an epoch.
+    session_view_lag: crate::outage::Outage,
     /// Self-clone of the inbound message sender, so `on_finalized` (running
     /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
     self_msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -2367,6 +2373,9 @@ impl AppConsensusEngine {
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
+            // Checked every 10 s: three unreadable checks in a row.
+            session_status_outage: crate::outage::Outage::begin_after(3),
+            session_view_lag: Default::default(),
             self_msg_tx: msg_tx,
             sizes,
             fee_snapshot,
@@ -3890,7 +3899,25 @@ impl AppConsensusEngine {
                 Err(_) => {}
             }
         }
-        match crate::app_handoff::still_current(&global, &session) {
+        let status = crate::app_handoff::still_current(&global, &session);
+        let now = std::time::Instant::now();
+        let filter = hex::encode(&self.filter);
+        let error = status.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        match self.session_status_outage.observe(now, status.is_ok()) {
+            Some(OutageEvent::Began) => warn!(core_id = self.core_id, filter = %filter,
+                generation = session.generation, error = %error, scope = "local", action = "report",
+                "committee session status unavailable; the session keeps running until it can be read"),
+            Some(OutageEvent::Continues { secs, failures }) => warn!(core_id = self.core_id, filter = %filter,
+                generation = session.generation, secs, failures, error = %error, scope = "local", action = "report",
+                "committee session status still unavailable"),
+            Some(OutageEvent::Ended { secs, failures }) => info!(core_id = self.core_id, filter = %filter,
+                generation = session.generation, secs, failures, "committee session status readable again"),
+            None => {}
+        }
+        if matches!(status, Ok(true)) {
+            self.observe_session_view_lag(&global, &session, now, &filter);
+        }
+        match status {
             Ok(true) => {}
             Ok(false) => {
                 info!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -3903,7 +3930,45 @@ impl AppConsensusEngine {
                 self.cw_session = None;
                 self.execution.state("handoff", "awaiting successor");
             }
-            Err(error) => debug!(core_id = self.core_id, error = %error, "committee session status unavailable"),
+            // Logged above, at its transitions.
+            Err(_) => {}
+        }
+    }
+
+    /// A session is retired only once this node's GLOBAL view shows it
+    /// superseded, so a view that stops advancing keeps the session hosted
+    /// and voting while its committee moves to a newer generation. Warn while
+    /// the view trails the latest GLOBAL frame this node holds by more than
+    /// an epoch, and log when it catches up.
+    fn observe_session_view_lag(
+        &mut self,
+        global: &Arc<quil_hypergraph::HypergraphCrdt>,
+        session: &quil_cw_consensus::handoff::Session,
+        now: std::time::Instant,
+        filter: &str,
+    ) {
+        use quil_execution::global_intrinsic::handoff::CommittedView;
+        let Ok(committed_frame) = CommittedView::capture(global).map(|view| view.frame()) else {
+            return;
+        };
+        let Some(latest_global_frame) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.frame_number)) else {
+            return;
+        };
+        let behind = session_view_behind(committed_frame, latest_global_frame,
+            quil_types::consensus::epoch_length_frames());
+        match self.session_view_lag.observe(now, !behind) {
+            Some(OutageEvent::Began) => warn!(core_id = self.core_id, filter, generation = session.generation,
+                committed_frame, latest_global_frame, scope = "local", action = "check",
+                "committee session's GLOBAL view is over an epoch behind this node's latest GLOBAL frame; \
+                 its committee may have moved to a newer generation; check this worker's prover-tree sync"),
+            Some(OutageEvent::Continues { secs, .. }) => warn!(core_id = self.core_id, filter,
+                generation = session.generation, committed_frame, latest_global_frame, secs,
+                scope = "local", action = "check", "committee session's GLOBAL view still over an epoch behind"),
+            Some(OutageEvent::Ended { secs, .. }) => info!(core_id = self.core_id, filter,
+                generation = session.generation, committed_frame, latest_global_frame, secs,
+                "committee session's GLOBAL view caught up"),
+            None => {}
         }
     }
 
@@ -7589,6 +7654,27 @@ pub(crate) fn validate_app_frame_panic_safe(
         Err(_) => Err(QuilError::Crypto(
             "app-shard frame validation panicked (malformed input)".into(),
         )),
+    }
+}
+
+/// Whether a session's committed GLOBAL view, at `committed_frame`, trails
+/// the latest GLOBAL frame the node holds by more than an epoch.
+fn session_view_behind(committed_frame: u64, latest_global_frame: u64, epoch_frames: u64) -> bool {
+    latest_global_frame.saturating_sub(committed_frame) > epoch_frames
+}
+
+#[cfg(test)]
+mod session_view_lag_tests {
+    use super::*;
+
+    /// A view up to an epoch old is current enough; beyond that it is behind,
+    /// and a view ahead of the stored head (the head lags) is not.
+    #[test]
+    fn a_session_view_over_an_epoch_old_is_behind() {
+        assert!(!session_view_behind(1_000, 1_000, 720));
+        assert!(!session_view_behind(1_000, 1_720, 720));
+        assert!(session_view_behind(1_000, 1_721, 720));
+        assert!(!session_view_behind(2_000, 1_000, 720));
     }
 }
 
