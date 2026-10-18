@@ -753,6 +753,23 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
     if materialized == 0 && latest == 0 { "-".into() } else { materialized.to_string() }
 }
 
+/// The ProverPhases cell: the shard's provers by lifecycle phase, symbols in
+/// compact mode and names in expanded mode. Zero fields are omitted except
+/// active, so an empty shard reads `a0`; unreported counts read `-`. A
+/// trailing `!` marks halt risk for `warning_slot`.
+fn prover_phases_cell(m: &Model, counts: Option<&quil_types::proto::node::ShardProverCounts>, size: &BigInt) -> String {
+    let Some(c) = counts else { return "-".into(); };
+    let fields = [(c.active, "a", "active"), (c.joining, "j", "joining"), (c.activating, "+", "activating"),
+        (c.leaving, "l", "leaving"), (c.departing, "-", "departing"), (c.paused, "p", "paused")];
+    let shown = fields.iter().enumerate().filter(|(i, (count, ..))| *i == 0 || *count > 0).map(|(_, field)| field);
+    let text = if m.compact_actions {
+        shown.map(|(count, symbol, _)| format!("{symbol}{count}")).collect::<Vec<_>>().join(" ")
+    } else {
+        shown.map(|(count, _, name)| format!("{count} {name}")).collect::<Vec<_>>().join(", ")
+    };
+    if prover_halt_risk(counts, size) { text + "!" } else { text }
+}
+
 /// The printed text of one allocations cell. Sizing and rendering both go
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
@@ -776,6 +793,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         13 => a.mode().to_string(),
         14 => next_action_text(m, &a.next_action),
         16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
+        ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
         _ => a.default_action.render(m.threshold_unit, m.epoch_length),
     }
 }
@@ -802,12 +820,12 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     let text = alloc_cell(m, a, col, fw);
-    if matches!(col, 6 | 7 | 12) { warning_slot(&text, m.color_coding) } else { text }
+    if matches!(col, 6 | 7 | 12 | ALLOC_PROVER_PHASES_COL) { warning_slot(&text, m.color_coding) } else { text }
 }
 
 fn avail_display_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     let text = avail_cell(m, s, col, fw);
-    if col == 9 { warning_slot(&text, m.color_coding) } else { text }
+    if matches!(col, 9 | AVAIL_PROVER_PHASES_COL) { warning_slot(&text, m.color_coding) } else { text }
 }
 
 fn alloc_marker(m: &Model, a: &AllocationRow) -> &'static str {
@@ -834,7 +852,7 @@ fn alloc_header(m: &Model, idx: usize) -> String {
     if idx == 8 && m.compact_actions && m.header_kpi_visible("Allocation GLOBAL snapshot") {
         text += snapshot_suffix(m, m.allocations.iter().map(|a| a.global_head.as_ref())).trim_start();
     }
-    if matches!(idx, 6 | 12) { warning_slot(&text, true) } else { text }
+    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL) { warning_slot(&text, true) } else { text }
 }
 
 /// Align shared columns through Reward; local and peer context use their own labels.
@@ -862,7 +880,8 @@ fn alloc_col_widths(
         ColumnSizing::Dynamic => alloc_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => alloc_widths_fixed(m, content_width, sorted),
     };
-    if (0..widths.len()).all(|col| m.alloc_column_visible(col)) { return (widths, fw); }
+    // The sizers already leave a hidden ProverPhases out.
+    if (0..widths.len()).all(|col| m.alloc_column_visible(col) || col == ALLOC_PROVER_PHASES_COL) { return (widths, fw); }
     for (col, width) in widths.iter_mut().enumerate() { if !m.alloc_column_visible(col) { *width = 0; } }
     let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
         else { filter_cap(&alloc_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
@@ -886,6 +905,7 @@ fn alloc_widths_measured(
     let n = ALLOC_COL_NAMES.len();
     let mut widths: Vec<usize> = (0..n)
         .map(|c| {
+            if c == ALLOC_PROVER_PHASES_COL && !m.alloc_column_visible(c) { return 0; }
             col_width(
                 &alloc_header(m, c),
                 sorted
@@ -899,7 +919,7 @@ fn alloc_widths_measured(
         &alloc_header(m, 1),
         sorted.iter().map(|a| printed_width(&a.filter_hex)),
     );
-    let fw = filter_width(content_width, &widths, n, cap);
+    let fw = filter_width(content_width, &widths, n - usize::from(widths[ALLOC_PROVER_PHASES_COL] == 0), cap);
     widths[1] = fw;
     (widths, fw)
 }
@@ -925,8 +945,13 @@ fn alloc_widths_fixed(
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&alloc_header(m, 8))), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 8, 0))));
     let status_w = fit(STATUS_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 12, 0))));
+    // The optional column has no fixed width: measured when shown, else absent.
+    let phases_w = if m.alloc_column_visible(ALLOC_PROVER_PHASES_COL) {
+        col_width(&alloc_header(m, ALLOC_PROVER_PHASES_COL), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, ALLOC_PROVER_PHASES_COL, 0))))
+    } else { 0 };
     // Whatever the wide columns took comes out of the flexible Filter column.
-    let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
+    let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH)
+        + phases_w + usize::from(phases_w > 0);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -959,6 +984,7 @@ fn alloc_widths_fixed(
         NEXT_ACTION_WIDTH,
         DEFAULT_ACTION_WIDTH,
         col_width(&alloc_header(m, 16), sorted.iter().map(|a| printed_width(&alloc_display_cell(m, a, 16, 0)))),
+        phases_w,
     ];
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -971,7 +997,8 @@ fn alloc_widths_fixed(
             widths[col] += 1;
         }
     }
-    if m.alloc_sort_col >= 0 && (m.alloc_sort_col as usize) < widths.len() {
+    // A hidden column stays absent, even when it is the sort column.
+    if m.alloc_sort_col >= 0 && (m.alloc_sort_col as usize) < widths.len() && widths[m.alloc_sort_col as usize] > 0 {
         widths[m.alloc_sort_col as usize] += 1;
     }
     if m.compact_units {
@@ -979,7 +1006,7 @@ fn alloc_widths_fixed(
             widths[col] = col_width(&alloc_header(m, col), sorted.iter()
                 .map(|a| printed_width(&alloc_display_cell(m, a, col, 0))));
         }
-        fw = filter_width(content_width, &widths, widths.len(), FILTER_WIDTH);
+        fw = filter_width(content_width, &widths, widths.len() - usize::from(phases_w == 0), FILTER_WIDTH);
         widths[1] = fw;
     }
     (widths, fw)
@@ -1172,6 +1199,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 if ci > 0 { spans.push(Span::raw(" ")); }
                 let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(m, a) }
                     else if ci == 7 && m.color_coding && m.reported_app_stalled(&a.filter) { WARNING }
+                    else if ci == ALLOC_PROVER_PHASES_COL && m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) { WARNING }
                     else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
                     else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
@@ -1198,6 +1226,9 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                     }
                     7 if m.color_coding && m.reported_app_stalled(&a.filter) => Span::styled(cell.clone(), Style::new().fg(WARNING)),
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
+                    ALLOC_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) => {
+                        Span::styled(cell.clone(), Style::new().fg(WARNING))
+                    }
                     11 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
@@ -1250,6 +1281,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         9 if m.reported_app_stalled(&s.filter) => "stalled!".into(),
         9 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         11 => interval_values(m, m.node_app_cadence.get(&s.filter), m.interval_mask()),
+        AVAIL_PROVER_PHASES_COL => prover_phases_cell(m, s.prover_counts.as_ref(), &s.shard_size),
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { reward_cell(m, &s.estimated_reward, &s.filter) },
     }
 }
@@ -1278,7 +1310,7 @@ fn avail_header(m: &Model, idx: usize) -> String {
     if idx == 8 && m.compact_actions && m.header_kpi_visible("Available GLOBAL snapshot") {
         text += snapshot_suffix(m, m.available.iter().map(|s| s.global_head.as_ref())).trim_start();
     }
-    if idx == 9 { warning_slot(&text, true) } else { text }
+    if matches!(idx, 9 | AVAIL_PROVER_PHASES_COL) { warning_slot(&text, true) } else { text }
 }
 
 fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Vec<usize>, usize) {
@@ -1286,7 +1318,7 @@ fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Ve
         ColumnSizing::Dynamic => avail_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => avail_widths_fixed(m, content_width, sorted),
     };
-    if (0..widths.len()).all(|col| m.avail_column_visible(col)) { return (widths, fw); }
+    if (0..widths.len()).all(|col| m.avail_column_visible(col) || col == AVAIL_PROVER_PHASES_COL) { return (widths, fw); }
     for (col, width) in widths.iter_mut().enumerate() { if !m.avail_column_visible(col) { *width = 0; } }
     let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
         else { filter_cap(&avail_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
@@ -1304,6 +1336,7 @@ fn avail_widths_measured(
     let n = AVAIL_COL_NAMES.len();
     let mut widths: Vec<usize> = (0..n)
         .map(|c| {
+            if c == AVAIL_PROVER_PHASES_COL && !m.avail_column_visible(c) { return 0; }
             col_width(
                 &avail_header(m, c),
                 sorted
@@ -1317,7 +1350,7 @@ fn avail_widths_measured(
         &avail_header(m, 1),
         sorted.iter().map(|s| printed_width(&s.filter_hex)),
     );
-    let fw = filter_width(content_width, &widths, n, cap);
+    let fw = filter_width(content_width, &widths, n - usize::from(widths[AVAIL_PROVER_PHASES_COL] == 0), cap);
     widths[1] = fw;
     (widths, fw)
 }
@@ -1337,7 +1370,11 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&avail_header(m, 8))), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, 8, 0))));
     let state_w = STATE_WIDTH.max(printed_width(&avail_header(m, 9)));
-    let grown = (state_w - STATE_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
+    let phases_w = if m.avail_column_visible(AVAIL_PROVER_PHASES_COL) {
+        col_width(&avail_header(m, AVAIL_PROVER_PHASES_COL), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, AVAIL_PROVER_PHASES_COL, 0))))
+    } else { 0 };
+    let grown = (state_w - STATE_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH)
+        + phases_w + usize::from(phases_w > 0);
     let mut fw = content_width.saturating_sub(AVAIL_FIXED_WIDTH + grown);
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -1365,6 +1402,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         state_w,
         reward_w,
         col_width(&avail_header(m, 11), sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, 11, 0)))),
+        phases_w,
     ];
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -1377,7 +1415,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
             widths[col] += 1;
         }
     }
-    if m.avail_sort_col >= 0 && (m.avail_sort_col as usize) < widths.len() {
+    if m.avail_sort_col >= 0 && (m.avail_sort_col as usize) < widths.len() && widths[m.avail_sort_col as usize] > 0 {
         widths[m.avail_sort_col as usize] += 1;
     }
     if m.compact_units {
@@ -1385,7 +1423,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
             widths[col] = col_width(&avail_header(m, col), sorted.iter()
                 .map(|s| printed_width(&avail_display_cell(m, s, col, 0))));
         }
-        fw = filter_width(content_width, &widths, widths.len(), FILTER_WIDTH);
+        fw = filter_width(content_width, &widths, widths.len() - usize::from(phases_w == 0), FILTER_WIDTH);
         widths[1] = fw;
     }
     (widths, fw)
@@ -1492,7 +1530,8 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 let cell = &cells[c];
                 if !m.avail_column_visible(c) { continue; }
                 if c > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) { WARNING } else if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
+                let color = if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) { WARNING } else if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) }
+                    else if m.color_coding && c == AVAIL_PROVER_PHASES_COL && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) { WARNING } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().enumerate().filter(|(col, _)| m.avail_column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
@@ -1515,6 +1554,9 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
                     7 | 9 if m.color_coding && m.reported_app_stalled(&s.filter) => Span::styled(cell, Style::new().fg(WARNING)),
                     7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
+                    AVAIL_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) => {
+                        Span::styled(cell, Style::new().fg(WARNING))
+                    }
                     6 | 9 if m.color_coding => {
                         let color = materialization_state_color(materialization_state(
                             s.materialized_frame,
@@ -2232,7 +2274,16 @@ fn help_items() -> Vec<HelpItem> {
         sec("Columns"),
         kv("Select", "`[x]` marks the row for a batch action (‹space›, or ‹a› for all)"),
         kv("Filter", "Shard filter, in hex; shortened from the middle when narrow"),
-        kv("Provers", "Live allocations: active, joining, paused and leaving; not peer availability"),
+        kv("Provers", "Live allocations: active, joining, paused and leaving; not peer availability. ProverPhases splits them by phase"),
+        kv("ProverPhases", "The shard's provers by lifecycle phase, as this node reports them at its frame; counts are provers of this shard, not of this node. Hidden by default: ‹b› → Columns, select it, ‹space›. Zero counts are omitted except active, so an empty shard shows `a0`; compact symbol / expanded name:"),
+        item("`a` / `active`: active provers"),
+        item("`j` / `joining`: joins not yet confirmed"),
+        item("`+` / `activating`: join confirmed; it joins its committee at the next epoch boundary"),
+        item("`l` / `leaving`: leaves not yet confirmed"),
+        item("`-` before a count / `departing`: leave confirmed; it keeps serving until the next epoch boundary"),
+        item("`p` / `paused`: paused provers"),
+        item("`-` alone: unavailable from this node (older server or no shard info)"),
+        item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
@@ -2307,7 +2358,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval/reward options nest beneath their KPI. Panel names and identity columns stay visible"),
         kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
         kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
-        kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, Worker, Status and Mode; values quoted in this help follow it"),
+        kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
         kv("‹e›", "Show Next/Default Action thresholds as frames (`f…`) or epochs (`e…`)"),
         kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
         kv("‹q› / ‹Ctrl+C›", "Quit"),
@@ -3405,6 +3456,7 @@ mod tests {
             status_name: "joining".to_string(),
             ring: 5,
             active_provers: provers,
+            prover_counts: None,
             shard_size: BigInt::from(0),
             data_shards: shards,
             materialized_frame: 0,
@@ -3568,6 +3620,7 @@ mod tests {
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),
             active_provers: 42,
+            prover_counts: None,
             ring: 1,
             shard_size: BigInt::from(size),
             data_shards: 2,
@@ -3636,8 +3689,8 @@ mod tests {
         for mode in [ColumnSizing::Fixed, ColumnSizing::Dynamic] {
             m.column_sizing = mode;
             let (alloc, avail) = shared_col_widths(&m, 260, &[a.clone()], &[peer.clone()]);
-            assert_eq!(alloc.len(), 17);
-            assert_eq!(avail.len(), 12);
+            assert_eq!(alloc.len(), 18);
+            assert_eq!(avail.len(), 13);
             assert_eq!(alloc[16], avail[11]);
             assert!(alloc[16] >= "15.0".len());
         }
@@ -3873,6 +3926,7 @@ mod tests {
                 13, // "(pause|leave)", wider than "NextAction"
                 16, // "activate@f699840", wider than "DefaultAction"
                 20, // "Interval [s 60m/24h]"
+                0,  // "ProverPhases", hidden by default
             ]
         );
         assert_eq!(fw, 15);
@@ -3883,7 +3937,7 @@ mod tests {
     #[test]
     fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
         let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20]);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0]);
         assert_eq!(fw, 12);
         assert_eq!(w.iter().sum::<usize>() + 16, 216);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
@@ -3898,7 +3952,8 @@ mod tests {
         for m in [Model::new(), fixed(), expanded] {
             let rows = joining_table();
             let (w, fw) = alloc_col_widths(&m, 165, &rows);
-            for (c, width) in w.iter().enumerate() {
+            // A hidden column takes no width and prints no cell.
+            for (c, width) in w.iter().enumerate().filter(|(c, _)| m.alloc_column_visible(*c)) {
                 for a in &rows {
                     let cell = alloc_cell(&m, a, c, fw);
                     assert!(
@@ -4028,6 +4083,87 @@ mod tests {
         assert_eq!(worker_color(-1), Some(ERROR));
         assert_eq!(worker_color(0), None);
         assert_eq!(worker_color(57), None);
+    }
+
+    #[test]
+    fn prover_phase_cells_omit_zero_fields_except_active_in_both_modes() {
+        use quil_types::proto::node::ShardProverCounts;
+        let mut m = Model::new();
+        let sample = ShardProverCounts { joining: 3, activating: 1, active: 12, paused: 0, leaving: 2, departing: 1 };
+        let mut a = row("aa", 19, 1, 1, "", "");
+        a.shard_size = BigInt::from(1_000_000u64);
+        a.prover_counts = Some(sample.clone());
+        let mut s = shard("bb", 1_000_000, 0);
+        s.prover_counts = Some(sample);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "a12 j3 +1 l2 -1");
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "a12 j3 +1 l2 -1");
+        m.compact_actions = false;
+        let expanded = "12 active, 3 joining, 1 activating, 2 leaving, 1 departing";
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), expanded);
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), expanded);
+        a.prover_counts = Some(ShardProverCounts { active: 5, paused: 2, ..Default::default() });
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "5 active, 2 paused");
+        m.compact_actions = true;
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "a5 p2");
+        // An empty shard keeps its active field; without data it is no halt risk.
+        s.shard_size = BigInt::from(0);
+        s.prover_counts = Some(ShardProverCounts::default());
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "a0");
+        m.compact_actions = false;
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "0 active");
+        // Unreported counts are unavailable, not zero.
+        a.prover_counts = None;
+        s.prover_counts = None;
+        assert_eq!(alloc_cell(&m, &a, ALLOC_PROVER_PHASES_COL, 0), "-");
+        assert_eq!(avail_cell(&m, &s, AVAIL_PROVER_PHASES_COL, 0), "-");
+    }
+
+    #[test]
+    fn prover_phases_warn_of_halt_risk_by_active_and_activating_count() {
+        use quil_types::proto::node::ShardProverCounts;
+        let counts = |active, activating, joining| Some(ShardProverCounts { active, activating, joining, ..Default::default() });
+        let size = BigInt::from(1u64);
+        assert!(prover_halt_risk(counts(2, 1, 9).as_ref(), &size), "unconfirmed joins are no coverage");
+        assert!(prover_halt_risk(counts(0, 0, 0).as_ref(), &size));
+        assert!(!prover_halt_risk(counts(3, 1, 0).as_ref(), &size), "a confirmed join is coverage");
+        assert!(!prover_halt_risk(counts(4, 0, 0).as_ref(), &size));
+        assert!(!prover_halt_risk(counts(0, 0, 0).as_ref(), &BigInt::from(0)), "a shard without data cannot halt");
+        assert!(!prover_halt_risk(None, &size), "unreported counts establish nothing");
+
+        let mut m = Model::new();
+        m.hidden_columns.remove(&ALLOC_PROVER_PHASES_COL);
+        let mut risky = row("aa", 3, 1, 1, "", "");
+        risky.shard_size = size.clone();
+        risky.prover_counts = counts(2, 1, 0);
+        let mut healthy = row("bb", 4, 1, 2, "", "");
+        healthy.shard_size = size.clone();
+        healthy.prover_counts = counts(4, 0, 0);
+        let mut risky_shard = shard("cc", 1, 0);
+        risky_shard.prover_counts = risky.prover_counts.clone();
+        let mut healthy_shard = shard("dd", 1, 0);
+        healthy_shard.prover_counts = healthy.prover_counts.clone();
+        // Colors off: `!` marks the warning; colors on keep its slot blank.
+        m.color_coding = false;
+        assert_eq!(alloc_display_cell(&m, &risky, ALLOC_PROVER_PHASES_COL, 0), "a2 +1!");
+        assert_eq!(alloc_display_cell(&m, &healthy, ALLOC_PROVER_PHASES_COL, 0), "a4 ");
+        assert_eq!(avail_display_cell(&m, &risky_shard, AVAIL_PROVER_PHASES_COL, 0), "a2 +1!");
+        m.color_coding = true;
+        assert_eq!(alloc_display_cell(&m, &risky, ALLOC_PROVER_PHASES_COL, 0), "a2 +1 ");
+        let fg = |lines: &[Line<'static>], line: usize, text: &str| lines[line].spans.iter()
+            .find(|span| span.content.trim() == text).unwrap_or_else(|| panic!("no `{text}` cell: {}", lines[line])).style.fg;
+        // Both row renderings: the cursor row and the others.
+        for allocations in [[risky.clone(), healthy.clone()], [healthy.clone(), risky.clone()]] {
+            let lines = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 300, 6), None);
+            let (r, h) = if allocations[0].filter_hex == "aa" { (1, 2) } else { (2, 1) };
+            assert_eq!(fg(&lines, r, "a2 +1"), Some(WARNING));
+            assert_ne!(fg(&lines, h, "a4"), Some(WARNING));
+        }
+        for available in [[risky_shard.clone(), healthy_shard.clone()], [healthy_shard.clone(), risky_shard.clone()]] {
+            let lines = render_avail_panel(&mut m, &available, Rect::new(0, 0, 300, 6), None);
+            let (r, h) = if available[0].filter_hex == "cc" { (1, 2) } else { (2, 1) };
+            assert_eq!(fg(&lines, r, "a2 +1"), Some(WARNING));
+            assert_ne!(fg(&lines, h, "a4"), Some(WARNING));
+        }
     }
 
     fn help_text() -> String {
@@ -4655,5 +4791,46 @@ mod visibility_grid_tests {
             assert!(m.column_picker_offset>0,"focused last item must scroll into view");
             assert!(text.contains("▶ [x]") || text.contains("▶   [x]"),"selected item missing: {text}");
         }
+    }
+    #[test]
+    fn prover_phases_column_is_hidden_until_the_picker_enables_it_for_both_panels() {
+        use quil_types::proto::node::ShardProverCounts;
+        use super::super::update::handle_key;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.compact_actions = false; m.compact_units = false; m.data_loaded = true;
+        let mut a = super::tests::row("aa", 7, 1, 1, "", "");
+        a.prover_counts = Some(ShardProverCounts { active: 7, ..Default::default() });
+        let mut s = super::tests::shard("bb", 0, 0);
+        s.prover_counts = Some(ShardProverCounts { active: 5, joining: 1, ..Default::default() });
+        let tables = |m: &mut Model| (render_alloc_panel(m, &[a.clone()], Rect::new(0, 0, 300, 5), None),
+            render_avail_panel(m, &[s.clone()], Rect::new(0, 0, 300, 5), None));
+        let (alloc, avail) = tables(&mut m);
+        assert!(!alloc[0].to_string().contains("ProverPhases") && !avail[0].to_string().contains("ProverPhases"));
+        assert!(!alloc[1].to_string().contains("7 active") && !avail[1].to_string().contains("5 active"));
+        // ‹b›, move to the item, ‹space›: the picker shows it unchecked, then checked.
+        let mut terminal = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        handle_key(&mut m, key(KeyCode::Char('b')));
+        assert!(m.column_picker_active);
+        let item = m.visibility_names().iter().position(|&name| name == "ProverPhases").unwrap();
+        assert!(m.column_picker_cursor < item);
+        while m.column_picker_cursor < item { handle_key(&mut m, key(KeyCode::Down)); }
+        assert!(screen(&mut terminal, &mut m, 100, 44).contains("[ ] ProverPhases"));
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert!(screen(&mut terminal, &mut m, 100, 44).contains("[x] ProverPhases"));
+        handle_key(&mut m, key(KeyCode::Enter));
+        assert!(!m.column_picker_active);
+        let (alloc, avail) = tables(&mut m);
+        assert!(alloc[0].to_string().contains("ProverPhases") && avail[0].to_string().contains("ProverPhases"));
+        assert!(alloc[1].to_string().contains("7 active"), "{}", alloc[1]);
+        assert!(avail[1].to_string().contains("5 active, 1 joining"), "{}", avail[1]);
+        // The Available panel's picker toggles the same shared setting.
+        m.focus = PanelFocus::Available;
+        handle_key(&mut m, key(KeyCode::Char('b')));
+        let item = m.visibility_names().iter().position(|&name| name == "ProverPhases").unwrap();
+        while m.column_picker_cursor < item { handle_key(&mut m, key(KeyCode::Down)); }
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        handle_key(&mut m, key(KeyCode::Esc));
+        let (alloc, avail) = tables(&mut m);
+        assert!(!alloc[0].to_string().contains("ProverPhases") && !avail[0].to_string().contains("ProverPhases"));
     }
 }
