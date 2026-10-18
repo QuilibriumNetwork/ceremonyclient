@@ -27,6 +27,22 @@ pub struct Config {
     pub proof_worker: ProofWorkerConfig,
 }
 
+/// The gRPC listener a node binds when `listenGrpcMultiaddr` is empty: local
+/// only, since NodeService serves unauthenticated control RPCs.
+pub const DEFAULT_LISTEN_GRPC_MULTIADDR: &str = "/ip4/127.0.0.1/tcp/8337";
+
+impl Config {
+    /// The gRPC listener the node binds: the configured multiaddr, or
+    /// [`DEFAULT_LISTEN_GRPC_MULTIADDR`] when it is empty.
+    pub fn effective_listen_grpc_multiaddr(&self) -> &str {
+        if self.listen_grpc_multiaddr.is_empty() {
+            DEFAULT_LISTEN_GRPC_MULTIADDR
+        } else {
+            &self.listen_grpc_multiaddr
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -35,7 +51,7 @@ impl Default for Config {
             engine: EngineConfig::default(),
             db: DbConfig::default(),
             logger: LogConfig::default(),
-            listen_grpc_multiaddr: String::new(),
+            listen_grpc_multiaddr: DEFAULT_LISTEN_GRPC_MULTIADDR.to_string(),
             listen_rest_multiaddr: String::new(),
             explorer: ExplorerConfig::default(),
             proof_worker: ProofWorkerConfig::default(),

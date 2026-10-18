@@ -248,10 +248,19 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_empty_listen_addresses() {
+    fn default_config_listens_for_grpc_locally_only() {
         let c = Config::default();
-        assert!(c.listen_grpc_multiaddr.is_empty());
+        assert_eq!(c.listen_grpc_multiaddr, DEFAULT_LISTEN_GRPC_MULTIADDR);
         assert!(c.listen_rest_multiaddr.is_empty());
+    }
+
+    #[test]
+    fn an_empty_grpc_listener_means_the_local_default() {
+        let mut c = Config::default();
+        c.listen_grpc_multiaddr.clear();
+        assert_eq!(c.effective_listen_grpc_multiaddr(), "/ip4/127.0.0.1/tcp/8337");
+        c.listen_grpc_multiaddr = "/ip4/0.0.0.0/tcp/8337".into();
+        assert_eq!(c.effective_listen_grpc_multiaddr(), "/ip4/0.0.0.0/tcp/8337");
     }
 
     #[test]

@@ -764,29 +764,21 @@ pub(crate) fn spawn_all(
         })
     };
 
-    let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
-        // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
-        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
-        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
-        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
-        // bind turns it into a remotely-reachable control plane. Operators who
-        // need remote access set `listen_grpc_multiaddr` explicitly.
-        "127.0.0.1:8337".to_string()
-    } else {
-        let parts: Vec<&str> = config.listen_grpc_multiaddr
+    // SECURITY: an empty listener means LOCALHOST (quil-config's
+    // DEFAULT_LISTEN_GRPC_MULTIADDR), not 0.0.0.0. This NodeService exposes
+    // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
+    // its per-RPC no-auth assumes a local/trusted caller. A world-open default
+    // bind turns it into a remotely-reachable control plane. Operators who
+    // need remote access set `listen_grpc_multiaddr` explicitly.
+    let grpc_addr = {
+        let parts: Vec<&str> = config.effective_listen_grpc_multiaddr()
             .trim_start_matches('/')
             .split('/')
             .collect();
         if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
             format!("{}:{}", parts[1], parts[3])
         } else {
-            // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
-        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
-        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
-        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
-        // bind turns it into a remotely-reachable control plane. Operators who
-        // need remote access set `listen_grpc_multiaddr` explicitly.
-        "127.0.0.1:8337".to_string()
+            "127.0.0.1:8337".to_string()
         }
     };
 
