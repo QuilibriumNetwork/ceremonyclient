@@ -467,6 +467,13 @@ pub type AcceptAnyClientCert = XsignClientCertVerifier;
 /// presents the Ed25519-derived Quilibrium cert and requires every
 /// client to present one (verified permissively — trust is at the
 /// application layer via the peer-auth interceptor).
+/// Install rustls's ring provider as the process default if none is yet.
+/// rustls cannot pick one itself when the build enables more than one
+/// provider feature, and then panics on its first TLS config.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub fn build_quil_server_tls_config(
     falcon_signing_key: &[u8],
 ) -> Result<Arc<ServerConfig>, QuilTlsError> {

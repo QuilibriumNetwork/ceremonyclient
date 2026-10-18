@@ -73,18 +73,25 @@ pub async fn connect_channel(opts: &ConnectOpts) -> anyhow::Result<Channel> {
     build_channel(&addr, tls).await
 }
 
-async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
+fn endpoint(addr: &str, tls: bool) -> anyhow::Result<Endpoint> {
     let scheme = if tls { "https" } else { "http" };
     let mut endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
         .map_err(|e| anyhow::anyhow!("invalid endpoint {addr}: {e}"))?
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(120));
     if tls {
+        // rustls cannot pick a process-level provider from its features in
+        // qclient's build and would panic here without one (#696).
+        quil_rpc::quil_tls::install_crypto_provider();
         // System trust roots, verifying the server cert (Go's
         // InsecureSkipVerify:false). SNI is taken from the URI authority.
         endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
-    let channel = endpoint
+    Ok(endpoint)
+}
+
+async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
+    let channel = endpoint(addr, tls)?
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
@@ -175,6 +182,11 @@ mod tests {
             grpc_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8337").unwrap(),
             "127.0.0.1:8337"
         );
+    }
+
+    #[test]
+    fn a_tls_endpoint_builds_without_a_preinstalled_crypto_provider() {
+        assert!(endpoint(PUBLIC_RPC_ADDR, true).is_ok());
     }
 
     #[test]
