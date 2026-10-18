@@ -2210,6 +2210,26 @@ fn help_body() -> Vec<Line<'static>> {
     help_entries().into_iter().map(|(item, entry)| item.line(entry, true)).collect()
 }
 
+/// One frame of the TUI drawn at `width` × `height`, as plain text with
+/// trailing spaces trimmed: what `manage --render` prints.
+pub(super) fn render_text(m: &mut Model, width: u16, height: u16) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("an in-memory terminal");
+    terminal.draw(|f| draw(f, m)).expect("drawing into memory");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string() + "\n")
+        .collect()
+}
+
+/// The help screen at `width`, as plain text without colors.
+pub(super) fn help_text(width: u16) -> String {
+    help_lines(width, false)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>().trim_end().to_string() + "\n")
+        .collect()
+}
+
 /// The help laid out for a terminal `width` columns wide; `colors` follows
 /// the main view's color-coding toggle.
 fn help_lines(width: u16, colors: bool) -> Vec<Line<'static>> {
@@ -2639,6 +2659,35 @@ mod tests {
         assert_eq!(alloc_heading_lines(&m, &[], 1000).len(), 1);
         assert!(alloc_heading_lines(&m, &[], 80).len() > 1);
         assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]: 1 @f123456"));
+    }
+
+    /// A render is the drawn frame as text: one line per row, no trailing
+    /// spaces, with the same content an interactive draw shows.
+    #[test]
+    fn a_render_prints_the_drawn_frame_as_text() {
+        let mut m = Model::new(); m.compact_actions = false; m.data_loaded = true;
+        m.allocations = joining_table();
+        let text = render_text(&mut m, 100, 40);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 40);
+        assert!(lines.iter().all(|l| !l.ends_with(' ')));
+        assert!(lines.iter().any(|l| l.contains("Select Filter")), "{text}");
+        assert!(!text.contains('\u{1b}'), "no escape sequences");
+    }
+
+    /// The help as text keeps every section heading and has no styling.
+    #[test]
+    fn help_text_lists_the_help_sections() {
+        let text = super::help_text(100);
+        // Wrapping folds a heading's runs of spaces into one.
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words = flat(&text);
+        for item in help_items() {
+            if let HelpItem::Section(section) = item {
+                assert!(words.contains(&flat(section)), "missing section {section}");
+            }
+        }
+        assert!(!text.contains('\u{1b}'));
     }
 
     #[test]
