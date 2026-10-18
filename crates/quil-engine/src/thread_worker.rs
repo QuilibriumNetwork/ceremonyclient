@@ -252,6 +252,9 @@ pub struct WorkerOwnedDeps {
     /// Committees that certified legacy frames today's registry no longer
     /// reproduces (see `historical_committee`).
     pub historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
+    /// Authenticated archive copies of GLOBAL frames the master never held,
+    /// which app frames this worker validates are anchored to.
+    pub global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -666,6 +669,8 @@ impl ThreadWorkerManager {
                                                         owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
                                                     ).with_historical_committee_source(
                                                         owned.as_ref().and_then(|o| o.historical_committee_source.clone()),
+                                                    ).with_global_anchor_source(
+                                                        owned.as_ref().and_then(|o| o.global_anchor_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.

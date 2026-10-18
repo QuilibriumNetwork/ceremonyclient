@@ -510,6 +510,7 @@ message GlobalAlert {
 
 message GetGlobalFrameRequest {
   uint64 frame_number = 1;
+  bool historical_anchor = 2; // a worker asks its own master for a historical header, from an archive if not held
 }
 
 message GlobalFrameResponse {

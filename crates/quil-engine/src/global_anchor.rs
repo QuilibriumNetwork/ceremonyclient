@@ -40,7 +40,8 @@ pub async fn ensure_global_anchor(
             "historical anchor is not behind the worker GLOBAL head".into(),
         ));
     }
-    let frame = tokio::time::timeout(Duration::from_secs(10), source(number))
+    // The master has a bounded archive fallback; give that hop time.
+    let frame = tokio::time::timeout(Duration::from_secs(12), source(number))
         .await
         .map_err(|_| {
             QuilError::ExecutionUnavailable("master GLOBAL anchor fetch timed out".into())

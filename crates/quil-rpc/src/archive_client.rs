@@ -650,7 +650,24 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false })
+            .await?
+            .into_inner();
+        resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// Historical GLOBAL frame `frame_number` from this worker's own master
+    /// (see [`Self::connect_own_master`]), which needs only its header: the
+    /// master serves it even when it pruned the frame's request bodies, and
+    /// fetches an authenticated copy from an archive when it never held it.
+    /// Any other server treats this as [`Self::get_global_frame`].
+    pub async fn get_global_anchor(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))

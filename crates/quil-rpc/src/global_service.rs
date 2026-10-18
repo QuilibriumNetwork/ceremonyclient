@@ -32,6 +32,19 @@ pub trait FrameLookup: Send + Sync {
     ) -> Result<global::GlobalProposal, String> {
         Err("get_global_proposal not supported by this FrameLookup".into())
     }
+
+    /// Frame `frame_number` as this node holds it, for its own worker's
+    /// historical anchor (`GetGlobalFrame` with `historical_anchor`), which
+    /// needs only the header: unlike [`Self::get_frame`], a frame whose
+    /// request bodies were pruned is returned as its header. `Ok(None)` when
+    /// the frame is not held. Never cached and never served to a peer. The
+    /// default holds none.
+    fn get_anchor_frame(
+        &self,
+        _frame_number: u64,
+    ) -> Result<Option<global::GlobalFrame>, String> {
+        Ok(None)
+    }
 }
 
 /// Read-through, bounded in-memory cache in front of a [`FrameLookup`].
@@ -194,6 +207,15 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
             self.insert_proposal(frame_number, Arc::new(proposal.clone()));
         }
         Ok(proposal)
+    }
+
+    /// Uncached: a header-only frame must never reach the by-number cache
+    /// the peer-facing `get_frame` reads.
+    fn get_anchor_frame(
+        &self,
+        frame_number: u64,
+    ) -> Result<Option<global::GlobalFrame>, String> {
+        self.inner.get_anchor_frame(frame_number)
     }
 }
 
@@ -414,6 +436,9 @@ pub struct GlobalRpcServer {
     app_shards: Option<AppShardsProvider>,
     forest_server: Option<Arc<dyn ForestServer>>,
     global_vertex_proof_source: Option<quil_engine::storage_history::GlobalVertexProofSource>,
+    /// Authenticated archive copies of GLOBAL frames this node never held,
+    /// for its own workers' historical anchors; `None` answers "not found".
+    global_anchor_source: Option<quil_engine::global_anchor::GlobalAnchorSource>,
     archive_directory: Option<Arc<crate::ArchiveEndpointPool>>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
@@ -464,6 +489,8 @@ fn default_forest_read_slots(cores: usize) -> usize {
     (cores / 4).clamp(1, 32)
 }
 static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// Concurrent own-worker GLOBAL anchor fetches from archives.
+static GLOBAL_ANCHOR_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// How long a forest read waits for a storage slot before the archive answers
 /// busy. A syncing client retries; a long queue would only hold its
@@ -635,6 +662,7 @@ impl GlobalRpcServer {
             app_shards: None,
             forest_server: None,
             global_vertex_proof_source: None,
+            global_anchor_source: None,
             archive_directory: None,
             message_broadcast: None,
             self_peer_id: None,
@@ -738,6 +766,36 @@ impl GlobalRpcServer {
         self
     }
 
+    /// Install the archive fallback for own-worker historical anchors (see
+    /// [`Self::own_worker_anchor`]).
+    pub fn with_global_anchor_source(mut self, source: Option<quil_engine::global_anchor::GlobalAnchorSource>) -> Self {
+        self.global_anchor_source = source;
+        self
+    }
+
+    /// A historical GLOBAL frame for this node's own worker, which validates
+    /// an app frame anchored to it and needs only its header: the stored
+    /// frame even when its request bodies were pruned, else an authenticated
+    /// archive copy from `global_anchor_source`. A peer asking the
+    /// same is served by `get_frame`, which refuses both.
+    async fn own_worker_anchor(&self, frame_number: u64) -> Result<global::GlobalFrame, Status> {
+        let frames = self.frames.clone();
+        let held = tokio::task::spawn_blocking(move || frames.get_anchor_frame(frame_number))
+            .await
+            .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+            .map_err(|e| Status::unavailable(format!("frame {frame_number} unreadable: {e}")))?;
+        if let Some(frame) = held {
+            return Ok(frame);
+        }
+        let Some(source) = self.global_anchor_source.as_ref() else {
+            return Err(Status::not_found(format!("frame {frame_number} not found")));
+        };
+        let _permit = GLOBAL_ANCHOR_WORKERS.try_acquire().map_err(|_| Status::resource_exhausted("GLOBAL anchor fetches busy"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), source(frame_number))
+            .await.map_err(|_| Status::unavailable("GLOBAL anchor archive fetch timed out"))?
+            .map_err(|e| Status::unavailable(e.to_string()))
+    }
+
     pub fn with_archive_directory(mut self, pool: Arc<crate::ArchiveEndpointPool>) -> Self {
         self.archive_directory = Some(pool);
         self
@@ -833,8 +891,17 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetGlobalFrameRequest>,
     ) -> Result<Response<global::GlobalFrameResponse>, Status> {
+        // Only this node's own worker may ask for an anchor; from anyone else
+        // the flag is ignored. The latest-frame alias is never an anchor.
+        let anchor = request.get_ref().historical_anchor
+            && request.get_ref().frame_number != 0
+            && self.is_own_identity(request.extensions());
         let req = request.into_inner();
         let frame_number = req.frame_number;
+        if anchor {
+            let frame = self.own_worker_anchor(frame_number).await?;
+            return Ok(Response::new(global::GlobalFrameResponse { frame: Some(frame), proof: Vec::new() }));
+        }
 
         // Store read runs on the blocking pool, NOT inline on a peer-gRPC
         // runtime worker. This is the hottest serving RPC on the network
@@ -2190,5 +2257,82 @@ mod historical_proof_tests {
             Arc::new(|_, _| Box::pin(async { Err(quil_types::error::QuilError::ExecutionUnavailable("pruned".into())) })),
         ));
         assert_eq!(unavailable.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+}
+
+#[cfg(test)]
+mod global_anchor_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn frame(number: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader { frame_number: number, ..Default::default() }),
+            requests: vec![],
+        }
+    }
+
+    /// Holds frame 5 only as its header, its request bodies pruned, and
+    /// refuses it to `get_frame` as the clock-store lookup does.
+    struct PrunedLookup;
+    impl FrameLookup for PrunedLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Ok(frame(9)) }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            Err(format!("frame {n} requests are not retained (kept from 8)"))
+        }
+        fn get_anchor_frame(&self, n: u64) -> Result<Option<global::GlobalFrame>, String> {
+            Ok((n == 5).then(|| frame(5)))
+        }
+    }
+
+    /// The node's own worker asking for an anchor gets a pruned frame's
+    /// header, and an archive copy of a frame the node never held. A peer,
+    /// even setting the flag, and a request without it keep the refusal and
+    /// cause no archive fetch; the latest-frame alias is never an anchor.
+    #[tokio::test]
+    async fn only_own_workers_get_pruned_headers_and_archive_anchors() {
+        let me = quil_p2p::PeerId::random();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: quil_engine::global_anchor::GlobalAnchorSource = {
+            let calls = calls.clone();
+            Arc::new(move |n| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 6 {
+                        Ok(frame(6))
+                    } else {
+                        Err(quil_types::error::QuilError::ExecutionUnavailable("no archive served it".into()))
+                    }
+                })
+            })
+        };
+        let lookup = CachingFrameLookup::new(PrunedLookup, 16, std::time::Duration::from_secs(1));
+        let server = GlobalRpcServer::new(Arc::new(lookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_global_anchor_source(Some(source));
+        let request = |frame_number, historical_anchor, peer: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor });
+            if let Some(peer_id) = peer {
+                request.extensions_mut().insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
+            }
+            request
+        };
+        let served = |result: Result<Response<global::GlobalFrameResponse>, Status>| {
+            result
+                .map(|response| response.into_inner().frame.and_then(|f| f.header).map_or(u64::MAX, |h| h.frame_number))
+                .map_err(|status| status.code())
+        };
+        assert_eq!(served(server.get_global_frame(request(5, true, Some(me))).await), Ok(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a held header needs no archive");
+        assert_eq!(served(server.get_global_frame(request(6, true, Some(me))).await), Ok(6));
+        assert_eq!(served(server.get_global_frame(request(7, true, Some(me))).await), Err(tonic::Code::Unavailable));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for (anchor, peer) in [(true, Some(quil_p2p::PeerId::random())), (true, None), (false, Some(me))] {
+            assert_eq!(served(server.get_global_frame(request(5, anchor, peer)).await), Err(tonic::Code::NotFound));
+            assert_eq!(served(server.get_global_frame(request(6, anchor, peer)).await), Err(tonic::Code::NotFound));
+        }
+        assert_eq!(served(server.get_global_frame(request(0, true, Some(me))).await), Ok(9));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
