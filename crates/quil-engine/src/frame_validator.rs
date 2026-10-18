@@ -1021,14 +1021,18 @@ impl BlsAppFrameValidator {
 
         // 2. Committee authentication is required for every finalized
         // post-genesis frame. Recomputing the public deterministic digest alone
-        // does not authenticate a frame. Genesis has no signature.
+        // does not authenticate a frame. Genesis has no signature. The error
+        // names the frame, so it can be fetched from an archive for review.
         if require_signature
             && header.frame_number != 0
             && header.public_key_signature_bls48581.is_none()
         {
-            return Err(QuilError::InvalidArgument(
-                "app shard frame missing BLS signature (post-genesis frames must be signed)".into(),
-            ));
+            return Err(QuilError::InvalidArgument(format!(
+                "app shard frame {} (parent selector {}) missing BLS signature \
+                 (post-genesis frames must be signed)",
+                header.frame_number,
+                hex::encode(&header.parent_selector),
+            )));
         }
         // A commonware-simplex-finalized shard frame carries the simplex
         // FINALIZATION certificate (magic-prefixed) in the sig field's
@@ -1659,6 +1663,7 @@ mod tests {
         };
         let err = v.validate(&frame).unwrap_err();
         assert!(err.to_string().contains("missing BLS signature"));
+        assert!(err.to_string().contains("app shard frame 3 "), "the error names the frame: {err}");
     }
 
     #[test]
