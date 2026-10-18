@@ -663,6 +663,9 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             } else if let Some(window) = m.visibility_reward_window(m.visibility_section, m.column_picker_cursor) {
                 let next = m.reward_mask() ^ (1 << window);
                 if next != 0 { m.reward_windows = next; }
+            } else if let Some(field) = m.visibility_global_field(m.visibility_section, m.column_picker_cursor) {
+                let next = m.global_field_mask() ^ (1 << field);
+                if next != 0 { m.global_fields = next; }
             } else if m.visibility_section == 0 {
                 let col = m.visibility_column_index(m.column_picker_cursor).unwrap();
                 let key = m.column_visibility_key(col);
@@ -675,7 +678,7 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('c') if m.visibility_section == 0 => m.hidden_columns.extend([2, 4, 5]),
         KeyCode::Char('a') => {
             if m.visibility_section == 0 { m.hidden_columns.clear(); m.interval_windows = 3; m.reward_windows = 7; }
-            else { for name in m.visibility_names() { m.hidden_header_kpis.remove(name); } if m.visibility_section == 1 { m.global_interval_windows = 3; } if m.visibility_section == 2 { m.reward_windows = 7; } }
+            else { for name in m.visibility_names() { m.hidden_header_kpis.remove(name); } if m.visibility_section == 1 { m.global_interval_windows = 3; m.global_fields = 7; } if m.visibility_section == 2 { m.reward_windows = 7; } }
         }
         KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => m.column_picker_active = false,
         _ => {}
@@ -1723,15 +1726,58 @@ mod tests {
             m.column_picker_cursor = parent; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.column_visible(interval));
             assert_eq!(m.interval_mask(), 2);
             handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
-            m.column_picker_cursor = 6; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
-            m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
+            // Top header rows: Global 3, its fields 4-6, Global interval 7, its windows 8-9.
+            m.column_picker_cursor = 9; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
+            m.column_picker_cursor = 8; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
             assert_eq!(m.interval_mask(), 2); assert!(m.header_kpi_visible("Global interval"));
-            m.column_picker_cursor = 4; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 7; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), 5);
+            assert_eq!(m.global_interval_mask(), 1); assert!(m.header_kpi_visible("Global"));
             handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.global_interval_mask(), 3); assert!(m.header_kpi_visible("Global interval"));
+            assert_eq!(m.global_field_mask(), 7);
             assert_eq!(m.interval_mask(), 2); assert_eq!(m.reward_mask(), 7);
             handle_key(&mut m, key(KeyCode::BackTab)); handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.interval_mask(), 3);
         }
     }
+    /// The Global KPI's frame/epoch/next fields nest beneath it in the Top
+    /// header group; the last field cannot be deselected, and the KPI itself
+    /// still hides as a whole.
+    #[test]
+    fn global_fields_toggle_in_the_top_header_picker() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.column_picker_active = true;
+        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+        let names = m.visibility_names();
+        assert_eq!(&names[3..10], &["Global", "  frame", "  epoch", "  next boundary", "Global interval", "  60m window", "  24h window"]);
+        assert_eq!((4..7).map(|i| m.visibility_global_field(1, i)).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(m.visibility_global_field(1, 3), None); assert_eq!(m.visibility_global_field(1, 7), None);
+        assert_eq!(m.visibility_global_field(0, 4), None);
+        assert_eq!(m.visibility_interval_window(1, 8), Some((true, 0))); assert_eq!(m.visibility_interval_window(1, 6), None);
+        assert_eq!(m.global_field_mask(), 7);
+        for (cursor, mask) in [(4, 6), (6, 2)] {
+            m.column_picker_cursor = cursor; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), mask);
+            assert!(!m.visibility_item_visible_in(1, cursor));
+        }
+        m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), 2, "one field stays");
+        assert!(m.visibility_item_visible_in(1, 5));
+        m.column_picker_cursor = 3; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global"));
+        assert_eq!(m.global_field_mask(), 2); assert_eq!(m.global_interval_mask(), 3);
+        handle_key(&mut m, key(KeyCode::Char('a'))); assert!(m.header_kpi_visible("Global")); assert_eq!(m.global_field_mask(), 7);
+    }
+
+    /// ‹e› switches thresholds between relative and absolute and leaves the
+    /// Global KPI alone.
+    #[test]
+    fn e_toggles_thresholds_between_relative_and_absolute() {
+        use super::super::super::epoch::ThresholdUnit;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new();
+        assert_eq!(m.threshold_unit, ThresholdUnit::Relative);
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty()); assert_eq!(m.threshold_unit, ThresholdUnit::Absolute);
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty()); assert_eq!(m.threshold_unit, ThresholdUnit::Relative);
+        assert_eq!(m.global_field_mask(), 7);
+    }
+
     #[test]
     fn shifted_arrows_move_columns_with_children_and_preserve_identity_and_other_panel() {
         use super::super::model::{ALLOC_DISPLAY_COLS, AVAIL_DISPLAY_COLS};

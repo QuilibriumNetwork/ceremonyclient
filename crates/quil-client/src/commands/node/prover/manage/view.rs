@@ -13,7 +13,6 @@ use ratatui::{
     Frame,
 };
 
-use super::super::epoch::ThresholdUnit;
 #[cfg(test)]
 use super::super::format_quil_daily_round;
 use super::model::*;
@@ -186,9 +185,10 @@ fn printed_width(s: &str) -> usize {
 ///
 /// Right-justifying aligns a column on its tail, which is what you want when
 /// the tail is the part being compared. Default Action always carries a
-/// threshold, so its `@f804960`s line up and the eye reads straight down
-/// them. Next Action does not: `(pause|leave)` has no threshold at all, and
-/// aligned on the tail it lands under the middle of `(reject|confirm)@f804960`
+/// threshold, so its `in 512f`s (or `@f804960`s) line up and the eye reads
+/// straight down them. Next Action does not: `(pause|leave)` has no threshold
+/// at all, and aligned on the tail it lands under the middle of
+/// `(reject|confirm)@f804960`
 /// — the column stops looking like one column. Left is the only edge its
 /// values share. Filters likewise align on their prefix.
 fn alloc_left_aligned(col: usize) -> bool {
@@ -500,11 +500,7 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
         ("Peer ID", peer),
         ("Strategy", strategy.into()),
         ("Seniority", format!("Seniority: {}", m.seniority)),
-        ("Global", if !compact {
-            format!("Global: f{} | e{}", m.last_received_frame, super::super::epoch::epoch_for_frame(m.last_received_frame, m.epoch_length))
-        } else if m.threshold_unit == ThresholdUnit::Epochs {
-            format!("Global: e{}", super::super::epoch::epoch_for_frame(m.last_received_frame, m.epoch_length))
-        } else { format!("Global: f{}", m.last_received_frame) }),
+        ("Global", global_kpi(m)),
         ("Global interval", format!("{} [s {}]: {}", if compact { "Global" } else { "Global interval" }, m.global_interval_labels(), interval_values(m, m.node_global_cadence.as_ref(), m.global_interval_mask()))),
         ("World size", format!("{} [GB]: {world}", if compact { "World" } else { "World size" })),
         ("RPC", rpc_text),
@@ -521,6 +517,43 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
     blocks
 }
 
+fn global_kpi(m: &Model) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    global_kpi_at(m, now)
+}
+
+/// The Global KPI at wall-clock `now` (UNIX seconds): the received GLOBAL
+/// head, its epoch and the frames to the next epoch boundary, the selected
+/// fields joined by ` | `. The time to the boundary is a `~` estimate from the
+/// measured GLOBAL interval, absent without one; expanded mode adds the UTC
+/// clock time it falls at.
+fn global_kpi_at(m: &Model, now: u64) -> String {
+    use super::super::epoch::{epoch_for_frame, fmt_estimate, next_epoch_boundary};
+    let frame = m.last_received_frame;
+    if frame == 0 { return "Global: -".into(); }
+    let compact = m.compact_actions;
+    let epoch = epoch_for_frame(frame, m.epoch_length);
+    let left = next_epoch_boundary(frame, m.epoch_length) - frame;
+    let fields = [
+        if compact { format!("f{frame}") } else { format!("frame {frame}") },
+        if compact { format!("e{epoch}") } else { format!("epoch {epoch}") },
+        match (compact, m.global_seconds_per_frame()) {
+            (true, None) => format!("next {left}f"),
+            (true, Some(spf)) => format!("next {left}f ~{}", fmt_estimate(left as f64 * spf)),
+            (false, None) => format!("next boundary in {left} frames"),
+            (false, Some(spf)) => {
+                let seconds = left as f64 * spf;
+                // The clock time of the rounded estimate, so the two agree.
+                let at = now + (seconds.max(0.0) / 60.0).round() as u64 * 60;
+                format!("next boundary in {left} frames, ~{} (~{:02}:{:02} UTC)", fmt_estimate(seconds), at / 3600 % 24, at / 60 % 60)
+            }
+        },
+    ];
+    let mask = m.global_field_mask();
+    let shown: Vec<_> = fields.into_iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, f)| f).collect();
+    format!("Global: {}", shown.join(" | "))
+}
+
 /// Only operator actions have shortcuts; automatic defaults keep their names.
 fn next_action_text(m: &Model, hint: &super::super::epoch::ActionHint) -> String {
     let mut hint = hint.clone();
@@ -529,7 +562,7 @@ fn next_action_text(m: &Model, hint: &super::super::epoch::ActionHint) -> String
             hint.label = hint.label.replace(name, key);
         }
     }
-    hint.render(m.threshold_unit, m.epoch_length)
+    hint.render(m.threshold_unit, m.threshold_clock())
 }
 
 #[cfg(test)]
@@ -794,7 +827,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         14 => next_action_text(m, &a.next_action),
         16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
         ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
-        _ => a.default_action.render(m.threshold_unit, m.epoch_length),
+        _ => a.default_action.render(m.threshold_unit, m.threshold_clock()),
     }
 }
 
@@ -945,13 +978,16 @@ fn alloc_widths_fixed(
     );
     let global_head_w = fit(GLOBAL_HEAD_WIDTH.max(printed_width(&alloc_header(m, 8))), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 8, 0))));
     let status_w = fit(STATUS_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 12, 0))));
+    // Expanded relative thresholds append a time estimate past the fixed widths.
+    let next_w = fit(NEXT_ACTION_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 14, 0))));
+    let default_w = fit(DEFAULT_ACTION_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 15, 0))));
     // The optional column has no fixed width: measured when shown, else absent.
     let phases_w = if m.alloc_column_visible(ALLOC_PROVER_PHASES_COL) {
         col_width(&alloc_header(m, ALLOC_PROVER_PHASES_COL), sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, ALLOC_PROVER_PHASES_COL, 0))))
     } else { 0 };
     // Whatever the wide columns took comes out of the flexible Filter column.
     let grown = (status_w - STATUS_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH)
-        + phases_w + usize::from(phases_w > 0);
+        + (next_w - NEXT_ACTION_WIDTH) + (default_w - DEFAULT_ACTION_WIDTH) + phases_w + usize::from(phases_w > 0);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -981,8 +1017,8 @@ fn alloc_widths_fixed(
         WORKER_WIDTH,
         status_w,
         MODE_WIDTH,
-        NEXT_ACTION_WIDTH,
-        DEFAULT_ACTION_WIDTH,
+        next_w,
+        default_w,
         col_width(&alloc_header(m, 16), sorted.iter().map(|a| printed_width(&alloc_display_cell(m, a, 16, 0)))),
         phases_w,
     ];
@@ -1869,7 +1905,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
     let actions_label = if m.compact_actions { "expand" } else { "compact" };
     let refresh_label = format!("refresh {}s", m.refresh_seconds);
     let colors_label = if m.color_coding { "colors on" } else { "colors off" };
-    let units_label = if m.threshold_unit == ThresholdUnit::Epochs { "units epochs" } else { "units frames" };
+    let units_label = format!("thresholds {}", m.threshold_unit.label());
     // (key, desc, action-tag)
     let entries: [(&str, &str, &str); 24] = [
         ("tab", "switch", ""),
@@ -1890,7 +1926,7 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
         ("s", "sort", ""),
         ("f", if filters_active { "filter*" } else { "filter" }, "Filter"),
         ("c", colors_label, "ColorCoding"),
-        ("e", units_label, "ThresholdUnit"),
+        ("e", units_label.as_str(), "ThresholdUnit"),
         ("v", "notice level", ""),
         ("t", refresh_label.as_str(), ""),
         ("[/] {/}", "upper/lower edge", ""),
@@ -2237,7 +2273,10 @@ fn help_items() -> Vec<HelpItem> {
         item("`H → D`: halt-risk shards first, then data"),
         item("`?`: not reported by this node"),
         kv("Seniority", "Committed prover seniority; committee rings rank members by it (see Ring)"),
-        kv("Global", "Received GLOBAL head, compact as `f<frame>` or `e<epoch>` (‹e› switches), expanded as both"),
+        kv("Global", "The received GLOBAL head, its epoch and the next epoch boundary; ‹b› → Top header selects the fields. `-` until a frame is received. Compact / expanded labels:"),
+        item("`f<frame>` / `frame`: the received GLOBAL head"),
+        item("`e<epoch>` / `epoch`: the epoch that frame falls in"),
+        item("`next Nf` / `next boundary`: frames to the next epoch boundary, where activations, departures, renewals and the epoch reconfirm take effect. `~` estimates the time from the measured GLOBAL interval (`60m`, else `24h`); expanded mode adds the `~HH:MM UTC` it falls at. No measurement, no time"),
         kv("Global interval", "Mean seconds per received GLOBAL frame in the selected `60m`/`24h` windows (compact label `Global [s …]`); see Frame intervals"),
         kv("World size", "Node-reported total world state in GB from the shard-info snapshot, not this table subtotal or local disk use; compact label `World`, `-` unreported. Toggle under ‹b› → Top header"),
         kv("RPC", "Local status responses; they do not establish peer or shard health:"),
@@ -2331,7 +2370,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("NextAction", "What you can do now, and the threshold it applies from"),
         kv("DefaultAction", "What the network does if you do nothing, and when"),
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
-        note("Thresholds read `f<frame>` or `e<epoch>`; ‹e› switches. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
+        note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
         kv("Details", "Selected allocation footer shows reason/blocker, last advance as `<60s` / `>60s`, and Local app frames warnings; no ticking timers. PeerHead is peer-reported metadata"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
@@ -2341,7 +2380,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
         kv("Reported app heads", "No peer-reported app frames advanced on the stated subset of tracked shards. Counts include allocated and unallocated shards. Affected PeerHead / PeerState cells are `yellow`, or marked `!` with colors off. Requires 3+ fresh snapshots over max(60s, 3 polls); missing/unstaffed rows are excluded. Does not prove a network halt"),
         kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
-        kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and frame/epoch units. `filter*` means a column filter is active"),
+        kv("Command legends", "Compact mode shows applicable UI/worker commands only; expanded mode also shows disabled commands. Usable commands share one highlight; labels show colors on/off and relative/absolute thresholds. `filter*` means a column filter is active"),
         kv("Scroll hints", "Bottom border counts hidden rows `↑`/`↓` and columns `←`/`→`"),
         kv("Colors", "What the main view's colors mean:"),
         item("`green`: current"),
@@ -2352,14 +2391,14 @@ fn help_items() -> Vec<HelpItem> {
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
         kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute. Freshness 90s; coverage in RPC. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
         kv("Reward estimates", "`60m`/`24h` are observation windows; `T` (`theory` in expanded mode) assumes 10s/frame. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
-        kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames; ‹e› changes only the compact Global head unit"),
+        kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
         sec("Display"),
-        kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, units and recovery/seal detail; default actions remain named"),
-        kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval/reward options nest beneath their KPI. Panel names and identity columns stay visible"),
+        kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
+        kv("‹b›", "Visibility picker (b: blocks): ‹tab› moves focus between Columns, Top header and every panel header group; ‹↑/↓› selects, ‹space› toggles, ‹a› restores the focused group, ‹enter›/‹esc› closes. Interval, reward and Global field options nest beneath their KPI. Panel names and identity columns stay visible"),
         kv("Columns group", "In the picker, visibility shared by both panels; ‹Shift+↑/↓› reorders focused table columns with their sub-items, ‹r› restores order, ‹c› hides Provers/Size/Shards and ‹a› restores all columns. Select/Filter stay pinned; settings last for the TUI session"),
         kv("‹t›", "Cycle refresh (t: timer) 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
         kv("‹c›", "Toggle color-coding of Ring, Mat/Lag/State, ProverPhases, Worker, Status and Mode; values quoted in this help follow it"),
-        kv("‹e›", "Show Next/Default Action thresholds as frames (`f…`) or epochs (`e…`)"),
+        kv("‹e›", "Show Next/Default Action thresholds relative to the received GLOBAL frame (`in Nf`, default) or as absolute frames (`@f…`)"),
         kv("‹h›", "Open this help (‹↑/↓› or ‹Pg↑/↓› scroll; ‹h› or ‹esc› closes)"),
         kv("‹q› / ‹Ctrl+C›", "Quit"),
         sec("Navigation"),
@@ -2472,7 +2511,8 @@ fn render_visibility_group(f: &mut Frame, m: &mut Model, section: usize, title: 
     for (index, name) in names.iter().enumerate().skip(offset).take(visible) {
         let selected = active && index == m.column_picker_cursor;
         let required = section == 0 && index < 2;
-        let child = m.visibility_interval_window(section, index).is_some() || m.visibility_reward_window(section, index).is_some();
+        let child = m.visibility_interval_window(section, index).is_some() || m.visibility_reward_window(section, index).is_some()
+            || m.visibility_global_field(section, index).is_some();
         let indent = if child { "  " } else { "" };
         let label = format!("{}{}", name.trim_start(), if required { " (required)" } else { "" });
         let text = format!("{} {}{} {}", if selected { "▶" } else { " " },
@@ -4240,6 +4280,10 @@ mod tests {
         for value in ["a", "m"] {
             assert!(values("Columns", "Mode").iter().any(|v| v == value), "mode `{value}` is not listed under Mode");
         }
+        let global = values("Top header KPIs", "Global");
+        for label in GLOBAL_FIELD_NAMES.iter().map(|name| name.trim()).chain(["f<frame>", "e<epoch>", "next Nf"]) {
+            assert!(global.iter().any(|v| v == label), "Global field `{label}` is not listed under the Global KPI");
+        }
         let kpis = ["Peer ID", "Strategy", "Seniority", "Global", "Global interval", "World size", "RPC", "Workers", "Status",
             "Claimable", "Reward", "Snapshot", "Shown", "Selected", "Count", "Level", "Line"];
         let topics = ["KPI separators", "Details", "Recovery footer", "Freshness", "Local app notice", "Reported app heads",
@@ -4438,10 +4482,14 @@ mod tests {
         m.allocations = joining_table();
         m.allocations[0].next_action = ActionHint::at("(reject|confirm)", 2_160);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@e3");
+        m.last_received_frame = 1_500;
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm) in 660f");
+        assert!(help_line(&m).to_string().contains("thresholds relative"));
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
         assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@f2160");
+        assert!(help_line(&m).to_string().contains("thresholds absolute"));
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm) in 660f");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         assert!(handle_key(&mut m, key(KeyCode::Char('h'))).is_empty());
@@ -4529,16 +4577,16 @@ mod compact_action_tests {
     #[test]
     fn compact_global_units_and_frame_offsets_keep_distinct_citations() {
         let mut m = Model::new(); m.data_loaded = true; m.last_received_frame = 1442; m.epoch_length = 720;
-        assert!(header_line(&m).to_string().contains("Global: f1442"));
-        m.threshold_unit = ThresholdUnit::Epochs;
-        assert!(header_line(&m).to_string().contains("Global: e"));
+        assert!(header_line(&m).to_string().contains("Global: f1442 | e2 | next 718f ·"));
+        m.threshold_unit = ThresholdUnit::Absolute;
+        assert!(header_line(&m).to_string().contains("Global: f1442 | e2 | next 718f ·"), "‹e› leaves the Global KPI alone");
         assert_eq!(frame_citation(&m, 1440), " @-2f");
         assert_eq!(frame_citation(&m, 1442), "");
         assert_eq!(frame_citation(&m, 1443), " @+1f");
         m.claimable_reward = Some((8_000_000_000, 1440));
         assert!(alloc_title(&m, &[]).to_string().contains("[Q] 1 @-2f"));
         m.compact_actions = false;
-        assert!(header_line(&m).to_string().contains("Global: f1442 | e"));
+        assert!(header_line(&m).to_string().contains("Global: frame 1442 | epoch 2 | next boundary in 718 frames ·"));
         assert_eq!(frame_citation(&m, 1440), " @f1440");
         for line in [help_line(&m), worker_commands_line(&m)] {
             assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
@@ -4643,7 +4691,7 @@ mod compact_action_tests {
     #[test]
     fn shortcut_labels_preserve_thresholds_and_automatic_actions() {
         let mut m = Model::new(); m.compact_actions = false; m.compact_units = false;
-        m.threshold_unit = ThresholdUnit::Frames;
+        m.threshold_unit = ThresholdUnit::Absolute;
         let hint = ActionHint::at("(reject|confirm)", 123);
         assert_eq!(next_action_text(&m, &hint), "(reject|confirm)@f123");
         m.compact_actions = true;
@@ -4651,6 +4699,112 @@ mod compact_action_tests {
         assert_eq!(next_action_text(&m, &ActionHint::text("(pause|leave)")), "(P|L)");
         assert_eq!(next_action_text(&m, &ActionHint::at("renew", 123)), "renew@f123");
         assert_eq!(hint.label, "(reject|confirm)");
+    }
+
+    /// A fresh GLOBAL cadence whose 60m window measures 3600s over 191 frames
+    /// (~18.8s/frame), so 512 frames estimate ~2h41m.
+    fn global_cadence(hour: Option<(u64, u64)>, day: Option<(u64, u64)>, age: u64) -> quil_types::proto::node::FrameCadence {
+        use quil_types::proto::node::{FrameCadence, FrameWindow};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let window = |seconds, (observed_seconds, advanced_frames)| FrameWindow { window_seconds: seconds, observed_seconds, advanced_frames };
+        FrameCadence { last_observed_unix_seconds: now - age, hour: hour.map(|w| window(3600, w)), day: day.map(|w| window(86400, w)) }
+    }
+
+    /// 21:11 UTC on the second UNIX day; 2h41m later is 23:52.
+    const CLOCK: u64 = 86_400 + 21 * 3600 + 11 * 60;
+
+    #[test]
+    fn global_kpi_reads_frame_epoch_and_next_boundary() {
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: -");
+        m.last_received_frame = 896_608; // epoch 1245 spans 896400..897120
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f");
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames");
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640)), 0));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+        m.compact_actions = true;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f ~2h41m");
+        assert!(header_line(&m).to_string().contains("Global: f896608 | e1245 | next 512f ~2h41m ·"));
+        // Without 60m advances the 24h window (10s/frame) estimates instead.
+        m.node_global_cadence = Some(global_cadence(Some((3600, 0)), Some((7_200, 720)), 0));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f ~1h25m");
+        // A stale or missing measurement shows frames only, never a guessed time.
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), Some((86_400, 8_640)), 600));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896608 | e1245 | next 512f");
+        m.node_global_cadence = None;
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames");
+    }
+
+    /// From an epoch's first frame a whole epoch remains; from its last, one
+    /// frame.
+    #[test]
+    fn global_kpi_next_boundary_at_an_epochs_first_and_last_frame() {
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 360)), None, 0)); // 10s/frame
+        m.last_received_frame = 896_400;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f896400 | e1245 | next 720f ~2h00m");
+        m.last_received_frame = 897_119;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f897119 | e1245 | next 1f ~<1m");
+        m.last_received_frame = 897_120;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: f897120 | e1246 | next 720f ~2h00m");
+    }
+
+    /// Fields deselected under ‹b› → Top header drop out of the KPI; the
+    /// remaining ones keep their order and separators.
+    #[test]
+    fn global_kpi_fields_follow_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use super::super::update::handle_key;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut m = Model::new(); m.data_loaded = true; m.epoch_length = 720; m.last_received_frame = 896_608;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        handle_key(&mut m, key(KeyCode::Char('b'))); assert!(m.column_picker_active);
+        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+        let row = |name: &str| m.visibility_names().iter().position(|n| n.trim() == name).unwrap();
+        let (frame, epoch, next) = (row("frame"), row("epoch"), row("next boundary"));
+        m.column_picker_cursor = frame; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245 | next 512f ~2h41m");
+        m.column_picker_cursor = next; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245");
+        m.column_picker_cursor = epoch; handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: e1245", "the last field stays");
+        m.column_picker_cursor = next; handle_key(&mut m, key(KeyCode::Char(' ')));
+        m.column_picker_cursor = epoch; handle_key(&mut m, key(KeyCode::Char(' ')));
+        m.compact_actions = false;
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+        handle_key(&mut m, key(KeyCode::Char('a')));
+        assert_eq!(global_kpi_at(&m, CLOCK), "Global: frame 896608 | epoch 1245 | next boundary in 512 frames, ~2h41m (~23:52 UTC)");
+    }
+
+    /// Relative thresholds count down from the received frame; expanded mode
+    /// adds the estimate from the measured GLOBAL interval.
+    #[test]
+    fn expanded_relative_thresholds_add_the_global_estimate() {
+        let mut m = Model::new(); m.epoch_length = 720; m.last_received_frame = 896_608;
+        let mut a = super::tests::row("aabb", 1, 1, 1, "", "");
+        a.next_action = ActionHint::at("(reject|confirm)", 897_120);
+        a.default_action = ActionHint::at("expire", 897_840);
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(R|Y) in 512f");
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f");
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(R|Y) in 512f", "compact mode shows frames only");
+        m.compact_actions = false; m.compact_units = false;
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(reject|confirm) in 512f (~2h41m)");
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f (~6h27m)");
+        m.threshold_unit = ThresholdUnit::Absolute;
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire@f897840");
+        m.threshold_unit = ThresholdUnit::Relative;
+        m.node_global_cadence = None;
+        assert_eq!(alloc_cell(&m, &a, 15, 0), "expire in 1232f");
+        m.last_received_frame = 897_120;
+        assert_eq!(alloc_cell(&m, &a, 14, 0), "(reject|confirm) now");
+        // The fixed layout grows the action columns to the estimate.
+        m.last_received_frame = 896_608; m.column_sizing = ColumnSizing::Fixed;
+        m.node_global_cadence = Some(global_cadence(Some((3600, 191)), None, 0));
+        let (w, _) = alloc_col_widths(&m, 260, &[a.clone()]);
+        assert!(w[14] >= printed_width(&alloc_cell(&m, &a, 14, 0)) && w[15] >= printed_width(&alloc_cell(&m, &a, 15, 0)));
     }
     #[test]
     fn reward_windows_share_order_and_sum_each_allocations_own_cadence() {
