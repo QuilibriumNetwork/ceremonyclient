@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use quil_engine::prover_message_transport::ProverMessageTransport;
 use quil_rpc::{ArchiveClient, ArchiveEndpointPool};
@@ -178,7 +178,7 @@ async fn submit_to_archives(
                     Err(e) => {
                         debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
                         let retry = retryable(&e);
-                        Err((stream_addr, format!("submit rejected: {e}"), retry))
+                        Err((stream_addr, format!("submit rejected: {}", refusal_reason(&e)), retry))
                     }
                 },
                 Err(e) => {
@@ -421,6 +421,7 @@ where
         handles.push(tokio::spawn(async move { submit(stream_addr, bytes).await }));
     }
     let mut delivery = Delivery::default();
+    let mut refused = Vec::new();
     for h in handles {
         match h.await {
             Ok(Ok(addr)) => {
@@ -431,19 +432,112 @@ where
                 if retry {
                     delivery.retry += 1;
                 }
-                warn!(%addr, %reason, retry, "gRPC submit failed");
+                refused.push((addr, reason, retry));
             }
             Err(e) => {
                 warn!(error = %e, "gRPC submit task join error");
             }
         }
     }
+    // A refusal another archive made up for loses nothing: summarize each
+    // such archive at most every ARCHIVE_REFUSAL_EVERY, its reason naming
+    // its state (a stale archive reports its executed frame against its
+    // head). Without any acceptance, each refusal is a warning naming the
+    // request.
+    if !refused.is_empty() {
+        let request = describe_bundle(&bundle_bytes);
+        for (addr, reason, retry) in refused {
+            if delivery.accepted == 0 {
+                warn!(%addr, %reason, retry, %request, "gRPC submit failed");
+                continue;
+            }
+            let now = Instant::now();
+            let summary = archive_refusals().lock().unwrap_or_else(|p| p.into_inner()).note(now, &addr);
+            if let Some((refusals, secs)) = summary {
+                info!(
+                    scope = "peer",
+                    archive = %addr,
+                    refusals,
+                    secs,
+                    %reason,
+                    %request,
+                    "an archive refused prover submissions another archive accepted"
+                );
+            }
+        }
+    }
     delivery
+}
+
+/// How often an archive's refusals of submissions another archive accepted
+/// are summarized again.
+const ARCHIVE_REFUSAL_EVERY: Duration = Duration::from_secs(600);
+
+/// Refusals per archive since its last summary line.
+#[derive(Debug, Default)]
+struct ArchiveRefusals {
+    archives: std::collections::HashMap<String, (Instant, u64)>,
+}
+
+impl ArchiveRefusals {
+    /// Count one refusal by `archive`; returns the refusals and seconds
+    /// since its last line when one is due (its first refusal at once).
+    fn note(&mut self, now: Instant, archive: &str) -> Option<(u64, u64)> {
+        let Some((logged, count)) = self.archives.get_mut(archive) else {
+            self.archives.insert(archive.to_string(), (now, 0));
+            return Some((1, 0));
+        };
+        *count += 1;
+        let secs = now.duration_since(*logged);
+        if secs < ARCHIVE_REFUSAL_EVERY {
+            return None;
+        }
+        let refusals = std::mem::take(count);
+        *logged = now;
+        Some((refusals, secs.as_secs()))
+    }
+}
+
+fn archive_refusals() -> &'static std::sync::Mutex<ArchiveRefusals> {
+    static REFUSALS: std::sync::OnceLock<std::sync::Mutex<ArchiveRefusals>> = std::sync::OnceLock::new();
+    REFUSALS.get_or_init(Default::default)
+}
+
+/// An archive's refusal without the transport's metadata: the gRPC code and
+/// the archive's message.
+fn refusal_reason(error: &quil_rpc::archive_client::ArchiveClientError) -> String {
+    match error {
+        quil_rpc::archive_client::ArchiveClientError::Rpc(status) => format!("{:?}: {}", status.code(), status.message()),
+        other => other.to_string(),
+    }
+}
+
+/// What a bundle carries, for its failure lines: each request's type, and a
+/// shard frame header's shard and frame (`frame header <filter>@<frame>`).
+fn describe_bundle(bundle: &[u8]) -> String {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    let Ok(bundle) = CanonicalMessageBundle::from_canonical_bytes(bundle) else {
+        return "undecodable bundle".to_string();
+    };
+    bundle
+        .requests
+        .iter()
+        .flatten()
+        .map(|request| match request.inner_type_prefix {
+            TYPE_FRAME_HEADER => match FrameHeader::from_canonical_bytes(&request.inner_bytes) {
+                Ok(header) => format!("frame header {}@{}", hex::encode(&header.address), header.frame_number),
+                Err(_) => "frame header".to_string(),
+            },
+            prefix => format!("request type {prefix:#06x}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{combine_publish_outcome, fan_out_to_archives, retryable, run_retries, Delivery, RetryTiming, SubmitRetryQueue};
+    use super::{combine_publish_outcome, describe_bundle, fan_out_to_archives, refusal_reason, retryable, run_retries, ArchiveRefusals, Delivery, RetryTiming, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY};
     use std::time::Duration;
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -605,5 +699,33 @@ mod tests {
         let expired = RetryTiming { give_up: Duration::ZERO, ..FAST };
         run_retries(queue.clone(), expired, |_| async { unreachable!("an expired message is not sent") }).await;
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn failure_lines_name_the_request() {
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
+        let header = FrameHeader { address: vec![7; 4], frame_number: 9, ..Default::default() }.to_canonical_bytes().unwrap();
+        let bundle = crate::master_node::reward_proofs::prover_bundle(header).unwrap();
+        assert_eq!(describe_bundle(&bundle), "frame header 07070707@9");
+        let mut join = quil_execution::global_intrinsic::TYPE_PROVER_JOIN.to_be_bytes().to_vec();
+        join.extend_from_slice(b"join");
+        let bundle = crate::master_node::reward_proofs::prover_bundle(join).unwrap();
+        assert_eq!(describe_bundle(&bundle), format!("request type {:#06x}", quil_execution::global_intrinsic::TYPE_PROVER_JOIN));
+        assert_eq!(describe_bundle(b"junk"), "undecodable bundle");
+        let refused = quil_rpc::archive_client::ArchiveClientError::Rpc(tonic::Status::invalid_argument("rank buffer full"));
+        assert_eq!(refusal_reason(&refused), "InvalidArgument: rank buffer full");
+    }
+
+    #[test]
+    fn an_archive_refusing_what_another_accepted_is_summarized_every_interval() {
+        let mut refusals = ArchiveRefusals::default();
+        let t = std::time::Instant::now();
+        assert_eq!(refusals.note(t, "a:8340"), Some((1, 0)), "its first refusal logs at once");
+        for n in 1..=5 {
+            assert_eq!(refusals.note(t + Duration::from_secs(n), "a:8340"), None);
+        }
+        assert_eq!(refusals.note(t + Duration::from_secs(2), "b:8340"), Some((1, 0)), "archives are counted apart");
+        assert_eq!(refusals.note(t + ARCHIVE_REFUSAL_EVERY, "a:8340"), Some((6, 600)));
+        assert_eq!(refusals.note(t + ARCHIVE_REFUSAL_EVERY + Duration::from_secs(1), "a:8340"), None);
     }
 }
