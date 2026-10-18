@@ -12,7 +12,7 @@ use quil_types::proto::node::{
 };
 
 use super::super::epoch::{
-    action_hints, compute_effective_status, epoch_len, ActionHint, AllocationTiming, ConfirmWindow,
+    action_hints, compute_effective_status, confirmed_phase, epoch_len, ActionHint, AllocationTiming, ConfirmWindow,
     EffectiveStatus, ThresholdUnit, WindowState,
 };
 
@@ -493,7 +493,7 @@ impl Model {
     /// Joining allocations have no execution requirement before admission.
     /// Retain observed states and unknown telemetry for admitted allocations.
     pub fn allocation_execution_state<'a>(&self, row: &'a AllocationRow) -> &'a str {
-        if row.execution.is_none() && row.status_name == "joining" { "-" }
+        if row.execution.is_none() && matches!(row.status_name.as_str(), "joining" | "activating") { "-" }
         else { execution_label(self.execution_state(row.execution.as_ref())) }
     }
 
@@ -710,7 +710,7 @@ impl Model {
 
             let filter_hex = hex::encode(&a.filter);
             allocated_filters.insert(filter_hex.clone());
-            let status_name = eff.label().to_string();
+            let status_name = confirmed_phase(&t, eff, el).map_or(eff.label(), |(name, _)| name).to_string();
 
             let (next_action, default_action) = action_hints(&t, eff, el, ef, next_boundary);
 
@@ -1782,9 +1782,9 @@ mod tests {
         use quil_types::proto::node::WorkerInfo;
 
         let filter = vec![0xab];
-        for (status, confirm_frame) in [
-            (raw_status::JOINING, 0),
-            (raw_status::ACTIVE, 2_160),
+        for (status, confirm_frame, label) in [
+            (raw_status::JOINING, 0, "joining"),
+            (raw_status::ACTIVE, 2_160, "activating"),
         ] {
             for assigned in [false, true] {
                 let mut alloc = allocation(filter.clone(), 3);
@@ -1803,7 +1803,7 @@ mod tests {
                     Some(shard_info(filter.clone(), 42)),
                     workers,
                 );
-                assert_eq!(model.allocations[0].status_name, "joining");
+                assert_eq!(model.allocations[0].status_name, label);
                 assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
                 assert_eq!(model.allocations[0].reward_status(2160, 720), assigned.then_some(EffectiveStatus::Joining));
                 // Expired joins lose their forecast, but their bound worker stays visible.

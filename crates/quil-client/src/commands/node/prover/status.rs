@@ -7,7 +7,7 @@ use num_bigint::{BigInt, Sign};
 use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAllocationInfo};
 
 use super::epoch::{
-    action_hints, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
+    action_hints, compute_effective_status, confirmed_phase, epoch_for_frame, epoch_len, AllocationTiming,
     ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
@@ -88,7 +88,7 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
 
         println!(
             "  [{i}] Filter: {filter_hex}  Status: {}{worker_str}",
-            eff.label()
+            confirmed_phase(&t, eff, epoch_length).map_or(eff.label(), |(name, _)| name)
         );
 
         // Same vocabulary as the `manage` TUI's Next/Default Action columns.
