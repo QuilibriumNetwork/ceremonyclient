@@ -66,12 +66,93 @@ pub fn run(global: GlobalArgs, cmd: &LogCommand) -> anyhow::Result<()> {
 
 /// The directory the node of the resolved config writes its log files to, or
 /// `None` when it logs only to stderr.
+///
+/// Without `--network`, an installed node service names the node's own
+/// config and working directory ([`ServiceLocation`]), so the logs are found
+/// from any directory; otherwise the config resolves as for every command
+/// and a relative `logger.path` is taken from the current directory.
 pub(crate) fn configured_log_dir(global: &GlobalArgs) -> anyhow::Result<Option<PathBuf>> {
     let network = global.network.as_deref().filter(|s| !s.is_empty());
-    let config_dir = nodeconfig::default_node_config_dir(network)?;
+    let service = if network.is_none() { service_location() } else { None };
+    let (config_dir, node_dir) = match service.filter(|s| nodeconfig::has_node_config_files(&s.config_dir())) {
+        Some(service) => (service.config_dir(), Some(service.working_dir)),
+        None => (nodeconfig::default_node_config_dir(network)?, None),
+    };
     let config = quil_config::load_config(&config_dir)
         .map_err(|e| anyhow::anyhow!("load config: {e}"))?;
-    Ok(config.logger.log_dir(&config_dir))
+    Ok(config.logger.log_dir(&config_dir).map(|dir| from_node_dir(node_dir.as_deref(), dir)))
+}
+
+/// `path` as the node resolves it: a relative path from its working
+/// directory, when that is known.
+fn from_node_dir(node_dir: Option<&Path>, path: PathBuf) -> PathBuf {
+    match node_dir {
+        Some(node_dir) if path.is_relative() => node_dir.join(path),
+        _ => path,
+    }
+}
+
+/// Where the node service runs, as its unit sets it: the working directory
+/// (systemd's default is `/`) and the `--config` the node is started with
+/// (the node's default is `.config`).
+#[derive(Debug, PartialEq)]
+struct ServiceLocation {
+    working_dir: PathBuf,
+    config: PathBuf,
+}
+
+impl ServiceLocation {
+    /// The node's config directory: `--config`, from the working directory
+    /// when relative.
+    fn config_dir(&self) -> PathBuf {
+        from_node_dir(Some(&self.working_dir), self.config.clone())
+    }
+
+    /// Parse `systemctl show -p LoadState -p WorkingDirectory -p ExecStart`;
+    /// `None` unless the unit is loaded and its directory is a plain path.
+    fn parse(show: &str) -> Option<Self> {
+        let mut loaded = false;
+        let mut location = Self { working_dir: PathBuf::from("/"), config: PathBuf::from(".config") };
+        for line in show.lines() {
+            if let Some(state) = line.strip_prefix("LoadState=") {
+                loaded = state == "loaded";
+            } else if let Some(dir) = line.strip_prefix("WorkingDirectory=") {
+                // A leading `-` only makes a missing directory non-fatal; `~`
+                // is the service user's home, which qclient cannot resolve.
+                let dir = dir.trim_start_matches('-');
+                if dir.starts_with('~') {
+                    return None;
+                }
+                if !dir.is_empty() {
+                    location.working_dir = PathBuf::from(dir);
+                }
+            } else if let Some(exec) = line.strip_prefix("ExecStart=") {
+                let argv = exec.split("argv[]=").nth(1)?.split(" ;").next()?;
+                let mut args = argv.split_whitespace().skip(1);
+                while let Some(arg) = args.next() {
+                    if let Some(dir) = arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")) {
+                        location.config = PathBuf::from(dir);
+                    } else if arg == "--config" || arg == "-c" {
+                        location.config = PathBuf::from(args.next()?);
+                    }
+                }
+            }
+        }
+        loaded.then_some(location)
+    }
+}
+
+/// The installed node service's location (Linux), if there is one.
+fn service_location() -> Option<ServiceLocation> {
+    if system::os_type() != "linux" {
+        return None;
+    }
+    let show = Command::new("systemctl")
+        .args(["show", system::NODE_SERVICE_NAME, "-p", "LoadState", "-p", "WorkingDirectory", "-p", "ExecStart"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    ServiceLocation::parse(&String::from_utf8_lossy(&show.stdout))
 }
 
 /// The node's live log file name for `core` (as the node's logging names it).
@@ -197,5 +278,40 @@ mod tests {
         left.sort();
         assert_eq!(left, ["master.log", "notes.txt", "worker-2.log"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The unit `qclient node service install` writes: no working directory,
+    /// an absolute `--config`.
+    #[test]
+    fn an_installed_service_names_its_config() {
+        let show = "LoadState=loaded\n\
+            ExecStart={ path=/usr/local/bin/quilibrium-node ; argv[]=/usr/local/bin/quilibrium-node --config /root/.quilibrium/configs/default ; ignore_errors=no ; pid=0 }\n\
+            WorkingDirectory=\n";
+        let service = ServiceLocation::parse(show).expect("a loaded unit");
+        assert_eq!(service.config_dir(), PathBuf::from("/root/.quilibrium/configs/default"));
+        assert_eq!(service.working_dir, PathBuf::from("/"));
+    }
+
+    /// A unit that runs the node from its directory: the default `.config`
+    /// and a relative `logger.path` both resolve from there, not from where
+    /// qclient runs.
+    #[test]
+    fn relative_paths_resolve_from_the_service_directory() {
+        let show = "LoadState=loaded\n\
+            ExecStart={ path=/srv/node/node ; argv[]=/srv/node/node --signature-check=false ; ignore_errors=no }\n\
+            WorkingDirectory=-/srv/node\n";
+        let service = ServiceLocation::parse(show).expect("a loaded unit");
+        assert_eq!(service.config_dir(), PathBuf::from("/srv/node/.config"));
+        assert_eq!(from_node_dir(Some(&service.working_dir), PathBuf::from(".log")), PathBuf::from("/srv/node/.log"));
+        assert_eq!(from_node_dir(Some(&service.working_dir), PathBuf::from("/var/log/q")), PathBuf::from("/var/log/q"));
+        assert_eq!(from_node_dir(None, PathBuf::from(".log")), PathBuf::from(".log"));
+    }
+
+    /// No service, or one whose directory qclient cannot resolve: the
+    /// config resolves as before.
+    #[test]
+    fn without_a_usable_service_nothing_changes() {
+        assert_eq!(ServiceLocation::parse("LoadState=not-found\nWorkingDirectory=\n"), None);
+        assert_eq!(ServiceLocation::parse("LoadState=loaded\nWorkingDirectory=~\n"), None);
     }
 }
