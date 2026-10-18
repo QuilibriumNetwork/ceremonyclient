@@ -130,6 +130,8 @@ pub enum AppEngineMessage {
         /// Ancestors this finalization makes final that never finalized on
         /// their own (encoded frames, lowest first, with their verified flag).
         implied: Vec<(Vec<u8>, bool)>,
+        /// The sending committee host's build count (see `cw_host_epoch`).
+        host_epoch: u64,
     },
     /// The running committee session finalized its terminal seal (`seal` bytes,
     /// finalization `cert`). The run loop submits it to the global chain as a
@@ -141,6 +143,8 @@ pub enum AppEngineMessage {
         /// (encoded, lowest first, with their verified flag), its checkpoint
         /// frame last.
         implied: Vec<(Vec<u8>, bool)>,
+        /// The sending committee host's build count (see `cw_host_epoch`).
+        host_epoch: u64,
     },
     /// An inbound commonware-simplex message from a committee peer, demuxed
     /// from `shard_cw_bitmask` gossip. `channel` = CW channel id; `from` = the
@@ -2185,6 +2189,13 @@ pub struct AppConsensusEngine {
     /// Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
     cw_handle: Option<crate::cw_app_seams::AppConsensusCwHandle>,
+    /// Committee hosts built so far by `start_consensus_cw_observed`; each
+    /// host tags the finalized frames and seals it queues with its count.
+    cw_host_epoch: u64,
+    /// The host count when the legacy app history was discarded. A host
+    /// stops before the discard, but what it already queued in this engine's
+    /// mailbox is still delivered; those frames belong to the discarded chain.
+    cw_discarded_through_epoch: Option<u64>,
     /// Fingerprint (sorted-member hash) of the committee the running `cw_handle`
     /// was built with. The run loop recomputes the active-prover set each tick
     /// and, when it changes, tears down the old simplex instance and rebuilds —
@@ -2362,6 +2373,8 @@ impl AppConsensusEngine {
             kv_db: deps.kv_db,
             app_consensus_cw: deps.app_consensus_cw,
             cw_handle: None,
+            cw_host_epoch: 0,
+            cw_discarded_through_epoch: None,
             cw_committee_fp: None,
             cw_session: None,
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3459,12 +3472,17 @@ impl AppConsensusEngine {
                             cert,
                             locally_verified,
                             implied,
+                            host_epoch,
                         }) => {
-                            self.handle_cw_finalized_frame(&frame, &cert, locally_verified, implied)
-                                .await;
+                            if !self.from_discarded_host(host_epoch, "finalized frame") {
+                                self.handle_cw_finalized_frame(&frame, &cert, locally_verified, implied)
+                                    .await;
+                            }
                         }
-                        Some(AppEngineMessage::CwSealed { seal, cert, implied }) => {
-                            self.handle_cw_sealed(&seal, cert, implied).await;
+                        Some(AppEngineMessage::CwSealed { seal, cert, implied, host_epoch }) => {
+                            if !self.from_discarded_host(host_epoch, "seal") {
+                                self.handle_cw_sealed(&seal, cert, implied).await;
+                            }
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
                             if let Some(count) = self.cw_inbound.get_mut(channel as usize) {
@@ -4023,6 +4041,21 @@ impl AppConsensusEngine {
     /// application state, before any session runs here. The store records
     /// that it ran, so it runs once. A running legacy host stops first.
     /// Returns whether it discarded.
+    /// Whether a committee host's queued message comes from a host built
+    /// before the legacy app history was discarded. Such a message is dropped:
+    /// committing its frame would restore the discarded chain's head, which
+    /// the next session would then take as its anchor.
+    fn from_discarded_host(&self, host_epoch: u64, kind: &'static str) -> bool {
+        let stale = self.cw_discarded_through_epoch.is_some_and(|through| host_epoch <= through);
+        if stale {
+            info!(
+                core_id = self.core_id, host_epoch, kind,
+                "dropped a legacy committee host's message queued before the app history discard",
+            );
+        }
+        stale
+    }
+
     async fn discard_legacy_history_if_due(&mut self) -> Result<bool> {
         let Some(policy) = quil_types::consensus::committee_handoff_policy()
             .filter(|policy| policy.legacy_history == quil_types::consensus::LegacyHistory::Discard)
@@ -4040,6 +4073,7 @@ impl AppConsensusEngine {
             }
         }
         self.clock_store.discard_app_frame_history(global_frame)?;
+        self.cw_discarded_through_epoch = Some(self.cw_host_epoch);
         // What this engine holds of the discarded chain.
         self.set_materialized_frame(0);
         self.shard_frame_number = 0;
@@ -4221,6 +4255,8 @@ impl AppConsensusEngine {
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
+        self.cw_host_epoch += 1;
+        let host_epoch = self.cw_host_epoch;
 
         // Candidate anchor for a NEW local session. An existing journal reuses
         // its persisted genesis below. Different members' heads may disagree;
@@ -4500,6 +4536,7 @@ impl AppConsensusEngine {
                     cert,
                     locally_verified,
                     implied,
+                    host_epoch,
                 }).is_ok()
             })
         };
@@ -4767,7 +4804,7 @@ impl AppConsensusEngine {
                         let implied = implied.into_iter()
                             .map(|(frame, verified)| (prost::Message::encode_to_vec(&frame), verified))
                             .collect();
-                        msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert, implied }).is_ok()
+                        msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert, implied, host_epoch }).is_ok()
                     }),
                     liveness,
                     checkpoint_votes: Some({
