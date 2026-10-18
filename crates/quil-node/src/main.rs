@@ -414,6 +414,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // prefix and let it drop at main's end.
     let _log_guard = logging::init_logging(
         &config.logger,
+        &args.config,
         args.core,
         args.debug,
         args.log_filter.as_deref(),

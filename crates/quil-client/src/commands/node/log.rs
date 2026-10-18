@@ -1,9 +1,10 @@
 //! `qclient node log …` — view/clean node logs.
 //!
 //! The node writes `master.log` and `worker-N.log` (rotated as
-//! `<name>.<timestamp>[.gz]`) to its config's `logger.path`; with no path it
-//! logs only to stderr, which the system service captures (the systemd
-//! journal on Linux, `node.err` under the log directory on macOS).
+//! `<name>.<timestamp>[.gz]`) to its log directory, `logger.path` or by
+//! default `.log` under its config directory; with `path: none` it logs only
+//! to stderr, which the system service captures (the systemd journal on
+//! Linux, `node.err` under the log directory on macOS).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,21 +44,7 @@ pub(crate) fn configured_log_dir(global: &GlobalArgs) -> anyhow::Result<Option<P
     let config_dir = nodeconfig::default_node_config_dir(network)?;
     let config = quil_config::load_config(&config_dir)
         .map_err(|e| anyhow::anyhow!("load config: {e}"))?;
-    Ok(log_dir(&config.logger.path, &config_dir))
-}
-
-/// Resolve `logger.path`: empty means stderr only; a relative path is looked
-/// up under the config directory, then as given.
-fn log_dir(path: &str, config_dir: &Path) -> Option<PathBuf> {
-    if path.is_empty() {
-        return None;
-    }
-    let path = Path::new(path);
-    if path.is_absolute() {
-        return Some(path.to_path_buf());
-    }
-    let under_config = config_dir.join(path);
-    Some(if under_config.exists() || !path.exists() { under_config } else { path.to_path_buf() })
+    Ok(config.logger.log_dir(&config_dir))
 }
 
 /// The node's live log file name for `core` (as the node's logging names it).
@@ -106,7 +93,7 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
         None => {
             let file = Path::new(system::LOG_PATH).join("node.err");
             if !file.exists() {
-                anyhow::bail!("the node logs to stderr only and {} is missing; set logger.path", file.display());
+                anyhow::bail!("the node logs to stderr only and {} is missing", file.display());
             }
             let mut cmd = Command::new("tail");
             if follow {
@@ -126,7 +113,7 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
 /// Delete the rotated logs in the node's log directory; returns how many.
 pub(crate) fn clean(global: &GlobalArgs) -> anyhow::Result<usize> {
     let Some(dir) = configured_log_dir(global)? else {
-        println!("The node writes no log files (logger.path is empty)");
+        println!("The node writes no log files (logger.path is none)");
         return Ok(0);
     };
     let removed = remove_rotated_logs(&dir)?;
@@ -156,16 +143,6 @@ fn remove_rotated_logs(dir: &Path) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An empty path is stderr only; an absolute path is used as given; a
-    /// relative one is looked up under the config directory.
-    #[test]
-    fn the_log_dir_follows_logger_path() {
-        let config_dir = Path::new("/nonexistent-config");
-        assert_eq!(log_dir("", config_dir), None);
-        assert_eq!(log_dir("/srv/node/logs", config_dir), Some(PathBuf::from("/srv/node/logs")));
-        assert_eq!(log_dir(".logs-not-here", config_dir), Some(config_dir.join(".logs-not-here")));
-    }
 
     #[test]
     fn live_logs_are_never_rotated_logs() {
