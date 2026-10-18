@@ -1405,7 +1405,8 @@ mod tests {
             .unwrap_err();
             if variant == 0 {
                 assert!(
-                    error.to_string().contains("missing BLS signature"),
+                    error.to_string().contains("app shard frame 95 ")
+                        && error.to_string().contains("missing BLS signature"),
                     "{error}"
                 );
             }
