@@ -97,7 +97,7 @@ pub(crate) fn handle_diagnostic_flags(
             0
         };
 
-        println!("Version: {}", quil_config::VERSION_STRING);
+        println!("Version: {}", quil_config::display_version());
         println!("Peer ID: {}", peer_id_b58);
         println!("Prover Address: {}", hex::encode(&prover_address));
         println!("BLS Public Key: {}...{}", hex::encode(&bls_pubkey[..8]), hex::encode(&bls_pubkey[bls_pubkey.len()-8..]));

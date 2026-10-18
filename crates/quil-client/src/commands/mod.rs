@@ -11,4 +11,3 @@ pub mod message;
 pub mod node;
 pub mod release_cmds;
 pub mod token;
-pub mod version;
