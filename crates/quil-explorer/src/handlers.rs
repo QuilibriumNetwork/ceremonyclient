@@ -18,7 +18,7 @@ use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 
 use quil_execution::prover_registry::{
-    credited_after_join, inactivity_start, limit_evictions_to_shard_floor, shard_progressing,
+    allocation_fresh_at, inactivity_start, limit_evictions_to_shard_floor, shard_progressing,
     EvictionCandidate,
 };
 use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverStatus};
@@ -941,32 +941,28 @@ fn active_allocations_by_filter(provers: &[ProverInfo], frame: u64) -> HashMap<V
     m
 }
 
-/// Of the census allocations, those at most `threshold` frames inactive per
-/// `assess_allocation`, keyed by confirmation filter: the fresh count the
-/// evictor's stall exemption (`shard_progressing`) uses. A never-credited
-/// allocation (last active 0), or one credited only by its join confirm
-/// (`credited_after_join`), is not fresh; `None` otherwise means not yet
-/// inactive, or a shard exempt anyway.
+/// Of the census allocations, those the evictor's stall census counts as
+/// fresh (`allocation_fresh_at`, with the shard's halt credit), keyed by
+/// confirmation filter: the fresh count its stall exemption
+/// (`shard_progressing`) uses. `signed_frame_activation` is
+/// `SIGNED_FRAME_ACTIVATION_FRAME` outside tests.
 fn fresh_allocations_by_filter(
     provers: &[ProverInfo],
     frame: u64,
     halts: &HashMap<Vec<u8>, u64>,
-    active_by_filter: &HashMap<Vec<u8>, u64>,
     threshold: u64,
+    signed_frame_activation: u64,
 ) -> HashMap<Vec<u8>, u64> {
     let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
     for p in provers {
         for alloc in &p.allocations {
             if alloc.confirmation_filter.is_empty()
                 || alloc.effective_status(frame) != EffectiveStatus::Active
-                || alloc.last_active_frame_number == 0
-                || !credited_after_join(alloc)
             {
                 continue;
             }
-            if assess_allocation(alloc, frame, halts, active_by_filter)
-                .is_none_or(|a| a.effective_inactive <= threshold)
-            {
+            let halt = halts.get(&alloc.confirmation_filter).copied().unwrap_or(0);
+            if allocation_fresh_at(alloc, frame, halt, threshold, signed_frame_activation) {
                 *m.entry(alloc.confirmation_filter.clone()).or_insert(0) += 1;
             }
         }
@@ -1050,8 +1046,13 @@ pub async fn handle_eviction_risk(
 
     let provers = all_provers(&state, frame);
     let active_by_filter = active_allocations_by_filter(&provers, frame);
-    let fresh_by_filter =
-        fresh_allocations_by_filter(&provers, frame, &halts, &active_by_filter, threshold);
+    let fresh_by_filter = fresh_allocations_by_filter(
+        &provers,
+        frame,
+        &halts,
+        threshold,
+        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+    );
     let progressing = |filter: &[u8]| {
         shard_progressing(
             active_by_filter.get(filter).copied().unwrap_or(0),
@@ -1956,6 +1957,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    last_signed_frame_number: 0,
                     epoch: 0,
                     ring: 0,
                     vertex_address: vec![],
@@ -1974,6 +1976,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    last_signed_frame_number: 0,
                     epoch: 0,
                     ring: 0,
                     vertex_address: vec![],
@@ -2073,6 +2076,7 @@ mod tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: last_active,
+            last_signed_frame_number: 0,
             // Current-epoch so `effective_status` reads Active (not
             // ExpiredEpoch) at the ~EVICTION_INACTIVITY_START_FRAME test frames;
             // epoch is well above any frame these tests use.
@@ -2179,7 +2183,13 @@ mod tests {
         }
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
         let active = active_allocations_by_filter(&provers, frame);
-        let fresh = fresh_allocations_by_filter(&provers, frame, &halts, &active, threshold);
+        let fresh = fresh_allocations_by_filter(
+            &provers,
+            frame,
+            &halts,
+            threshold,
+            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        );
         let census = |filter: u8| {
             let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
             (get(&active), get(&fresh))
@@ -2189,6 +2199,69 @@ mod tests {
         assert_eq!(census(0xCC), (3, 2));
         assert!(shard_progressing(6, 4));
         assert!(!shard_progressing(6, 3));
+    }
+
+    #[test]
+    fn fresh_census_reads_signed_frames_once_they_govern() {
+        // Shard 0xDD stalled with recent re-confirms: four members confirmed
+        // within the threshold but recorded no signed frame, two are stale.
+        // Shard 0xEE produces: four signed within the threshold, two are
+        // stale. Read by last active both are progressing; once signed frames
+        // govern, only 0xEE is, as the evictor's census reads them.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let threshold = crate::EVICTION_THRESHOLD_FRAMES;
+        let activation = start + 2000;
+        let frame = activation + threshold + 100;
+        let member = |filter: u8, last_active: u64, last_signed: u64| {
+            let mut alloc = active_alloc(vec![filter], last_active);
+            alloc.last_signed_frame_number = last_signed;
+            ProverInfo {
+                public_key: vec![],
+                address: vec![],
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![alloc],
+                available_storage: 0,
+                seniority: 0,
+                delegate_address: vec![],
+            }
+        };
+        let mut provers = Vec::new();
+        for (filter, last_active, last_signed, count) in [
+            (0xDDu8, frame - 10, 0, 4),
+            (0xDD, start + 100, 0, 2),
+            (0xEE, frame - 10, frame - 100, 4),
+            (0xEE, start + 100, 0, 2),
+        ] {
+            for _ in 0..count {
+                provers.push(member(filter, last_active, last_signed));
+            }
+        }
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let active = active_allocations_by_filter(&provers, frame);
+        let census = |signed_frame_activation: u64, filter: u8| {
+            let fresh = fresh_allocations_by_filter(
+                &provers,
+                frame,
+                &halts,
+                threshold,
+                signed_frame_activation,
+            );
+            let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
+            (get(&active), get(&fresh))
+        };
+        let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+        assert_eq!(census(default, 0xDD), (6, 4));
+        assert_eq!(census(default, 0xEE), (6, 4));
+        assert_eq!(census(activation, 0xDD), (6, 0));
+        assert_eq!(census(activation, 0xEE), (6, 4));
+        // Each count is the evictor's own predicate over the same allocations.
+        for p in &provers {
+            let alloc = &p.allocations[0];
+            let fresh = |a| allocation_fresh_at(alloc, frame, 0, threshold, a);
+            assert_eq!(fresh(activation), alloc.last_signed_frame_number == frame - 100);
+            assert_eq!(fresh(default), alloc.last_active_frame_number == frame - 10);
+        }
     }
 
     #[test]

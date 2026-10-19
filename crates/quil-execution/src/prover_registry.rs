@@ -774,8 +774,8 @@ impl InMemoryProverRegistry {
     /// seniority. Each shard keeps at least `MIN_SHARD_CONSENSUS_PROVERS`
     /// effectively-active allocations (see [`limit_evictions_to_shard_floor`]).
     /// A stalled shard, one on which fewer than two thirds of the active
-    /// allocations are within the threshold, loses none (see
-    /// [`shard_progressing`]): inactivity there does not tell who votes.
+    /// allocations are fresh, loses none (see [`shard_progressing`] and
+    /// [`allocation_fresh_at`]): inactivity there does not tell who votes.
     ///
     /// `shard_halt_durations` maps confirmation-filter bytes →
     /// number of frames the shard has been in a halt state. A value
@@ -788,6 +788,24 @@ impl InMemoryProverRegistry {
         frame_number: u64,
         inactivity_threshold: u64,
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
+    ) -> Vec<EvictionCandidate> {
+        self.find_eviction_candidates_at(
+            frame_number,
+            inactivity_threshold,
+            shard_halt_durations,
+            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        )
+    }
+
+    /// [`Self::find_eviction_candidates`] with the stall census reading
+    /// `LastSignedFrameNumber` from `signed_frame_activation` (see
+    /// [`allocation_fresh_at`]), so tests can activate it.
+    fn find_eviction_candidates_at(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+        signed_frame_activation: u64,
     ) -> Vec<EvictionCandidate> {
         // Per-shard census of effectively-active allocations at this frame.
         // A shard with fewer than `MIN_SHARD_CONSENSUS_PROVERS` active provers
@@ -803,8 +821,12 @@ impl InMemoryProverRegistry {
         // the eviction pass reads below — deterministic across the fleet,
         // independent of the per-node coverage monitor / shard-size source.
         // The fresh count per shard drives the stall exemption.
-        let (active_by_filter, fresh_by_filter) =
-            self.eviction_census(frame_number, inactivity_threshold, shard_halt_durations);
+        let (active_by_filter, fresh_by_filter) = self.eviction_census(
+            frame_number,
+            inactivity_threshold,
+            shard_halt_durations,
+            signed_frame_activation,
+        );
 
         let mut stale: Vec<EvictionCandidate> = Vec::new();
         for info in self.prover_cache.values() {
@@ -904,16 +926,18 @@ impl InMemoryProverRegistry {
 
     /// Effectively-active allocations per confirmation filter at
     /// `frame_number` (empty filters excluded), and how many of them are
-    /// fresh: at most `inactivity_threshold` frames inactive by
-    /// [`effective_inactivity`], with credit later than the join confirm
-    /// ([`credited_after_join`]). The census
-    /// [`Self::find_eviction_candidates`] applies its stall exemption and
-    /// shard floor to.
+    /// fresh ([`allocation_fresh_at`]): at most `inactivity_threshold` frames
+    /// inactive since their last credit, with credit later than the join
+    /// confirm. The credit is `LastActiveFrameNumber`, or
+    /// `LastSignedFrameNumber` once the signed-frame census governs. The
+    /// census [`Self::find_eviction_candidates`] applies its stall exemption
+    /// and shard floor to.
     fn eviction_census(
         &self,
         frame_number: u64,
         inactivity_threshold: u64,
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
+        signed_frame_activation: u64,
     ) -> (HashMap<Vec<u8>, u64>, HashMap<Vec<u8>, u64>) {
         let mut active_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut fresh_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
@@ -931,10 +955,13 @@ impl InMemoryProverRegistry {
                     .get(&alloc.confirmation_filter)
                     .copied()
                     .unwrap_or(0);
-                if credited_after_join(alloc)
-                    && effective_inactivity(alloc, frame_number, halt_duration)
-                        .is_some_and(|inactive| inactive <= inactivity_threshold)
-                {
+                if allocation_fresh_at(
+                    alloc,
+                    frame_number,
+                    halt_duration,
+                    inactivity_threshold,
+                    signed_frame_activation,
+                ) {
                     *fresh_by_filter
                         .entry(alloc.confirmation_filter.clone())
                         .or_insert(0) += 1;
@@ -985,7 +1012,7 @@ impl EvictionCandidate {
 /// Frames of inactivity counted against `alloc` at `frame_number`, after
 /// `halt_duration` frames of halt credit, counted from [`inactivity_start`].
 /// `None` for an allocation never credited (`LastActiveFrameNumber` 0): it
-/// accrues no inactivity and is not fresh either.
+/// accrues no inactivity.
 fn effective_inactivity(
     alloc: &ProverAllocationInfo,
     frame_number: u64,
@@ -1004,9 +1031,13 @@ fn effective_inactivity(
 /// join confirm and cannot sign a frame before then, while the confirm's own
 /// credit is already most of an epoch old at that boundary's eviction pass.
 pub fn inactivity_start(alloc: &ProverAllocationInfo) -> u64 {
-    let mut start = alloc
-        .last_active_frame_number
-        .max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
+    inactivity_start_from(alloc, alloc.last_active_frame_number)
+}
+
+/// [`inactivity_start`] counted from the credit `credit` instead of
+/// `LastActiveFrameNumber`.
+fn inactivity_start_from(alloc: &ProverAllocationInfo, credit: u64) -> u64 {
+    let mut start = credit.max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
     if alloc.join_confirm_frame_number > 0 {
         let activation = (quil_types::consensus::epoch_for_frame(alloc.join_confirm_frame_number) + 1)
             .saturating_mul(quil_types::consensus::epoch_length_frames());
@@ -1015,29 +1046,74 @@ pub fn inactivity_start(alloc: &ProverAllocationInfo) -> u64 {
     start
 }
 
-/// Whether `alloc`'s activity credit postdates its join confirm. The confirm
+/// Whether the stall census credits allocations by `LastSignedFrameNumber` at
+/// `frame_number`: from one `inactivity_threshold` after
+/// `signed_frame_activation`, when every member has had a full threshold of
+/// frames that record the field to sign one. With the disabled default
+/// (`u64::MAX`) the bound saturates at `u64::MAX`, past every reachable frame.
+pub fn signed_frame_census_governs(
+    frame_number: u64,
+    inactivity_threshold: u64,
+    signed_frame_activation: u64,
+) -> bool {
+    frame_number >= signed_frame_activation.saturating_add(inactivity_threshold)
+}
+
+/// Whether `alloc` counts as fresh in its shard's stall census at
+/// `frame_number`: at most `inactivity_threshold` frames inactive after
+/// `halt_duration` frames of halt credit, counted from its last credit as
+/// [`inactivity_start`] counts (not before EVICTION_INACTIVITY_START_FRAME or
+/// its activation), with that credit later than its join confirm. The confirm
 /// writes `LastActiveFrameNumber` itself, so credit no later than it says
-/// nothing about signing frames and does not count as fresh.
-pub fn credited_after_join(alloc: &ProverAllocationInfo) -> bool {
-    alloc.last_active_frame_number > alloc.join_confirm_frame_number
+/// nothing about signing frames; a never-credited allocation (credit 0) is
+/// not fresh either.
+///
+/// The credit is `LastActiveFrameNumber` until
+/// [`signed_frame_census_governs`], then `LastSignedFrameNumber`, which only
+/// the signers of an included app frame record. Public paths pass
+/// `SIGNED_FRAME_ACTIVATION_FRAME`; reads committed registry fields only.
+pub fn allocation_fresh_at(
+    alloc: &ProverAllocationInfo,
+    frame_number: u64,
+    halt_duration: u64,
+    inactivity_threshold: u64,
+    signed_frame_activation: u64,
+) -> bool {
+    let credit = if signed_frame_census_governs(
+        frame_number,
+        inactivity_threshold,
+        signed_frame_activation,
+    ) {
+        alloc.last_signed_frame_number
+    } else {
+        alloc.last_active_frame_number
+    };
+    credit > alloc.join_confirm_frame_number
+        && frame_number
+            .saturating_sub(inactivity_start_from(alloc, credit))
+            .saturating_sub(halt_duration)
+            <= inactivity_threshold
 }
 
 /// Whether a shard with `active` effectively-active allocations, `fresh` of
-/// them within the inactivity threshold, is progressing: `fresh` is at least
-/// two thirds of `active`. `LastActiveFrameNumber` advances on confirms and
-/// for the signers of each finalized app frame GLOBAL includes, which needs
-/// signatures from two thirds of the shard's active members. A committee
-/// below that quorum certifies nothing, so its voting and absent members age
-/// alike and eviction could only pick by address; it skips such a stalled
-/// shard. A frame included within the threshold credited two thirds of the
-/// members, so a producing shard stays eligible.
+/// them within the inactivity threshold ([`allocation_fresh_at`]), is
+/// progressing: `fresh` is at least two thirds of `active`. Each finalized app
+/// frame GLOBAL includes credits its signers, two thirds of the shard's active
+/// members. A committee below that quorum certifies nothing, so its voting
+/// and absent members age alike and eviction could only pick by address; it
+/// skips such a stalled shard. A frame included within the threshold credited
+/// two thirds of the members, so a producing shard stays eligible.
 ///
-/// A join confirm's own credit is not fresh ([`credited_after_join`]).
-/// Limitation: an epoch re-confirm records no frame of its own, so a stalled
-/// shard on which two thirds of the members re-confirmed within the threshold
-/// reads as progressing. Errors the other way only exempt a shard: a committee
-/// grown since its last frame, or credited signers now `Leaving`, lowers the
-/// fresh share.
+/// A join confirm's own credit is not fresh. Until the signed-frame census
+/// governs ([`signed_frame_census_governs`]), the credit is
+/// `LastActiveFrameNumber`, which confirms also advance. Limitation: an epoch
+/// re-confirm records no frame of its own, so a stalled shard on which two
+/// thirds of the members re-confirmed within the threshold reads as
+/// progressing. Once the census governs, the credit is
+/// `LastSignedFrameNumber`, which only signers record, and re-confirms no
+/// longer count. Errors the other way only exempt a shard: a committee grown
+/// since its last frame, or credited signers now `Leaving`, lowers the fresh
+/// share.
 pub fn shard_progressing(active: u64, fresh: u64) -> bool {
     u128::from(fresh) * 3 >= u128::from(active) * 2
 }
@@ -2208,6 +2284,7 @@ fn decode_allocation(
         leave_confirm_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LeaveConfirmFrameNumber"),
         leave_reject_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LeaveRejectFrameNumber"),
         last_active_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LastActiveFrameNumber"),
+        last_signed_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LastSignedFrameNumber"),
         epoch: read_u64_be(root, "allocation:ProverAllocation", "Epoch"),
         ring: read_bytes(root, "allocation:ProverAllocation", "Ring")
             .first()
@@ -4171,10 +4248,11 @@ mod tests {
 
     #[test]
     fn find_eviction_candidates_reads_reconfirmed_stalled_shard_as_progressing() {
-        // Documented limitation: a confirm credits `LastActiveFrameNumber`
-        // like a frame does, so a stalled shard on which two thirds of the
-        // members confirmed within the threshold reads as progressing and
-        // its other members are selected.
+        // Documented limitation until the signed-frame census governs: a
+        // confirm credits `LastActiveFrameNumber` like a frame does, so a
+        // stalled shard on which two thirds of the members confirmed within
+        // the threshold reads as progressing and its other members are
+        // selected.
         let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
         let frame = start + 5000;
         let filter = vec![0x4Bu8; 64];
@@ -4189,6 +4267,241 @@ mod tests {
             selected_pairs(&reg.find_eviction_candidates(frame, 500, &HashMap::new())),
             vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())]
         );
+    }
+
+    /// Signed-frame activation for the stall tests, a non-default value so
+    /// the census can read `LastSignedFrameNumber`.
+    const SIGNED_ACTIVATION: u64 = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 2000;
+
+    /// Seed one prover per `(prover byte, last_active, last_signed)` member on
+    /// `filter`, each allocation keyed `prover byte + 0x80` and current for
+    /// `frame`. A zero `last_signed` leaves the field unrecorded.
+    fn seed_signers(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filter: &[u8],
+        members: &[(u8, u64, u64)],
+        frame: u64,
+    ) {
+        for &(p, last_active, last_signed) in members {
+            seed_prover(store, shard, p, 0);
+            let mut leaves = vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", vec![p; 32]),
+                field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.to_vec()),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "LastActiveFrameNumber",
+                    last_active.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "Epoch",
+                    quil_types::consensus::epoch_for_frame(frame).to_be_bytes().to_vec(),
+                ),
+            ];
+            if last_signed > 0 {
+                leaves.push(field_leaf(
+                    "allocation:ProverAllocation",
+                    "LastSignedFrameNumber",
+                    last_signed.to_be_bytes().to_vec(),
+                ));
+            }
+            store
+                .save_vertex_underlying(
+                    "vertex",
+                    "adds",
+                    shard,
+                    &make_vertex_key(p + 0x80),
+                    &build_sub_tree(leaves),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn refresh_decodes_last_signed_frame_number() {
+        let frame = SIGNED_ACTIVATION + 1000;
+        let filter = vec![0x4Cu8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        seed_signers(&store, &shard, &filter, &[(0x10, frame, frame - 5), (0x11, frame, 0)], frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let last_signed = |p: u8| {
+            reg.get_prover_info(&[p; 32]).unwrap().allocations[0].last_signed_frame_number
+        };
+        assert_eq!(last_signed(0x10), frame - 5);
+        assert_eq!(last_signed(0x11), 0, "an unrecorded field decodes as 0");
+    }
+
+    #[test]
+    fn allocation_fresh_matches_last_active_rule_until_signed_frames_govern() {
+        // Until the signed-frame census governs, freshness is exactly the
+        // `LastActiveFrameNumber` rule: credit later than the join confirm and
+        // within the threshold after halt credit, `LastSignedFrameNumber`
+        // ignored. With the default activation it never governs.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (activation, threshold) = (SIGNED_ACTIVATION, 500u64);
+        let last_active_rule = |alloc: &ProverAllocationInfo, frame: u64, halt: u64| {
+            alloc.last_active_frame_number > alloc.join_confirm_frame_number
+                && effective_inactivity(alloc, frame, halt).is_some_and(|i| i <= threshold)
+        };
+        let below = [start + 10, activation, activation + threshold - 1];
+        let after = [activation + threshold, activation + threshold + 100];
+        let mut checked = 0;
+        let last_actives = [0, start - 50, start + 100, activation + 200, activation + threshold - 2];
+        for last_active in last_actives {
+            for last_signed in [0, activation + 5, activation + threshold - 2] {
+                for join_confirm in [0, start + 100, activation + 100] {
+                    for halt in [0, 300, u64::MAX] {
+                        let alloc = ProverAllocationInfo {
+                            status: ProverStatus::Active,
+                            confirmation_filter: vec![0x4Du8; 64],
+                            rejection_filter: Vec::new(),
+                            join_frame_number: 0,
+                            leave_frame_number: 0,
+                            pause_frame_number: 0,
+                            resume_frame_number: 0,
+                            kick_frame_number: 0,
+                            join_confirm_frame_number: join_confirm,
+                            join_reject_frame_number: 0,
+                            leave_confirm_frame_number: 0,
+                            leave_reject_frame_number: 0,
+                            last_active_frame_number: last_active,
+                            last_signed_frame_number: last_signed,
+                            epoch: 0,
+                            ring: 0,
+                            vertex_address: Vec::new(),
+                        };
+                        for frame in below.iter().chain(after.iter()).copied() {
+                            let expected = last_active_rule(&alloc, frame, halt);
+                            let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+                            assert_eq!(
+                                allocation_fresh_at(&alloc, frame, halt, threshold, default),
+                                expected,
+                                "default activation: {alloc:?} at {frame}, halt {halt}"
+                            );
+                            if below.contains(&frame) {
+                                assert_eq!(
+                                    allocation_fresh_at(&alloc, frame, halt, threshold, activation),
+                                    expected,
+                                    "below the boundary: {alloc:?} at {frame}, halt {halt}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 3 * 3 * 3 * below.len());
+        assert!(!signed_frame_census_governs(activation + threshold - 1, threshold, activation));
+        assert!(signed_frame_census_governs(activation + threshold, threshold, activation));
+        assert!(!signed_frame_census_governs(u64::MAX - 1, threshold, u64::MAX));
+    }
+
+    #[test]
+    fn find_eviction_candidates_ignores_reconfirm_credit_once_signed_frames_govern() {
+        // A stalled shard whose members re-confirmed recently: four confirmed
+        // within the threshold but signed no frame within it (two never
+        // recorded one), two are long stale. Read by `LastActiveFrameNumber`
+        // the re-confirms are fresh and the two stale members go; once the
+        // signed-frame census governs, no member is fresh and none goes.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (activation, threshold) = (SIGNED_ACTIVATION, 500);
+        let frame = activation + threshold + 100;
+        let filter = vec![0x4Cu8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let members = [
+            (0x10u8, start + 100, 0u64),
+            (0x11, start + 100, 0),
+            (0x12, frame - 10, 0),
+            (0x13, frame - 10, 0),
+            (0x14, frame - 10, activation + 10),
+            (0x15, frame - 10, activation + 10),
+        ];
+        seed_signers(&store, &shard, &filter, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(
+            selected_pairs(&reg.find_eviction_candidates(frame, threshold, &HashMap::new())),
+            vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())],
+            "the default activation keeps the LastActiveFrameNumber census"
+        );
+        assert!(reg
+            .find_eviction_candidates_at(frame, threshold, &HashMap::new(), activation)
+            .is_empty());
+    }
+
+    #[test]
+    fn find_eviction_candidates_evicts_on_signing_shard_once_signed_frames_govern() {
+        // Six of nine members signed a frame within the threshold (three
+        // re-confirmed since): two thirds are fresh by signed frames, so the
+        // shard progresses and its two stale members go. 0x18 re-confirmed
+        // without signing: not fresh, but staleness still reads
+        // `LastActiveFrameNumber`, so it is no candidate.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (activation, threshold) = (SIGNED_ACTIVATION, 500);
+        let frame = activation + threshold + 100;
+        let filter = vec![0x4Du8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut members = vec![
+            (0x10u8, start + 100, 0u64),
+            (0x11, activation + 10, activation + 10),
+            (0x18, frame - 10, 0),
+        ];
+        members.extend((0x12u8..0x15).map(|p| (p, frame - 100, frame - 100)));
+        members.extend((0x15u8..0x18).map(|p| (p, frame - 10, frame - 100)));
+        seed_signers(&store, &shard, &filter, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let stale = vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())];
+        assert_eq!(
+            selected_pairs(
+                &reg.find_eviction_candidates_at(frame, threshold, &HashMap::new(), activation)
+            ),
+            stale
+        );
+        assert_eq!(
+            selected_pairs(&reg.find_eviction_candidates(frame, threshold, &HashMap::new())),
+            stale
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_switches_to_signed_frames_at_activation_plus_threshold() {
+        // Four members re-confirmed shortly before the boundary and never
+        // signed a recorded frame; two are long stale. One frame before
+        // activation + threshold the census still reads re-confirms as
+        // fresh; from that frame it reads signed frames only.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (activation, threshold) = (SIGNED_ACTIVATION, 500);
+        let boundary = activation + threshold;
+        let filter = vec![0x4Eu8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut members = vec![(0x10u8, start + 100, 0u64), (0x11, start + 100, 0)];
+        members.extend((0x12u8..0x16).map(|p| (p, boundary - 20, 0)));
+        seed_signers(&store, &shard, &filter, &members, boundary);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let candidates_at = |frame: u64| {
+            selected_pairs(&reg.find_eviction_candidates_at(
+                frame,
+                threshold,
+                &HashMap::new(),
+                activation,
+            ))
+        };
+        assert_eq!(
+            candidates_at(boundary - 1),
+            vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())]
+        );
+        assert!(candidates_at(boundary).is_empty());
     }
 
     #[test]

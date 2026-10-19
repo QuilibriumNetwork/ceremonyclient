@@ -2922,6 +2922,7 @@ mod owned_filter_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: join_frame,
+            last_signed_frame_number: 0,
             epoch: 0,
             ring: 0,
             vertex_address: Vec::new(),

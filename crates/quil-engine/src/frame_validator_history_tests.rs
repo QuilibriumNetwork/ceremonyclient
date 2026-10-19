@@ -177,6 +177,7 @@ fn aged_out_registration_attested(requests_root: Vec<u8>, bitmask: &[u8]) -> Age
                 join_confirm_frame_number: 0, join_reject_frame_number: 0,
                 leave_confirm_frame_number: 0, leave_reject_frame_number: 0,
                 last_active_frame_number: global_frame, epoch, ring: 0, vertex_address: vec![],
+                last_signed_frame_number: 0,
             }],
             available_storage: 0,
             seniority: 0,

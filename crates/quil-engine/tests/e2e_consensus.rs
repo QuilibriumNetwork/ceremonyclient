@@ -487,6 +487,7 @@ async fn worker_active_storage_attestation() {
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 1000,
+                last_signed_frame_number: 0,
                 epoch: quil_types::consensus::epoch_for_frame(1000),
                 ring: 0,
                 vertex_address: Vec::new(),

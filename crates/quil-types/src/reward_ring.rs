@@ -206,6 +206,7 @@ mod tests {
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
+                last_signed_frame_number: 0,
                 epoch: 10,
                 ring: 99,
                 vertex_address: vec![],
