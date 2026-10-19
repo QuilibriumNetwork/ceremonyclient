@@ -607,6 +607,21 @@ service DataIPCService {
   // A shard consensus message a committee member sent the master directly,
   // for the shard this worker runs. `from` is the sender's committee key.
   rpc DeliverShardConsensus(DeliverShardConsensusRequest) returns (DeliverShardConsensusResponse);
+  // The engine this worker runs and its latest execution report. The master
+  // renews a seat only while its worker hosts the committee session that
+  // counts it, and shows the report to operators.
+  rpc GetWorkerExecution(GetWorkerExecutionRequest) returns (GetWorkerExecutionResponse);
+}
+
+message GetWorkerExecutionRequest {}
+
+message GetWorkerExecutionResponse {
+  // The filter of the engine this worker runs; empty when it runs none.
+  bytes filter = 1;
+  WorkerExecution execution = 2;
+  // The worker's clock when it answered, so the master can rebase the
+  // report's timestamps onto its own clock.
+  uint64 now_unix_ms = 3;
 }
 
 message DeliverShardConsensusRequest {
