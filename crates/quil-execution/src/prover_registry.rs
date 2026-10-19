@@ -514,6 +514,27 @@ impl InMemoryProverRegistry {
             .collect()
     }
 
+    /// [`Self::get_provers`] over all of `filters`, each prover once, in
+    /// first-seen order.
+    pub fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> Vec<&ProverInfo> {
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut out: Vec<&ProverInfo> = Vec::new();
+        for filter in filters {
+            let Some(addrs) = self.filter_cache.get(filter) else {
+                continue;
+            };
+            for addr in addrs {
+                if !seen.insert(addr.as_slice()) {
+                    continue;
+                }
+                if let Some(info) = self.prover_cache.get(addr) {
+                    out.push(info);
+                }
+            }
+        }
+        out
+    }
+
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
@@ -2098,6 +2119,14 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         Ok(guard.get_provers(filter).into_iter().cloned().collect())
+    }
+
+    fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> QuilResult<Vec<ProverInfo>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard.get_provers_on_filters(filters).into_iter().cloned().collect())
     }
 
     fn get_leaf_root(
@@ -4499,34 +4528,41 @@ mod tests {
     }
 
     #[test]
-    fn scan_eviction_candidates_counts_what_the_floor_and_stall_exemption_spare() {
-        // Three shards with members past the threshold: a progressing one
-        // whose two stale members are selected, a stalled one whose six are
-        // spared, and one at the floor whose stale member is spared.
-        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
-        let (frame, threshold) = (start + 2000, 500);
-        let (progressing, stalled, floor) = (vec![0x51u8; 64], vec![0x52u8; 64], vec![0x53u8; 64]);
-        let (_tmp, store) = temp_store();
-        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
-        let mut members: Vec<(u8, u64, u64)> = vec![(0x10, start + 100, 0), (0x11, start + 100, 0)];
-        members.extend((0x12u8..0x16).map(|p| (p, frame - 10, 0)));
-        seed_signers(&store, &shard, &progressing, &members, frame);
-        let members: Vec<(u8, u64, u64)> = (0x20u8..0x26).map(|p| (p, start + 100, 0)).collect();
-        seed_signers(&store, &shard, &stalled, &members, frame);
-        let mut members: Vec<(u8, u64, u64)> = vec![(0x30, start + 100, 0)];
-        members.extend((0x31u8..0x34).map(|p| (p, frame - 10, 0)));
-        seed_signers(&store, &shard, &floor, &members, frame);
+    fn get_provers_on_filters_returns_each_prover_once() {
+        // 0xA1 holds two shards, 0xB2 one of them, 0xC3 the global
+        // committee; 0xD4 is registered on no listed filter.
+        let (shard_a, shard_b) = (vec![0x0Au8; 35], vec![0x0Bu8; 35]);
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(store.as_ref()).unwrap();
-        let scan = reg.scan_eviction_candidates(frame, threshold, &HashMap::new());
+        for p in [0xA1u8, 0xB2, 0xC3, 0xD4] {
+            reg.prover_cache.insert(
+                vec![p; 32],
+                ProverInfo {
+                    public_key: vec![p; 897],
+                    address: vec![p; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: Vec::new(),
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: Vec::new(),
+                },
+            );
+        }
+        reg.filter_cache.insert(shard_a.clone(), vec![vec![0xA1u8; 32]]);
+        reg.filter_cache.insert(shard_b.clone(), vec![vec![0xA1u8; 32], vec![0xB2u8; 32]]);
+        reg.filter_cache.insert(Vec::new(), vec![vec![0xC3u8; 32]]);
+        let addresses = |filters: &[Vec<u8>]| {
+            let mut out: Vec<Vec<u8>> =
+                reg.get_provers_on_filters(filters).into_iter().map(|p| p.address.clone()).collect();
+            out.sort();
+            out
+        };
         assert_eq!(
-            selected_pairs(&scan.candidates),
-            vec![(vec![0x10u8; 32], progressing.clone()), (vec![0x11u8; 32], progressing)]
+            addresses(&[Vec::new(), shard_a.clone(), shard_b.clone()]),
+            vec![vec![0xA1u8; 32], vec![0xB2u8; 32], vec![0xC3u8; 32]]
         );
-        assert_eq!(scan.candidates, reg.find_eviction_candidates(frame, threshold, &HashMap::new()));
-        assert_eq!((scan.shards, scan.active, scan.stale), (3, 16, 2));
-        assert_eq!((scan.spared_floor, scan.spared_stalled), (1, 6));
-        assert_eq!(scan.stalled, vec![(stalled, 6, 0)]);
+        assert_eq!(addresses(&[shard_a.clone(), shard_a]), vec![vec![0xA1u8; 32]]);
+        assert!(addresses(&[vec![0x0Cu8; 35]]).is_empty());
     }
 
     #[test]

@@ -837,26 +837,17 @@ pub async fn handle_key_prover(
 // Net-new endpoints (no Go counterpart): seniority + eviction risk + stats.
 // ---------------------------------------------------------------------------
 
-/// Collect every prover known to the registry, deduplicated by address.
-/// `get_provers(&[])` only returns the global committee, so we also fan out
-/// over each shard filter from the shard summaries and merge.
+/// Collect every prover known to the registry, deduplicated by address:
+/// the global committee plus every shard filter from the shard summaries,
+/// in one registry call that clones each prover once. Asking per filter
+/// cloned a prover once per shard it holds, each clone carrying its key
+/// and all its allocations.
 fn all_provers(state: &ExplorerState, frame: u64) -> Vec<ProverInfo> {
-    let mut by_addr: HashMap<Vec<u8>, ProverInfo> = HashMap::new();
-    if let Ok(globals) = state.prover_registry.get_provers(&[]) {
-        for p in globals {
-            by_addr.insert(p.address.clone(), p);
-        }
-    }
+    let mut filters: Vec<Vec<u8>> = vec![Vec::new()];
     if let Ok(summaries) = state.prover_registry.get_prover_shard_summaries(frame) {
-        for s in summaries {
-            if let Ok(list) = state.prover_registry.get_provers(&s.filter) {
-                for p in list {
-                    by_addr.entry(p.address.clone()).or_insert(p);
-                }
-            }
-        }
+        filters.extend(summaries.into_iter().map(|s| s.filter));
     }
-    by_addr.into_values().collect()
+    state.prover_registry.get_provers_on_filters(&filters).unwrap_or_default()
 }
 
 /// Per-allocation inactivity assessment, mirroring
