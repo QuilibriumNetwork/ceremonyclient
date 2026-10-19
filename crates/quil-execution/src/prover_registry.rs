@@ -807,6 +807,38 @@ impl InMemoryProverRegistry {
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
         signed_frame_activation: u64,
     ) -> Vec<EvictionCandidate> {
+        self.scan_eviction_candidates_at(
+            frame_number,
+            inactivity_threshold,
+            shard_halt_durations,
+            signed_frame_activation,
+        )
+        .candidates
+    }
+
+    /// [`Self::find_eviction_candidates`] with the census that spared the
+    /// other stale allocations, for the eviction pass log.
+    pub fn scan_eviction_candidates(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+    ) -> EvictionScan {
+        self.scan_eviction_candidates_at(
+            frame_number,
+            inactivity_threshold,
+            shard_halt_durations,
+            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        )
+    }
+
+    fn scan_eviction_candidates_at(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+        signed_frame_activation: u64,
+    ) -> EvictionScan {
         // Per-shard census of effectively-active allocations at this frame.
         // A shard with fewer than `MIN_SHARD_CONSENSUS_PROVERS` active provers
         // cannot run its consensus (it is under a coverage halt), so NO shard
@@ -827,6 +859,20 @@ impl InMemoryProverRegistry {
             shard_halt_durations,
             signed_frame_activation,
         );
+        let mut scan = EvictionScan {
+            shards: active_by_filter.len() as u64,
+            active: active_by_filter.values().sum(),
+            ..EvictionScan::default()
+        };
+        scan.stalled = active_by_filter
+            .iter()
+            .filter(|(_, active)| **active > quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS)
+            .map(|(filter, &active)| {
+                (filter.clone(), active, fresh_by_filter.get(filter).copied().unwrap_or(0))
+            })
+            .filter(|&(_, active, fresh)| !shard_progressing(active, fresh))
+            .collect();
+        scan.stalled.sort();
 
         let mut stale: Vec<EvictionCandidate> = Vec::new();
         for info in self.prover_cache.values() {
@@ -871,6 +917,23 @@ impl InMemoryProverRegistry {
                 if alloc.confirmation_filter.is_empty() {
                     continue;
                 }
+                // Inactivity first, so the pass log counts what each
+                // exemption below spares.
+                let halt_duration = shard_halt_durations
+                    .get(&alloc.confirmation_filter)
+                    .copied()
+                    .unwrap_or(0);
+                if halt_duration == u64::MAX {
+                    continue;
+                }
+                let Some(effective_inactive) =
+                    effective_inactivity(alloc, frame_number, halt_duration)
+                else {
+                    continue;
+                };
+                if effective_inactive <= inactivity_threshold {
+                    continue;
+                }
                 // Coverage-halt / under-provisioned exemption: if this shard
                 // has fewer than the consensus minimum of active provers it
                 // cannot run consensus, so no shard frame is produced and this
@@ -888,6 +951,7 @@ impl InMemoryProverRegistry {
                     .copied()
                     .unwrap_or(0);
                 if shard_active <= quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS {
+                    scan.spared_floor += 1;
                     continue;
                 }
                 // Stall exemption: a shard that certified no frame within the
@@ -897,31 +961,20 @@ impl InMemoryProverRegistry {
                     .copied()
                     .unwrap_or(0);
                 if !shard_progressing(shard_active, shard_fresh) {
+                    scan.spared_stalled += 1;
                     continue;
                 }
-                let halt_duration = shard_halt_durations
-                    .get(&alloc.confirmation_filter)
-                    .copied()
-                    .unwrap_or(0);
-                if halt_duration == u64::MAX {
-                    continue;
-                }
-                let Some(effective_inactive) =
-                    effective_inactivity(alloc, frame_number, halt_duration)
-                else {
-                    continue;
-                };
-                if effective_inactive > inactivity_threshold {
-                    stale.push(EvictionCandidate {
-                        prover_address: info.address.clone(),
-                        confirmation_filter: alloc.confirmation_filter.clone(),
-                        vertex_address: alloc.vertex_address.clone(),
-                        effective_inactive,
-                    });
-                }
+                stale.push(EvictionCandidate {
+                    prover_address: info.address.clone(),
+                    confirmation_filter: alloc.confirmation_filter.clone(),
+                    vertex_address: alloc.vertex_address.clone(),
+                    effective_inactive,
+                });
             }
         }
-        limit_evictions_to_shard_floor(stale, &active_by_filter)
+        scan.stale = stale.len() as u64;
+        scan.candidates = limit_evictions_to_shard_floor(stale, &active_by_filter);
+        scan
     }
 
     /// Effectively-active allocations per confirmation filter at
@@ -986,6 +1039,32 @@ impl InMemoryProverRegistry {
     pub fn distinct_provers(&self) -> usize { self.prover_cache.len() }
     pub fn distinct_filters(&self) -> usize { self.filter_cache.len() }
 }
+
+/// What one eviction census saw: the selected allocations, and how many
+/// allocations past the threshold each exemption spared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvictionScan {
+    /// The selection [`InMemoryProverRegistry::find_eviction_candidates`]
+    /// returns, in its order.
+    pub candidates: Vec<EvictionCandidate>,
+    /// Shards with an effectively-active allocation.
+    pub shards: u64,
+    /// Effectively-active allocations on those shards.
+    pub active: u64,
+    /// Allocations past the threshold on progressing shards above the
+    /// floor, before the floor limit.
+    pub stale: u64,
+    /// Past the threshold on a shard at or below the consensus minimum.
+    pub spared_floor: u64,
+    /// Past the threshold on a stalled shard ([`shard_progressing`]).
+    pub spared_stalled: u64,
+    /// Stalled shards above the floor as (filter, active, fresh), by filter.
+    pub stalled: Vec<(Vec<u8>, u64, u64)>,
+}
+
+/// Allocations one eviction pass kicks at most: the first of the sorted
+/// candidates, so every archive kicks the same ones.
+pub const EVICTION_MAX_PER_PASS: usize = 25;
 
 /// One allocation selected for inactivity eviction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1538,6 +1617,24 @@ impl SharedProverRegistry {
         }
     }
 
+    /// [`Self::find_eviction_candidates`] with the census behind it, for the
+    /// eviction pass log.
+    pub fn scan_eviction_candidates(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+    ) -> EvictionScan {
+        match self.inner.read() {
+            Ok(guard) => guard.scan_eviction_candidates(
+                frame_number,
+                inactivity_threshold,
+                shard_halt_durations,
+            ),
+            Err(_) => EvictionScan::default(),
+        }
+    }
+
     /// Find stale allocations AND kick them in the supplied
     /// HypergraphState: each selected allocation vertex gets Status=4 and
     /// KickFrameNumber=frame_number. The prover vertex is not touched, so
@@ -1583,7 +1680,6 @@ impl SharedProverRegistry {
         // allocations. find_eviction_candidates returns a deterministically
         // SORTED list, so taking the first N yields the same set on every
         // archive, and any subset of it still respects the shard floor.
-        const EVICTION_MAX_PER_FRAME: usize = 25;
         let candidates: Vec<(EvictionCandidate, Option<Vec<u8>>)> = {
             let guard = self
                 .inner
@@ -1592,7 +1688,7 @@ impl SharedProverRegistry {
             guard
                 .find_eviction_candidates(frame_number, inactivity_threshold, shard_halt_durations)
                 .into_iter()
-                .take(EVICTION_MAX_PER_FRAME)
+                .take(EVICTION_MAX_PER_PASS)
                 .map(|candidate| {
                     let vertex = if candidate.vertex_address.len() == 32 {
                         Some(candidate.vertex_address.clone())
@@ -4400,6 +4496,37 @@ mod tests {
         assert!(!signed_frame_census_governs(activation + threshold - 1, threshold, activation));
         assert!(signed_frame_census_governs(activation + threshold, threshold, activation));
         assert!(!signed_frame_census_governs(u64::MAX - 1, threshold, u64::MAX));
+    }
+
+    #[test]
+    fn scan_eviction_candidates_counts_what_the_floor_and_stall_exemption_spare() {
+        // Three shards with members past the threshold: a progressing one
+        // whose two stale members are selected, a stalled one whose six are
+        // spared, and one at the floor whose stale member is spared.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (frame, threshold) = (start + 2000, 500);
+        let (progressing, stalled, floor) = (vec![0x51u8; 64], vec![0x52u8; 64], vec![0x53u8; 64]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut members: Vec<(u8, u64, u64)> = vec![(0x10, start + 100, 0), (0x11, start + 100, 0)];
+        members.extend((0x12u8..0x16).map(|p| (p, frame - 10, 0)));
+        seed_signers(&store, &shard, &progressing, &members, frame);
+        let members: Vec<(u8, u64, u64)> = (0x20u8..0x26).map(|p| (p, start + 100, 0)).collect();
+        seed_signers(&store, &shard, &stalled, &members, frame);
+        let mut members: Vec<(u8, u64, u64)> = vec![(0x30, start + 100, 0)];
+        members.extend((0x31u8..0x34).map(|p| (p, frame - 10, 0)));
+        seed_signers(&store, &shard, &floor, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let scan = reg.scan_eviction_candidates(frame, threshold, &HashMap::new());
+        assert_eq!(
+            selected_pairs(&scan.candidates),
+            vec![(vec![0x10u8; 32], progressing.clone()), (vec![0x11u8; 32], progressing)]
+        );
+        assert_eq!(scan.candidates, reg.find_eviction_candidates(frame, threshold, &HashMap::new()));
+        assert_eq!((scan.shards, scan.active, scan.stale), (3, 16, 2));
+        assert_eq!((scan.spared_floor, scan.spared_stalled), (1, 6));
+        assert_eq!(scan.stalled, vec![(stalled, 6, 0)]);
     }
 
     #[test]
