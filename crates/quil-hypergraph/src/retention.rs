@@ -1,6 +1,7 @@
 //! Background pruning of superseded tree versions, blob versions and index
-//! entries, so a node's store stops growing with every commit. Off unless
-//! `QUIL_PRUNE_RETAINED_VERSIONS=1`: which trees are prunable is decided by
+//! entries, so a node's store stops growing with every commit. On by default
+//! on nodes that do not serve history (`QUIL_PRUNE_RETAINED_VERSIONS=0` turns
+//! it off, `=1` turns it on for an archive): which trees are prunable is decided by
 //! [`HypergraphCrdt::prune_retaining`], which keeps every root syncing peers
 //! may still request and leaves any tree whose history it cannot read alone.
 use std::sync::{Arc, Weak};
@@ -35,11 +36,12 @@ impl RetentionPolicy {
     pub const DEFAULT_RETAIN_FRAMES: u64 =
         crate::SNAPSHOT_MAX_GENERATIONS as u64 + quil_types::consensus::EPOCH_LENGTH_FRAMES;
 
-    /// `QUIL_PRUNE_RETAINED_VERSIONS=1` enables it; `QUIL_PRUNE_RETAIN_FRAMES`
-    /// and `QUIL_PRUNE_INTERVAL_SECS` override the defaults. A retention below
+    /// The policy for a store, or `None` when pruning is off: see
+    /// [`pruning_enabled`]. `QUIL_PRUNE_RETAIN_FRAMES` and
+    /// `QUIL_PRUNE_INTERVAL_SECS` override the defaults. A retention below
     /// the sync window is refused.
-    pub fn from_env() -> Option<Self> {
-        if std::env::var("QUIL_PRUNE_RETAINED_VERSIONS").ok().as_deref() != Some("1") {
+    pub fn from_env(serves_history: bool) -> Option<Self> {
+        if !pruning_enabled(std::env::var("QUIL_PRUNE_RETAINED_VERSIONS").ok().as_deref(), serves_history) {
             return None;
         }
         let number = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
@@ -52,6 +54,17 @@ impl RetentionPolicy {
             max_value_deletes: (std::env::var("QUIL_PRUNE_JMT_VALUES").ok().as_deref() != Some("0"))
                 .then_some(100_000),
         })
+    }
+}
+
+/// Whether retained-version pruning runs for a `QUIL_PRUNE_RETAINED_VERSIONS`
+/// setting: `0` turns it off and `1` on; unset (or anything else) leaves it on
+/// unless the store serves history, as an archive's master store does.
+pub fn pruning_enabled(setting: Option<&str>, serves_history: bool) -> bool {
+    match setting.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !serves_history,
     }
 }
 
@@ -88,9 +101,11 @@ pub fn spawn_retention_pruner(crdt: &Arc<HypergraphCrdt>, policy: RetentionPolic
     let spawned = std::thread::Builder::new().name(format!("prune-{label}")).spawn(move || loop {
         std::thread::sleep(policy.interval);
         let Some(crdt) = crdt.upgrade() else { return };
+        let started = std::time::Instant::now();
         match crdt.prune_retaining_with(policy.retain_frames, policy.max_blob_deletes, policy.max_value_deletes) {
             Ok(RetentionPass { trees, nodes, values }) if trees > 0 || nodes > 0 || values > 0 => {
-                tracing::info!(store = %label, trees, nodes, values, "pruned retained versions");
+                let ms = started.elapsed().as_millis() as u64;
+                tracing::info!(store = %label, trees, nodes, values, ms, "pruned retained versions");
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(store = %label, %error, "retained-version prune failed; retrying next pass"),
@@ -104,6 +119,18 @@ pub fn spawn_retention_pruner(crdt: &Arc<HypergraphCrdt>, policy: RetentionPolic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pruning is on by default except where history is served, and the
+    /// setting overrides either default.
+    #[test]
+    fn retained_version_pruning_defaults_on_unless_history_is_served() {
+        assert!(pruning_enabled(None, false));
+        assert!(!pruning_enabled(None, true));
+        assert!(pruning_enabled(Some("not a switch"), false));
+        assert!(!pruning_enabled(Some("not a switch"), true));
+        assert!(!pruning_enabled(Some("0"), false));
+        assert!(pruning_enabled(Some(" 1 "), true));
+    }
 
     /// The pin cap defaults to [`DEFAULT_PINNED_GENERATIONS`], can be switched
     /// off, and is never below [`MIN_PINNED_GENERATIONS`].

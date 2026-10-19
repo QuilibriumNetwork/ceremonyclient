@@ -16,6 +16,7 @@ pub(crate) struct EngineHandles {
 pub(crate) fn init_engines(
     storage: &StorageHandles,
     network: u8,
+    archive_mode: bool,
     #[cfg(feature = "native-proof")]
     proof_worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
 ) -> anyhow::Result<EngineHandles> {
@@ -68,9 +69,10 @@ pub(crate) fn init_engines(
             Err(error) => tracing::error!(%error, "could not check the GLOBAL prover tree's head markers"),
         }
     }
-    // Opt-in (`QUIL_PRUNE_RETAINED_VERSIONS=1`): superseded tree and blob
-    // versions otherwise accumulate with every commit.
-    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+    // Superseded tree and blob versions otherwise accumulate with every
+    // commit. An archive serves history, so it prunes only when
+    // `QUIL_PRUNE_RETAINED_VERSIONS=1`; other nodes unless it is `0`.
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env(archive_mode)) {
         tracing::info!(?policy, "retained-version pruning enabled on the global CRDT");
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "master".into());
     }

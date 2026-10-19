@@ -90,7 +90,7 @@ pub(crate) async fn start(
         tracing::info!("Phase-3 JMT forest installed — committing state to the forest");
     }
     crate::master_node::worker_manager::initialize_worker_size_accounting(&crdt, "worker");
-    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env(false)) {
         tracing::info!(?policy, "retained-version pruning enabled on the worker CRDT");
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "worker".into());
     }

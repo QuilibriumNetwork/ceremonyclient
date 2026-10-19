@@ -249,6 +249,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut peer_infos_received: u64 = 0;
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // When the loop started: archives announce themselves about every
+        // thirty minutes, so the first one is verified up to that long after it.
+        let loop_started = std::time::Instant::now();
         let mut consensus_msgs_received: u64 = 0;
         let mut prover_msgs_received: u64 = 0;
         let mut router_drops: u64 = 0;
@@ -286,6 +289,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut committee_peer_timer = tokio::time::interval(std::time::Duration::from_secs(5));
         committee_peer_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let committee_peer_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut committee_builds = super::committee_builds::CommitteeBuilds::default();
+        let mut committee_builds_checked = std::time::Instant::now();
         let mut last_committee_peers = std::collections::HashSet::new();
         let mut pending_committee_policy: Option<(std::collections::HashSet<quil_p2p::PeerId>, Arc<std::sync::atomic::AtomicBool>)> = None;
         let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -394,6 +399,43 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         Ok(_) => {}
                         Err(error) => warn!(%error, "committed committee peer policy unavailable"),
                     }
+                    // Which build each member of a served committee runs, by its
+                    // verified PeerInfo (committee_builds.rs).
+                    committee_builds.retain(&filters);
+                    let now = std::time::Instant::now();
+                    let builds_due = now.duration_since(committee_builds_checked) >= std::time::Duration::from_secs(60);
+                    if builds_due {
+                        committee_builds_checked = now;
+                    }
+                    if let Some(view) = builds_due.then(|| CommittedView::capture(&crdt_for_recv).ok()).flatten() {
+                        for filter in &filters {
+                            let Ok(Some(session)) = handoff::head(&view, filter) else { continue };
+                            let Ok(id) = session.id() else { continue };
+                            if !committee_builds.due(filter, id, now) {
+                                continue;
+                            }
+                            let builds: Vec<_> = {
+                                let infos = pic_for_recv.read();
+                                session.members.iter()
+                                    .map(|key| if quil_engine::bitmasks::shard_cw_addressee_tag(key) == local_cw_tag {
+                                        super::committee_builds::Build::ThisNode
+                                    } else {
+                                        super::committee_builds::Build::of(
+                                            infos.get(&quil_p2p::peer_id_from_falcon_pubkey(key)).map(|info| info.build_fingerprint()))
+                                    })
+                                    .collect()
+                            };
+                            info!(
+                                scope = "peer",
+                                filter = %hex::encode(filter),
+                                generation = session.generation,
+                                session = %hex::encode(id),
+                                members = builds.len(),
+                                builds = %super::committee_builds::groups(&builds),
+                                "app committee member builds by member index"
+                            );
+                        }
+                    }
                 }
                 _ = status_timer.tick() => {
                     if let Some(ingest) = archive_ingest_for_recv.as_ref() {
@@ -401,6 +443,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
+                    // Archive endpoints in use (seeded at startup or learned);
+                    // `archive_peers` counts only archives verified from their
+                    // own PeerInfo since start.
+                    let archive_endpoints = pool_for_recv.len().await;
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
@@ -448,6 +494,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         cw_sender_session = shard_sender_keys.session,
                         cw_sender_cached = shard_sender_keys.cached,
                         cw_sender_unresolved = shard_sender_keys.unresolved,
+                        archive_endpoints,
                         archive_peers = archive_peers_seen.len(),
                         consensus_msgs = consensus_msgs_received,
                         prover_msgs = prover_msgs_received,
@@ -833,6 +880,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     peer = peer_hex,
                                                     head_frame = info.last_global_head_frame,
                                                     total = archive_peers_seen.len(),
+                                                    secs_since_start = loop_started.elapsed().as_secs(),
                                                     "verified genesis archive peer"
                                                 );
                                             }

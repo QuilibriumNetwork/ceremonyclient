@@ -1,4 +1,5 @@
 mod actor;
+mod discards;
 mod ingress;
 mod round;
 mod verifier;

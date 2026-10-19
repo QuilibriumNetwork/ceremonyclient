@@ -11,6 +11,7 @@ pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
 pub(crate) mod grpc;
 pub(crate) mod keys;
+mod committee_builds;
 pub(crate) mod message_loop;
 mod shard_sender;
 mod committee_peer_policy;
@@ -120,6 +121,7 @@ pub(crate) async fn start(
     let engines = engines::init_engines(
         &storage,
         network,
+        archive_mode,
         #[cfg(feature = "native-proof")]
         proof_worker.as_ref(),
     )?;
