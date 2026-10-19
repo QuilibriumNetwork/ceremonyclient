@@ -22,7 +22,7 @@ use axum::{
     routing::any,
     Router,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 pub mod handlers;
 pub mod message_ring;
@@ -75,10 +75,16 @@ pub struct ExplorerState {
     /// per-request `proverCache`/`proverShardCache` maps. Keyed by an
     /// endpoint-specific string; stores the already-serialized body.
     pub(crate) cache: Arc<RwLock<HashMap<String, (Instant, Vec<u8>)>>>,
+    /// Every prover known to the registry at one frame, with its build
+    /// time, shared by requests within that frame and a few seconds (see
+    /// `handlers::all_provers`). Holds at most one snapshot.
+    pub(crate) provers_snapshot:
+        Arc<Mutex<Option<(u64, Instant, Arc<Vec<quil_types::consensus::ProverInfo>>)>>>,
 }
 
 impl ExplorerState {
-    /// Build the state. The cache map is created internally.
+    /// Build the state. The cache map and prover snapshot are created
+    /// internally.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         clock_store: Arc<dyn quil_types::store::ClockStore>,
@@ -104,6 +110,7 @@ impl ExplorerState {
             messages,
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            provers_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 }
