@@ -1259,7 +1259,11 @@ impl FrameMaterializer {
                 // committed registry state) deterministically protects provers
                 // on shards that can't run consensus — which subsumes the
                 // "don't evict while under-covered" intent, per-shard and
-                // node-independent. The `u64::MAX` coverage entries only ever
+                // node-independent. Its stall exemption likewise spares every
+                // member of a shard on which fewer than two thirds of the
+                // active allocations were credited within the grace window
+                // (no frame certified, so inactivity cannot tell who votes).
+                // The `u64::MAX` coverage entries only ever
                 // occur for under-quorum shards, which the census already
                 // exempts, so dropping them from the decision changes no
                 // outcome except the divergence.

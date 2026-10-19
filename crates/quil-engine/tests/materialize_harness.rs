@@ -323,20 +323,24 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     let node_a = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
     let node_b = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
 
-    // Above-quorum shard X: MIN+1 idle provers → one is evictable (the shard
-    // CAN run consensus, so its idle provers are genuinely inactive, and the
-    // floor keeps MIN of them).
+    // Above-quorum shard X: one idle prover and MIN fresh ones → the idle one
+    // is evictable (the shard CAN run consensus and is progressing, two thirds
+    // of its members fresh, so its idle prover is genuinely inactive, and the
+    // floor keeps MIN members).
     let filter_x = vec![0x33u8; 64];
     // Under-quorum shard Y: 2 idle provers → exempt on BOTH via the census
     // (2 < MIN_SHARD_CONSENSUS_PROVERS), regardless of any coverage-halt entry.
     let filter_y = vec![0x44u8; 64];
 
-    let x_count = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8 + 1;
+    let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
     // Seed BOTH nodes with byte-identical committed state.
     let seed_node = |node: &MaterializeHarness| -> Vec<Vec<u8>> {
-        let mut xs = Vec::new();
-        for i in 0..x_count {
-            xs.push(seed_idle_prover(node, 0x10 + i, 0x90 + i, &filter_x));
+        let xs = vec![seed_idle_prover(node, 0x10, 0x90, &filter_x)];
+        for i in 0..quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8 {
+            let faddr = [0xB0u8 + i; 32];
+            let (fp, fa) = active_recent_prover(&faddr, &filter_x, frame);
+            node.seed_flat_vertex(&faddr, &fp);
+            node.seed_flat_vertex(&[0xC0u8 + i; 32], &fa);
         }
         // Under-quorum shard Y: exactly 2 provers.
         seed_idle_prover(node, 0x50, 0xD0, &filter_y);
@@ -347,12 +351,9 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     let x_addrs = seed_node(&node_a);
     let _ = seed_node(&node_b);
 
-    let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
-
     // Registry-level determinism: two independently-built registries on the same
-    // committed state produce the identical census-driven candidate set — one
-    // shard-X allocation, the floor's surplus (shard-Y is exempt: 2 < quorum).
-    // All shard-X provers are equally inactive, so the lowest address goes.
+    // committed state produce the identical census-driven candidate set — the
+    // idle shard-X allocation (shard-Y is exempt: 2 < quorum, and stalled).
     // This is the input the materializer decision consumes (census-only,
     // coverage-map-free).
     let cand_a = node_a
@@ -365,9 +366,9 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     assert_eq!(
         cand_a.len(),
         1,
-        "only shard X's surplus over the floor is a candidate; shard-Y is exempt"
+        "only shard X's idle prover is a candidate; shard-Y is exempt"
     );
-    assert_eq!(cand_a[0].prover_address, x_addrs[0], "ties go to the lowest address");
+    assert_eq!(cand_a[0].prover_address, x_addrs[0], "the idle shard-X prover goes");
     assert_eq!(cand_a[0].confirmation_filter, filter_x);
 
     // DIVERGENT per-node coverage state — the crux. Node A saw no halts; node B's
@@ -400,7 +401,7 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
         "two archives with divergent coverage state must converge to the same prover root"
     );
 
-    // Both nodes kicked the shard-X surplus (shard X is now at its floor) and
+    // Both nodes kicked the idle shard-X prover (shard X is now at its floor) and
     // spared the under-quorum shard-Y provers (never candidates).
     for node in [&node_a, &node_b] {
         let post = node
