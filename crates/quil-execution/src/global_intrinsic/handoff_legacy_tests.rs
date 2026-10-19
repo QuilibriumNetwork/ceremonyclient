@@ -139,6 +139,23 @@ fn a_legacy_shard_becomes_generation_zero_and_is_scheduled_into_its_successor() 
         "a closing source is not scheduled twice");
 }
 
+/// A shard registered from the presence report frame on is timed from its
+/// registration, the GLOBAL frame that recorded its legacy tip; one
+/// registered before it, or by default, has no record.
+#[test]
+fn a_legacy_source_records_its_registration_frame_as_its_tip_advance() {
+    for (activation, expected) in [(Some(8), Some(8)), (Some(9), None), (None, None)] {
+        set_presence_report_frame_for_thread(activation);
+        let fixture = legacy(vec![0x6e; 32], 40, 1);
+        let (state, filter, keys) = (&fixture.state, &fixture.filter, &fixture.keys);
+        assert_eq!(legacy::migrate(state, 8, &policy(), &[filter.clone()], &scan_of(&[(filter, keys)])).unwrap(), 1);
+        commit(state, 8);
+        let zero = head(state, filter).unwrap().unwrap().id().unwrap();
+        assert_eq!(session_tip_frame(state, &zero).unwrap(), expected, "activation {activation:?}");
+    }
+    set_presence_report_frame_for_thread(None);
+}
+
 /// The legacy committee seals its own head in the legacy namespace; GLOBAL
 /// accepts it as generation zero's terminal seal and authorizes generation 1
 /// in its own namespace from the sealed checkpoint.

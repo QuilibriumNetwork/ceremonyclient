@@ -484,6 +484,8 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
     let source = session(&keys, vec![0x62; 32]);
     let fixture = Fixture::new(&source);
     let intrinsic = fixture.intrinsic();
+    // Tip advances record their GLOBAL frame from here on.
+    handoff::set_presence_report_frame_for_thread(Some(0));
     handoff::initialize(&fixture.state, 2, &source).unwrap();
     commit(&fixture.state, 2);
 
@@ -509,6 +511,8 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
     intrinsic.invoke_step(3, &wire(&frames[0]), &fixture.state).unwrap();
     commit(&fixture.state, 3);
     assert_eq!(handoff::session_tip(&fixture.state, &source.id().unwrap()).unwrap().unwrap().frame, 1);
+    assert_eq!(handoff::session_tip_frame(&fixture.state, &source.id().unwrap()).unwrap(), Some(3),
+        "the executing GLOBAL frame, not the header's anchor");
 
     let next_keys = self::keys();
     let request = handoff::schedule(
@@ -561,13 +565,26 @@ fn a_seal_brings_the_drain_headers_global_never_executed() {
     // The full drain, an already-executed header included, is accepted.
     let drain = sealed(vec![wire(&frames[0]), wire(&frames[1]), wire(&frames[2])]);
     assert!(intrinsic.validate(6, &drain, None, None).unwrap());
+    // Checking it against the execution state stages nothing, the tip's
+    // GLOBAL frame included.
+    let staged = fixture.state.changeset_len();
+    let checked = handoff::SealSubmission {
+        submission: submission.clone(),
+        drain: vec![wire(&frames[0]), wire(&frames[1]), wire(&frames[2])],
+    };
+    intrinsic.verify_seal_submission(6, &checked, &fixture.state).unwrap();
+    assert_eq!(fixture.state.changeset_len(), staged, "a checked drain stages nothing");
+    assert_eq!(handoff::session_tip_frame(&fixture.state, &source.id().unwrap()).unwrap(), Some(3));
     intrinsic.invoke_step(6, &drain, &fixture.state).unwrap();
     commit(&fixture.state, 6);
     let tip = handoff::session_tip(&fixture.state, &source.id().unwrap()).unwrap().unwrap();
     assert_eq!((tip.frame, tip.view, tip.digest), (3, 9, submission.seal.checkpoint.digest));
+    assert_eq!(handoff::session_tip_frame(&fixture.state, &source.id().unwrap()).unwrap(), Some(6),
+        "the executed drain records its GLOBAL frame");
     assert_eq!(handoff::head(&fixture.state, &source.filter).unwrap().unwrap().generation, 2,
         "the seal authorized the successor");
     handoff::set_seal_drain_frame_for_thread(None);
+    handoff::set_presence_report_frame_for_thread(None);
 }
 
 /// A seal built on a notarized checkpoint finalizes that frame, and a
