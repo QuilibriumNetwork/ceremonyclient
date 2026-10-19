@@ -1721,3 +1721,6 @@ fn a_merge_activates_from_one_sealed_and_one_fenced_source() {
 
 #[path = "handoff_legacy_tests.rs"]
 mod legacy_tests;
+
+#[path = "handoff_presence_tests.rs"]
+mod presence_tests;

@@ -398,6 +398,15 @@ impl GlobalIntrinsic {
                 self.verify_seal_submission(frame_number, &sealed, &state)?;
                 Ok(true)
             }
+            super::handoff::TYPE_PRESENCE_REPORT => {
+                super::handoff::presence::require_active(frame_number)?;
+                let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
+                    "presence report validation requires authenticated global state".into()))?;
+                let state = HypergraphState::new(crdt.clone());
+                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
+                self.verify_presence_report(frame_number, &report, &state)?;
+                Ok(true)
+            }
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
@@ -1272,6 +1281,11 @@ impl GlobalIntrinsic {
                     return Err(error);
                 }
                 Ok(())
+            }
+            super::handoff::TYPE_PRESENCE_REPORT => {
+                // Validation only: an accepted report writes nothing yet.
+                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
+                self.verify_presence_report(frame_number, &report, state)
             }
             TYPE_SHARD_SPLIT => {
                 let op = super::prover_ops::ShardSplit::from_canonical_bytes(input)?;
@@ -2437,6 +2451,28 @@ impl GlobalIntrinsic {
             super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
         }
         Ok(())
+    }
+
+    /// Check a presence report against `state`, with each proposal's anchor
+    /// output from this node's clock store, without writing anything.
+    pub fn verify_presence_report(
+        &self,
+        frame_number: u64,
+        report: &super::handoff::presence::PresenceReport,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        super::handoff::presence::verify(state, frame_number, report, |anchor| {
+            let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+                QuilError::Internal("presence report: clock_store not installed — cannot recompute output".into())
+            })?;
+            clock_store
+                .get_global_clock_frame_header(anchor)
+                .ok()
+                .map(|header| header.output)
+                .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
+                    "presence report: anchored global frame {anchor} unavailable — cannot recompute output"
+                )))
+        })
     }
 
     fn invoke_frame_header(

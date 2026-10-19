@@ -19,6 +19,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const TYPE_COMMITTEE_HANDOFF: u32 = 0x0321;
+/// A session's notarize votes as evidence of its members' presence
+/// ([`presence::PresenceReport`]).
+pub const TYPE_PRESENCE_REPORT: u32 = 0x0322;
 pub const MAX_TRANSITION_SHARDS: usize = 512;
 
 /// Second leaf of every authorization vertex. The records share the global
@@ -587,6 +590,52 @@ pub fn fenced_successor_eligibility_frame() -> u64 {
 /// Set the fenced successor eligibility frame for the calling thread only (tests).
 pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
     FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame GLOBAL validates presence reports
+/// ([`presence::PresenceReport`]); before it every report is refused, as an
+/// older build refuses it. An accepted report changes no state yet, but the
+/// operation is consensus-affecting all the same: an older build decodes it
+/// as an empty request, so it computes another requests root for any GLOBAL
+/// frame that carries one, and every archive and GLOBAL prover must run a
+/// build with it before the frame. Not scheduled on mainnet;
+/// `QUIL_PRESENCE_REPORT_FRAME` elsewhere, never by default.
+pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = None;
+
+static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PRESENCE_REPORT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn presence_report_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_PRESENCE_REPORT_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's presence report frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_presence_report_frame(network: u8) -> u64 {
+    *PRESENCE_REPORT_FRAME.get_or_init(|| {
+        presence_report_frame_for(network, std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().as_deref())
+    })
+}
+
+pub fn presence_report_frame() -> u64 {
+    if let Some(frame) = PRESENCE_REPORT_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *PRESENCE_REPORT_FRAME.get_or_init(|| {
+        std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the presence report frame for the calling thread only (tests).
+pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
+    PRESENCE_REPORT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1457,6 +1506,9 @@ pub mod schedule;
 
 #[path = "handoff_legacy.rs"]
 pub mod legacy;
+
+#[path = "handoff_presence.rs"]
+pub mod presence;
 
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
