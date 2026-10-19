@@ -483,6 +483,9 @@ pub struct ProverLifecycle {
     /// Whether evaluations keep failing: a failed evaluation decides no
     /// joins, confirms or leaves for its frame.
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
+    /// How long each bound seat's worker has not hosted the committee
+    /// session that counts it; a seat an epoch unhosted is not renewed.
+    session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
     pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
@@ -642,6 +645,7 @@ impl ProverLifecycle {
             proof_in_progress: AtomicBool::new(false),
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
+            session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             current_frame,
@@ -1558,6 +1562,25 @@ impl ProverLifecycle {
         // departure boundary, so their unbound slots are reserved too.
         let worker_bound_filters: std::collections::HashSet<Vec<u8>> =
             worker_view.filter_set().map(|w| w.filter.clone()).collect();
+        // Whether each bound seat's worker hosts the committee session that
+        // counts this prover, for the renewal below.
+        if let Some(prover) = prover_info.as_ref() {
+            let bound: Vec<(u32, Vec<u8>)> = worker_view.filter_set()
+                .map(|w| (w.core_id, w.filter.clone())).collect();
+            let filters: Vec<Vec<u8>> = bound.iter().map(|(_, filter)| filter.clone()).collect();
+            let members = self.allocator.session_member_filters(&filters, &prover.public_key);
+            let executions = worker_manager.worker_execution();
+            let now = crate::worker_execution::now_ms();
+            let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
+            for (core_id, filter) in &bound {
+                let report = executions.iter()
+                    .find(|(id, reported, _)| id == core_id && reported == filter)
+                    .map(|(_, _, execution)| execution);
+                hosting.observe(frame_number, filter, *core_id, members.contains(filter),
+                    super::session_hosting::classify(report, now));
+            }
+            hosting.retain_bound(&worker_bound_filters);
+        }
         let unbound_held_count = all_our_filters
             .iter()
             .filter(|f| !worker_bound_filters.contains(*f))
@@ -1660,9 +1683,34 @@ impl ProverLifecycle {
         // which removes it from committee eligibility. The allocator binds
         // free workers to recovering allocations, which then renew here; one
         // still unbound after the grace is left by the orphan sweep.
-        let renewal_filters: Vec<Vec<u8>> = expired_epoch_filters.into_iter()
-            .filter(|f| worker_bound_filters.contains(f))
-            .collect();
+        //
+        // Nor does a bound seat whose worker has gone an epoch without
+        // hosting the committee session that counts it (decided 2026-10-18,
+        // `session_hosting`): workers refused their predecessor's state for
+        // hours while their seats renewed, so their committees stayed below
+        // quorum. Hosting again renews it, late if need be (through the
+        // recovery epoch); otherwise it lapses, the allocator releases the
+        // worker and the orphan sweep leaves it.
+        let epoch_frames = quil_types::consensus::epoch_length_frames();
+        let renewal_filters: Vec<Vec<u8>> = {
+            let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
+            expired_epoch_filters.into_iter()
+                .filter(|f| worker_bound_filters.contains(f))
+                .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
+                    None => true,
+                    Some(withheld) => {
+                        if withheld.first {
+                            tracing::warn!(frame = frame_number, filter = hex::encode(f), core_id = withheld.run.core_id,
+                                unhosted_since = withheld.run.since, state = %withheld.run.state,
+                                blocker = %withheld.run.blocker, scope = "local", action = "check",
+                                "seat renewal withheld: its worker has not hosted the committee session that counts it \
+                                 for an epoch; renewed once the worker hosts, otherwise the seat lapses and is left");
+                        }
+                        false
+                    }
+                })
+                .collect()
+        };
         if !renewal_filters.is_empty() {
             // Never renew an abandoned orphan we may propose leaving below.
             // The pipeline reserves filters before spawning; failed preparation
@@ -3949,6 +3997,99 @@ mod proposal_loop_tests {
         assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
         assert_eq!(lc.allocator.last_join_attempt(), 725);
         assert_eq!(lc.last_leave_attempt.read().unwrap().get(&held), Some(&725));
+    }
+
+    /// A seat whose worker has gone an epoch without hosting the committee
+    /// session that counts it is not renewed (decided 2026-10-18); a hosting
+    /// worker, an unobservable one, and a seat its session does not count
+    /// renew as before.
+    #[test]
+    fn a_seat_whose_worker_never_hosts_its_session_is_not_renewed() {
+        use quil_cw_consensus::handoff::Session;
+        use quil_execution::global_intrinsic::handoff;
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let local_key = signers[0].public_key().to_vec();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let address = vec![0xCD; 32];
+        // Sessions name full 32-byte shard filters.
+        let held = vec![0xA1; 32];
+        let outside = vec![0xA2; 32];
+        let session = |filter: &Vec<u8>, members: Vec<Vec<u8>>| Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members,
+        };
+        commit(1);
+        handoff::initialize(&state, 2, &session(&held, members)).unwrap();
+        // `outside`'s session does not count this prover.
+        handoff::initialize(&state, 2, &session(&outside, vec![signers[1].public_key().to_vec()])).unwrap();
+        commit(2);
+
+        let report = |state: &str| WorkerExecution {
+            state: state.into(), blocker: "predecessor state has not been recovered through its seal".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(), ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction], filter: &Vec<u8>| actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(filter)));
+        // (worker report on `held`, whether `held` renews at 725)
+        for (observed, renewed) in [(Some("blocked"), false), (Some("syncing"), false),
+            (Some("serving"), true), (None, true)]
+        {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, outside.clone()));
+            if let Some(state) = observed {
+                wm.set_execution(1, &held, report(state));
+            }
+            wm.set_execution(2, &outside, report("blocked"));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            // Confirmed for epoch 1: renewal for epoch 2 is due from frame 720.
+            let due = |filter: &Vec<u8>| {
+                let mut allocation = alloc(filter.clone(), ProverStatus::Active, 10);
+                allocation.epoch = 1;
+                allocation
+            };
+            reg.set_prover(ProverInfo { public_key: local_key.clone(),
+                ..prover(address.clone(), vec![due(&held), due(&outside)]) });
+            reg.set_summaries(vec![shard_summary(held.clone(), 50), shard_summary(outside.clone(), 50)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(global.clone());
+            // Observed from frame 5 (not yet due), then when renewal is due,
+            // an epoch later.
+            lc.set_prover_root_verified_frame(5);
+            let early = lc.evaluate(5, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(!renews(&early, &held), "{early:?}");
+            lc.set_prover_root_verified_frame(725);
+            let actions = lc.evaluate(725, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(renews(&actions, &held), renewed, "{observed:?}: {actions:?}");
+            assert!(renews(&actions, &outside), "a seat its session does not count owes no hosting: {actions:?}");
+            assert_eq!(count_proposed_leaves(&actions), 0, "a withheld renewal is not a leave: {actions:?}");
+            if !renewed {
+                // Hosting again renews it.
+                wm.set_execution(1, &held, report("serving"));
+                lc.set_prover_root_verified_frame(730);
+                let late = lc.evaluate(730, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+                assert!(renews(&late, &held), "{late:?}");
+            }
+        }
     }
 
     #[test]

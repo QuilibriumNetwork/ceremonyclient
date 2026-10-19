@@ -500,6 +500,9 @@ pub(crate) fn init(
                     loop {
                         tick.tick().await;
                         cm.connect_all().await;
+                        // The lifecycle renews a seat only while its worker
+                        // hosts its committee session (decided 2026-10-18).
+                        cm.refresh_executions().await;
                     }
                 });
             }

@@ -1528,6 +1528,29 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         Ok(tonic::Response::new(quil_types::proto::node::DeliverShardConsensusResponse { accepted }))
     }
 
+    /// The engine this worker runs and its latest execution report, for the
+    /// master's renewal decisions and operator views.
+    async fn get_worker_execution(
+        &self,
+        _request: tonic::Request<quil_types::proto::node::GetWorkerExecutionRequest>,
+    ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetWorkerExecutionResponse>, tonic::Status> {
+        let handle = self
+            .worker
+            .engine_handle
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
+            .clone();
+        let (filter, execution) = match handle {
+            Some(handle) => (handle.filter.clone(), Some(handle.execution())),
+            None => (Vec::new(), None),
+        };
+        Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
+            filter,
+            execution,
+            now_unix_ms: crate::worker_execution::now_ms(),
+        }))
+    }
+
     async fn get_app_fee_snapshot(
         &self, request: tonic::Request<quil_types::proto::node::GetAppFeeSnapshotRequest>,
     ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetAppFeeSnapshotResponse>, tonic::Status> {

@@ -182,6 +182,22 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
     }
 }
 
+/// Of `filters`, those whose head session counts `member` and is not closed:
+/// the sessions this prover's workers are there to host.
+pub fn member_sessions(global: &Arc<HypergraphCrdt>, filters: &[Vec<u8>], member: &[u8]) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let view = CommittedView::capture(global)?;
+    let mut counted = std::collections::HashSet::new();
+    for filter in filters {
+        let Some(session) = handoff::head(&view, filter)? else { continue };
+        if session.members.iter().any(|key| key == member)
+            && !matches!(handoff::status(&view, &session.id()?)?, Status::Closed(_))
+        {
+            counted.insert(filter.clone());
+        }
+    }
+    Ok(counted)
+}
+
 struct HistoryTip {
     frame: u64,
     root: [u8; 32],

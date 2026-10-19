@@ -219,6 +219,7 @@ impl ProverRegistry for TestProverRegistry {
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
+    executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
 }
 
 impl Default for TestWorkerManager {
@@ -232,7 +233,13 @@ impl TestWorkerManager {
         Self {
             workers: Mutex::new(HashMap::new()),
             evictions: Mutex::new(Vec::new()),
+            executions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The execution report `core_id`'s engine gives for `filter`.
+    pub fn set_execution(&self, core_id: u32, filter: &[u8], execution: quil_types::proto::node::WorkerExecution) {
+        self.executions.lock().unwrap().insert(core_id, (filter.to_vec(), execution));
     }
 
     /// Payload evictions requested so far, as `(core, protected filters)`.
@@ -265,6 +272,15 @@ impl TestWorkerManager {
 }
 
 impl WorkerManager for TestWorkerManager {
+    /// Reports set with `set_execution`, for workers still bound to their filter.
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        let workers = self.workers.lock().unwrap();
+        self.executions.lock().unwrap().iter()
+            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| &w.filter == filter))
+            .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
+            .collect()
+    }
+
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
         self.evictions.lock().unwrap().push((core_id, keep));
         Ok(())

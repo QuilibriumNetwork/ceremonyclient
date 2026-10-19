@@ -537,6 +537,23 @@ impl WorkerAllocator {
         *self.session_authority.write().unwrap_or_else(|e| e.into_inner()) = Some(global);
     }
 
+    /// Of `filters`, those whose current committee session counts `member`
+    /// ([`crate::app_handoff::member_sessions`]). None without authenticated
+    /// GLOBAL state or when it is unreadable: no seat is then held to
+    /// hosting a session.
+    pub(crate) fn session_member_filters(&self, filters: &[Vec<u8>], member: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Default::default();
+        };
+        match crate::app_handoff::member_sessions(&global, filters, member) {
+            Ok(members) => members,
+            Err(error) => {
+                debug!(%error, "committee sessions unreadable; no seat is held to hosting");
+                Default::default()
+            }
+        }
+    }
+
     pub fn new(
         worker_manager: Arc<dyn WorkerManager>,
         prover_registry: Arc<dyn ProverRegistry>,

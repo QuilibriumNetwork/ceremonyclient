@@ -78,6 +78,10 @@ pub struct RemoteWorkerManager {
     /// server cert against the node CA — so only node-key holders interoperate.
     /// `None` = plaintext (back-compat / tests).
     client_tls: Option<tonic::transport::ClientTlsConfig>,
+    /// Each standalone worker's latest execution report, as the filter its
+    /// engine runs and the report on this node's clock
+    /// (`refresh_executions`).
+    executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
 }
 
 /// What became of a shard consensus message handed to a standalone worker.
@@ -160,6 +164,7 @@ impl RemoteWorkerManager {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             client_tls,
+            executions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -259,6 +264,58 @@ impl RemoteWorkerManager {
                         "failed to connect to remote worker"
                     );
                 }
+            }
+        }
+    }
+
+    /// Fetch the execution report of every standalone worker running
+    /// consensus: its engine's phase, which the lifecycle reads to renew only
+    /// seats whose worker hosts its committee session. A worker that does not
+    /// answer, answers for another filter, or whose build lacks the call has
+    /// no report; nothing is inferred from its silence.
+    pub async fn refresh_executions(&self) {
+        let targets: Vec<(u32, Vec<u8>, Channel)> = match self.workers.lock() {
+            Ok(workers) => workers
+                .values()
+                .filter(|w| Self::runs(w, &w.filter))
+                .filter_map(|w| w.channel.clone().map(|channel| (w.core_id, w.filter.clone(), channel)))
+                .collect(),
+            Err(_) => return,
+        };
+        let mut fetches = tokio::task::JoinSet::new();
+        for (core_id, filter, channel) in targets {
+            fetches.spawn(async move {
+                let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+                    .max_decoding_message_size(64 << 10);
+                let answer = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    client.get_worker_execution(quil_types::proto::node::GetWorkerExecutionRequest {}),
+                )
+                .await;
+                let report = match answer {
+                    Ok(Ok(response)) => {
+                        let response = response.into_inner();
+                        (response.filter == filter)
+                            .then_some(response.execution)
+                            .flatten()
+                            .map(|execution| on_local_clock(execution, response.now_unix_ms, crate::worker_execution::now_ms()))
+                    }
+                    _ => None,
+                };
+                (core_id, filter, report)
+            });
+        }
+        let mut fetched = Vec::new();
+        while let Some(result) = fetches.join_next().await {
+            if let Ok(entry) = result {
+                fetched.push(entry);
+            }
+        }
+        let Ok(mut executions) = self.executions.lock() else { return };
+        executions.clear();
+        for (core_id, filter, report) in fetched {
+            if let Some(report) = report {
+                executions.insert(core_id, (filter, report));
             }
         }
     }
@@ -587,6 +644,19 @@ impl WorkerManager for RemoteWorkerManager {
             .collect())
     }
 
+    /// The reports `refresh_executions` fetched, for workers still running
+    /// the filter they were fetched for.
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        let (Ok(workers), Ok(executions)) = (self.workers.lock(), self.executions.lock()) else {
+            return Vec::new();
+        };
+        executions
+            .iter()
+            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| Self::runs(w, filter)))
+            .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
+            .collect()
+    }
+
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
         let workers = self.workers.lock().unwrap();
         Ok(workers.values()
@@ -633,6 +703,23 @@ impl WorkerManager for RemoteWorkerManager {
 
 /// Convert a libp2p multiaddr string to an HTTP endpoint.
 /// `/ip4/192.168.1.10/tcp/32501` → `http://192.168.1.10:32501`
+/// A worker's `execution` report with its timestamps moved from the
+/// worker's clock (`worker_now_ms` when it answered) onto this node's
+/// (`local_now_ms`), so its age reads the same on both machines.
+fn on_local_clock(
+    mut execution: quil_types::proto::node::WorkerExecution,
+    worker_now_ms: u64,
+    local_now_ms: u64,
+) -> quil_types::proto::node::WorkerExecution {
+    if worker_now_ms == 0 {
+        return execution;
+    }
+    let rebase = |at: u64| if at == 0 { 0 } else { local_now_ms.saturating_sub(worker_now_ms.saturating_sub(at)) };
+    execution.observed_unix_ms = rebase(execution.observed_unix_ms);
+    execution.last_advance_unix_ms = rebase(execution.last_advance_unix_ms);
+    execution
+}
+
 fn multiaddr_to_http(multiaddr: &str) -> String {
     let parts: Vec<&str> = multiaddr.split('/').collect();
     let mut host = "127.0.0.1";
@@ -814,6 +901,66 @@ mod fee_relay_tests {
         async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("not used by fee relay"))
         }
+        /// Mode 5 is an older build without the call; otherwise the engine
+        /// runs `[7; 32]`, blocked, observed a minute before the answer, on
+        /// a clock an hour ahead of the master's.
+        async fn get_worker_execution(&self, _: tonic::Request<node::GetWorkerExecutionRequest>)
+            -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status> {
+            if self.mode.load(Ordering::SeqCst) == 5 {
+                return Err(tonic::Status::unimplemented("older worker"));
+            }
+            let now = crate::worker_execution::now_ms() + 3_600_000;
+            Ok(tonic::Response::new(node::GetWorkerExecutionResponse {
+                filter: vec![7; 32],
+                execution: Some(node::WorkerExecution { state: "blocked".into(), observed_unix_ms: now - 60_000, ..Default::default() }),
+                now_unix_ms: now,
+            }))
+        }
+    }
+
+    /// A standalone worker's execution report reaches the master on the
+    /// master's clock, only while the worker runs the filter it reports;
+    /// a build without the call leaves no report.
+    #[tokio::test]
+    async fn worker_execution_reports_come_from_the_worker_running_the_filter() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(0));
+        let server = SnapshotServer {
+            mode: mode.clone(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+        });
+        let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[8; 32], true).unwrap();
+        manager.refresh_executions().await;
+        assert!(manager.worker_execution().is_empty(), "a report for another filter is no report");
+
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        manager.refresh_executions().await;
+        let reports = manager.worker_execution();
+        assert_eq!(reports.len(), 1);
+        let (core_id, filter, execution) = &reports[0];
+        assert_eq!((*core_id, filter.as_slice(), execution.state.as_str()), (1, &[7u8; 32][..], "blocked"));
+        let age = crate::worker_execution::now_ms().saturating_sub(execution.observed_unix_ms);
+        assert!((59_000..=65_000).contains(&age), "a minute old on the master's clock: {age}");
+
+        manager.set_worker_filter(1, &[7; 32], false).unwrap();
+        assert!(manager.worker_execution().is_empty(), "a worker no longer running consensus reports nothing");
+
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        mode.store(5, Ordering::SeqCst);
+        manager.refresh_executions().await;
+        assert!(manager.worker_execution().is_empty(), "an older build leaves no report");
+        stop.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
     }
 
     /// A shard a worker runs consensus for is served, and a direct message

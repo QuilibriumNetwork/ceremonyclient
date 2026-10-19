@@ -2851,32 +2851,41 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 // loudly instead of silently
                                                 // corrupting state; a restart
                                                 // re-materializes cleanly from the
-                                                // durable cursor, and the halt is
-                                                // detectable rather than a silent
-                                                // fall-out-of-consensus. (Atomic
+                                                // durable cursor. (Atomic
                                                 // publication failures never reach
                                                 // here; they retry or use this path.)
+                                                //
+                                                // The node exits with it (decided
+                                                // 2026-10-18): a stopped materializer
+                                                // left an archive running for over a
+                                                // day with execution frozen at
+                                                // 897,477, nullifying every view and
+                                                // judging submissions by that state,
+                                                // with one error line at the start.
+                                                // The error shuts the supervisor
+                                                // down, and the service manager's
+                                                // restart re-materializes.
                                                 Ok(Err(e)) => {
                                                     tracing::error!(
                                                         error = %e,
                                                         target,
                                                         "frame materialize failed — stopping \
-                                                         materializer to avoid a permanent state \
-                                                         hole; restart to re-materialize from the \
+                                                         the node to avoid a permanent state \
+                                                         hole; a restart re-materializes from the \
                                                          durable cursor",
                                                     );
-                                                    break;
+                                                    return Err(anyhow::anyhow!("GLOBAL materializer stopped (target {target}): {e}"));
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(
                                                         error = %e,
                                                         target,
                                                         "materializer task panicked — stopping \
-                                                         materializer to avoid a permanent state \
-                                                         hole; restart to re-materialize from the \
+                                                         the node to avoid a permanent state \
+                                                         hole; a restart re-materializes from the \
                                                          durable cursor",
                                                     );
-                                                    break;
+                                                    return Err(anyhow::anyhow!("GLOBAL materializer panicked (target {target}): {e}"));
                                                 }
                                             }
                                         }
