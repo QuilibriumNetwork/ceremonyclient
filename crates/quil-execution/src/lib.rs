@@ -38,7 +38,7 @@ pub use global_schema::{
 };
 pub use manager::{ExecutionBranch, ExecutionBranchLimits, ExecutionEngineManager, ExecutionForkContext, ExecutionPublicationGuard};
 pub use global_anchor_view::GlobalAnchorView;
-pub use prover_registry::{InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry};
+pub use prover_registry::{EvictionCandidate, InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry};
 
 /// Well-known domain addresses for execution engines.
 pub mod domains {

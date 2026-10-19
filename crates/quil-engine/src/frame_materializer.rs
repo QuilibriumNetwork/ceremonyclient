@@ -170,8 +170,8 @@ pub struct FrameMaterializer {
     prover_tree_reset: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Concrete `SharedProverRegistry` reference for the mutating
     /// `evict_inactive_provers` path. When set, archive
-    /// nodes apply Status=4 + KickFrameNumber to evicted prover and
-    /// allocation vertices via `HypergraphState`. When `None`, eviction
+    /// nodes apply Status=4 + KickFrameNumber to evicted allocation
+    /// vertices via `HypergraphState`. When `None`, eviction
     /// falls back to the trait method which only finds candidates
     /// (matching Go's `EvictInactiveProvers` read+write semantics).
     eviction_registry: Option<Arc<ConcreteProverRegistry>>,
@@ -1282,8 +1282,8 @@ impl FrameMaterializer {
                     // `effective_halt` is retained above for the log only.
                     let decision_halt: std::collections::HashMap<Vec<u8>, u64> =
                         std::collections::HashMap::new();
-                    // Compute the would-be eviction set every frame (read
-                    // only) so it's observable (logs + explorer
+                    // Compute the would-be eviction set (stale allocations,
+                    // read only) so it's observable (logs + explorer
                     // `/provers/eviction-risk`) even before eviction
                     // actually activates.
                     let candidates = eviction_reg.find_eviction_candidates(
@@ -1294,7 +1294,7 @@ impl FrameMaterializer {
                     // Unconditional: log the candidate count every frame, even
                     // zero. The gate is open here (no surviving u64::MAX), so a
                     // zero count means find_eviction_candidates itself rejected
-                    // every prover — e.g. the per-shard streak subtraction in
+                    // every allocation — e.g. the per-shard streak subtraction in
                     // effective_halt pulled effective_inactive below the grace
                     // threshold — which is invisible without this line and
                     // shows up only as an explorer/materializer divergence.
@@ -1304,7 +1304,8 @@ impl FrameMaterializer {
                         "eviction candidate scan (census-based)"
                     );
                     if self.evictions_enabled && frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME {
-                        // Activated: actually mark Status=4 + KickFrameNumber.
+                        // Activated: kick the selected allocations
+                        // (Status=4 + KickFrameNumber on each allocation).
                         let state = quil_execution::hypergraph_state::HypergraphState::new(
                             self.hypergraph.clone(),
                         );
@@ -1358,11 +1359,11 @@ impl FrameMaterializer {
                                             warn!(frame = frame_number, %error, "post-eviction registry refresh failed; will retry");
                                         } else {
                                             // Persistence probe: after the flush+refresh the
-                                            // just-kicked provers must no longer be eviction
-                                            // candidates — their vertex is now Status=4 and is
-                                            // dropped from the registry cache. If any still
-                                            // appear, the kick did not reach the backing store
-                                            // (or was reverted by a later sync) — surface it.
+                                            // just-kicked allocations must no longer be eviction
+                                            // candidates — their vertex is now Status=4, which
+                                            // the registry no longer reads as active. If any
+                                            // still appear, the kick did not reach the backing
+                                            // store (or was reverted by a later sync) — surface it.
                                             let recheck = eviction_reg.find_eviction_candidates(
                                                 frame_number,
                                                 self.eviction_grace_frames,
@@ -1370,13 +1371,19 @@ impl FrameMaterializer {
                                             );
                                             let still_present = recheck
                                                 .iter()
-                                                .filter(|a| evicted.contains(a))
+                                                .filter(|a| evicted.iter().any(|e| e.same_allocation(a)))
                                                 .count();
+                                            let provers = evicted
+                                                .iter()
+                                                .map(|e| e.prover_address.as_slice())
+                                                .collect::<std::collections::BTreeSet<_>>()
+                                                .len();
                                             info!(
                                                 frame = frame_number,
                                                 count = evicted.len(),
+                                                provers,
                                                 still_candidates = still_present,
-                                                "evicted inactive provers (still_candidates>0 ⇒ kick did not persist)"
+                                                "evicted inactive allocations (still_candidates>0 ⇒ kick did not persist)"
                                             );
                                         }
                                     }
@@ -1388,13 +1395,22 @@ impl FrameMaterializer {
                             }
                         }
                     } else if !candidates.is_empty() {
-                        // Pre-activation ramp: identify but do NOT evict.
-                        info!(
-                            frame = frame_number,
-                            count = candidates.len(),
-                            activation_frame = GLOBAL_EVICTION_ACTIVATION_FRAME,
-                            "eviction targets identified — gated until activation frame, not evicting yet"
-                        );
+                        // Identified but not evicted: name the gate that holds.
+                        // Runs once per eviction pass, like the scan line above.
+                        if !self.evictions_enabled {
+                            info!(
+                                frame = frame_number,
+                                count = candidates.len(),
+                                "eviction candidates identified — evictions disabled on this node, not evicting"
+                            );
+                        } else {
+                            info!(
+                                frame = frame_number,
+                                count = candidates.len(),
+                                activation_frame = GLOBAL_EVICTION_ACTIVATION_FRAME,
+                                "eviction candidates identified — activation frame not reached, not evicting yet"
+                            );
+                        }
                     }
                 }
             } else {

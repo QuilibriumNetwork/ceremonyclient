@@ -249,10 +249,10 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     h.seed_flat_vertex(&[0xA5u8; 32], &alloc_blob);
 
     let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
-    // Top the shard up to consensus quorum with fresh-active fillers, so the
-    // target isn't spared by the under-provisioned exemption (a shard below
-    // MIN_SHARD_CONSENSUS_PROVERS can't run consensus → no one is evicted).
-    for i in 0..(quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS - 1) as u8 {
+    // Seed MIN_SHARD_CONSENSUS_PROVERS fresh-active fillers, so evicting the
+    // target leaves the shard at its floor (eviction never takes a shard
+    // below MIN_SHARD_CONSENSUS_PROVERS effectively-active allocations).
+    for i in 0..quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8 {
         let faddr = [0xB0u8 + i; 32];
         let (fp, fa) = active_recent_prover(&faddr, &filter, frame);
         h.seed_flat_vertex(&faddr, &fp);
@@ -264,7 +264,7 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     let halts: HashMap<Vec<u8>, u64> = HashMap::new();
     let pre = h.registry.find_eviction_candidates(frame, 360, &halts);
     assert!(
-        pre.iter().any(|a| a == &prover_addr.to_vec()),
+        pre.iter().any(|a| a.prover_address == prover_addr.to_vec()),
         "registry must see the inactive prover as a candidate pre-materialize"
     );
 
@@ -273,12 +273,12 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     // and refreshes the registry.
     materialize_synced(&h.materializer, &frame_at(frame)).expect("materialize");
 
-    // The kicked prover must no longer be an eviction candidate (Status=4 →
-    // dropped from the registry on refresh).
+    // The kicked allocation must no longer be an eviction candidate (its
+    // Status=4 is no longer read as active on refresh).
     let post = h.registry.find_eviction_candidates(frame, 360, &halts);
     assert!(
-        !post.iter().any(|a| a == &prover_addr.to_vec()),
-        "after materialize the prover must be kicked and gone from the candidate set \
+        !post.iter().any(|a| a.prover_address == prover_addr.to_vec()),
+        "after materialize the allocation must be kicked and gone from the candidate set \
          (this is the store-vs-CRDT seam that had no end-to-end coverage)"
     );
 }
@@ -323,8 +323,9 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     let node_a = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
     let node_b = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
 
-    // Above-quorum shard X: MIN..+1 idle provers → evictable (the shard CAN run
-    // consensus, so its idle provers are genuinely inactive).
+    // Above-quorum shard X: MIN+1 idle provers → one is evictable (the shard
+    // CAN run consensus, so its idle provers are genuinely inactive, and the
+    // floor keeps MIN of them).
     let filter_x = vec![0x33u8; 64];
     // Under-quorum shard Y: 2 idle provers → exempt on BOTH via the census
     // (2 < MIN_SHARD_CONSENSUS_PROVERS), regardless of any coverage-halt entry.
@@ -349,9 +350,11 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
 
     // Registry-level determinism: two independently-built registries on the same
-    // committed state produce the identical census-driven candidate set — exactly
-    // the shard-X provers (shard-Y is exempt: 2 < quorum). This is the input the
-    // materializer decision consumes (census-only, coverage-map-free).
+    // committed state produce the identical census-driven candidate set — one
+    // shard-X allocation, the floor's surplus (shard-Y is exempt: 2 < quorum).
+    // All shard-X provers are equally inactive, so the lowest address goes.
+    // This is the input the materializer decision consumes (census-only,
+    // coverage-map-free).
     let cand_a = node_a
         .registry
         .find_eviction_candidates(frame, 360, &HashMap::new());
@@ -361,12 +364,11 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     assert_eq!(cand_a, cand_b, "independent nodes must agree on the candidate set");
     assert_eq!(
         cand_a.len(),
-        x_count as usize,
-        "exactly the above-quorum shard-X provers are candidates; shard-Y is exempt"
+        1,
+        "only shard X's surplus over the floor is a candidate; shard-Y is exempt"
     );
-    for xa in &x_addrs {
-        assert!(cand_a.contains(xa), "each shard-X prover is a candidate");
-    }
+    assert_eq!(cand_a[0].prover_address, x_addrs[0], "ties go to the lowest address");
+    assert_eq!(cand_a[0].confirmation_filter, filter_x);
 
     // DIVERGENT per-node coverage state — the crux. Node A saw no halts; node B's
     // coverage monitor recorded a FULL halt on the under-quorum shard Y (u64::MAX,
@@ -398,7 +400,7 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
         "two archives with divergent coverage state must converge to the same prover root"
     );
 
-    // Both nodes kicked the shard-X provers (gone from the candidate set) and
+    // Both nodes kicked the shard-X surplus (shard X is now at its floor) and
     // spared the under-quorum shard-Y provers (never candidates).
     for node in [&node_a, &node_b] {
         let post = node
@@ -406,7 +408,7 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
             .find_eviction_candidates(frame, 360, &HashMap::new());
         assert!(
             post.is_empty(),
-            "post-eviction: shard-X kicked, shard-Y exempt → no remaining candidates"
+            "post-eviction: shard X at its floor, shard-Y exempt → no remaining candidates"
         );
     }
 }
