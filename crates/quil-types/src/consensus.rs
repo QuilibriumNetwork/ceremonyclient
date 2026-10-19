@@ -170,6 +170,11 @@ pub struct ProverAllocationInfo {
     pub leave_confirm_frame_number: u64,
     pub leave_reject_frame_number: u64,
     pub last_active_frame_number: u64,
+    /// The last GLOBAL frame that included an app frame this allocation
+    /// signed. Unlike `last_active_frame_number`, confirms do not advance it.
+    /// `0` when never recorded, including every frame before
+    /// [`SIGNED_FRAME_ACTIVATION_FRAME`].
+    pub last_signed_frame_number: u64,
     /// The storage epoch this allocation was last confirmed for. A data-shard
     /// (non-empty filter) Active allocation whose `epoch` is older than the
     /// current epoch is read as [`EffectiveStatus::ExpiredEpoch`]. `0` is the
@@ -699,6 +704,16 @@ pub struct ProverShardSummary {
 /// eviction-risk display so they agree exactly.
 pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 
+/// First GLOBAL frame whose included app frames record each signer's
+/// `LastSignedFrameNumber` on its allocation. One inactivity threshold later,
+/// when every member has had a full window to sign, the eviction stall census
+/// counts an allocation as fresh by that field instead of
+/// `LastActiveFrameNumber`, which confirms also advance. Recording the field
+/// changes committed allocation trees, so every archive must start at the same
+/// frame. `u64::MAX` disables both: no frame records the field and the census
+/// keeps reading `LastActiveFrameNumber`.
+pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
+
 /// Minimum number of effectively-active provers a shard needs to run its
 /// app-shard consensus (form a committee and reach quorum). A shard with
 /// FEWER than this many active provers is under a coverage halt and cannot
@@ -1056,6 +1071,7 @@ pub(crate) mod epoch_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            last_signed_frame_number: 0,
             epoch,
             ring: 0,
             vertex_address: Vec::new(),

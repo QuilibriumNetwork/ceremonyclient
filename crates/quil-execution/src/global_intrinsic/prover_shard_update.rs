@@ -1156,7 +1156,9 @@ fn encode_rewarded_shards(
     write_field(tree, cls, "RewardedShardsBlob", &blob)
 }
 
-/// Update an allocation's `LastActiveFrameNumber`.
+/// Update an allocation's `LastActiveFrameNumber`, and from
+/// `SIGNED_FRAME_ACTIVATION_FRAME` its `LastSignedFrameNumber`: the caller
+/// passes the signers of an app frame this GLOBAL frame includes.
 ///
 /// Go equivalent: `updateAllocationActivity` at
 /// `global_prover_shard_update.go:509`.
@@ -1165,6 +1167,25 @@ fn update_allocation_activity(
     frame_number: u64,
     prover: &ProverInfo,
     filter: &[u8],
+) -> Result<()> {
+    update_allocation_activity_from(
+        state,
+        frame_number,
+        prover,
+        filter,
+        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+    )
+}
+
+/// [`update_allocation_activity`] recording `LastSignedFrameNumber` from
+/// `signed_frame_activation`, so tests can activate it. Below it, the vertex
+/// is written exactly as before the field existed.
+fn update_allocation_activity_from(
+    state: &HypergraphState,
+    frame_number: u64,
+    prover: &ProverInfo,
+    filter: &[u8],
+    signed_frame_activation: u64,
 ) -> Result<()> {
     let alloc_addr = allocation_address(&prover.public_key, filter)?;
     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
@@ -1177,6 +1198,14 @@ fn update_allocation_activity(
     let mut alloc_tree = rebuild_vertex_tree_from_blob(&existing);
 
     materialize_frame_header_activity(&mut alloc_tree, frame_number)?;
+    if frame_number >= signed_frame_activation {
+        write_field(
+            &mut alloc_tree,
+            "allocation:ProverAllocation",
+            "LastSignedFrameNumber",
+            &frame_number.to_be_bytes(),
+        )?;
+    }
 
     let blob = vertex_tree_to_blob(&alloc_tree);
     state.set(domain, &alloc_addr, &va_disc, frame_number, blob)?;
@@ -1305,6 +1334,7 @@ mod tests {
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
+                last_signed_frame_number: 0,
                 epoch: 0,
                 ring: 0,
                 vertex_address: vec![seed; 32],
@@ -1728,6 +1758,81 @@ mod tests {
         let tree = rebuild_vertex_tree_from_blob(&blob);
         let v = read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap();
         assert_eq!(v, 77u64.to_be_bytes().to_vec());
+    }
+
+    /// The allocation blob `update_allocation_activity` stores, and the blob
+    /// of the seeded allocation with `edit` applied, for one update at `frame`
+    /// with the signed frame recorded from `activation`.
+    fn activity_blobs(
+        frame: u64,
+        activation: u64,
+        edit: impl Fn(&mut quil_tries::VectorCommitmentTree),
+    ) -> (Vec<u8>, Vec<u8>) {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        seed_alloc_blob(&state, &p, &filter);
+        let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let read = || {
+            state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap().unwrap()
+        };
+        let mut expected = rebuild_vertex_tree_from_blob(&read());
+        edit(&mut expected);
+        update_allocation_activity_from(&state, frame, &p, &filter, activation).unwrap();
+        (read(), vertex_tree_to_blob(&expected))
+    }
+
+    #[test]
+    fn update_allocation_activity_writes_only_last_active_below_signed_frame_activation() {
+        // Below the activation the allocation vertex is byte-identical to the
+        // one written before `LastSignedFrameNumber` existed: LastActive only.
+        let last_active_only = |tree: &mut quil_tries::VectorCommitmentTree| {
+            materialize_frame_header_activity(tree, 77).unwrap();
+        };
+        for activation in [78, quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME] {
+            let (written, expected) = activity_blobs(77, activation, last_active_only);
+            assert_eq!(written, expected, "activation {activation}");
+            let tree = rebuild_vertex_tree_from_blob(&written);
+            let last_signed = read_field(&tree, "allocation:ProverAllocation", "LastSignedFrameNumber");
+            assert_eq!(last_signed, None);
+        }
+        // The production path uses the disabled default.
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        seed_alloc_blob(&state, &p, &filter);
+        update_allocation_activity(&state, 77, &p, &filter).unwrap();
+        let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap();
+        assert_eq!(blob.unwrap(), activity_blobs(77, 78, last_active_only).1);
+    }
+
+    #[test]
+    fn update_allocation_activity_sets_last_signed_from_signed_frame_activation() {
+        // At and after the activation, one vertex write records both fields.
+        for (frame, activation) in [(77u64, 77u64), (78, 77)] {
+            let (written, expected) = activity_blobs(frame, activation, |tree| {
+                materialize_frame_header_activity(tree, frame).unwrap();
+                write_field(
+                    tree,
+                    "allocation:ProverAllocation",
+                    "LastSignedFrameNumber",
+                    &frame.to_be_bytes(),
+                )
+                .unwrap();
+            });
+            assert_eq!(written, expected, "frame {frame}");
+            let tree = rebuild_vertex_tree_from_blob(&written);
+            for field in ["LastActiveFrameNumber", "LastSignedFrameNumber"] {
+                assert_eq!(
+                    read_field(&tree, "allocation:ProverAllocation", field),
+                    Some(frame.to_be_bytes().to_vec()),
+                    "{field} at frame {frame}"
+                );
+            }
+        }
     }
 
     #[test]

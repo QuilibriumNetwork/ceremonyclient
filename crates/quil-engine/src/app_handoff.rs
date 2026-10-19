@@ -1606,7 +1606,7 @@ mod successor_tests {
                 join_frame_number: 0, leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
                 kick_frame_number: 0, join_confirm_frame_number: 0, join_reject_frame_number: 0,
                 leave_confirm_frame_number: 0, leave_reject_frame_number: 0, last_active_frame_number: 0,
-                epoch: u64::MAX, ring: 0, vertex_address: vec![],
+                last_signed_frame_number: 0, epoch: u64::MAX, ring: 0, vertex_address: vec![],
             }));
         }
         let scan = quil_execution::prover_registry::CommittedProverScan::from_parts(pubkeys, allocations);

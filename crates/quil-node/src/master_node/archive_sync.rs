@@ -3715,6 +3715,7 @@ mod validation_tests {
             kick_frame_number: 0, join_reject_frame_number: 0,
             leave_confirm_frame_number: 0, leave_reject_frame_number: 0,
             last_active_frame_number: 2, epoch: 2, ring: 0, vertex_address: vec![],
+            last_signed_frame_number: 0,
         };
         let workers = Arc::new(TestWorkerManager::new());
         workers.add_with_filter(6, vec![1; 32]);

@@ -835,7 +835,7 @@ fn scan_of(assignments: &[(&[u8], &[FalconPrivateKey])]) -> crate::prover_regist
                 resume_frame_number: 0, kick_frame_number: 0, join_confirm_frame_number: 0,
                 join_reject_frame_number: 0, leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0, last_active_frame_number: 0,
-                epoch: u64::MAX, ring: 0, vertex_address: vec![],
+                last_signed_frame_number: 0, epoch: u64::MAX, ring: 0, vertex_address: vec![],
             }));
         }
     }
