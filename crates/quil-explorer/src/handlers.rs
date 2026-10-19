@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, Query, State},
-    http::{Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode},
     response::Response,
 };
 use base64::Engine as _;
@@ -1020,6 +1020,42 @@ struct EvictionRiskEntry {
     shard_progressing: bool,
 }
 
+/// Which eviction-risk entries a request asks for: one prover's
+/// (`address`), one shard's (`filter`), at most `limit` of them. The hex
+/// values are lowercase, as the entries carry them.
+struct EvictionRiskSelection {
+    address: Option<String>,
+    filter: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The entries `selection` asks for, in their order (most at risk first),
+/// and their count before `limit`. Applied after `eviction_pending` is set
+/// over every allocation, so the selection never changes which
+/// allocations are pending.
+fn select_eviction_risk(
+    entries: Vec<EvictionRiskEntry>,
+    selection: &EvictionRiskSelection,
+) -> (Vec<EvictionRiskEntry>, usize) {
+    let mut selected: Vec<EvictionRiskEntry> = entries
+        .into_iter()
+        .filter(|e| selection.address.as_deref().is_none_or(|a| e.address == a))
+        .filter(|e| selection.filter.as_deref().is_none_or(|f| e.filter == f))
+        .collect();
+    let total = selected.len();
+    if let Some(n) = selection.limit {
+        selected.truncate(n);
+    }
+    (selected, total)
+}
+
+/// `/provers/eviction-risk`: one entry per active allocation accruing
+/// inactivity, most at risk first. Optional query parameters: `min_ratio`
+/// (least `risk_ratio`), `address` (one prover's hex address), `filter`
+/// (one shard's hex confirmation filter) and `limit` (the most at risk
+/// entries). `eviction_pending` is computed over every allocation,
+/// whatever the selection. The `X-Total-Count` header carries the number
+/// of entries selected before `limit`.
 pub async fn handle_eviction_risk(
     method: Method,
     State(state): State<ExplorerState>,
@@ -1032,6 +1068,24 @@ pub async fn handle_eviction_risk(
         .get("min_ratio")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    // Optional hex parameter, normalized to the entries' lowercase hex.
+    let hex_param = |name: &str| -> Result<Option<String>, ()> {
+        match params.get(name).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(h) => hex::decode(h).map(|b| Some(hex::encode(b))).map_err(|_| ()),
+        }
+    };
+    let Ok(address) = hex_param("address") else {
+        return error(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    let Ok(filter) = hex_param("filter") else {
+        return error(StatusCode::BAD_REQUEST, "invalid filter");
+    };
+    let selection = EvictionRiskSelection {
+        address,
+        filter,
+        limit: params.get("limit").and_then(|s| s.parse().ok()),
+    };
 
     let frame = state.current_frame.load(Ordering::Relaxed);
     let halts = current_halts(&state, frame);
@@ -1115,7 +1169,12 @@ pub async fn handle_eviction_risk(
             .cmp(&b.frames_until_eviction)
             .then_with(|| b.effective_inactive.cmp(&a.effective_inactive))
     });
-    json_ok(&entries, None)
+    let (selected, total) = select_eviction_risk(entries, &selection);
+    let mut response = json_ok(&selected, None);
+    response
+        .headers_mut()
+        .insert("X-Total-Count", HeaderValue::from(total));
+    response
 }
 
 #[derive(Serialize)]
@@ -2282,6 +2341,77 @@ mod tests {
         assert!(s.contains(r#""frames_until_eviction":10"#), "{s}");
         assert!(s.contains(r#""eviction_threshold":360"#), "{s}");
         assert!(!s.contains("public_key"), "{s}");
+    }
+
+    #[test]
+    fn eviction_risk_selection_keeps_order_and_pending() {
+        let threshold = crate::EVICTION_THRESHOLD_FRAMES;
+        let entry = |address: &str, filter: &str, runway: u64, pending: bool| {
+            let effective = threshold - runway;
+            EvictionRiskEntry {
+                address: address.into(),
+                seniority: 0,
+                filter: filter.into(),
+                last_active_frame_number: 1,
+                current_frame: 1000,
+                shard_halt_duration: 0,
+                frames_inactive: effective,
+                effective_inactive: effective,
+                eviction_threshold: threshold,
+                frames_until_eviction: runway,
+                risk_ratio: effective as f64 / threshold as f64,
+                eviction_pending: pending,
+                shard_progressing: true,
+            }
+        };
+        // As the handler emits them: most at risk first, and the shard
+        // floor leaves "bb" on shard 01 stale but not pending.
+        let entries = || {
+            vec![
+                entry("aa", "01", 0, true),
+                entry("bb", "01", 0, false),
+                entry("aa", "02", 50, false),
+                entry("cc", "02", 200, false),
+            ]
+        };
+        let pick = |address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
+            let selection = EvictionRiskSelection {
+                address: address.map(String::from),
+                filter: filter.map(String::from),
+                limit,
+            };
+            let (selected, total) = select_eviction_risk(entries(), &selection);
+            let selected = selected
+                .into_iter()
+                .map(|e| (e.address, e.filter, e.eviction_pending))
+                .collect::<Vec<_>>();
+            (selected, total)
+        };
+        let rows = |r: &[(&str, &str, bool)]| {
+            r.iter()
+                .map(|&(a, f, p)| (a.to_string(), f.to_string(), p))
+                .collect::<Vec<_>>()
+        };
+        let (all, total) = pick(None, None, None);
+        assert_eq!((all.len(), total), (4, 4));
+        assert_eq!(
+            pick(Some("aa"), None, None),
+            (rows(&[("aa", "01", true), ("aa", "02", false)]), 2)
+        );
+        assert_eq!(pick(Some("bb"), None, None), (rows(&[("bb", "01", false)]), 1));
+        assert_eq!(
+            pick(None, Some("02"), None),
+            (rows(&[("aa", "02", false), ("cc", "02", false)]), 2)
+        );
+        // The limit keeps the most at risk; the total counts all selected.
+        assert_eq!(
+            pick(None, None, Some(2)),
+            (rows(&[("aa", "01", true), ("bb", "01", false)]), 4)
+        );
+        assert_eq!(pick(Some("aa"), Some("02"), Some(1)), (rows(&[("aa", "02", false)]), 1));
+        let (none, total) = pick(None, Some("01"), Some(0));
+        assert!(none.is_empty());
+        assert_eq!(total, 2);
     }
 
     #[test]

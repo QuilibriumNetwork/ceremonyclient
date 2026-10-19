@@ -152,7 +152,8 @@ pub async fn serve(
 
 /// CORS + OPTIONS middleware, mirroring Go's `withCORS`: every response
 /// carries the three CORS headers, and an `OPTIONS` request short-circuits
-/// to 204 No Content (before any handler runs).
+/// to 204 No Content (before any handler runs). It also exposes the
+/// eviction-risk `X-Total-Count` header to cross-origin dashboards.
 async fn cors_layer(req: Request, next: Next) -> Response {
     use axum::http::{header::HeaderValue, Method, StatusCode};
 
@@ -178,6 +179,10 @@ async fn cors_layer(req: Request, next: Next) -> Response {
     headers.insert(
         "Access-Control-Allow-Headers",
         HeaderValue::from_static("Content-Type"),
+    );
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("X-Total-Count"),
     );
     resp
 }
@@ -211,6 +216,7 @@ mod tests {
         assert_eq!(resp.headers()["Access-Control-Allow-Origin"], "*");
         assert_eq!(resp.headers()["Access-Control-Allow-Methods"], "GET, OPTIONS");
         assert_eq!(resp.headers()["Access-Control-Allow-Headers"], "Content-Type");
+        assert_eq!(resp.headers()["Access-Control-Expose-Headers"], "X-Total-Count");
     }
 
     #[tokio::test]
@@ -227,5 +233,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["Access-Control-Allow-Origin"], "*");
+        assert_eq!(resp.headers()["Access-Control-Expose-Headers"], "X-Total-Count");
     }
 }
