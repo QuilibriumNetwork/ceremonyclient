@@ -249,6 +249,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut peer_infos_received: u64 = 0;
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // When the loop started: archives announce themselves about every
+        // thirty minutes, so the first one is verified up to that long after it.
+        let loop_started = std::time::Instant::now();
         let mut consensus_msgs_received: u64 = 0;
         let mut prover_msgs_received: u64 = 0;
         let mut router_drops: u64 = 0;
@@ -401,6 +404,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
+                    // Archive endpoints in use (seeded at startup or learned);
+                    // `archive_peers` counts only archives verified from their
+                    // own PeerInfo since start.
+                    let archive_endpoints = pool_for_recv.len().await;
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
@@ -448,6 +455,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         cw_sender_session = shard_sender_keys.session,
                         cw_sender_cached = shard_sender_keys.cached,
                         cw_sender_unresolved = shard_sender_keys.unresolved,
+                        archive_endpoints,
                         archive_peers = archive_peers_seen.len(),
                         consensus_msgs = consensus_msgs_received,
                         prover_msgs = prover_msgs_received,
@@ -833,6 +841,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     peer = peer_hex,
                                                     head_frame = info.last_global_head_frame,
                                                     total = archive_peers_seen.len(),
+                                                    secs_since_start = loop_started.elapsed().as_secs(),
                                                     "verified genesis archive peer"
                                                 );
                                             }
