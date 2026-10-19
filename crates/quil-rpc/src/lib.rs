@@ -27,7 +27,10 @@ pub use frame_sync::{
     run_archive_poller, ArchiveEndpointPool, ArchivePollerConfig, GossipFreshness,
 };
 pub use archive_shard_list::{ArchiveShardListTracker, EndCause, ShardList, ShardListEvent};
-pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ArchiveShardInfo, ShardInfoRefreshError};
+pub use shard_info_refresh::{
+    fetch_shard_info_from_endpoint, fetch_shard_sizes_from_archive, ArchiveShardInfo,
+    ShardInfoRefreshError,
+};
 pub use forest_sync_reader::RemoteTreeReader;
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler, SubmitRefusal};
 pub use prover_counts::{

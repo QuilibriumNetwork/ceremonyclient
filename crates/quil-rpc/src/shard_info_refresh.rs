@@ -175,6 +175,16 @@ pub async fn fetch_shard_sizes_from_archive(
     ))
 }
 
+/// Ask the single archive `endpoint` for every shard under `shard_keys`, as
+/// one refresh does; `qclient node archive shards` compares archives with it.
+pub async fn fetch_shard_info_from_endpoint(
+    endpoint: &str,
+    falcon_signing_key: &[u8],
+    shard_keys: &[Vec<u8>],
+) -> Result<ArchiveShardInfo, ArchiveClientError> {
+    try_one_endpoint(endpoint, falcon_signing_key, shard_keys).await
+}
+
 /// Enumerate `shard_keys` against a single endpoint. Returns
 /// whatever sizes were successfully fetched; per-shard errors are
 /// logged and skipped (partial OK).

@@ -71,14 +71,7 @@ impl MessageCtx {
         let dispatch_addr = if !rpc_override.is_empty() {
             rpc_override.to_string()
         } else {
-            let stream = if node_config.p2p.stream_listen_multiaddr.is_empty() {
-                "/ip4/0.0.0.0/tcp/8340".to_string()
-            } else {
-                node_config.p2p.stream_listen_multiaddr.clone()
-            };
-            let addr = rpc::grpc_multiaddr_to_host_port(&stream)?;
-            // Dial localhost for a 0.0.0.0 listener.
-            addr.replace("0.0.0.0", "127.0.0.1")
+            rpc::local_stream_addr(&node_config)?
         };
 
         let key_manager = ctx.key_manager(&node_config, &dir)?;

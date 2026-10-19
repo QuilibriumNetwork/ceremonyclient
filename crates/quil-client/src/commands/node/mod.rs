@@ -7,6 +7,7 @@ use clap::Subcommand;
 
 use crate::context::GlobalArgs;
 
+pub mod archive;
 pub mod lifecycle;
 pub mod log;
 pub mod nodeconfig;
@@ -24,6 +25,11 @@ pub enum NodeCommand {
     Config {
         #[command(subcommand)]
         command: nodeconfig::ConfigCommand,
+    },
+    /// Archive peers the node reads from.
+    Archive {
+        #[command(subcommand)]
+        command: archive::ArchiveCommand,
     },
     /// Node log management.
     Log {
@@ -74,6 +80,7 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
         NodeCommand::Prover { command } => prover::run(global, command).await,
         NodeCommand::Config { command } => nodeconfig::run(global, command),
         NodeCommand::Log { command } => log::run(global, command),
+        NodeCommand::Archive { command } => archive::run(global, command).await,
         NodeCommand::Info { config } => info(global, config.as_deref()),
         NodeCommand::Service { action } => service::run(action),
         NodeCommand::Clean { all, logs, node } => clean(&global, *all, *logs, *node),

@@ -187,7 +187,8 @@ impl ShardListEvent {
             recent_endpoints = d.recent_endpoints,
             distinct_lists = d.distinct_lists,
             "archives disagree on the shard list: archive-side, this node cannot fix it; \
-             report endpoint, other_endpoint and their *_only_filters to the archive operators"
+             report endpoint, other_endpoint and their *_only_filters to the archive operators; \
+             `qclient node archive shards` shows each archive's list"
         );
     }
 }
