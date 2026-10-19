@@ -1007,10 +1007,12 @@ fn current_halts(state: &ExplorerState, frame: u64) -> HashMap<Vec<u8>, u64> {
     halts
 }
 
+/// One allocation's eviction runway. The prover's public key is left out:
+/// the response carries one entry per allocation, and
+/// `/provers?address=<hex>` serves the key.
 #[derive(Serialize)]
 struct EvictionRiskEntry {
     address: String,
-    public_key: String,
     seniority: u64,
     filter: String,
     last_active_frame_number: u64,
@@ -1088,7 +1090,6 @@ pub async fn handle_eviction_risk(
             }
             entries.push(EvictionRiskEntry {
                 address: hex::encode(&prover.address),
-                public_key: hex::encode(&prover.public_key),
                 seniority: prover.seniority,
                 filter: hex::encode(&alloc.confirmation_filter),
                 last_active_frame_number: alloc.last_active_frame_number,
@@ -2271,7 +2272,6 @@ mod tests {
         let effective = 350u64;
         let entry = EvictionRiskEntry {
             address: "ab".into(),
-            public_key: "cd".into(),
             seniority: 5,
             filter: "ef".into(),
             last_active_frame_number: 100,
@@ -2290,6 +2290,7 @@ mod tests {
         let s = to_str(&entry);
         assert!(s.contains(r#""frames_until_eviction":10"#), "{s}");
         assert!(s.contains(r#""eviction_threshold":360"#), "{s}");
+        assert!(!s.contains("public_key"), "{s}");
     }
 
     #[test]
