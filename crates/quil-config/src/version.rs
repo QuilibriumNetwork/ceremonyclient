@@ -14,6 +14,26 @@ pub const MINIMUM_PATCH_NUMBER: u8 = 0x04;
 /// with `VERSION` and `PATCH_NUMBER`.
 pub const VERSION_STRING: &str = "2.1.0.25";
 
+/// The repository's `subpatch` counter at build time, bumped with each fix
+/// within a patch release; empty when the build had no `subpatch` file.
+pub const SUBPATCH: &str = env!("QUIL_SUBPATCH");
+
+/// The version shown to operators: `VERSION_STRING` with the subpatch as
+/// a fifth part, e.g. `2.1.0.25.87`, so builds within one patch release can
+/// be told apart. Peers still exchange `VERSION_STRING`.
+pub fn display_version() -> &'static str {
+    static DISPLAY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DISPLAY.get_or_init(|| with_subpatch(VERSION_STRING, SUBPATCH))
+}
+
+fn with_subpatch(version: &str, subpatch: &str) -> String {
+    if subpatch.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}.{subpatch}")
+    }
+}
+
 /// Format a 3-byte version array as `"major.minor.patch"`. A 4th byte
 /// is treated as a release-candidate suffix: `"major.minor.patch-pN"`.
 pub fn format_version(version: &[u8]) -> String {
@@ -27,6 +47,21 @@ pub fn format_version(version: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_subpatch_is_the_repository_counter() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../subpatch");
+        let counter = std::fs::read_to_string(path).expect("subpatch file");
+        assert_eq!(SUBPATCH, counter.trim());
+        assert!(!SUBPATCH.is_empty());
+    }
+
+    #[test]
+    fn the_display_version_carries_the_subpatch() {
+        assert_eq!(display_version(), format!("{VERSION_STRING}.{SUBPATCH}"));
+        assert_eq!(with_subpatch("2.1.0.25", "87"), "2.1.0.25.87");
+        assert_eq!(with_subpatch("2.1.0.25", ""), "2.1.0.25");
+    }
 
     #[test]
     fn version_string_matches_constants() {

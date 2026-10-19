@@ -70,7 +70,7 @@ mod rpc_metrics;
 
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
-#[command(name = "quil-node", version = quil_config::VERSION_STRING, about)]
+#[command(name = "quil-node", version = quil_config::display_version(), about)]
 struct Args {
     /// Configuration directory path
     #[arg(short, long, default_value = ".config")]
@@ -731,6 +731,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     info!(
         version = quil_config::VERSION_STRING,
+        subpatch = quil_config::SUBPATCH,
         core = args.core,
         network = args.network,
         "starting quil-node"

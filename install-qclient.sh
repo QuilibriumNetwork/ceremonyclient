@@ -169,4 +169,4 @@ else
 fi
 
 echo "Installation complete. You can now start the Quilibrium client with the following command:"
-echo "qclient version"
+echo "qclient --version"
