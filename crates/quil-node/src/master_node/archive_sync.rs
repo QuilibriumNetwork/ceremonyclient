@@ -189,7 +189,7 @@ fn archive_frame_is_valid(
 /// computable VDF and allowlisted prover alone, which a proposal from a view
 /// that was then nullified also does; it is on the finalized chain only if a
 /// certified frame links down to it.
-fn frame_self_certified(
+pub(crate) fn frame_self_certified(
     frame: &quil_types::proto::global::GlobalFrame,
     frame_validator: &quil_engine::frame_validator::GlobalFrameVerifier,
 ) -> bool {

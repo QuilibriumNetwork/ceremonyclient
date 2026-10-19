@@ -2166,6 +2166,9 @@ pub struct AppConsensusEngine {
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
+    /// How long this successor has been unable to start on its predecessor's
+    /// state, and why the shard sync last failed to recover it.
+    predecessor_block: PredecessorBlock,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -2366,6 +2369,7 @@ impl AppConsensusEngine {
             outgoing_history_source: None,
             global_anchor_source: None,
             historical_committee_source: None,
+            predecessor_block: PredecessorBlock::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2919,11 +2923,15 @@ impl AppConsensusEngine {
         predecessor: Option<&quil_types::proto::global::AppShardFrame>,
     ) -> Result<u64> {
         let validator = self.frame_validator();
-        let anchor_history = storage_history_retained(&validator, anchor).await;
+        let anchor_history = storage_history_unavailable(&validator, anchor).await;
         let predecessor_history = match predecessor {
-            Some(previous) => storage_history_retained(&validator, previous).await,
-            None => true,
+            Some(previous) => storage_history_unavailable(&validator, previous).await,
+            None => None,
         };
+        // Names the GLOBAL anchor's master or archive answer if it refuses.
+        self.predecessor_block.history_error =
+            anchor_history.as_ref().or(predecessor_history.as_ref()).map(|error| error.to_string());
+        let (anchor_history, predecessor_history) = (anchor_history.is_none(), predecessor_history.is_none());
         let genesis = self.first_frame_genesis(anchor)?;
         // A frame without a certificate of its own is still authenticated by
         // the certified frame after it (it is final only through it), or by
@@ -2978,6 +2986,74 @@ impl AppConsensusEngine {
                 result.map_err(|error| QuilError::InvalidArgument(format!("archive sync {role} frame {number}: {error}")))
             },
         )
+    }
+
+    /// Keep why the shard sync's archive anchor was refused, for the warning
+    /// a successor blocked on its predecessor's state gives: the first of
+    /// the two frames whose GLOBAL anchor this node lacks, else the anchor.
+    fn record_anchor_refusal(
+        &mut self,
+        anchor: &quil_types::proto::global::AppShardFrame,
+        predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+        error: &QuilError,
+    ) {
+        let validator = self.frame_validator();
+        let number = |frame: &quil_types::proto::global::AppShardFrame| frame.header.as_ref().map_or(0, |h| h.frame_number);
+        let (frame, global_frame) = std::iter::once(anchor).chain(predecessor)
+            .find_map(|frame| validator.missing_global_anchor(frame).map(|(wanted, _)| (number(frame), Some(wanted))))
+            .unwrap_or((number(anchor), None));
+        let history = self.predecessor_block.history_error.take();
+        self.predecessor_block.refusal = Some(AnchorRefusal {
+            frame,
+            global_frame,
+            cause: anchor_refusal_cause(history.as_deref(), global_frame.is_some()),
+            error: match history {
+                Some(history) => format!("{error}; GLOBAL anchor: {history}"),
+                None => error.to_string(),
+            },
+        });
+    }
+
+    /// Warn while this successor cannot start on its predecessor's state
+    /// ([`PredecessorBlock::blocked`]), naming the predecessor and the shard
+    /// sync's last anchor refusal.
+    fn warn_predecessor_blocked(&mut self, now: std::time::Instant) {
+        let Some(blocked) = self.predecessor_block.blocked(now) else { return };
+        let predecessor = self.global_hypergraph.as_ref()
+            .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
+            .map_or_else(|| "unknown".to_string(), |seal| format!(
+                "generation {} {} at frame {}, successor generation {}",
+                seal.predecessor_generation, if seal.fenced { "fenced" } else { "sealed" },
+                seal.through, seal.session_generation,
+            ));
+        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let refusal = self.predecessor_block.refusal.as_ref();
+        let action = if refusal.is_some_and(|r| r.global_frame.is_some()) {
+            "this node's master could not supply the anchored GLOBAL frame from its store or an archive; \
+                this worker cannot join the shard's consensus until it is recovered; the shard sync retries it; \
+                report it with this line if it persists"
+        } else {
+            "this worker cannot join the shard's consensus until the shard sync recovers the predecessor's \
+                state from an archive; it retries; report it with this line if it persists"
+        };
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
+            local_frame = self.last_materialized_frame,
+            anchor_frame = %or_none(refusal.map(|r| r.frame)),
+            anchored_global_frame = %or_none(refusal.and_then(|r| r.global_frame)),
+            cause = refusal.map_or("no archive sync anchor refused yet", |r| r.cause),
+            last_error = %refusal.map_or("none", |r| r.error.as_str()),
+            blocked_secs = blocked.as_secs(), scope = "this node", action = action,
+            "successor session blocked: predecessor state not recovered through its seal");
+    }
+
+    /// Once this successor no longer waits on its predecessor's state, say
+    /// so if it was warned about, with how long it waited.
+    fn end_predecessor_block(&mut self, outcome: &'static str, now: std::time::Instant) {
+        if let Some(blocked) = self.predecessor_block.cleared(now) {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
+                blocked_secs = blocked.as_secs(),
+                "successor session no longer blocked on predecessor state");
+        }
     }
 
     /// A finalized header carries the quorum-certified fee total of its
@@ -3430,9 +3506,13 @@ impl AppConsensusEngine {
                         }
                         Some(AppEngineMessage::ValidateShardSyncAnchor { anchor, predecessor, reply }) => {
                             let valid = match self.validate_archive_sync_anchor(&anchor, predecessor.as_ref()).await {
-                                Ok(_) => true,
+                                Ok(_) => {
+                                    self.predecessor_block.refusal = None;
+                                    true
+                                }
                                 Err(error) => {
                                     warn!(core_id = self.core_id, error = %error, "archive sync anchor rejected before tree writes");
+                                    self.record_anchor_refusal(&anchor, predecessor.as_ref(), &error);
                                     false
                                 }
                             };
@@ -3610,8 +3690,14 @@ impl AppConsensusEngine {
                                     filter = hex::encode(&self.filter),
                                     "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
                                 );
+                                self.end_predecessor_block("consensus started", std::time::Instant::now());
                             }
                             Err(e) => {
+                                if predecessor_recovery_pending(&e) {
+                                    self.warn_predecessor_blocked(std::time::Instant::now());
+                                } else {
+                                    self.end_predecessor_block("startup now waits on something else", std::time::Instant::now());
+                                }
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
                                 if expected_admission_wait(&e) {
@@ -7643,6 +7729,14 @@ async fn storage_history_retained(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> bool {
+    storage_history_unavailable(validator, frame).await.is_none()
+}
+
+/// [`storage_history_retained`], with why the history is not.
+async fn storage_history_unavailable(
+    validator: &BlsAppFrameValidator,
+    frame: &quil_types::proto::global::AppShardFrame,
+) -> Option<QuilError> {
     // Every certified frame taken from an archive or the local store passes
     // here before it is validated: a legacy certificate today's registry no
     // longer reproduces gets its historical committees first.
@@ -7651,12 +7745,150 @@ async fn storage_history_retained(
             "historical committee of a certified legacy frame unavailable");
     }
     match validator.prepare_storage_history(frame).await {
-        Ok(()) => true,
+        Ok(()) => None,
         Err(error) => {
             warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
                 "storage history of a certified frame unavailable; validating its certificate without possession");
-            false
+            Some(error)
         }
+    }
+}
+
+/// Whether a start failed only because this successor has not yet recovered
+/// its predecessor's sealed state or outgoing history.
+fn predecessor_recovery_pending(error: &QuilError) -> bool {
+    crate::app_handoff::predecessor_unrecovered(error)
+        || matches!(error, QuilError::ExecutionUnavailable(reason)
+            if reason == "predecessor outgoing history recovery is still in progress")
+}
+
+/// How long a successor waits on its predecessor's state before it warns.
+/// The retry requests a shard sync every 10 s, and a sync's GLOBAL anchor
+/// and storage-proof fetches are bounded at 12 s and 15 s, so a recovery that
+/// can succeed does so within a few attempts, about two minutes; ten minutes
+/// is dozens of failed attempts.
+const PREDECESSOR_BLOCKED_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How often a successor still blocked on its predecessor's state warns again.
+const PREDECESSOR_BLOCKED_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// Why the shard sync's archive anchor was last refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorRefusal {
+    /// The refused archive frame: the anchor or its predecessor.
+    frame: u64,
+    /// The GLOBAL frame it is anchored to, when this node does not hold it.
+    global_frame: Option<u64>,
+    cause: &'static str,
+    error: String,
+}
+
+/// A successor's wait on its predecessor's state, from the first start
+/// refused for it to the first start that is not.
+#[derive(Default)]
+struct PredecessorBlock {
+    since: Option<std::time::Instant>,
+    /// When it was last warned about.
+    warned: Option<std::time::Instant>,
+    refusal: Option<AnchorRefusal>,
+    /// Why the last anchor validation had no storage history, which names a
+    /// GLOBAL anchor fetch that failed.
+    history_error: Option<String>,
+}
+
+impl PredecessorBlock {
+    /// A start refused at `now` for the predecessor's state: how long it has
+    /// been refused, once that reaches [`PREDECESSOR_BLOCKED_AFTER`] and then
+    /// every [`PREDECESSOR_BLOCKED_REPEAT`]; otherwise `None`.
+    fn blocked(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = *self.since.get_or_insert(now);
+        let blocked = now.saturating_duration_since(since);
+        if blocked < PREDECESSOR_BLOCKED_AFTER
+            || self.warned.is_some_and(|at| now.saturating_duration_since(at) < PREDECESSOR_BLOCKED_REPEAT)
+        {
+            return None;
+        }
+        self.warned = Some(now);
+        Some(blocked)
+    }
+
+    /// A start no longer refused for it: how long it was, if that was
+    /// warned about. The anchor refusal is kept for a later wait.
+    fn cleared(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since.take()?;
+        self.warned.take().map(|_| now.saturating_duration_since(since))
+    }
+}
+
+/// The operator-facing reason in an [`AnchorRefusal`]: `history` is why the
+/// refused frame had no storage history (the GLOBAL anchor fetch's answer).
+fn anchor_refusal_cause(history: Option<&str>, global_missing: bool) -> &'static str {
+    match history {
+        _ if !global_missing => "archive sync frame failed validation",
+        Some(error) if error.contains("not retained") => "anchored GLOBAL frame pruned on this node's master",
+        Some(error) if error.contains("not found") || error.contains("no archive served") => {
+            "anchored GLOBAL frame not found on this node's master or its archives"
+        }
+        Some(_) => "anchored GLOBAL frame unavailable from this node's master",
+        None => "anchored GLOBAL frame not held by this node",
+    }
+}
+
+#[cfg(test)]
+mod predecessor_block_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A wait on the predecessor's state is warned about only once it lasted
+    /// the threshold.
+    #[test]
+    fn a_blocked_successor_warns_only_after_the_threshold() {
+        let start = std::time::Instant::now();
+        let mut block = PredecessorBlock::default();
+        assert_eq!(block.blocked(start), None);
+        assert_eq!(block.blocked(start + MINUTE * 9), None);
+        assert_eq!(block.blocked(start + MINUTE * 10), Some(MINUTE * 10));
+    }
+
+    /// After a warning, the next comes only a repeat interval later, with
+    /// the whole duration.
+    #[test]
+    fn a_blocked_successor_warns_again_only_after_the_interval() {
+        let start = std::time::Instant::now();
+        let mut block = PredecessorBlock::default();
+        block.blocked(start);
+        assert_eq!(block.blocked(start + MINUTE * 11), Some(MINUTE * 11));
+        assert_eq!(block.blocked(start + MINUTE * 12), None);
+        assert_eq!(block.blocked(start + MINUTE * 40), None);
+        assert_eq!(block.blocked(start + MINUTE * 41), Some(MINUTE * 41));
+    }
+
+    /// The end is named only for a wait that was warned about, once, and a
+    /// later wait is timed afresh.
+    #[test]
+    fn the_end_of_a_wait_is_named_only_after_a_warning() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = PredecessorBlock::default();
+        assert_eq!(block.cleared(at(0)), None, "nothing waited");
+        block.blocked(at(0));
+        assert_eq!(block.cleared(at(5)), None, "never warned about");
+        block.blocked(at(6));
+        assert_eq!(block.blocked(at(15)), None, "timed from the new wait");
+        assert_eq!(block.blocked(at(16)), Some(MINUTE * 10));
+        assert_eq!(block.cleared(at(20)), Some(MINUTE * 14));
+        assert_eq!(block.cleared(at(21)), None, "named once");
+    }
+
+    #[test]
+    fn an_anchor_refusal_names_whose_store_lacks_the_global_frame() {
+        let pruned = "GLOBAL anchor master read: status: NotFound, message: \"frame 5 requests are not retained (kept from 9)\"";
+        assert_eq!(anchor_refusal_cause(Some(pruned), true), "anchored GLOBAL frame pruned on this node's master");
+        assert_eq!(anchor_refusal_cause(Some("not found: global frame 5 not found"), true),
+            "anchored GLOBAL frame not found on this node's master or its archives");
+        assert_eq!(anchor_refusal_cause(Some(pruned), false), "archive sync frame failed validation");
+        assert_eq!(anchor_refusal_cause(None, true), "anchored GLOBAL frame not held by this node");
     }
 }
 

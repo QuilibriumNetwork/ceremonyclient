@@ -764,6 +764,7 @@ pub(crate) fn init(
                     outgoing_history_source: falcon_sk_for_builder.clone().map(|key|
                         crate::storage_history::outgoing_history_from_pool(archive_pool_for_builder.clone(), key)),
                     historical_committee_source: Some(historical_committee_source(historical_committees_for_builder.clone())),
+                    global_anchor_source: Some(super::historical_committees::global_anchor_source(historical_committees_for_builder.clone())),
                     clock_store,
                     hypergraph: crdt,
                     execution_engine: exec_manager,

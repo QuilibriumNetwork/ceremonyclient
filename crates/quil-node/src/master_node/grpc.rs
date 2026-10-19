@@ -678,6 +678,52 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
     }
 }
 
+// Bridge RocksClockStore to the FrameLookup trait
+struct ClockStoreFrameLookup(Arc<quil_store::RocksClockStore>);
+impl quil_rpc::FrameLookup for ClockStoreFrameLookup {
+    fn get_latest_frame(&self) -> Result<quil_types::proto::global::GlobalFrame, String> {
+        self.0.get_latest_global_frame().map_err(|e| e.to_string())
+    }
+    fn get_frame(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
+        refuse_pruned_requests(&self.0, n)?;
+        self.0.get_global_frame(n).map_err(|e| e.to_string())
+    }
+    /// Assemble the full proposal for frame `n` from the clock store, mirroring
+    /// Go `GlobalConsensusEngine.GetGlobalProposal` (`services.go`): state + the
+    /// parent's QC + the prior-rank TC (optional) + the proposer vote (keyed by
+    /// `(filter, rank, frame-identity)`, where the frame identity is
+    /// `poseidon(header.output)`).
+    fn get_global_proposal(
+        &self,
+        n: u64,
+    ) -> Result<quil_types::proto::global::GlobalProposal, String> {
+        // Delegate to the shared, candidate-aware assembler so peers can
+        // fetch an uncommitted TIP candidate over `GetGlobalProposal`.
+        // Without the QCT3 fallback, a coordinated-halt tip (a frame
+        // some replicas produced but never committed) is invisible to sync
+        // and the chain can only be unstuck manually. See
+        // `archive_sync::load_committed_or_tip_candidate`.
+        refuse_pruned_requests(&self.0, n)?;
+        super::archive_sync::reconstruct_local_proposal(self.0.as_ref(), n)
+    }
+    /// The node's own worker needs only the header, which pruning keeps.
+    fn get_anchor_frame(&self, n: u64) -> Result<Option<quil_types::proto::global::GlobalFrame>, String> {
+        match self.0.get_global_frame(n) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+// A frame whose request bodies were pruned is only a header here; never
+// hand it to a peer as if it were complete.
+fn refuse_pruned_requests(store: &quil_store::RocksClockStore, n: u64) -> Result<(), String> {
+    match store.global_requests_retained_from() {
+        Some(from) if n != 0 && n < from => Err(format!("frame {n} requests are not retained (kept from {from})")),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn spawn_all(
     sup: &mut Supervisor<anyhow::Error>,
     args: GrpcArgs,
@@ -782,43 +828,6 @@ pub(crate) fn spawn_all(
         }
     };
 
-    // Bridge RocksClockStore to the FrameLookup trait
-    struct ClockStoreFrameLookup(Arc<quil_store::RocksClockStore>);
-    impl quil_rpc::FrameLookup for ClockStoreFrameLookup {
-        fn get_latest_frame(&self) -> Result<quil_types::proto::global::GlobalFrame, String> {
-            self.0.get_latest_global_frame().map_err(|e| e.to_string())
-        }
-        fn get_frame(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
-            refuse_pruned_requests(&self.0, n)?;
-            self.0.get_global_frame(n).map_err(|e| e.to_string())
-        }
-        /// Assemble the full proposal for frame `n` from the clock store, mirroring
-        /// Go `GlobalConsensusEngine.GetGlobalProposal` (`services.go`): state + the
-        /// parent's QC + the prior-rank TC (optional) + the proposer vote (keyed by
-        /// `(filter, rank, frame-identity)`, where the frame identity is
-        /// `poseidon(header.output)`).
-        fn get_global_proposal(
-            &self,
-            n: u64,
-        ) -> Result<quil_types::proto::global::GlobalProposal, String> {
-            // Delegate to the shared, candidate-aware assembler so peers can
-            // fetch an uncommitted TIP candidate over `GetGlobalProposal`.
-            // Without the QCT3 fallback, a coordinated-halt tip (a frame
-            // some replicas produced but never committed) is invisible to sync
-            // and the chain can only be unstuck manually. See
-            // `archive_sync::load_committed_or_tip_candidate`.
-            refuse_pruned_requests(&self.0, n)?;
-            super::archive_sync::reconstruct_local_proposal(self.0.as_ref(), n)
-        }
-    }
-    // A frame whose request bodies were pruned is only a header here; never
-    // hand it to a peer as if it were complete.
-    fn refuse_pruned_requests(store: &quil_store::RocksClockStore, n: u64) -> Result<(), String> {
-        match store.global_requests_retained_from() {
-            Some(from) if n != 0 && n < from => Err(format!("frame {n} requests are not retained (kept from {from})")),
-            _ => Ok(()),
-        }
-    }
     // Submit handler
     let submit_mc = message_collector.clone();
     let submit_cf = current_frame.clone();
@@ -1178,6 +1187,8 @@ pub(crate) fn spawn_all(
         file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok()
             .map(|key| crate::storage_history::from_pool(archive_pool.clone(), key))
     } else { None })
+    // Own workers' historical anchors this node never held, from an archive.
+    .with_global_anchor_source(Some(super::historical_committees::global_anchor_source(historical_committees.clone())))
     .with_message_broadcast(global_msg_tx.clone())
     // Gate worker-privileged RPCs (StreamGlobalMessages, GetWorkerInfo) to this
     // node's OWN identity: only our data-worker processes — which dial with the
@@ -3029,6 +3040,38 @@ mod owned_filter_tests {
     fn an_unknown_address_owns_nothing() {
         let reg = registry(vec![allocation(&FILTER, ProverStatus::Active, 100)]);
         assert!(owned_filters(&reg, &[0u8; 32], 200).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod anchor_lookup_tests {
+    use super::*;
+    use quil_rpc::FrameLookup as _;
+
+    /// A frame whose request bodies were pruned is the node's own worker's
+    /// anchor as its header while a peer is still refused it; a retained
+    /// frame is whole either way, and one never held is no anchor here.
+    #[test]
+    fn own_workers_read_pruned_headers_that_peers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let frame = |n: u64| quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: n, ..Default::default() }),
+            requests: vec![quil_types::proto::global::MessageBundle { timestamp: n as i64, ..Default::default() }],
+        };
+        for n in (1..=10).filter(|n| *n != 4) {
+            clock.put_global_frame(&frame(n), None).unwrap();
+        }
+        assert_eq!(clock.prune_global_frame_requests(3).unwrap().retained_from, Some(7));
+        let lookup = ClockStoreFrameLookup(clock.clone());
+        assert!(lookup.get_frame(5).unwrap_err().contains("not retained"));
+        let anchor = lookup.get_anchor_frame(5).unwrap().expect("the header is kept");
+        assert_eq!(anchor.header, frame(5).header);
+        assert!(anchor.requests.is_empty());
+        assert_eq!(lookup.get_frame(8).unwrap(), frame(8));
+        assert_eq!(lookup.get_anchor_frame(8).unwrap(), Some(frame(8)));
+        assert_eq!(lookup.get_anchor_frame(4).unwrap(), None);
     }
 }
 

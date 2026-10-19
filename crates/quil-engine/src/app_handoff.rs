@@ -29,6 +29,45 @@ fn unavailable(message: impl Into<String>) -> QuilError {
     QuilError::ExecutionUnavailable(format!("app committee session: {}", message.into()))
 }
 
+/// Why [`successor_state_matches`] refuses a member that does not yet hold
+/// its same-filter predecessor's state through the seal.
+const PREDECESSOR_UNRECOVERED: &str = "predecessor state has not been recovered through its seal";
+
+/// Whether `error` is [`successor_state_matches`] waiting for this member to
+/// recover its predecessor's sealed state.
+pub fn predecessor_unrecovered(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason) if reason.ends_with(PREDECESSOR_UNRECOVERED))
+}
+
+/// The same-filter predecessor whose state a member of a shard's current
+/// session must hold before it may start ([`successor_state_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredecessorSeal {
+    pub session_generation: u64,
+    pub predecessor_generation: u64,
+    /// The frame its seal, or its fence, names.
+    pub through: u64,
+    pub fenced: bool,
+}
+
+/// The [`PredecessorSeal`] of `filter`'s current session, if it has a
+/// same-filter origin.
+pub fn same_filter_predecessor(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Option<PredecessorSeal>> {
+    let view = CommittedView::capture(global)?;
+    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
+    for (source, checkpoint) in effective_origins(&view, &session)?.origins {
+        if source.filter == session.filter {
+            return Ok(Some(PredecessorSeal {
+                session_generation: session.generation,
+                predecessor_generation: source.generation,
+                through: checkpoint.frame,
+                fenced: handoff::is_fenced(&view, &source.id()?)?,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// How this shard's consensus must be started, per committed GLOBAL state.
 pub enum SessionChoice {
     /// The application never entered the protocol: legacy registry committee.
@@ -687,7 +726,7 @@ pub fn successor_state_matches(
             .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes));
         let cursor = recorded.unwrap_or(0);
         if cursor < checkpoint.frame {
-            return Err(unavailable("predecessor state has not been recovered through its seal"));
+            return Err(unavailable(PREDECESSOR_UNRECOVERED));
         }
         if handoff::is_fenced(&view, &source.id()?)? {
             if cursor > checkpoint.frame {

@@ -78,7 +78,7 @@ pub fn global_frames_from_master(endpoint: String, key: Vec<u8>) -> quil_engine:
         Box::pin(async move {
             let mut client = quil_rpc::ArchiveClient::connect_own_master(&endpoint, &key).await
                 .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL anchor master connect: {e}")))?;
-            client.get_global_frame(number).await
+            client.get_global_anchor(number).await
                 .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL anchor master read: {e}")))
         })
     })
