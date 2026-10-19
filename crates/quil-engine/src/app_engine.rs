@@ -2227,6 +2227,9 @@ pub struct AppConsensusEngine {
     /// or foreign PeerInfo key): Simplex drops such a vote as a signer
     /// mismatch.
     cw_nonmember: u64,
+    /// Which members of the running session were heard, to name those that
+    /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
+    session_silent: SilentMembers,
     /// Executes an unfinalized selected parent for the running consensus host.
     private_parents: Option<Arc<AppParentExecutor>>,
     /// A finalized terminal seal: `(session id, canonical CommitteeHandoff)`.
@@ -2387,6 +2390,7 @@ impl AppConsensusEngine {
             cw_inbound: [0; 4],
             cw_unresolved: 0,
             cw_nonmember: 0,
+            session_silent: SilentMembers::default(),
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
@@ -3570,8 +3574,12 @@ impl AppConsensusEngine {
                             }
                             if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_none() {
                                 self.cw_unresolved += 1;
-                            } else if self.cw_session.as_ref().is_some_and(|session| !session.members.contains(&from)) {
-                                self.cw_nonmember += 1;
+                            } else {
+                                match self.cw_session.as_ref().map(|session| session.members.binary_search(&from)) {
+                                    Some(Ok(member)) => self.session_silent.record(member, channel),
+                                    Some(Err(_)) => self.cw_nonmember += 1,
+                                    None => {}
+                                }
                             }
                             if let Some(h) = self.cw_handle.as_ref() {
                                 if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
@@ -3938,6 +3946,7 @@ impl AppConsensusEngine {
         let seen = liveness.snapshot();
         let decided = liveness.decisions();
         let members = session.members.len();
+        let quorum = members - members.saturating_sub(1) / 3;
         let tally = |t: quil_cw_consensus::adapters::ViewTally| format!(
             "view {}: notarize {} ({} proposals), nullify {}, finalize {}",
             t.view, t.notarize, t.proposals, t.nullify, t.finalize,
@@ -3946,7 +3955,7 @@ impl AppConsensusEngine {
             format!("view {}: {} ({})", o.view, o.reason, o.detail)
         });
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
-            base = session.base_frame, members, quorum = members - members.saturating_sub(1) / 3,
+            base = session.base_frame, members, quorum,
             voters = seen.voters, view = seen.view, notarized = seen.notarized, nullified = seen.nullified,
             finalized = seen.finalized, notarize_votes = seen.notarize_votes, nullify_votes = seen.nullify_votes,
             finalize_votes = seen.finalize_votes, current_view = %tally(seen.current), best_view = %tally(seen.best),
@@ -3958,6 +3967,59 @@ impl AppConsensusEngine {
             inbound_by_channel = ?self.cw_inbound, inbound_unattributed = self.cw_unresolved,
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
+        self.log_silent_members(seen.voters, quorum);
+    }
+
+    /// While the running session lacks a voting quorum, the members never
+    /// heard on the vote channel ([`SilentMembers`]), each with its prover
+    /// registry allocation on this shard: an Active prover that never takes
+    /// part, or a Leaving one still counted, is a remote problem only its
+    /// prover or the protocol can fix (public issue #748).
+    fn log_silent_members(&mut self, voters: usize, quorum: usize) {
+        let now = std::time::Instant::now();
+        let report = self.session_silent.report(voters >= quorum, now);
+        let (Some(report), Some(session)) = (report, self.cw_session.as_ref()) else {
+            return;
+        };
+        let observed_secs = self.session_silent.observed(now).as_secs();
+        let never_voted = match report {
+            SilentReport::Cleared => {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+                    members = session.members.len(), quorum, voters, observed_secs,
+                    "app session no longer below quorum with members that never voted");
+                return;
+            }
+            SilentReport::NeverVoted(never_voted) => never_voted,
+        };
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        let describe = |&(member, heard): &(usize, bool)| {
+            let address = session.members.get(member)
+                .and_then(|key| quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(key).ok());
+            let prover = address.and_then(|address| self.prover_registry.get_prover_info(&address).ok().flatten());
+            let allocation = prover.as_ref()
+                .map(|prover| prover.allocations.iter().find(|a| a.confirmation_filter == self.filter));
+            let registry = match allocation {
+                Some(Some(a)) => format!("{:?}/{:?} join {} leave {} last active {}", a.status,
+                    a.effective_status(global_frame), a.join_frame_number, a.leave_frame_number,
+                    a.last_active_frame_number),
+                Some(None) => "no allocation on this shard".to_string(),
+                None => "not registered".to_string(),
+            };
+            let address = address.map_or_else(|| "unknown".to_string(), |address| hex::encode(&address[..8]));
+            // The peer ID is what an operator knows their node by.
+            let peer = session.members.get(member)
+                .map_or_else(|| "unknown".to_string(), |key| bs58::encode(quil_p2p::peer_id_from_falcon_pubkey(key)).into_string());
+            format!("{member} {address} peer {peer} {registry}{}", if heard { "" } else { ", sent nothing" })
+        };
+        let listed = never_voted.iter().take(SILENT_LISTED).map(describe).collect::<Vec<_>>().join("; ");
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+            members = session.members.len(), quorum, voters, never_voted = never_voted.len(),
+            silent = never_voted.iter().filter(|&&(_, heard)| !heard).count(), observed_secs, global_frame,
+            never_voted_members = %listed, unlisted = never_voted.len().saturating_sub(SILENT_LISTED), scope = "peer",
+            action = "nothing to fix on this node; ends when they vote or a successor session replaces the committee; \
+                report it with this line if it persists",
+            "app session below voting quorum: members never voted");
     }
 
     /// Timer-driven session upkeep: republish an unrecorded closing certificate,
@@ -4892,6 +4954,9 @@ impl AppConsensusEngine {
                 self.cw_inbound = [0; 4];
                 self.cw_unresolved = 0;
                 self.cw_nonmember = 0;
+                self.session_silent.restart(
+                    session.members.len(), session.members.binary_search(&my_pk).ok(), std::time::Instant::now(),
+                );
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
                     read_parent: source.reader(),
@@ -7953,6 +8018,139 @@ pub(crate) fn validate_app_frame_panic_safe(
 /// the latest GLOBAL frame the node holds by more than an epoch.
 fn session_view_behind(committed_frame: u64, latest_global_frame: u64, epoch_frames: u64) -> bool {
     latest_global_frame.saturating_sub(committed_frame) > epoch_frames
+}
+
+/// Simplex's vote channel (`cw_app_seams` routes channels 0/1/2 as
+/// vote/certificate/resolver).
+const VOTE_CHANNEL: u64 = 0;
+
+/// How long a session is observed before members are named as never voting.
+const SILENT_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// How often unchanged non-voting members are named again.
+const SILENT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// Non-voting members named in one line; the rest are counted.
+const SILENT_LISTED: usize = 32;
+
+/// Which members of one session's host this node heard from, and on the vote
+/// channel, so the members that never voted can be named while the session
+/// lacks a quorum.
+#[derive(Default)]
+struct SilentMembers {
+    /// When the host started; `None` before any session ran.
+    since: Option<std::time::Instant>,
+    /// This member's own index: its votes are not received.
+    me: Option<usize>,
+    /// Per member: heard at all, and heard on the vote channel.
+    heard: Vec<(bool, bool)>,
+    /// The non-voters last named, and when.
+    named: Option<(Vec<(usize, bool)>, std::time::Instant)>,
+    /// Named since the session last had a quorum.
+    open: bool,
+}
+
+/// What [`SilentMembers::report`] names.
+#[derive(Debug, PartialEq, Eq)]
+enum SilentReport {
+    /// Members never heard on the vote channel, each with whether it was
+    /// heard at all.
+    NeverVoted(Vec<(usize, bool)>),
+    /// Named non-voters no longer keep the session below quorum: it has one,
+    /// or every member voted.
+    Cleared,
+}
+
+impl SilentMembers {
+    fn restart(&mut self, members: usize, me: Option<usize>, now: std::time::Instant) {
+        *self = Self { since: Some(now), me, heard: vec![(false, false); members], ..Self::default() };
+    }
+
+    fn record(&mut self, member: usize, channel: u64) {
+        if let Some((any, votes)) = self.heard.get_mut(member) {
+            *any = true;
+            *votes |= channel == VOTE_CHANNEL;
+        }
+    }
+
+    fn observed(&self, now: std::time::Instant) -> Duration {
+        self.since.map_or(Duration::ZERO, |since| now.duration_since(since))
+    }
+
+    /// What to log at `now`: nothing until the session was observed for
+    /// [`SILENT_AFTER`] (nothing heard yet is not silence) or while it has a
+    /// quorum; the non-voters when first known, when they change, and every
+    /// [`SILENT_REPEAT`] while they persist; and once that they cleared.
+    fn report(&mut self, quorate: bool, now: std::time::Instant) -> Option<SilentReport> {
+        if self.since.is_none() || self.observed(now) < SILENT_AFTER {
+            return None;
+        }
+        let never_voted: Vec<_> = self.heard.iter().enumerate()
+            .filter_map(|(member, &(any, votes))| (Some(member) != self.me && !votes).then_some((member, any)))
+            .collect();
+        if quorate || never_voted.is_empty() {
+            return std::mem::take(&mut self.open).then_some(SilentReport::Cleared);
+        }
+        // A quorum that comes and goes does not name the same members sooner.
+        let unchanged = self.named.as_ref()
+            .is_some_and(|(named, at)| *named == never_voted && now.duration_since(*at) < SILENT_REPEAT);
+        if unchanged {
+            return None;
+        }
+        self.open = true;
+        self.named = Some((never_voted.clone(), now));
+        Some(SilentReport::NeverVoted(never_voted))
+    }
+}
+
+#[cfg(test)]
+mod silent_member_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// Nothing heard is not silence until the session was observed for a
+    /// while; this member and a quorate session are never reported.
+    #[test]
+    fn non_voters_are_named_only_once_the_session_was_observed() {
+        let start = std::time::Instant::now();
+        let mut silent = SilentMembers::default();
+        assert_eq!(silent.report(false, start + MINUTE * 60), None, "no session ran");
+        silent.restart(3, Some(0), start);
+        assert_eq!(silent.report(false, start + MINUTE * 4), None, "not yet observed");
+        assert_eq!(silent.report(true, start + MINUTE * 5), None, "quorate");
+        assert_eq!(
+            silent.report(false, start + MINUTE * 5),
+            Some(SilentReport::NeverVoted(vec![(1, false), (2, false)])),
+        );
+    }
+
+    /// Unchanged non-voters are named again only half an hour later, a
+    /// change at once; their end is named once, and a quorum that comes and
+    /// goes does not repeat them sooner.
+    #[test]
+    fn non_voters_are_named_on_change_and_every_half_hour() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut silent = SilentMembers::default();
+        silent.restart(4, Some(0), start);
+        silent.record(1, VOTE_CHANNEL);
+        silent.record(2, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL);
+        assert_eq!(silent.report(false, at(5)), Some(SilentReport::NeverVoted(vec![(2, true), (3, false)])));
+        assert_eq!(silent.report(false, at(6)), None);
+        silent.record(3, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL);
+        let heard = || Some(SilentReport::NeverVoted(vec![(2, true), (3, true)]));
+        assert_eq!(silent.report(false, at(7)), heard());
+        assert_eq!(silent.report(false, at(36)), None);
+        assert_eq!(silent.report(false, at(37)), heard());
+        assert_eq!(silent.report(true, at(38)), Some(SilentReport::Cleared));
+        assert_eq!(silent.report(true, at(39)), None);
+        assert_eq!(silent.report(false, at(40)), None, "named three minutes ago");
+        assert_eq!(silent.report(false, at(67)), heard());
+        silent.record(2, VOTE_CHANNEL);
+        silent.record(3, VOTE_CHANNEL);
+        assert_eq!(silent.report(false, at(68)), Some(SilentReport::Cleared), "every member voted");
+    }
 }
 
 #[cfg(test)]
