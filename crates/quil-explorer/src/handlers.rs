@@ -17,6 +17,7 @@ use base64::Engine as _;
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 
+use quil_execution::prover_registry::{limit_evictions_to_shard_floor, EvictionCandidate};
 use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverStatus};
 use quil_types::error::QuilError;
 use quil_types::protojson;
@@ -1015,6 +1016,10 @@ pub async fn handle_eviction_risk(
     let active_by_filter = active_allocations_by_filter(&provers, frame);
 
     let mut entries: Vec<EvictionRiskEntry> = Vec::new();
+    // Every allocation past the threshold, before the shard floor and
+    // regardless of `min_ratio`, so `eviction_pending` matches the
+    // evictor's selection.
+    let mut stale: Vec<EvictionCandidate> = Vec::new();
     for prover in &provers {
         if prover.status != ProverStatus::Active {
             continue;
@@ -1023,6 +1028,14 @@ pub async fn handle_eviction_risk(
             let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) else {
                 continue;
             };
+            if a.effective_inactive > threshold {
+                stale.push(EvictionCandidate {
+                    prover_address: prover.address.clone(),
+                    confirmation_filter: alloc.confirmation_filter.clone(),
+                    vertex_address: alloc.vertex_address.clone(),
+                    effective_inactive: a.effective_inactive,
+                });
+            }
             let risk_ratio = a.effective_inactive as f64 / threshold as f64;
             if risk_ratio < min_ratio {
                 continue;
@@ -1040,9 +1053,21 @@ pub async fn handle_eviction_risk(
                 eviction_threshold: threshold,
                 frames_until_eviction: threshold.saturating_sub(a.effective_inactive),
                 risk_ratio,
-                eviction_pending: a.effective_inactive > threshold,
+                // Set below: past the threshold AND within the shard floor.
+                eviction_pending: false,
             });
         }
+    }
+    // The evictor keeps every shard at MIN_SHARD_CONSENSUS_PROVERS active
+    // allocations, so only the most inactive stale allocations of a shard
+    // are pending; the rest stay at risk.
+    let pending: std::collections::HashSet<(String, String)> =
+        limit_evictions_to_shard_floor(stale, &active_by_filter)
+            .into_iter()
+            .map(|c| (hex::encode(&c.prover_address), hex::encode(&c.confirmation_filter)))
+            .collect();
+    for entry in &mut entries {
+        entry.eviction_pending = pending.contains(&(entry.address.clone(), entry.filter.clone()));
     }
     // Most-at-risk first: least runway, then highest inactivity.
     entries.sort_by(|a, b| {

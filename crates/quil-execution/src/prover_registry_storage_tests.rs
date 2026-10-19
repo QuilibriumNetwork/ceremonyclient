@@ -552,7 +552,7 @@ fn registry_eviction_commits_only_to_its_overlay_with_versioned_fallback() {
     let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
     let target = 0x55;
     seed_active_filler(&store, &shard, &filter, frame, target);
-    top_up_shard_quorum(&store, &shard, &filter, frame, 1, 0xe0);
+    seed_shard_floor(&store, &shard, &filter, frame, 0xe0);
     let base = quil_hypergraph::HypergraphCrdt::new(
         Arc::new(RocksHypergraphStore::new(db.inner())),
         Arc::new(quil_types::crypto::NoopInclusionProver),
@@ -635,7 +635,10 @@ fn registry_eviction_commits_only_to_its_overlay_with_versioned_fallback() {
     assert_eq!(
         fallback_registry
             .evict_inactive_provers(frame, 500, &HashMap::new(), &missing, Some(branch.as_ref()))
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .map(|c| c.prover_address)
+            .collect::<Vec<_>>(),
         vec![vec![target; 32]]
     );
     let data = missing
@@ -658,40 +661,54 @@ fn registry_eviction_commits_only_to_its_overlay_with_versioned_fallback() {
     );
     let registry = SharedProverRegistry::new();
     registry.refresh_from_store(branch.as_ref()).unwrap();
+    let candidates = registry.find_eviction_candidates(frame, 500, &HashMap::new());
     assert_eq!(
-        registry.find_eviction_candidates(frame, 500, &HashMap::new()),
+        candidates.iter().map(|c| c.prover_address.clone()).collect::<Vec<_>>(),
         vec![vec![target; 32]]
     );
     let state = crate::hypergraph_state::HypergraphState::new(hg.clone());
     let evicted = registry
         .evict_inactive_provers(frame, 500, &HashMap::new(), &state, Some(branch.as_ref()))
         .unwrap();
-    assert_eq!(evicted, vec![vec![target; 32]]);
+    assert_eq!(evicted, candidates);
     state.commit().unwrap();
     hg.commit(frame).unwrap();
     registry.refresh_from_store(branch.as_ref()).unwrap();
     registry.read(|r| {
         let prover = r.get_prover_info(&[target; 32]).unwrap();
-        // Terminal prover vertices are excluded by the legacy decoder; an
-        // allocation still supplies an Unknown stub for diagnostics.
-        assert_eq!(prover.status, ProverStatus::Unknown);
+        // Eviction kicks the allocation only; the prover stays Active.
+        assert_eq!(prover.status, ProverStatus::Active);
         assert_eq!(prover.allocations.len(), 1);
         // Preserve the existing wire encoding: the kick helper writes byte 4,
         // which the allocation decoder classifies as terminal Rejected.
         assert_eq!(prover.allocations[0].status, ProverStatus::Rejected);
         assert_eq!(prover.allocations[0].last_active_frame_number, 100);
     });
-    let kicked = branch
+    let prover = branch
         .load_vertex_underlying_raw("vertex", "adds", &shard, &make_vertex_key(target))
+        .unwrap()
+        .unwrap();
+    let tree = rebuild_vertex_tree_from_blob(&prover);
+    assert_eq!(
+        crate::global_schema::read_field(&tree, "prover:Prover", "Status").unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        crate::global_schema::read_field(&tree, "prover:Prover", "KickFrameNumber").unwrap(),
+        0u64.to_be_bytes()
+    );
+    let kicked = branch
+        .load_vertex_underlying_raw("vertex", "adds", &shard, &make_vertex_key(target ^ 0x80))
         .unwrap()
         .unwrap();
     let tree = rebuild_vertex_tree_from_blob(&kicked);
     assert_eq!(
-        crate::global_schema::read_field(&tree, "prover:Prover", "Status").unwrap(),
+        crate::global_schema::read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
         vec![4]
     );
     assert_eq!(
-        crate::global_schema::read_field(&tree, "prover:Prover", "KickFrameNumber").unwrap(),
+        crate::global_schema::read_field(&tree, "allocation:ProverAllocation", "KickFrameNumber")
+            .unwrap(),
         frame.to_be_bytes()
     );
     assert!(registry
