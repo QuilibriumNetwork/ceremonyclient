@@ -64,6 +64,8 @@ where
     skip_timeout: ViewDelta,
     forwarding: ForwardingPolicy,
     epoch: Epoch,
+    // QUILIBRIUM: discarded peer messages awaiting their summary line.
+    discards: super::discards::Discards<S::PublicKey>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
 
@@ -130,6 +132,7 @@ where
                 skip_timeout: cfg.skip_timeout,
                 forwarding: cfg.forwarding,
                 epoch: cfg.epoch,
+                discards: Default::default(),
 
                 mailbox_receiver: receiver,
 
@@ -144,6 +147,12 @@ where
             },
             Mailbox::new(sender),
         )
+    }
+
+    /// QUILIBRIUM: name the engine's journal partition in discard summaries
+    /// (discards.rs), so a line identifies its session.
+    pub fn name_discards(&mut self, partition: &str) {
+        self.discards.partition = partition.to_string();
     }
 
     fn new_round(&self, view: View) -> Round<S, B, D, Re> {
@@ -386,7 +395,12 @@ where
             Ok((sender, message)) = certificate_receiver.recv() else break => {
                 // If there is a decoding error, block
                 let Ok(message) = message else {
-                    commonware_p2p::block!(self.blocker, sender, "decoding error");
+                    // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
+                    if let Some(summary) = self.discards.undecodable(self.context.as_ref().current(), &sender) {
+                        summary.log(&self.discards.partition, self.epoch.get());
+                    }
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
                     continue;
                 };
 
@@ -400,7 +414,13 @@ where
 
                 // If the epoch is not the current epoch, block
                 if message.epoch() != self.epoch {
-                    commonware_p2p::block!(self.blocker, sender, "epoch mismatch");
+                    // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
+                    let now = self.context.as_ref().current();
+                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), self.epoch.get()) {
+                        summary.log(&self.discards.partition, self.epoch.get());
+                    }
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
                     continue;
                 }
 
@@ -503,7 +523,12 @@ where
             Ok((sender, message)) = vote_receiver.recv() else break => {
                 // If there is a decoding error, block
                 let Ok(message) = message else {
-                    commonware_p2p::block!(self.blocker, sender, "decoding error");
+                    // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
+                    if let Some(summary) = self.discards.undecodable(self.context.as_ref().current(), &sender) {
+                        summary.log(&self.discards.partition, self.epoch.get());
+                    }
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
                     continue;
                 };
 
@@ -517,7 +542,13 @@ where
 
                 // If the epoch is not the current epoch, block
                 if message.epoch() != self.epoch {
-                    commonware_p2p::block!(self.blocker, sender, "epoch mismatch");
+                    // QUILIBRIUM: summarized instead of a warning per message (discards.rs).
+                    let now = self.context.as_ref().current();
+                    if let Some(summary) = self.discards.epoch(now, &sender, message.epoch().get(), self.epoch.get()) {
+                        summary.log(&self.discards.partition, self.epoch.get());
+                    }
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
                     continue;
                 }
 
