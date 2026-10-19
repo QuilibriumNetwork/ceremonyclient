@@ -1252,29 +1252,54 @@ pub(crate) async fn start(
     // cursor never advances, and that application's app-shard state is frozen
     // for good — invisible while the application is whole (a wallet reads its
     // own node) and fatal once it splits, when a wallet must read an archive.
-    // Fetched frames are fed back through the consensus loopback so they take
-    // exactly the same verify-store-and-materialize path as gossiped ones.
-    let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(128);
+    // Fetched frames take the same verify-store-and-materialize path as
+    // gossiped ones: verified off the message loop, then admitted to the ingest.
+    // Frames a waiting GLOBAL frame needs come first; frames later GLOBAL
+    // frames need are fetched only while none of those wait.
+    let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
+    let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
     // The archive ingest's validator, once built below.
     let gap_validator: Arc<std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>> =
         Default::default();
+    // The archive ingest and its checks, once built below.
+    let gap_ingest: Arc<std::sync::OnceLock<(
+        Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>,
+        quil_engine::archive_ingest::ArchiveFrameVerifier,
+    )>> = Default::default();
     if archive_mode {
         let pool = archive_pool.clone();
         let loopback = consensus_loopback_tx.clone();
         let gap_validator = gap_validator.clone();
+        let gap_ingest = gap_ingest.clone();
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
         let gap_network = config.p2p.network;
+        // One connection per endpoint, shared by every fetch: a frame each
+        // second used to open a new connection to every endpoint it asked.
+        let clients: Arc<parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>> =
+            Default::default();
         detached_spawner.detach("archive-shard-gap-fetch", async move {
             use futures::StreamExt;
-            let requests = futures::stream::unfold(gap_rx, |mut rx| async move {
+            // Fetches at once, across shards. Four, each of one frame asked for
+            // only once the one before it arrived, recovered about a frame a
+            // second per shard; an archive thousands of frames behind executed
+            // one GLOBAL frame in hours and fell further behind (2026-10-19).
+            const FETCHES: usize = 16;
+            let urgent = futures::stream::unfold(gap_rx, |mut rx| async move {
                 rx.recv().await.map(|request| (request, rx))
             });
-            requests.for_each_concurrent(4, |(filter, frame_number)| {
+            let prefetch = futures::stream::unfold(prefetch_rx, |mut rx| async move {
+                rx.recv().await.map(|request| (request, rx))
+            });
+            let requests = futures::stream::select_with_strategy(urgent, prefetch,
+                |_: &mut ()| futures::stream::PollNext::Left);
+            requests.for_each_concurrent(FETCHES, |(filter, frame_number)| {
                 let pool = pool.clone();
                 let loopback = loopback.clone();
                 let key = key.clone();
+                let clients = clients.clone();
                 let validator = gap_validator.get().cloned();
+                let ingest = gap_ingest.get().cloned();
                 // The shard's own members first: they produced the frame and
                 // keep it, and they publish a stream endpoint for exactly this
                 // filter. Another archive is only a fallback, and a poor one:
@@ -1292,19 +1317,55 @@ pub(crate) async fn start(
                 endpoints.dedup();
                 async move {
                     let Some(key) = key.as_ref() else { return };
-                    // A few of the shard's members, then every archive: an
+                    // Every one of the shard's members, then every archive: an
                     // archive that executed the GLOBAL frames rewarding this
                     // frame holds it. The archive used to be appended after
                     // the members and cut off at six endpoints, so on a shard
                     // with more members it was never asked, and two archives
                     // sat on one missing frame each until GLOBAL lost quorum.
-                    // Each endpoint gets its own deadline, so unreachable
-                    // members cannot use up the attempt. Missing/failed
-                    // requests are retried by the ingest timer.
-                    const MEMBERS: usize = 3;
+                    // Members were then cut to the first three by address, so
+                    // every retry asked the same three of a 16-member shard,
+                    // none of which held frame 2063, and every archive's GLOBAL
+                    // execution stopped at 903,301 (2026-10-19). The members
+                    // are asked in an order that moves with each request and
+                    // frame, a few at a time; each endpoint gets its own
+                    // deadline, so unreachable members cannot use up the attempt.
+                    // Missing/failed requests are retried by the ingest timer.
                     const ARCHIVES: usize = 8;
+                    const CONCURRENT: usize = 4;
                     const PER_ENDPOINT: std::time::Duration = std::time::Duration::from_secs(4);
-                    endpoints.truncate(MEMBERS);
+                    if !endpoints.is_empty() {
+                        let turn = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs() / 5) as usize;
+                        let len = endpoints.len();
+                        endpoints.rotate_left(turn.wrapping_add(frame_number as usize) % len);
+                    }
+                    // A failed or timed-out endpoint's connection is dropped
+                    // and opened again on its next request.
+                    let fetch_from = |addr: String, number: u64| {
+                        let filter = filter.clone();
+                        let clients = clients.clone();
+                        async move {
+                            let fetch = async {
+                                let cached = clients.lock().get(&addr).cloned();
+                                let mut client = match cached {
+                                    Some(client) => client,
+                                    None => {
+                                        let client = quil_rpc::ArchiveClient::connect_mtls(&addr, key).await
+                                            .map_err(|e| e.to_string())?;
+                                        clients.lock().insert(addr.clone(), client.clone());
+                                        client
+                                    }
+                                };
+                                client.get_app_shard_frame(filter, number).await.map_err(|e| e.to_string())
+                            };
+                            let fetched = tokio::time::timeout(PER_ENDPOINT, fetch).await;
+                            if !matches!(fetched, Ok(Ok(_))) {
+                                clients.lock().remove(&addr);
+                            }
+                            fetched
+                        }
+                    };
                     let first = pool.next().await;
                     let mut archives = pool.get_all().await;
                     if let Some(first) = first {
@@ -1319,17 +1380,15 @@ pub(crate) async fn start(
                     }
                     let mut failures = Vec::new();
                     let mut recovered = None;
-                    for addr in &endpoints {
-                        let attempt = tokio::time::timeout(PER_ENDPOINT, async {
-                            let mut client = quil_rpc::ArchiveClient::connect_mtls(addr, key).await
-                                .map_err(|e| e.to_string())?;
-                            client.get_app_shard_frame(filter.clone(), frame_number).await
-                                .map_err(|e| e.to_string())
-                        });
-                        match attempt.await {
+                    let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
+                        let attempt = fetch_from(addr.clone(), frame_number);
+                        async move { (addr, attempt.await) }
+                    })).buffer_unordered(CONCURRENT);
+                    while let Some((addr, attempt)) = attempts.next().await {
+                        match attempt {
                             Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
                                 h.address == filter && h.frame_number == frame_number) => {
-                                recovered = Some((addr.clone(), frame));
+                                recovered = Some((addr, frame));
                                 break;
                             }
                             Ok(Ok(Some(_))) => failures.push(format!("{addr}: served another frame")),
@@ -1338,6 +1397,7 @@ pub(crate) async fn start(
                             Err(_) => failures.push(format!("{addr}: timed out")),
                         }
                     }
+                    drop(attempts);
                     match recovered {
                         Some((source, frame)) => {
                             // Validation needs the storage registrations the
@@ -1353,13 +1413,10 @@ pub(crate) async fn start(
                                             .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
                                             .collect();
                                         let filter = filter.clone();
+                                        let fetch_from = &fetch_from;
                                         async move {
                                             for addr in order {
-                                                let attempt = tokio::time::timeout(PER_ENDPOINT, async {
-                                                    let mut client = quil_rpc::ArchiveClient::connect_mtls(&addr, key).await.ok()?;
-                                                    client.get_app_shard_frame(filter.clone(), number).await.ok().flatten()
-                                                });
-                                                if let Ok(Some(frame)) = attempt.await {
+                                                if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
                                                     if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
                                                         return Some(frame);
                                                     }
@@ -1380,9 +1437,26 @@ pub(crate) async fn start(
                             let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
                             tracing::info!(filter = %hex::encode(&filter), frame = frame_number, through, %source,
                                 "app-shard gap fetch recovered a missing frame");
-                            for frame in frames {
-                                let data = prost::Message::encode_to_vec(&frame);
-                                let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                            match ingest {
+                                // Checked on the blocking pool, concurrently with
+                                // other fetches; the ingest is held only to admit.
+                                Some((ingest, verifier)) => {
+                                    let admitted = tokio::task::spawn_blocking(move || {
+                                        for frame in frames {
+                                            if let Some(certified) = verifier.verify(&frame) {
+                                                ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
+                                            }
+                                        }
+                                    }).await;
+                                    if let Err(error) = admitted {
+                                        tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                            "app-shard gap fetch: admitting the recovered frames failed");
+                                    }
+                                }
+                                None => for frame in frames {
+                                    let data = prost::Message::encode_to_vec(&frame);
+                                    let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                                },
                             }
                         }
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
@@ -1408,13 +1482,16 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ).with_gap_fetch(gap_tx).sequenced();
+        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).sequenced();
         let ingest = match mtls_seed.map(|_| falcon_signing_key.clone()) {
             Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(archive_pool.clone(), key)),
             None => ingest,
         };
         let _ = gap_validator.set(ingest.validator());
-        Some(Arc::new(std::sync::Mutex::new(ingest)))
+        let verifier = ingest.verifier();
+        let ingest = Arc::new(std::sync::Mutex::new(ingest));
+        let _ = gap_ingest.set((ingest.clone(), verifier));
+        Some(ingest)
     } else {
         None
     };

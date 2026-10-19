@@ -1128,16 +1128,28 @@ pub(crate) type AppIngestCell =
 /// A frame that keeps waiting names the shards and frames it waits for: the
 /// wait itself was silent, and an archive sat on one GLOBAL frame for two
 /// days with nothing in its log but the stall.
+///
+/// While a frame waits, the shards the stored GLOBAL frames after it reward
+/// are fetched behind it (`ArchiveAppShardIngest::prefetch_through`). Fetched
+/// only once a GLOBAL frame waited on them, a shard thousands of frames behind
+/// held up one GLOBAL frame after another, each for hours (2026-10-19).
 fn sequenced_ingest_hook(
     cell: AppIngestCell,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
     prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    clock: Arc<dyn quil_types::store::ClockStore>,
 ) -> quil_engine::global_finalization::SequencedIngest {
     const QUIET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
     const WAIT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    /// GLOBAL frames read ahead of a waiting one, about half an hour of them.
+    const LOOKAHEAD_FRAMES: u64 = 120;
+    const LOOKAHEAD_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
     // (GLOBAL frame, waiting since, last logged)
     let wait: std::sync::Mutex<Option<(u64, std::time::Instant, Option<std::time::Instant>)>> = Default::default();
+    // (GLOBAL frame, read at, per shard the highest frame the frames after it carry)
+    let lookahead: std::sync::Mutex<Option<(u64, std::time::Instant, std::collections::BTreeMap<Vec<u8>, u64>)>> =
+        Default::default();
     Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
         use quil_execution::global_intrinsic::{conversions, prover_shard_update};
         use quil_types::proto::global::message_request::Request;
@@ -1150,7 +1162,11 @@ fn sequenced_ingest_hook(
         ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
         let bls = quil_crypto::FalconKeyConstructor;
-        let mut through: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+        // Per shard: the certified headers this frame carries, by frame number.
+        // The highest is the frame to materialize through; any of them whose
+        // body no endpoint serves can be rebuilt if it carried no requests.
+        let mut vouched: std::collections::BTreeMap<Vec<u8>, std::collections::HashMap<u64, quil_types::proto::global::FrameHeader>> =
+            std::collections::BTreeMap::new();
         for request in frame.requests.iter().flat_map(|bundle| bundle.requests.iter()) {
             let Some(Request::Shard(header)) = request.request.as_ref() else { continue };
             let op = conversions::frame_header_from_proto(header);
@@ -1162,13 +1178,13 @@ fn sequenced_ingest_hook(
             {
                 continue;
             }
-            let entry = through.entry(op.address.clone()).or_insert(0);
-            *entry = (*entry).max(op.frame_number);
+            vouched.entry(op.address.clone()).or_default().insert(op.frame_number, header.clone());
         }
         let mut ingest = ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut missing = Vec::new();
-        for (address, through) in through {
-            if !ingest.materialize_through(&address, through)? {
+        for (address, headers) in vouched {
+            let Some(&through) = headers.keys().max() else { continue };
+            if !ingest.materialize_through_vouched(&address, through, &headers)? {
                 let held = ingest.materialized_height(&address).unwrap_or(0);
                 missing.push(format!("{}: frame {} of {through}", hex::encode(&address), held + 1));
             }
@@ -1176,6 +1192,21 @@ fn sequenced_ingest_hook(
         if missing.is_empty() {
             return Ok(true);
         }
+        drop(ingest);
+        let mut lookahead = lookahead.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lookahead.as_ref().is_none_or(|(frame, read, _)| *frame != frame_number || read.elapsed() >= LOOKAHEAD_REFRESH) {
+            let targets = upcoming_shard_frames(clock.as_ref(), frame_number, LOOKAHEAD_FRAMES);
+            *lookahead = Some((frame_number, std::time::Instant::now(), targets));
+        }
+        if let Some((_, _, targets)) = lookahead.as_ref() {
+            let mut ingest = cell.get().expect("checked above").lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (address, &through) in targets {
+                if let Err(error) = ingest.prefetch_through(address, through) {
+                    tracing::debug!(%error, address = %hex::encode(address), "application frame prefetch skipped");
+                }
+            }
+        }
+        drop(lookahead);
         let mut wait = wait.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = std::time::Instant::now();
         let (_, since, logged) = match wait.as_mut() {
@@ -1189,6 +1220,34 @@ fn sequenced_ingest_hook(
         }
         Ok(false)
     })
+}
+
+/// Per shard, the highest frame the stored GLOBAL frames after `frame`, at most
+/// `count` of them, carry a header for: certified ones, or a candidate where
+/// none is. A hint for prefetching only, not verified: the state their
+/// headers verify against has not been executed yet.
+fn upcoming_shard_frames(
+    clock: &dyn quil_types::store::ClockStore,
+    frame: u64,
+    count: u64,
+) -> std::collections::BTreeMap<Vec<u8>, u64> {
+    use quil_types::proto::global::message_request::Request;
+    let mut targets = std::collections::BTreeMap::new();
+    for number in frame.saturating_add(1)..=frame.saturating_add(count) {
+        let stored = clock.get_global_clock_frame(number).ok().or_else(|| {
+            clock.range_global_clock_frame_candidates(number, number, 1).ok().and_then(|mut frames| frames.pop())
+        });
+        let Some(stored) = stored else { break };
+        for request in stored.requests.iter().flat_map(|bundle| bundle.requests.iter()) {
+            let Some(Request::Shard(header)) = request.request.as_ref() else { continue };
+            if header.address.is_empty() {
+                continue;
+            }
+            let target = targets.entry(header.address.clone()).or_insert(0);
+            *target = header.frame_number.max(*target);
+        }
+    }
+    targets
 }
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
@@ -1238,7 +1297,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     // Archives bring application state to each GLOBAL frame's sequenced point
     // before executing it, on every execution path below.
     let sequenced_ingest = archive_mode.then(|| {
-        sequenced_ingest_hook(app_ingest, crdt.clone(), frame_prover.clone(), prover_registry.clone())
+        sequenced_ingest_hook(app_ingest, crdt.clone(), frame_prover.clone(), prover_registry.clone(),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>)
     });
 
     // The archive-sync transport identity is the FALCON network key (all
@@ -3730,6 +3790,37 @@ mod validation_tests {
         let allocator = quil_engine::worker_allocator::WorkerAllocator::new(
             workers.clone(), registry, vec![7; 32]);
         (workers, allocator)
+    }
+
+    /// The prefetch hint reads the stored GLOBAL frames after the waiting one,
+    /// certified or else candidate, up to the first height it holds neither of,
+    /// and keeps each shard's highest frame.
+    #[test]
+    fn upcoming_shard_frames_reads_ahead_to_the_first_missing_frame() {
+        use quil_types::store::ClockStore;
+        use quil_types::proto::global::{message_request::Request, FrameHeader, GlobalFrame, GlobalFrameHeader, MessageBundle, MessageRequest};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let frame = |number: u64, shards: &[(u8, u64)]| GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: number, output: vec![number as u8; 32], ..Default::default() }),
+            requests: vec![MessageBundle {
+                requests: shards.iter().map(|&(address, frame_number)| MessageRequest {
+                    request: Some(Request::Shard(FrameHeader { address: vec![address; 32], frame_number, ..Default::default() })),
+                    ..Default::default()
+                }).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&frame(11, &[(1, 40), (2, 7)]), txn.as_ref()).unwrap();
+        clock.put_global_clock_frame(&frame(12, &[(1, 38)]), txn.as_ref()).unwrap();
+        clock.put_global_clock_frame_candidate(&frame(13, &[(1, 41), (3, 9)]), txn.as_ref()).unwrap();
+        clock.put_global_clock_frame(&frame(15, &[(4, 99)]), txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let targets = upcoming_shard_frames(&clock, 10, 120);
+        assert_eq!(targets, std::collections::BTreeMap::from([(vec![1; 32], 41), (vec![2; 32], 7), (vec![3; 32], 9)]));
+        assert_eq!(upcoming_shard_frames(&clock, 10, 1), std::collections::BTreeMap::from([(vec![1; 32], 40), (vec![2; 32], 7)]));
     }
 
     #[test]

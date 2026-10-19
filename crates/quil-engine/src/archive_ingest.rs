@@ -22,7 +22,8 @@
 //! certified frame), is also stored in the archive's clock store, from which
 //! it serves shard frames to peers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,12 +59,23 @@ pub struct ArchiveAppShardIngest {
     /// Where to ask for a frame this archive is missing: `(shard filter, frame)`.
     /// `None` leaves a gap unrecoverable, which is what it was before.
     gap_requests: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
-    /// The frame last asked for per address, so a gap that persists across many
-    /// inbound frames asks once rather than on every one.
-    requested: HashMap<Vec<u8>, (u64, Instant)>,
+    /// Where to ask, behind every request on `gap_requests`, for frames a
+    /// GLOBAL frame after the executing one rewards ([`Self::prefetch_through`]).
+    prefetch_requests: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
+    /// Frames asked for per address, when, and whether on `gap_requests`, so a
+    /// gap that persists across many inbound frames or passes asks once.
+    requested: HashMap<Vec<u8>, BTreeMap<u64, (Instant, bool)>>,
     /// Frames are materialized only through [`Self::materialize_through`], at
     /// the points the GLOBAL chain sequences, never on arrival.
     sequenced: bool,
+    /// The frame a GLOBAL frame waits on per address, since when, and whether
+    /// its header-only materialization was refused and logged.
+    missing_since: HashMap<Vec<u8>, (u64, Instant, bool)>,
+    /// How long a provably empty frame's body is sought before the frame is
+    /// materialized from its certified header ([`EMPTY_FRAME_BODY_GRACE`]).
+    empty_body_grace: Duration,
+    #[cfg(test)]
+    skip_header_authentication: bool,
 }
 
 const GAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -71,10 +83,26 @@ const GAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// execution is stalled for as long as it is missing.
 const GLOBAL_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BUFFERED_FRAMES_PER_SHARD: usize = 128;
+/// Frames of one shard asked for at once while a GLOBAL frame waits on it.
+/// Asked one at a time, each only once the one before it arrived, an archive
+/// behind by thousands of frames per shard recovered about one frame a second:
+/// QmQr15 executed one GLOBAL frame every two hours or more while the network
+/// made 3.8 a minute, and fell further behind (2026-10-19).
+const GAP_WINDOW: u64 = 32;
+/// How far above its cursor a shard's frames are fetched for GLOBAL frames
+/// after the executing one. Below the buffer bound, so prefetched frames are
+/// never evicted by the frames above them, and small enough that every shard
+/// read ahead holding this many frames stays within memory.
+const PREFETCH_DEPTH: u64 = 64;
+const _: () = assert!(PREFETCH_DEPTH < MAX_BUFFERED_FRAMES_PER_SHARD as u64);
 /// Frames without a certificate held per shard until a certified descendant
 /// links to them. Keyed by output identity, so a well-formed impostor cannot
 /// displace the real frame at the same height.
 const MAX_HELD_FRAMES_PER_SHARD: usize = 32;
+/// How long GLOBAL execution waits for the body of a frame whose certified
+/// header proves it carried no requests before materializing it from that
+/// header. Every gap-fetch round in the meantime asks every member and archive.
+const EMPTY_FRAME_BODY_GRACE: Duration = Duration::from_secs(90);
 
 impl ArchiveAppShardIngest {
     pub fn new(
@@ -107,8 +135,13 @@ impl ArchiveAppShardIngest {
             buffered: HashMap::new(),
             held: HashMap::new(),
             gap_requests: None,
+            prefetch_requests: None,
             requested: HashMap::new(),
             sequenced: false,
+            missing_since: HashMap::new(),
+            empty_body_grace: EMPTY_FRAME_BODY_GRACE,
+            #[cfg(test)]
+            skip_header_authentication: false,
         }
     }
 
@@ -139,6 +172,13 @@ impl ArchiveAppShardIngest {
         self
     }
 
+    /// Where [`Self::prefetch_through`] asks for frames. The fetcher serves
+    /// these only when no request from [`Self::with_gap_fetch`] is waiting.
+    pub fn with_prefetch(mut self, requests: tokio::sync::mpsc::Sender<(Vec<u8>, u64)>) -> Self {
+        self.prefetch_requests = Some(requests);
+        self
+    }
+
     /// Where to fetch a storage registration that neither this archive's
     /// executed GLOBAL state nor its live registry holds: the one an app
     /// frame's GLOBAL anchor names when this archive's execution is behind
@@ -162,6 +202,17 @@ impl ArchiveAppShardIngest {
         self.validator.clone()
     }
 
+    /// This ingest's checks on a received frame, to run without holding the
+    /// ingest ([`Self::admit_verified`]).
+    pub fn verifier(&self) -> ArchiveFrameVerifier {
+        ArchiveFrameVerifier {
+            validator: self.validator.clone(),
+            execution_manager: self.execution_manager.clone(),
+            inclusion_prover: self.inclusion_prover.clone(),
+            has_forest: self.hypergraph.has_forest(),
+        }
+    }
+
     /// Read the cursor co-committed with app state. Read failures must not look
     /// like genesis and trigger reexecution against already advanced state.
     pub fn materialized_height(&mut self, address: &[u8]) -> quil_types::error::Result<u64> {
@@ -178,7 +229,13 @@ impl ArchiveAppShardIngest {
     /// Publish in memory only after state and cursor have committed together.
     fn set_materialized_height(&mut self, address: &[u8], frame: u64) {
         self.last_materialized.insert(address.to_vec(), frame);
-        self.requested.remove(address);
+        if let Some(requested) = self.requested.get_mut(address) {
+            *requested = requested.split_off(&(frame + 1));
+            if requested.is_empty() {
+                self.requested.remove(address);
+            }
+        }
+        self.missing_since.remove(address);
     }
 
     /// Retry missing frames and deferred execution even if gossip goes quiet.
@@ -223,10 +280,8 @@ impl ArchiveAppShardIngest {
             Ok(f) => f,
             Err(_) => return,
         };
-        let (address, frame_number, requests_root) = match frame.header.as_ref() {
-            Some(h) if !h.address.is_empty() => {
-                (h.address.clone(), h.frame_number, h.requests_root.clone())
-            }
+        let (address, frame_number) = match frame.header.as_ref() {
+            Some(h) if !h.address.is_empty() => (h.address.clone(), h.frame_number),
             _ => {
                 debug!("archive ingest: shard frame missing header or empty address — dropping");
                 return;
@@ -256,82 +311,31 @@ impl ArchiveAppShardIngest {
             return;
         }
 
-        // 1. Quorum BLS cert + VDF against the shard committee. A frame with
-        // no certificate of its own is one a certified descendant finalized
-        // (see `admit`): it gets every check but the quorum here, and is only
-        // ever materialized once a certified frame links to it.
-        let certified = has_certificate(&frame);
-        let validated = if certified { self.validator.validate(&frame) } else { self.validator.validate_proposal(&frame) };
-        match validated {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
-                    "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
-                );
-                return;
-            }
-            Err(e) => {
-                // Elevated from debug: this is the primary "why wasn't my shard
-                // frame accepted" signal. A common cause is the anchored GLOBAL
-                // frame being absent from the local clock store (ρ_N unavailable,
-                // frame_validator.rs), which chains directly off any global-frame
-                // propagation gap.
-                warn!(
-                    frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
-                    certified,
-                    error = %e,
-                    "archive ingest: shard frame validation FAILED — rejecting"
-                );
-                return;
-            }
+        let Some(certified) = self.verifier().verify(&frame) else { return };
+        self.admit(&address, frame, certified);
+        if !self.sequenced {
+            self.try_materialize(&address);
         }
+    }
 
-        // 2. Verify the carried requests recompute to the signed root.
-        let canonical: Vec<Vec<u8>> = frame
-            .requests
-            .iter()
-            .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
-            .collect();
-        if canonical.len() != frame.requests.len() {
-            warn!(
-                frame = frame_number,
-                address = %hex::encode(&address[..address.len().min(8)]),
-                converted = canonical.len(),
-                total = frame.requests.len(),
-                "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
-                frame.requests.len().saturating_sub(canonical.len()),
-                frame.requests.len(),
-            );
+    /// Admit a frame [`ArchiveFrameVerifier::verify`] passed, as [`Self::ingest`]
+    /// does. The gap fetch verifies the frames it recovers without holding the
+    /// ingest or the message loop, which used to run every check in turn.
+    pub fn admit_verified(&mut self, frame: AppShardFrame, certified: bool) {
+        let Some((address, frame_number)) = frame.header.as_ref()
+            .filter(|header| !header.address.is_empty())
+            .map(|header| (header.address.clone(), header.frame_number))
+        else {
             return;
-        }
-        let recomputed = match compute_requests_root(
-            &canonical,
-            &address,
-            frame_number,
-            Some(self.execution_manager.as_ref()),
-            Some(self.inclusion_prover.as_ref()),
-            self.hypergraph.has_forest(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
-                    error = %e,
-                    "archive ingest: requests_root recompute errored — rejecting frame"
-                );
-                return;
-            }
         };
-        if recomputed != requests_root {
-            warn!(frame = frame_number, "archive ingest: requests_root mismatch — rejecting");
-            return;
+        match self.materialized_height(&address) {
+            Ok(held) if frame_number > held => {}
+            Ok(_) => return,
+            Err(error) => {
+                warn!(error = %error, "archive ingest deferred: materialized cursor unavailable");
+                return;
+            }
         }
-
-        // 3. Buffer + materialize in strict order per shard.
         self.admit(&address, frame, certified);
         if !self.sequenced {
             self.try_materialize(&address);
@@ -421,7 +425,7 @@ impl ArchiveAppShardIngest {
     }
 
     fn try_materialize(&mut self, address: &[u8]) {
-        if let Err(error) = self.materialize_in_order(address, u64::MAX) {
+        if let Err(error) = self.materialize_in_order(address, u64::MAX, &HashMap::new()) {
             warn!(error = %error, "archive materialize deferred");
         }
     }
@@ -436,10 +440,29 @@ impl ArchiveAppShardIngest {
     /// has referenced when it executes a frame: never materialize ahead of
     /// that, never execute behind it.
     pub fn materialize_through(&mut self, address: &[u8], through: u64) -> quil_types::error::Result<bool> {
-        self.materialize_in_order(address, through)
+        self.materialize_in_order(address, through, &HashMap::new())
     }
 
-    fn materialize_in_order(&mut self, address: &[u8], through: u64) -> quil_types::error::Result<bool> {
+    /// [`Self::materialize_through`] for a GLOBAL frame that carries the
+    /// certified `headers` (by frame number) of this shard. A frame among them
+    /// whose body no endpoint serves is materialized from its header once
+    /// the header proves the frame carried no requests
+    /// ([`Self::empty_frame_from_header`]).
+    pub fn materialize_through_vouched(
+        &mut self,
+        address: &[u8],
+        through: u64,
+        headers: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+    ) -> quil_types::error::Result<bool> {
+        self.materialize_in_order(address, through, headers)
+    }
+
+    fn materialize_in_order(
+        &mut self,
+        address: &[u8],
+        through: u64,
+        vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+    ) -> quil_types::error::Result<bool> {
         let reached = loop {
             let last = self.materialized_height(address)?;
             if last >= through {
@@ -448,7 +471,10 @@ impl ArchiveAppShardIngest {
             let Some(next) = last.checked_add(1) else { break true };
             let frame = match self.buffered.get(address).and_then(|m| m.get(&next)) {
                 Some(f) => f.clone(),
-                None => break false, // gap — wait for the missing frame (or sync)
+                None => match self.empty_frame_from_header(address, next, vouched) {
+                    Some(frame) => frame,
+                    None => break false, // gap — wait for the missing frame (or sync)
+                },
             };
             let fee_multiplier_vote = frame
                 .header
@@ -498,30 +524,27 @@ impl ArchiveAppShardIngest {
         let next_needed = last + 1;
         let ahead = self.buffered.get(address).map_or(0, |m| m.keys().filter(|&&f| f > next_needed).count());
         let missing = !self.buffered.get(address).is_some_and(|m| m.contains_key(&next_needed));
-        if missing && (ahead > 0 || (!reached && through != u64::MAX)) {
+        let waiting = !reached && through != u64::MAX;
+        if missing && (ahead > 0 || waiting) {
             // A frame already held without a certificate needs its certified
             // descendant, not itself: ask for the first frame above the run.
             let mut wanted = next_needed;
-            while self.held.get(address).is_some_and(|held| {
-                held.range((wanted, [0; 32])..=(wanted, [0xff; 32])).next().is_some()
-            }) {
+            while self.is_held(address, wanted) {
                 wanted += 1;
             }
-            // Deduped per address: a gap persists across every later frame
-            // that arrives, and re-asking on each would flood the fetcher.
-            let interval = if through == u64::MAX { GAP_RETRY_INTERVAL } else { GLOBAL_WAIT_RETRY_INTERVAL };
-            let retry_due = self.requested.get(address).map_or(true, |(frame, sent)| {
-                *frame != wanted || sent.elapsed() >= interval
-            });
-            if retry_due {
-                if let Some(requests) = self.gap_requests.as_ref() {
-                    if requests.try_send((address.to_vec(), wanted)).is_ok() {
-                        self.requested.insert(address.to_vec(), (wanted, Instant::now()));
-                    }
-                }
+            // While a GLOBAL frame waits, every missing frame it needs is asked
+            // for at once, up to the window; otherwise the first missing frame.
+            let (upto, interval) = if waiting {
+                (through.min(last.saturating_add(GAP_WINDOW)).max(wanted), GLOBAL_WAIT_RETRY_INTERVAL)
+            } else {
+                (wanted, GAP_RETRY_INTERVAL)
+            };
+            let requested = self.request_frames(address, wanted..=upto, true, interval);
+            if requested > 0 {
                 warn!(
                     address = %hex::encode(address),
                     missing_from = next_needed,
+                    requested,
                     buffered_ahead = ahead,
                     "archive app-shard frame gap awaiting recovery"
                 );
@@ -544,6 +567,221 @@ impl ArchiveAppShardIngest {
         }
         Ok(reached)
     }
+
+    /// Ask for the frames of `address` that a GLOBAL frame after the executing
+    /// one rewards, through `through` and at most [`PREFETCH_DEPTH`] above the
+    /// cursor, behind every request a waiting GLOBAL frame makes. They wait in
+    /// the buffer, unmaterialized, for the GLOBAL frame that sequences them.
+    /// Only for a shard this archive already holds frames of: the stored GLOBAL
+    /// frames this reads ahead in are not verified against executed state yet,
+    /// and a header naming any other address may be forged. Returns how many
+    /// frames were asked for.
+    pub fn prefetch_through(&mut self, address: &[u8], through: u64) -> quil_types::error::Result<usize> {
+        let last = self.materialized_height(address)?;
+        let upto = through.min(last.saturating_add(PREFETCH_DEPTH));
+        if last == 0 || upto <= last {
+            return Ok(0);
+        }
+        Ok(self.request_frames(address, last + 1..=upto, false, GAP_RETRY_INTERVAL))
+    }
+
+    /// Ask for each frame of `frames` neither buffered nor held, unless it was
+    /// asked for within `interval` (at this priority or above). `urgent` asks
+    /// on `gap_requests`, otherwise on `prefetch_requests`. A full queue
+    /// leaves the rest for the next pass.
+    fn request_frames(&mut self, address: &[u8], frames: RangeInclusive<u64>, urgent: bool, interval: Duration) -> usize {
+        let sender = if urgent { self.gap_requests.clone() } else { self.prefetch_requests.clone() };
+        let Some(sender) = sender else { return 0 };
+        let mut sent = 0;
+        for number in frames {
+            if self.buffered.get(address).is_some_and(|buffered| buffered.contains_key(&number))
+                || self.is_held(address, number)
+            {
+                continue;
+            }
+            let due = self.requested.get(address).and_then(|requested| requested.get(&number))
+                .is_none_or(|&(at, was_urgent)| (urgent && !was_urgent) || at.elapsed() >= interval);
+            if !due {
+                continue;
+            }
+            if sender.try_send((address.to_vec(), number)).is_err() {
+                break;
+            }
+            self.requested.entry(address.to_vec()).or_default().insert(number, (Instant::now(), urgent));
+            sent += 1;
+        }
+        sent
+    }
+
+    /// Whether a frame `number` of `address` is held without a certificate.
+    fn is_held(&self, address: &[u8], number: u64) -> bool {
+        self.held.get(address)
+            .is_some_and(|held| held.range((number, [0; 32])..=(number, [0xff; 32])).next().is_some())
+    }
+
+    /// The frame `number` of `address`, rebuilt from the certified header the
+    /// executing GLOBAL frame carries, when no endpoint has served its body for
+    /// [`EMPTY_FRAME_BODY_GRACE`] and the header proves the frame carried no
+    /// requests (an all-zero `requests_root`, which the frame's output binds).
+    ///
+    /// Materializing a frame reads only its requests and header fields, so
+    /// such a frame leaves exactly the state its body would, on every archive,
+    /// whether or not it holds the body. The rebuilt frame lacks the storage
+    /// attestation, so it is never stored for serving. A frame that carried
+    /// requests cannot be rebuilt and keeps waiting for its body.
+    ///
+    /// GLOBAL 903,302 rewarded frame 2063 of a shard whose body no member or
+    /// archive served, and every archive's execution stopped there
+    /// (2026-10-19); decided 2026-10-19.
+    fn empty_frame_from_header(
+        &mut self,
+        address: &[u8],
+        number: u64,
+        vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
+    ) -> Option<AppShardFrame> {
+        let header = vouched.get(&number)
+            .filter(|header| header.address == address && header.frame_number == number)?;
+        if !requests_root_is_empty(&header.requests_root) {
+            return None;
+        }
+        let since = match self.missing_since.get(address) {
+            Some(&(frame, since, _)) if frame == number => since,
+            _ => {
+                self.missing_since.insert(address.to_vec(), (number, Instant::now(), false));
+                return None;
+            }
+        };
+        if since.elapsed() < self.empty_body_grace {
+            return None;
+        }
+        let frame = AppShardFrame { header: Some(header.clone()), requests: Vec::new(), storage_attestation: None };
+        if let Err(reason) = self.authenticate_header(&frame) {
+            if let Some(entry) = self.missing_since.get_mut(address).filter(|entry| !entry.2) {
+                entry.2 = true;
+                warn!(frame = number, address = %hex::encode(address), %reason,
+                    "archive cannot materialize an empty shard frame from its header: the header does not authenticate");
+            }
+            return None;
+        }
+        warn!(frame = number, address = %hex::encode(address), waited_secs = since.elapsed().as_secs(),
+            "archive materialized an empty shard frame from its certified header: no endpoint served its body");
+        Some(frame)
+    }
+
+    /// Certificate and deterministic output (which binds `requests_root`),
+    /// without the storage attestation the body would carry.
+    fn authenticate_header(&self, frame: &AppShardFrame) -> Result<(), String> {
+        #[cfg(test)]
+        if self.skip_header_authentication {
+            return Ok(());
+        }
+        match self.validator.validate_certified_without_storage(frame) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("certificate refused".into()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// The checks a received app-shard frame passes before [`ArchiveAppShardIngest`]
+/// admits it, apart from the ingest, so they can run without holding it.
+#[derive(Clone)]
+pub struct ArchiveFrameVerifier {
+    validator: Arc<BlsAppFrameValidator>,
+    execution_manager: Arc<quil_execution::ExecutionEngineManager>,
+    inclusion_prover: Arc<dyn InclusionProver>,
+    has_forest: bool,
+}
+
+impl ArchiveFrameVerifier {
+    /// `Some(certified)` when `frame` may be admitted, `certified` saying
+    /// whether it carries its own certificate; `None` (logged) when refused.
+    pub fn verify(&self, frame: &AppShardFrame) -> Option<bool> {
+        let header = frame.header.as_ref().filter(|header| !header.address.is_empty())?;
+        let (address, frame_number, requests_root) = (&header.address, header.frame_number, &header.requests_root);
+        // 1. Quorum BLS cert + VDF against the shard committee. A frame with
+        // no certificate of its own is one a certified descendant finalized
+        // (see `admit`): it gets every check but the quorum here, and is only
+        // ever materialized once a certified frame links to it.
+        let certified = has_certificate(frame);
+        let validated = if certified { self.validator.validate(frame) } else { self.validator.validate_proposal(frame) };
+        match validated {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
+                );
+                return None;
+            }
+            Err(e) => {
+                // Elevated from debug: this is the primary "why wasn't my shard
+                // frame accepted" signal. A common cause is the anchored GLOBAL
+                // frame being absent from the local clock store (ρ_N unavailable,
+                // frame_validator.rs), which chains directly off any global-frame
+                // propagation gap.
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    certified,
+                    error = %e,
+                    "archive ingest: shard frame validation FAILED — rejecting"
+                );
+                return None;
+            }
+        }
+
+        // 2. Verify the carried requests recompute to the signed root.
+        let canonical: Vec<Vec<u8>> = frame
+            .requests
+            .iter()
+            .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+            .collect();
+        if canonical.len() != frame.requests.len() {
+            warn!(
+                frame = frame_number,
+                address = %hex::encode(&address[..address.len().min(8)]),
+                converted = canonical.len(),
+                total = frame.requests.len(),
+                "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
+                frame.requests.len().saturating_sub(canonical.len()),
+                frame.requests.len(),
+            );
+            return None;
+        }
+        let recomputed = match compute_requests_root(
+            &canonical,
+            address,
+            frame_number,
+            Some(self.execution_manager.as_ref()),
+            Some(self.inclusion_prover.as_ref()),
+            self.has_forest,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    error = %e,
+                    "archive ingest: requests_root recompute errored — rejecting frame"
+                );
+                return None;
+            }
+        };
+        if recomputed != *requests_root {
+            warn!(frame = frame_number, "archive ingest: requests_root mismatch — rejecting");
+            return None;
+        }
+
+        Some(certified)
+    }
+}
+
+/// The `requests_root` of a frame with no requests: zero bytes, 32 on the
+/// forest path and 64 on the legacy one ([`compute_requests_root`]).
+fn requests_root_is_empty(root: &[u8]) -> bool {
+    matches!(root.len(), 32 | 64) && root.iter().all(|&byte| byte == 0)
 }
 
 /// Frames above a gap-fetched frame without a certificate that the gap
@@ -757,7 +995,7 @@ mod tests {
         ingest.retry_pending();
         assert!(rx.try_recv().is_err(), "one active request per gap");
         // The peer had no frame / connection failed. No new gossip arrives.
-        ingest.requested.get_mut(&filter).unwrap().1 = Instant::now() - GAP_RETRY_INTERVAL;
+        ingest.requested.get_mut(&filter).unwrap().get_mut(&1).unwrap().0 = Instant::now() - GAP_RETRY_INTERVAL;
         ingest.retry_pending();
         assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 1), "timer retries without inbound frames");
         ingest.buffered.get_mut(&filter).unwrap().insert(1, verified_frame(&filter, 1));
@@ -795,7 +1033,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "one active request per gap");
         // GLOBAL execution is waiting: the request is repeated sooner than an
         // ordinary gap's.
-        ingest.requested.get_mut(&filter).unwrap().1 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
+        ingest.requested.get_mut(&filter).unwrap().get_mut(&4).unwrap().0 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
         assert!(!ingest.materialize_through(&filter, 4).unwrap());
         assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 4), "retried while GLOBAL waits");
 
@@ -803,6 +1041,101 @@ mod tests {
         assert!(ingest.materialize_through(&filter, 4).unwrap());
         assert!(ingest.materialize_through(&filter, 1).unwrap(), "behind the cursor is already there");
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// A GLOBAL frame waiting on a shard asks for every missing frame it needs
+    /// at once, up to the window, and each only once per retry interval. Frames
+    /// later GLOBAL frames need are asked for behind those, up to the prefetch
+    /// depth, only for a shard already held, and are not materialized until a
+    /// GLOBAL frame sequences them. A frame only prefetched is asked for again
+    /// at once when a GLOBAL frame comes to wait on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_global_frame_asks_for_a_window_of_frames_and_prefetches_behind_it() {
+        let (ingest, _) = fixture();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = ingest.with_gap_fetch(tx).with_prefetch(prefetch_tx).sequenced();
+        let drain = |rx: &mut tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>| {
+            let mut frames = Vec::new();
+            while let Ok((address, number)) = rx.try_recv() {
+                assert_eq!(address, filter);
+                frames.push(number);
+            }
+            frames
+        };
+
+        assert_eq!(ingest.prefetch_through(&filter, 50).unwrap(), 0, "no frame of this shard held yet");
+        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        ingest.buffered.entry(filter.clone()).or_default().insert(5, verified_frame(&filter, 5));
+        assert!(!ingest.materialize_through(&filter, 200).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
+        let window: Vec<u64> = (2..=1 + GAP_WINDOW).filter(|&number| number != 5).collect();
+        assert_eq!(drain(&mut rx), window, "the window above the cursor, less what is buffered");
+        assert!(!ingest.materialize_through(&filter, 200).unwrap());
+        assert!(drain(&mut rx).is_empty(), "each asked once per interval");
+
+        assert_eq!(ingest.prefetch_through(&filter, 500).unwrap(), (PREFETCH_DEPTH - GAP_WINDOW) as usize);
+        assert_eq!(drain(&mut prefetch_rx), (2 + GAP_WINDOW..=1 + PREFETCH_DEPTH).collect::<Vec<_>>(),
+            "behind the window, to the prefetch depth");
+        assert_eq!(ingest.prefetch_through(&filter, 500).unwrap(), 0);
+
+        for number in 2..=40 {
+            ingest.buffered.entry(filter.clone()).or_default().insert(number, verified_frame(&filter, number));
+        }
+        assert!(ingest.materialize_through(&filter, 20).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 20, "prefetched frames wait for their GLOBAL frame");
+        assert!(ingest.requested[&filter].keys().all(|&number| number > 20), "requests at or below the cursor are dropped");
+        assert!(!ingest.materialize_through(&filter, 60).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 40);
+        assert_eq!(drain(&mut rx), (41..=60).collect::<Vec<_>>(), "prefetched frames a GLOBAL frame waits on");
+        assert!(drain(&mut prefetch_rx).is_empty());
+
+        ingest.admit_verified(verified_frame(&filter, 3), true);
+        assert!(ingest.buffered.get(&filter).is_none_or(|buffered| !buffered.contains_key(&3)), "below the cursor");
+        ingest.admit_verified(verified_frame(&filter, 41), true);
+        assert!(ingest.buffered[&filter].contains_key(&41));
+    }
+
+    /// A frame no endpoint serves is materialized from the certified header the
+    /// GLOBAL frame carries only when that header proves it had no requests,
+    /// and only after the body has been sought for the grace period. A frame
+    /// that had requests, or one the GLOBAL frame does not carry, keeps waiting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_empty_frame_is_materialized_from_its_certified_header() {
+        let (ingest, _) = fixture();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut ingest = ingest.with_gap_fetch(tx).sequenced();
+        ingest.skip_header_authentication = true;
+        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        let header = |number: u64, requests_root: Vec<u8>| quil_types::proto::global::FrameHeader {
+            requests_root,
+            ..verified_frame(&filter, number).header.unwrap()
+        };
+        let vouched = |header: quil_types::proto::global::FrameHeader| HashMap::from([(header.frame_number, header)]);
+
+        let empty = vouched(header(2, vec![0; 32]));
+        assert!(!ingest.materialize_through_vouched(&filter, 2, &empty).unwrap(), "the body is sought first");
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
+        ingest.missing_since.get_mut(&filter).unwrap().1 = Instant::now() - EMPTY_FRAME_BODY_GRACE;
+        assert!(!ingest.materialize_through(&filter, 2).unwrap(), "only a header the GLOBAL frame carries");
+        assert!(ingest.materialize_through_vouched(&filter, 2, &empty).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
+        assert!(ingest.missing_since.is_empty());
+
+        let with_requests = vouched(header(3, vec![7; 32]));
+        assert!(!ingest.materialize_through_vouched(&filter, 3, &with_requests).unwrap());
+        assert!(ingest.missing_since.is_empty(), "a frame with requests is never rebuilt");
+        let legacy_empty = vouched(header(3, vec![0; 64]));
+        assert!(!ingest.materialize_through_vouched(&filter, 3, &legacy_empty).unwrap());
+        ingest.missing_since.get_mut(&filter).unwrap().1 = Instant::now() - EMPTY_FRAME_BODY_GRACE;
+        let elsewhere = HashMap::from([(3, quil_types::proto::global::FrameHeader {
+            address: vec![9; 32], ..header(3, vec![0; 64])
+        })]);
+        assert!(!ingest.materialize_through_vouched(&filter, 3, &elsewhere).unwrap(), "another shard's header");
+        assert!(ingest.materialize_through_vouched(&filter, 3, &legacy_empty).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
