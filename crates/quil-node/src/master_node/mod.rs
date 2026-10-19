@@ -120,6 +120,7 @@ pub(crate) async fn start(
     let engines = engines::init_engines(
         &storage,
         network,
+        archive_mode,
         #[cfg(feature = "native-proof")]
         proof_worker.as_ref(),
     )?;
