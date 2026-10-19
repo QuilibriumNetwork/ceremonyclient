@@ -3616,6 +3616,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 let mut last_refresh_frame: u64 = 0;
                 // Starts empty, so a start without frozen shards logs nothing.
                 let mut last_frozen: Vec<Vec<u8>> = Vec::new();
+                // Each pool archive's latest shard list, to warn when archives
+                // disagree; the node still takes each refresh's list.
+                let mut shard_lists = quil_rpc::ArchiveShardListTracker::new();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 interval.set_missed_tick_behavior(
                     tokio::time::MissedTickBehavior::Skip,
@@ -3646,6 +3649,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         Ok(found) => {
                             let count = found.sizes.len();
                             let frozen = found.frozen.len();
+                            if let Some(list) = quil_rpc::ShardList::from_complete(&found) {
+                                let pool_endpoints = pool.get_all().await;
+                                if let Some(event) = shard_lists.observe(
+                                    &found.endpoint,
+                                    list,
+                                    std::time::Instant::now(),
+                                    &pool_endpoints,
+                                ) {
+                                    event.log(now_frame);
+                                }
+                            }
                             // Each refresh asks one archive and replaces the
                             // set: name the shards when it changes.
                             let mut frozen_filters: Vec<Vec<u8>> = found.frozen.iter().cloned().collect();
