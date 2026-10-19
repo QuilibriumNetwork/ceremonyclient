@@ -40,6 +40,17 @@ pub use selected_parent::{GlobalFinalizationAttempt, GlobalParentExecutor, Globa
 /// parameter). Wired separately via `with_eviction_registry`.
 type ConcreteProverRegistry = quil_execution::prover_registry::SharedProverRegistry;
 
+/// An eviction candidate in the pass log: the first 8 bytes of the prover
+/// address, the full shard filter and the inactive frames counted against it.
+fn describe_eviction(candidate: &quil_execution::prover_registry::EvictionCandidate) -> String {
+    format!(
+        "{}:{}:{}",
+        hex::encode(&candidate.prover_address[..candidate.prover_address.len().min(8)]),
+        hex::encode(&candidate.confirmation_filter),
+        candidate.effective_inactive
+    )
+}
+
 /// Preserve local failures before deduplicating prevalidated frame headers.
 /// In particular, a later successful duplicate cannot erase a failed read.
 fn finish_frame_header_validation(
@@ -1290,24 +1301,49 @@ impl FrameMaterializer {
                     // read only) so it's observable (logs + explorer
                     // `/provers/eviction-risk`) even before eviction
                     // actually activates.
-                    let candidates = eviction_reg.find_eviction_candidates(
+                    let scan = eviction_reg.scan_eviction_candidates(
                         frame_number,
                         self.eviction_grace_frames,
                         &decision_halt,
                     );
-                    // Unconditional: log the candidate count every frame, even
-                    // zero. The gate is open here (no surviving u64::MAX), so a
-                    // zero count means find_eviction_candidates itself rejected
-                    // every allocation — e.g. the per-shard streak subtraction in
-                    // effective_halt pulled effective_inactive below the grace
-                    // threshold — which is invisible without this line and
-                    // shows up only as an explorer/materializer divergence.
+                    // Unconditional: one line per pass, even with no
+                    // candidate, so a mainnet review sees what each pass
+                    // selects and what the floor and the stall exemption
+                    // spare before eviction is enabled. `kicks` lists what
+                    // this pass kicks (or would kick, while `enabled` is
+                    // false); `stalled` lists the exempt stalled shards as
+                    // filter:active/fresh.
+                    let enabled =
+                        self.evictions_enabled && frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME;
+                    let kicks = scan
+                        .candidates
+                        .iter()
+                        .take(quil_execution::prover_registry::EVICTION_MAX_PER_PASS)
+                        .map(describe_eviction)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let stalled = scan
+                        .stalled
+                        .iter()
+                        .map(|(filter, active, fresh)| format!("{}:{active}/{fresh}", hex::encode(filter)))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     info!(
                         frame = frame_number,
-                        candidates = candidates.len(),
+                        epoch = cur_eviction_epoch,
+                        enabled,
+                        candidates = scan.candidates.len(),
+                        shards = scan.shards,
+                        active = scan.active,
+                        stale = scan.stale,
+                        spared_floor = scan.spared_floor,
+                        spared_stalled = scan.spared_stalled,
+                        stalled_shards = scan.stalled.len(),
+                        %kicks,
+                        %stalled,
                         "eviction candidate scan (census-based)"
                     );
-                    if self.evictions_enabled && frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME {
+                    if enabled {
                         // Activated: kick the selected allocations
                         // (Status=4 + KickFrameNumber on each allocation).
                         let state = quil_execution::hypergraph_state::HypergraphState::new(
@@ -1382,11 +1418,17 @@ impl FrameMaterializer {
                                                 .map(|e| e.prover_address.as_slice())
                                                 .collect::<std::collections::BTreeSet<_>>()
                                                 .len();
+                                            let allocations = evicted
+                                                .iter()
+                                                .map(describe_eviction)
+                                                .collect::<Vec<_>>()
+                                                .join(",");
                                             info!(
                                                 frame = frame_number,
                                                 count = evicted.len(),
                                                 provers,
                                                 still_candidates = still_present,
+                                                %allocations,
                                                 "evicted inactive allocations (still_candidates>0 ⇒ kick did not persist)"
                                             );
                                         }
@@ -1398,19 +1440,19 @@ impl FrameMaterializer {
                                 warn!(frame = frame_number, error = %e, "eviction (mutating) failed");
                             }
                         }
-                    } else if !candidates.is_empty() {
+                    } else if !scan.candidates.is_empty() {
                         // Identified but not evicted: name the gate that holds.
                         // Runs once per eviction pass, like the scan line above.
                         if !self.evictions_enabled {
                             info!(
                                 frame = frame_number,
-                                count = candidates.len(),
+                                count = scan.candidates.len(),
                                 "eviction candidates identified — evictions disabled on this node, not evicting"
                             );
                         } else {
                             info!(
                                 frame = frame_number,
-                                count = candidates.len(),
+                                count = scan.candidates.len(),
                                 activation_frame = GLOBAL_EVICTION_ACTIVATION_FRAME,
                                 "eviction candidates identified — activation frame not reached, not evicting yet"
                             );

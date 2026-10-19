@@ -1395,7 +1395,11 @@ impl ProverLifecycle {
         // back without, and that neither the local grid nor a recorded change
         // names, are left on a retired shard (a legacy merge moves only
         // committee members). They neither make the filter a shard nor its
-        // ancestors split parents, and our own are left.
+        // ancestors split parents, and our own are left. A filter under a
+        // shard the archives report frozen is a split child they have not
+        // executed yet, not a retired shard.
+        let frozen_parents: Vec<Vec<u8>> =
+            self.frozen_shards.read().map(|g| g.iter().cloned().collect()).unwrap_or_default();
         let retired: std::collections::HashSet<Vec<u8>> = self
             .settled_unsized_shards
             .read()
@@ -1403,6 +1407,7 @@ impl ProverLifecycle {
                 settled
                     .iter()
                     .filter(|f| !shards_store_filters.contains(*f) && !arriving_shards.contains(*f))
+                    .filter(|f| !frozen_parents.iter().any(|parent| is_split_parent(parent, std::iter::once(*f))))
                     .cloned()
                     .collect()
             })
@@ -6912,6 +6917,9 @@ mod proposal_loop_tests {
         let splitting = put_grid(&app, &[&[true]], Some((Split, parent.clone(), vec![retired.clone()])));
         assert!(!leaves(splitting).contains(&retired), "a recorded split creates it");
         assert!(!leaves(put_grid(&app, &[&[true, false]], None)).contains(&retired), "the local grid lists it");
+        lifecycle.set_frozen_shards([parent.clone()].into_iter().collect());
+        assert!(!leaves(merged.clone()).contains(&retired), "the archives have not executed the frozen parent's split");
+        lifecycle.set_frozen_shards(std::collections::HashSet::new());
         assert!(leaves(merged).contains(&retired), "no view lists it");
     }
 
