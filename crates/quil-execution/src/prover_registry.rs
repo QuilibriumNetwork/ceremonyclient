@@ -514,6 +514,27 @@ impl InMemoryProverRegistry {
             .collect()
     }
 
+    /// [`Self::get_provers`] over all of `filters`, each prover once, in
+    /// first-seen order.
+    pub fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> Vec<&ProverInfo> {
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut out: Vec<&ProverInfo> = Vec::new();
+        for filter in filters {
+            let Some(addrs) = self.filter_cache.get(filter) else {
+                continue;
+            };
+            for addr in addrs {
+                if !seen.insert(addr.as_slice()) {
+                    continue;
+                }
+                if let Some(info) = self.prover_cache.get(addr) {
+                    out.push(info);
+                }
+            }
+        }
+        out
+    }
+
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
@@ -2002,6 +2023,14 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         Ok(guard.get_provers(filter).into_iter().cloned().collect())
+    }
+
+    fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> QuilResult<Vec<ProverInfo>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard.get_provers_on_filters(filters).into_iter().cloned().collect())
     }
 
     fn get_leaf_root(
@@ -4400,6 +4429,44 @@ mod tests {
         assert!(!signed_frame_census_governs(activation + threshold - 1, threshold, activation));
         assert!(signed_frame_census_governs(activation + threshold, threshold, activation));
         assert!(!signed_frame_census_governs(u64::MAX - 1, threshold, u64::MAX));
+    }
+
+    #[test]
+    fn get_provers_on_filters_returns_each_prover_once() {
+        // 0xA1 holds two shards, 0xB2 one of them, 0xC3 the global
+        // committee; 0xD4 is registered on no listed filter.
+        let (shard_a, shard_b) = (vec![0x0Au8; 35], vec![0x0Bu8; 35]);
+        let mut reg = InMemoryProverRegistry::new();
+        for p in [0xA1u8, 0xB2, 0xC3, 0xD4] {
+            reg.prover_cache.insert(
+                vec![p; 32],
+                ProverInfo {
+                    public_key: vec![p; 897],
+                    address: vec![p; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: Vec::new(),
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: Vec::new(),
+                },
+            );
+        }
+        reg.filter_cache.insert(shard_a.clone(), vec![vec![0xA1u8; 32]]);
+        reg.filter_cache.insert(shard_b.clone(), vec![vec![0xA1u8; 32], vec![0xB2u8; 32]]);
+        reg.filter_cache.insert(Vec::new(), vec![vec![0xC3u8; 32]]);
+        let addresses = |filters: &[Vec<u8>]| {
+            let mut out: Vec<Vec<u8>> =
+                reg.get_provers_on_filters(filters).into_iter().map(|p| p.address.clone()).collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            addresses(&[Vec::new(), shard_a.clone(), shard_b.clone()]),
+            vec![vec![0xA1u8; 32], vec![0xB2u8; 32], vec![0xC3u8; 32]]
+        );
+        assert_eq!(addresses(&[shard_a.clone(), shard_a]), vec![vec![0xA1u8; 32]]);
+        assert!(addresses(&[vec![0x0Cu8; 35]]).is_empty());
     }
 
     #[test]

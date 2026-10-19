@@ -825,6 +825,20 @@ pub trait ProverRegistry: Send + Sync {
     fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>>;
     fn get_prover_count(&self, filter: &[u8]) -> Result<usize>;
     fn get_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
+    /// The provers of [`Self::get_provers`] over all of `filters` (the empty
+    /// filter is the global committee), each once. The default asks
+    /// `get_provers` per filter, cloning a prover once per filter it holds;
+    /// the persistent registry clones each prover once.
+    fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> Result<Vec<ProverInfo>> {
+        let mut by_address: std::collections::HashMap<Vec<u8>, ProverInfo> =
+            std::collections::HashMap::new();
+        for filter in filters {
+            for prover in self.get_provers(filter)? {
+                by_address.entry(prover.address.clone()).or_insert(prover);
+            }
+        }
+        Ok(by_address.into_values().collect())
+    }
     fn get_provers_by_status(
         &self,
         filter: &[u8],
