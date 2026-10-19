@@ -773,6 +773,9 @@ impl InMemoryProverRegistry {
     /// loses only that allocation, not its other allocations, status or
     /// seniority. Each shard keeps at least `MIN_SHARD_CONSENSUS_PROVERS`
     /// effectively-active allocations (see [`limit_evictions_to_shard_floor`]).
+    /// A stalled shard, one on which fewer than two thirds of the active
+    /// allocations are within the threshold, loses none (see
+    /// [`shard_progressing`]): inactivity there does not tell who votes.
     ///
     /// `shard_halt_durations` maps confirmation-filter bytes →
     /// number of frames the shard has been in a halt state. A value
@@ -799,7 +802,9 @@ impl InMemoryProverRegistry {
         // the two agree, and derived from the same committed registry state
         // the eviction pass reads below — deterministic across the fleet,
         // independent of the per-node coverage monitor / shard-size source.
-        let active_by_filter = self.active_allocations_by_filter(frame_number);
+        // The fresh count per shard drives the stall exemption.
+        let (active_by_filter, fresh_by_filter) =
+            self.eviction_census(frame_number, inactivity_threshold, shard_halt_durations);
 
         let mut stale: Vec<EvictionCandidate> = Vec::new();
         for info in self.prover_cache.values() {
@@ -863,6 +868,15 @@ impl InMemoryProverRegistry {
                 if shard_active <= quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS {
                     continue;
                 }
+                // Stall exemption: a shard that certified no frame within the
+                // threshold ages all its members alike, so none is selected.
+                let shard_fresh = fresh_by_filter
+                    .get(&alloc.confirmation_filter)
+                    .copied()
+                    .unwrap_or(0);
+                if !shard_progressing(shard_active, shard_fresh) {
+                    continue;
+                }
                 let halt_duration = shard_halt_durations
                     .get(&alloc.confirmation_filter)
                     .copied()
@@ -870,25 +884,10 @@ impl InMemoryProverRegistry {
                 if halt_duration == u64::MAX {
                     continue;
                 }
-                // The inactivity clock does not start until the network is
-                // considered live for eviction. A prover accrues no
-                // inactivity before then, so count from
-                // max(last_active, EVICTION_INACTIVITY_START_FRAME).
-                let inactivity_start = alloc
-                    .last_active_frame_number
-                    .max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
-                if alloc.last_active_frame_number == 0
-                    || frame_number <= inactivity_start
-                {
+                let Some(effective_inactive) =
+                    effective_inactivity(alloc, frame_number, halt_duration)
+                else {
                     continue;
-                }
-                let total_inactive = frame_number - inactivity_start;
-                let effective_inactive = if halt_duration == 0 {
-                    total_inactive
-                } else if halt_duration < total_inactive {
-                    total_inactive - halt_duration
-                } else {
-                    0
                 };
                 if effective_inactive > inactivity_threshold {
                     stale.push(EvictionCandidate {
@@ -904,23 +903,45 @@ impl InMemoryProverRegistry {
     }
 
     /// Effectively-active allocations per confirmation filter at
-    /// `frame_number` (empty filters excluded) — the census
-    /// [`Self::find_eviction_candidates`] applies its shard floor to.
-    fn active_allocations_by_filter(&self, frame_number: u64) -> HashMap<Vec<u8>, u64> {
+    /// `frame_number` (empty filters excluded), and how many of them are
+    /// fresh: at most `inactivity_threshold` frames inactive by
+    /// [`effective_inactivity`], with credit later than the join confirm
+    /// ([`credited_after_join`]). The census
+    /// [`Self::find_eviction_candidates`] applies its stall exemption and
+    /// shard floor to.
+    fn eviction_census(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+    ) -> (HashMap<Vec<u8>, u64>, HashMap<Vec<u8>, u64>) {
         let mut active_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut fresh_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
         for info in self.prover_cache.values() {
             for alloc in &info.allocations {
-                if alloc.confirmation_filter.is_empty() {
+                if alloc.confirmation_filter.is_empty()
+                    || alloc.effective_status(frame_number) != EffectiveStatus::Active
+                {
                     continue;
                 }
-                if alloc.effective_status(frame_number) == EffectiveStatus::Active {
-                    *active_by_filter
+                *active_by_filter
+                    .entry(alloc.confirmation_filter.clone())
+                    .or_insert(0) += 1;
+                let halt_duration = shard_halt_durations
+                    .get(&alloc.confirmation_filter)
+                    .copied()
+                    .unwrap_or(0);
+                if credited_after_join(alloc)
+                    && effective_inactivity(alloc, frame_number, halt_duration)
+                        .is_some_and(|inactive| inactive <= inactivity_threshold)
+                {
+                    *fresh_by_filter
                         .entry(alloc.confirmation_filter.clone())
                         .or_insert(0) += 1;
                 }
             }
         }
-        active_by_filter
+        (active_by_filter, fresh_by_filter)
     }
 
     /// No-op. Pruning orphan joins is disabled because non-deterministic
@@ -959,6 +980,66 @@ impl EvictionCandidate {
         self.prover_address == other.prover_address
             && self.confirmation_filter == other.confirmation_filter
     }
+}
+
+/// Frames of inactivity counted against `alloc` at `frame_number`, after
+/// `halt_duration` frames of halt credit, counted from [`inactivity_start`].
+/// `None` for an allocation never credited (`LastActiveFrameNumber` 0): it
+/// accrues no inactivity and is not fresh either.
+fn effective_inactivity(
+    alloc: &ProverAllocationInfo,
+    frame_number: u64,
+    halt_duration: u64,
+) -> Option<u64> {
+    if alloc.last_active_frame_number == 0 {
+        return None;
+    }
+    Some(frame_number.saturating_sub(inactivity_start(alloc)).saturating_sub(halt_duration))
+}
+
+/// First frame from which `alloc` accrues inactivity: its last activity
+/// credit, but not before the network is considered live for eviction
+/// (EVICTION_INACTIVITY_START_FRAME), nor before its activation. A joined
+/// allocation enters its committee at the first frame of the epoch after its
+/// join confirm and cannot sign a frame before then, while the confirm's own
+/// credit is already most of an epoch old at that boundary's eviction pass.
+pub fn inactivity_start(alloc: &ProverAllocationInfo) -> u64 {
+    let mut start = alloc
+        .last_active_frame_number
+        .max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
+    if alloc.join_confirm_frame_number > 0 {
+        let activation = (quil_types::consensus::epoch_for_frame(alloc.join_confirm_frame_number) + 1)
+            .saturating_mul(quil_types::consensus::epoch_length_frames());
+        start = start.max(activation);
+    }
+    start
+}
+
+/// Whether `alloc`'s activity credit postdates its join confirm. The confirm
+/// writes `LastActiveFrameNumber` itself, so credit no later than it says
+/// nothing about signing frames and does not count as fresh.
+pub fn credited_after_join(alloc: &ProverAllocationInfo) -> bool {
+    alloc.last_active_frame_number > alloc.join_confirm_frame_number
+}
+
+/// Whether a shard with `active` effectively-active allocations, `fresh` of
+/// them within the inactivity threshold, is progressing: `fresh` is at least
+/// two thirds of `active`. `LastActiveFrameNumber` advances on confirms and
+/// for the signers of each finalized app frame GLOBAL includes, which needs
+/// signatures from two thirds of the shard's active members. A committee
+/// below that quorum certifies nothing, so its voting and absent members age
+/// alike and eviction could only pick by address; it skips such a stalled
+/// shard. A frame included within the threshold credited two thirds of the
+/// members, so a producing shard stays eligible.
+///
+/// A join confirm's own credit is not fresh ([`credited_after_join`]).
+/// Limitation: an epoch re-confirm records no frame of its own, so a stalled
+/// shard on which two thirds of the members re-confirmed within the threshold
+/// reads as progressing. Errors the other way only exempt a shard: a committee
+/// grown since its last frame, or credited signers now `Leaving`, lowers the
+/// fresh share.
+pub fn shard_progressing(active: u64, fresh: u64) -> bool {
+    u128::from(fresh) * 3 >= u128::from(active) * 2
 }
 
 /// Keep, per shard, at most `active − MIN_SHARD_CONSENSUS_PROVERS` of the
@@ -1388,8 +1469,10 @@ impl SharedProverRegistry {
     /// prover left without active allocations stays a registered prover
     /// with nothing allocated, like one whose allocations all expired, and
     /// may join shards again: only a prover-level KickFrameNumber bars a
-    /// re-join, and an allocation with Status=4 is re-joinable. Returns the
-    /// allocations that were kicked.
+    /// re-join, and an allocation with Status=4 is re-joinable. The selection
+    /// is [`InMemoryProverRegistry::find_eviction_candidates`]'s: stalled and
+    /// under-provisioned shards are exempt, and each shard keeps its floor.
+    /// Returns the allocations that were kicked.
     ///
     /// Mirrors the role of Go `ProverRegistry.EvictInactiveProvers`
     /// (`node/consensus/provers/prover_registry.go:2110-2201`), which kicks
@@ -2925,6 +3008,63 @@ mod tests {
         }
     }
 
+    /// Seed `count` fresh Active provers, each with one allocation on every
+    /// filter in `filters`, last active at `frame`. Addresses are
+    /// `[tag; 30] ++ [0, i]` for provers and `[tag; 30] ++ [1 + k, i]` for
+    /// their allocation on `filters[k]`, outside the single-byte keys of
+    /// `make_vertex_key`, so a shard can hold enough fresh members to read
+    /// as progressing.
+    fn seed_fresh_members(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filters: &[&[u8]],
+        frame: u64,
+        count: u8,
+        tag: u8,
+    ) {
+        let address_and_key = |hi: u8, lo: u8| -> (Vec<u8>, Vec<u8>) {
+            let mut address = vec![tag; 30];
+            address.extend_from_slice(&[hi, lo]);
+            let mut key = vec![0xFFu8; 32];
+            key.extend_from_slice(&address);
+            (address, key)
+        };
+        for i in 0..count {
+            let (address, prover_key) = address_and_key(0, i);
+            let prover = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ]);
+            store
+                .save_vertex_underlying("vertex", "adds", shard, &prover_key, &prover)
+                .unwrap();
+            for (k, filter) in filters.iter().enumerate() {
+                let (_, alloc_key) = address_and_key(1 + k as u8, i);
+                let alloc = build_sub_tree(vec![
+                    type_hash_leaf("allocation:ProverAllocation"),
+                    field_leaf("allocation:ProverAllocation", "Prover", address.clone()),
+                    field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                    field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.to_vec()),
+                    field_leaf(
+                        "allocation:ProverAllocation",
+                        "LastActiveFrameNumber",
+                        frame.to_be_bytes().to_vec(),
+                    ),
+                    field_leaf(
+                        "allocation:ProverAllocation",
+                        "Epoch",
+                        quil_types::consensus::epoch_for_frame(frame).to_be_bytes().to_vec(),
+                    ),
+                ]);
+                store
+                    .save_vertex_underlying("vertex", "adds", shard, &alloc_key, &alloc)
+                    .unwrap();
+            }
+        }
+    }
+
     /// Seed an Active prover vertex keyed `make_vertex_key(prover_byte)`.
     fn seed_prover(store: &RocksHypergraphStore, shard: &ShardKey, prover_byte: u8, seniority: u64) {
         let prover = build_sub_tree(vec![
@@ -3678,12 +3818,15 @@ mod tests {
         let cur_epoch = quil_types::consensus::epoch_for_frame(frame);
         let filter = vec![0x44u8; 64];
 
-        // Build `n` effectively-active but long-INACTIVE provers on one shard
-        // and return the eviction candidate set.
-        let candidates_for = |n: u8| -> Vec<EvictionCandidate> {
+        // Build `stale` effectively-active but long-INACTIVE provers and
+        // `fresh` freshly active ones on one shard and return the eviction
+        // candidate set. Two thirds fresh keeps the shard progressing, so only
+        // the quorum census decides.
+        let candidates_for = |stale: u8, fresh: u8| -> Vec<EvictionCandidate> {
             let (_tmp, store) = temp_store();
             let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
-            for i in 0..n {
+            for i in 0..stale + fresh {
+                let last_active = if i < stale { 100u64 } else { frame };
                 let addr = [0x10u8 + i; 32];
                 let prover = build_sub_tree(vec![
                     type_hash_leaf("prover:Prover"),
@@ -3698,8 +3841,8 @@ mod tests {
                     field_leaf("allocation:ProverAllocation", "Prover", addr.to_vec()),
                     field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
                     field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
-                    // Idle since before the inactivity-start frame → past threshold.
-                    field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+                    // Stale: idle since before the inactivity-start frame → past threshold.
+                    field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", last_active.to_be_bytes().to_vec()),
                     field_leaf("allocation:ProverAllocation", "Epoch", cur_epoch.to_be_bytes().to_vec()),
                 ]);
                 store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x10 + i), &prover).unwrap();
@@ -3714,8 +3857,8 @@ mod tests {
         let min = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8;
 
         // One prover below quorum: the shard can't run consensus → all exempt,
-        // even though every prover is long past the inactivity threshold.
-        let below = candidates_for(min - 1);
+        // even though its stale prover is long past the inactivity threshold.
+        let below = candidates_for(1, min - 2);
         assert!(
             below.is_empty(),
             "an under-provisioned shard (below consensus quorum) must not evict anyone"
@@ -3723,15 +3866,15 @@ mod tests {
 
         // At quorum: the shard can run consensus, but evicting anyone would
         // take it below the floor, so no one is selected.
-        let at = candidates_for(min);
+        let at = candidates_for(1, min - 1);
         assert!(at.is_empty(), "a shard exactly at the floor has nothing to evict");
 
-        // Above quorum: only the surplus over the floor is evictable.
-        let above = candidates_for(min + 2);
+        // Above quorum: the stale provers are evictable.
+        let above = candidates_for(2, min);
         assert_eq!(
             above.len(),
             2,
-            "only the shard's surplus over MIN_SHARD_CONSENSUS_PROVERS is evictable"
+            "a progressing shard above MIN_SHARD_CONSENSUS_PROVERS loses its stale provers"
         );
     }
 
@@ -3742,25 +3885,29 @@ mod tests {
         // the prover_cache HashMap. Two archives with the same state but
         // different insert order must select the identical set — otherwise they
         // mutate the prover tree differently and their prover roots diverge.
-        // This covers the floor's choice among tied allocations and a prover
-        // with stale allocations on two shards.
+        // This covers the stall exemption and a prover with stale allocations
+        // on two shards.
         let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
         let frame = start + 5000;
         let filter_a = vec![0x44u8; 64];
         let filter_b = vec![0x55u8; 64];
+        let filter_c = vec![0x66u8; 64];
 
         // (vertex key byte, Some((prover byte, filter, last_active)) for an
         // allocation, None for a prover vertex).
         type SeedWrite = (u8, Option<(u8, Vec<u8>, u64)>);
         let mut writes: Vec<SeedWrite> = Vec::new();
-        // Shard A: six members. 0x21 is the most inactive; 0x20, 0x22, 0x23
-        // tie; 0x24, 0x25 are fresh. Floor 4 → two may go: 0x21, then the
-        // lowest-addressed of the tie, 0x20.
-        let shard_a = [(0x20u8, start + 1000), (0x21, start + 100), (0x22, start + 1000),
-            (0x23, start + 1000), (0x24, frame), (0x25, frame)];
-        for (p, last_active) in shard_a {
+        // Shard A: nine members. 0x20, 0x21, 0x22 are stale; 0x23..=0x28 are
+        // fresh, so the shard is progressing and all three stale ones go.
+        let mut members = vec![(0x20u8, start + 1000), (0x21, start + 100), (0x22, start + 1000)];
+        members.extend((0x23u8..0x29).map(|p| (p, frame)));
+        // Shard C: six members, all equally stale. The shard is stalled, so
+        // none goes (the floor alone would take two, by address).
+        members.extend((0x50u8..0x56).map(|p| (p, start + 1000)));
+        for (p, last_active) in members {
+            let filter = if p < 0x50 { filter_a.clone() } else { filter_c.clone() };
             writes.push((p, None));
-            writes.push((p + 0x80, Some((p, filter_a.clone(), last_active))));
+            writes.push((p + 0x80, Some((p, filter, last_active))));
         }
         // Shard B: 0x22's second allocation (stale) plus four fresh members.
         // Floor 4 → only 0x22 may go.
@@ -3805,12 +3952,243 @@ mod tests {
             vec![
                 (vec![0x20u8; 32], filter_a.clone()),
                 (vec![0x21u8; 32], filter_a.clone()),
+                (vec![0x22u8; 32], filter_a.clone()),
                 (vec![0x22u8; 32], filter_b.clone()),
             ],
-            "most inactive first, ties by address, per shard; sorted by (prover, filter)"
+            "stale allocations of progressing shards only; sorted by (prover, filter)"
         );
         assert_eq!(a, b, "eviction set must not depend on insert order (fwd vs rev)");
         assert_eq!(a, c, "eviction set must not depend on insert order (fwd vs interleaved)");
+    }
+
+    /// Seed one prover per `(prover byte, last_active)` member on `filter`,
+    /// each allocation keyed `prover byte + 0x80` and current for `frame`.
+    fn seed_members(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filter: &[u8],
+        members: &[(u8, u64)],
+        frame: u64,
+    ) {
+        for &(p, last_active) in members {
+            seed_prover(store, shard, p, 0);
+            seed_allocation(store, shard, p, p + 0x80, filter, last_active, frame);
+        }
+    }
+
+    fn selected_pairs(candidates: &[EvictionCandidate]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        candidates
+            .iter()
+            .map(|c| (c.prover_address.clone(), c.confirmation_filter.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn find_eviction_candidates_exempts_stalled_shard() {
+        // A committee below voting quorum certifies no frame, so every member
+        // ages alike, voters and absentees. Six members, all last active at
+        // the same frame, long past the threshold, above the floor: inactivity
+        // cannot tell who votes, so none is selected.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let frame = start + 5000;
+        let filter = vec![0x47u8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let members: Vec<(u8, u64)> = (0x10u8..0x16).map(|p| (p, start + 100)).collect();
+        seed_members(&store, &shard, &filter, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert!(reg.find_eviction_candidates(frame, 500, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn find_eviction_candidates_evicts_only_on_progressing_shards() {
+        // Shard P produces: four of its six members are fresh, so its two
+        // stale members go. Shard S has three fresh members of seven, below
+        // two thirds: it is stalled and keeps all its members.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let frame = start + 5000;
+        let filter_p = vec![0x48u8; 64];
+        let filter_s = vec![0x49u8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut producing = vec![(0x10u8, start + 100), (0x11, start + 1000)];
+        producing.extend((0x12u8..0x16).map(|p| (p, frame - 100)));
+        seed_members(&store, &shard, &filter_p, &producing, frame);
+        let mut stalled: Vec<(u8, u64)> = (0x20u8..0x24).map(|p| (p, start + 100)).collect();
+        stalled.extend((0x24u8..0x27).map(|p| (p, frame - 100)));
+        seed_members(&store, &shard, &filter_s, &stalled, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(
+            selected_pairs(&reg.find_eviction_candidates(frame, 500, &HashMap::new())),
+            vec![(vec![0x10u8; 32], filter_p.clone()), (vec![0x11u8; 32], filter_p.clone())]
+        );
+    }
+
+    /// Seed one prover whose allocation on `filter` was join-confirmed at
+    /// `join_confirm`, last active at `last_active`, keyed `prover byte + 0x80`
+    /// and current for `frame`.
+    fn seed_joined_member(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filter: &[u8],
+        prover_byte: u8,
+        join_confirm: u64,
+        last_active: u64,
+        frame: u64,
+    ) {
+        seed_prover(store, shard, prover_byte, 0);
+        let alloc = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", vec![prover_byte; 32]),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.to_vec()),
+            field_leaf(
+                "allocation:ProverAllocation",
+                "JoinConfirmFrameNumber",
+                join_confirm.to_be_bytes().to_vec(),
+            ),
+            field_leaf(
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber",
+                last_active.to_be_bytes().to_vec(),
+            ),
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                quil_types::consensus::epoch_for_frame(frame).to_be_bytes().to_vec(),
+            ),
+        ]);
+        store
+            .save_vertex_underlying(
+                "vertex",
+                "adds",
+                shard,
+                &make_vertex_key(prover_byte + 0x80),
+                &alloc,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn find_eviction_candidates_spares_newly_activated_allocation() {
+        // 0x30 was join-confirmed early in the previous epoch and activates at
+        // this epoch's first frame, where the eviction pass runs. Its only
+        // credit is the confirm, ~710 frames old, yet it could not sign a
+        // frame before now: its inactivity counts from activation. Six fresh
+        // members keep the shard progressing.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let len = quil_types::consensus::epoch_length_frames();
+        let activation = (quil_types::consensus::epoch_for_frame(start) + 10) * len;
+        let join_confirm = activation - len + 10;
+        let filter = vec![0x4Au8; 64];
+        let candidates_at = |fresh_last_active: u64, frame: u64| -> Vec<EvictionCandidate> {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            let members: Vec<(u8, u64)> = (0x10u8..0x16).map(|p| (p, fresh_last_active)).collect();
+            seed_members(&store, &shard, &filter, &members, frame);
+            seed_joined_member(&store, &shard, &filter, 0x30, join_confirm, join_confirm, frame);
+            let mut reg = InMemoryProverRegistry::new();
+            reg.refresh(store.as_ref()).unwrap();
+            reg.find_eviction_candidates(frame, 500, &HashMap::new())
+        };
+        assert!(
+            candidates_at(activation - 10, activation).is_empty(),
+            "an allocation is not stale at its activation"
+        );
+        assert!(candidates_at(activation + 400, activation + 500).is_empty());
+        assert_eq!(
+            selected_pairs(&candidates_at(activation + 400, activation + 501)),
+            vec![(vec![0x30u8; 32], filter.clone())],
+            "stale once it stays idle past the threshold after activation"
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_does_not_count_join_confirm_credit_as_fresh() {
+        // Four members were join-confirmed late in the previous epoch and have
+        // signed nothing since; two more are long stale. Credit from a join
+        // confirm proves no signing, so no member is fresh: the shard is
+        // stalled and keeps everyone.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let len = quil_types::consensus::epoch_length_frames();
+        let activation = (quil_types::consensus::epoch_for_frame(start) + 10) * len;
+        let join_confirm = activation - 100;
+        let frame = activation + 100;
+        let filter = vec![0x4Bu8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        seed_members(&store, &shard, &filter, &[(0x10, start + 100), (0x11, start + 100)], frame);
+        for p in 0x20u8..0x24 {
+            seed_joined_member(&store, &shard, &filter, p, join_confirm, join_confirm, frame);
+        }
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert!(reg.find_eviction_candidates(frame, 500, &HashMap::new()).is_empty());
+
+        // Once they sign a frame after joining, they are fresh and the shard
+        // progresses: the two stale members go.
+        let (_tmp, store) = temp_store();
+        seed_members(&store, &shard, &filter, &[(0x10, start + 100), (0x11, start + 100)], frame);
+        for p in 0x20u8..0x24 {
+            seed_joined_member(&store, &shard, &filter, p, join_confirm, activation + 50, frame);
+        }
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(
+            selected_pairs(&reg.find_eviction_candidates(frame, 500, &HashMap::new())),
+            vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())]
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_stall_boundary_is_two_thirds_fresh() {
+        assert!(shard_progressing(6, 4));
+        assert!(!shard_progressing(6, 3));
+        assert!(shard_progressing(u64::MAX, u64::MAX));
+        // Six members on one shard: `fresh` exactly at the threshold (500
+        // frames inactive), the rest one frame past it.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let frame = start + 5000;
+        let filter = vec![0x4Au8; 64];
+        let candidates_for = |fresh: u8| -> Vec<EvictionCandidate> {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            let members: Vec<(u8, u64)> = (0..6u8)
+                .map(|i| (0x10 + i, if i < fresh { frame - 500 } else { frame - 501 }))
+                .collect();
+            seed_members(&store, &shard, &filter, &members, frame);
+            let mut reg = InMemoryProverRegistry::new();
+            reg.refresh(store.as_ref()).unwrap();
+            reg.find_eviction_candidates(frame, 500, &HashMap::new())
+        };
+        // fresh·3 == active·2: progressing, both stale members go.
+        assert_eq!(candidates_for(4).len(), 2);
+        // One fewer fresh: stalled, none goes.
+        assert!(candidates_for(3).is_empty());
+    }
+
+    #[test]
+    fn find_eviction_candidates_reads_reconfirmed_stalled_shard_as_progressing() {
+        // Documented limitation: a confirm credits `LastActiveFrameNumber`
+        // like a frame does, so a stalled shard on which two thirds of the
+        // members confirmed within the threshold reads as progressing and
+        // its other members are selected.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let frame = start + 5000;
+        let filter = vec![0x4Bu8; 64];
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut members = vec![(0x10u8, start + 100), (0x11, start + 100)];
+        members.extend((0x12u8..0x16).map(|p| (p, frame - 10)));
+        seed_members(&store, &shard, &filter, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(
+            selected_pairs(&reg.find_eviction_candidates(frame, 500, &HashMap::new())),
+            vec![(vec![0x10u8; 32], filter.clone()), (vec![0x11u8; 32], filter.clone())]
+        );
     }
 
     #[test]
@@ -4238,50 +4616,33 @@ mod tests {
     fn eviction_keeps_shard_floor_most_inactive_first() {
         // Six members, three stale. Floor 4 → only two go: the two most
         // inactive (0x11, 0x12), not the lowest-addressed stale one (0x10).
-        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
-        let frame = start + 5000;
+        // The stall exemption leaves at most a third of a shard stale, which
+        // a shard above a floor of 4 can always spare, so the order is
+        // tested on the floor directly.
         let filter = vec![0x46u8; 64];
-        let (_tmp, store) = temp_store();
-        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
-        let members = [
-            (0x10u8, start + 2000), // 3000 inactive
-            (0x11, start + 100),    // 4900 inactive (most)
-            (0x12, start + 500),    // 4500 inactive
-            (0x13, frame),
-            (0x14, frame),
-            (0x15, frame),
-        ];
-        for (p, last_active) in members {
-            seed_prover(&store, &shard, p, 0);
-            seed_allocation(&store, &shard, p, p + 0x80, &filter, last_active, frame);
-        }
-        let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(store.as_ref()).unwrap();
-        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
-
-        let picked = |candidates: &Vec<EvictionCandidate>| -> Vec<Vec<u8>> {
-            candidates.iter().map(|c| c.prover_address.clone()).collect()
+        let candidate = |p: u8, effective_inactive: u64| EvictionCandidate {
+            prover_address: vec![p; 32],
+            confirmation_filter: filter.clone(),
+            vertex_address: vec![p + 0x80; 32],
+            effective_inactive,
         };
-        let expected = vec![vec![0x11u8; 32], vec![0x12u8; 32]];
-        assert_eq!(picked(&shared.find_eviction_candidates(frame, 500, &halts)), expected);
-
-        let state = empty_state();
-        let evicted = shared
-            .evict_inactive_provers(frame, 500, &halts, &state, Some(store.as_ref()))
-            .unwrap();
-        assert_eq!(picked(&evicted), expected);
-        // The shard is now at the floor: nothing further is selected, and the
-        // remaining stale member keeps its active allocation.
-        assert!(shared.find_eviction_candidates(frame, 500, &halts).is_empty());
-        let kept = shared.get_prover_info(&[0x10u8; 32]).unwrap().unwrap();
-        assert_eq!(kept.allocations[0].status, ProverStatus::Active);
+        let stale = vec![candidate(0x10, 3000), candidate(0x11, 4900), candidate(0x12, 4500)];
+        let census: HashMap<Vec<u8>, u64> = [(filter.clone(), 6)].into_iter().collect();
+        let picked: Vec<Vec<u8>> = limit_evictions_to_shard_floor(stale.clone(), &census)
+            .into_iter()
+            .map(|c| c.prover_address)
+            .collect();
+        assert_eq!(picked, vec![vec![0x11u8; 32], vec![0x12u8; 32]]);
+        // A shard at the floor has nothing to spare.
+        let at_floor: HashMap<Vec<u8>, u64> = [(filter.clone(), 4)].into_iter().collect();
+        assert!(limit_evictions_to_shard_floor(stale, &at_floor).is_empty());
     }
 
     #[test]
     fn evict_cap_counts_allocations() {
-        // 20 provers, each stale on two shards → 40 stale allocations, all
-        // above the floor. The per-frame cap of 25 counts allocations, not
-        // provers.
+        // 20 provers, each stale on two shards, and 40 fresh members on both,
+        // so each shard is progressing → 40 stale allocations, all above the
+        // floor. The per-frame cap of 25 counts allocations, not provers.
         let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
         let filter_a = vec![0x61u8; 64];
         let filter_b = vec![0x62u8; 64];
@@ -4292,8 +4653,8 @@ mod tests {
             seed_allocation(&store, &shard, i, 0x20 + i, &filter_a, 100, frame);
             seed_allocation(&store, &shard, i, 0xA0 + i, &filter_b, 100, frame);
         }
-        seed_shard_floor(&store, &shard, &filter_a, frame, 0xE0);
-        seed_shard_floor(&store, &shard, &filter_b, frame, 0xF0);
+        let filters = [filter_a.as_slice(), filter_b.as_slice()];
+        seed_fresh_members(&store, &shard, &filters, frame, 40, 0x5A);
 
         let shared = SharedProverRegistry::new();
         shared.refresh_from_store(store.as_ref()).unwrap();
@@ -4548,6 +4909,15 @@ mod tests {
             store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(i), &prover_bytes).unwrap();
             store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(i.wrapping_add(128)), &alloc_bytes).unwrap();
         }
+        // 80 fresh members keep the shard progressing (two thirds fresh).
+        seed_fresh_members(
+            &store,
+            &shard,
+            &[shared_filter.as_slice()],
+            quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+            80,
+            0x5A,
+        );
 
         let shared = SharedProverRegistry::new();
         shared.refresh_from_store(store.as_ref()).unwrap();

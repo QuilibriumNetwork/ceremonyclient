@@ -17,7 +17,10 @@ use base64::Engine as _;
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 
-use quil_execution::prover_registry::{limit_evictions_to_shard_floor, EvictionCandidate};
+use quil_execution::prover_registry::{
+    credited_after_join, inactivity_start, limit_evictions_to_shard_floor, shard_progressing,
+    EvictionCandidate,
+};
 use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverStatus};
 use quil_types::error::QuilError;
 use quil_types::protojson;
@@ -897,16 +900,13 @@ fn assess_allocation(
         return None; // shard fully halted — exempt this tick
     }
     // Inactivity does not start accruing until the network is live for
-    // eviction — count from max(last_active, EVICTION_INACTIVITY_START_FRAME)
-    // so nobody is surfaced for downtime predating that frame. Mirrors the
-    // consensus path's `find_eviction_candidates`.
-    let inactivity_start = alloc
-        .last_active_frame_number
-        .max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
-    if alloc.last_active_frame_number == 0 || frame <= inactivity_start {
+    // eviction, nor before the allocation's activation — the evictor's own
+    // `inactivity_start`, so nobody is surfaced for downtime predating either.
+    let start = inactivity_start(alloc);
+    if alloc.last_active_frame_number == 0 || frame <= start {
         return None;
     }
-    let total_inactive = frame - inactivity_start;
+    let total_inactive = frame - start;
     let effective_inactive = if halt_duration == 0 {
         total_inactive
     } else if halt_duration < total_inactive {
@@ -934,6 +934,39 @@ fn active_allocations_by_filter(provers: &[ProverInfo], frame: u64) -> HashMap<V
                 continue;
             }
             if alloc.effective_status(frame) == EffectiveStatus::Active {
+                *m.entry(alloc.confirmation_filter.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    m
+}
+
+/// Of the census allocations, those at most `threshold` frames inactive per
+/// `assess_allocation`, keyed by confirmation filter: the fresh count the
+/// evictor's stall exemption (`shard_progressing`) uses. A never-credited
+/// allocation (last active 0), or one credited only by its join confirm
+/// (`credited_after_join`), is not fresh; `None` otherwise means not yet
+/// inactive, or a shard exempt anyway.
+fn fresh_allocations_by_filter(
+    provers: &[ProverInfo],
+    frame: u64,
+    halts: &HashMap<Vec<u8>, u64>,
+    active_by_filter: &HashMap<Vec<u8>, u64>,
+    threshold: u64,
+) -> HashMap<Vec<u8>, u64> {
+    let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
+    for p in provers {
+        for alloc in &p.allocations {
+            if alloc.confirmation_filter.is_empty()
+                || alloc.effective_status(frame) != EffectiveStatus::Active
+                || alloc.last_active_frame_number == 0
+                || !credited_after_join(alloc)
+            {
+                continue;
+            }
+            if assess_allocation(alloc, frame, halts, active_by_filter)
+                .is_none_or(|a| a.effective_inactive <= threshold)
+            {
                 *m.entry(alloc.confirmation_filter.clone()).or_insert(0) += 1;
             }
         }
@@ -993,6 +1026,9 @@ struct EvictionRiskEntry {
     frames_until_eviction: u64,
     risk_ratio: f64,
     eviction_pending: bool,
+    /// At least two thirds of the shard's active allocations are within the
+    /// threshold; a stalled shard's allocations are never pending.
+    shard_progressing: bool,
 }
 
 pub async fn handle_eviction_risk(
@@ -1014,11 +1050,19 @@ pub async fn handle_eviction_risk(
 
     let provers = all_provers(&state, frame);
     let active_by_filter = active_allocations_by_filter(&provers, frame);
+    let fresh_by_filter =
+        fresh_allocations_by_filter(&provers, frame, &halts, &active_by_filter, threshold);
+    let progressing = |filter: &[u8]| {
+        shard_progressing(
+            active_by_filter.get(filter).copied().unwrap_or(0),
+            fresh_by_filter.get(filter).copied().unwrap_or(0),
+        )
+    };
 
     let mut entries: Vec<EvictionRiskEntry> = Vec::new();
-    // Every allocation past the threshold, before the shard floor and
-    // regardless of `min_ratio`, so `eviction_pending` matches the
-    // evictor's selection.
+    // Every allocation past the threshold on a progressing shard, before the
+    // shard floor and regardless of `min_ratio`, so `eviction_pending`
+    // matches the evictor's selection.
     let mut stale: Vec<EvictionCandidate> = Vec::new();
     for prover in &provers {
         if prover.status != ProverStatus::Active {
@@ -1028,7 +1072,8 @@ pub async fn handle_eviction_risk(
             let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) else {
                 continue;
             };
-            if a.effective_inactive > threshold {
+            let on_progressing_shard = progressing(&alloc.confirmation_filter);
+            if a.effective_inactive > threshold && on_progressing_shard {
                 stale.push(EvictionCandidate {
                     prover_address: prover.address.clone(),
                     confirmation_filter: alloc.confirmation_filter.clone(),
@@ -1053,8 +1098,10 @@ pub async fn handle_eviction_risk(
                 eviction_threshold: threshold,
                 frames_until_eviction: threshold.saturating_sub(a.effective_inactive),
                 risk_ratio,
-                // Set below: past the threshold AND within the shard floor.
+                // Set below: past the threshold on a progressing shard AND
+                // within the shard floor.
                 eviction_pending: false,
+                shard_progressing: on_progressing_shard,
             });
         }
     }
@@ -2100,6 +2147,51 @@ mod tests {
     }
 
     #[test]
+    fn fresh_census_feeds_the_evictor_stall_rule() {
+        // Shard 0xAA: four members at exactly the threshold and two stale →
+        // progressing. Shard 0xBB: three fresh, three stale → stalled. Shard
+        // 0xCC: a never-credited member (last active 0) is active, not fresh.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let frame = start + 5000;
+        let threshold = crate::EVICTION_THRESHOLD_FRAMES;
+        let member = |filter: u8, last_active: u64| ProverInfo {
+            public_key: vec![],
+            address: vec![],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![active_alloc(vec![filter], last_active)],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let mut provers = Vec::new();
+        for (filter, last_active, count) in [
+            (0xAAu8, frame - threshold, 4),
+            (0xAA, start + 100, 2),
+            (0xBB, frame, 3),
+            (0xBB, start + 100, 3),
+            (0xCC, frame, 2),
+            (0xCC, 0, 1),
+        ] {
+            for _ in 0..count {
+                provers.push(member(filter, last_active));
+            }
+        }
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let active = active_allocations_by_filter(&provers, frame);
+        let fresh = fresh_allocations_by_filter(&provers, frame, &halts, &active, threshold);
+        let census = |filter: u8| {
+            let get = |m: &HashMap<Vec<u8>, u64>| m.get(&vec![filter]).copied().unwrap_or(0);
+            (get(&active), get(&fresh))
+        };
+        assert_eq!(census(0xAA), (6, 4));
+        assert_eq!(census(0xBB), (6, 3));
+        assert_eq!(census(0xCC), (3, 2));
+        assert!(shard_progressing(6, 4));
+        assert!(!shard_progressing(6, 3));
+    }
+
+    #[test]
     fn eviction_risk_entry_runway_and_flag() {
         // 350 frames inactive, threshold 360 -> 10 frames runway, not yet evictable.
         let threshold = crate::EVICTION_THRESHOLD_FRAMES;
@@ -2118,6 +2210,7 @@ mod tests {
             frames_until_eviction: threshold.saturating_sub(effective),
             risk_ratio: effective as f64 / threshold as f64,
             eviction_pending: effective > threshold,
+            shard_progressing: true,
         };
         assert_eq!(entry.frames_until_eviction, 10);
         assert!(!entry.eviction_pending);
