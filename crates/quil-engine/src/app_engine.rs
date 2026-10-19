@@ -4524,9 +4524,32 @@ impl AppConsensusEngine {
         if let (Some(session), Some(manager)) = (session.as_ref(), self.execution_engine.clone()) {
             let validator = self.frame_validator();
             let recovered = crate::app_history_recovery::recover(
-                session, manager, self.clock_store.clone(), validator,
+                session, manager.clone(), self.clock_store.clone(), validator.clone(),
                 self.delivery_frame_source.as_ref(), self.last_materialized_frame,
             ).await;
+            // The next header's accumulator field reads the carry window below
+            // the tip, which a member that joined at the tip never executed.
+            if matches!(recovered, Ok(true)) {
+                let cursor = self.last_materialized_frame;
+                match crate::app_history_recovery::recover_carry_window(
+                    &filter, manager, self.clock_store.clone(), validator,
+                    self.delivery_frame_source.as_ref(), cursor,
+                ).await {
+                    Ok((0, None)) => {}
+                    Ok((frames, None)) => info!(core_id = self.core_id, filter = hex::encode(&filter), cursor, frames,
+                        "recovered the accumulator records of the carry window below this member's tip from certified headers"),
+                    Ok((frames, Some(frame))) => warn!(core_id = self.core_id, filter = hex::encode(&filter), cursor, frames,
+                        unresolved_frame = frame, scope = "this node",
+                        action = "this member declines the next header's accumulator field until a heartbeat or a later \
+                            carried report decides it; report it with this line if the shard stalls",
+                        "accumulator carry window below this member's tip not decided by certified headers"),
+                    Err(error) => warn!(core_id = self.core_id, filter = hex::encode(&filter), cursor, %error,
+                        scope = "this node",
+                        action = "this member declines the next header's accumulator field; the next consensus start retries; \
+                            report it with this line if the shard stalls",
+                        "accumulator carry window below this member's tip not recovered"),
+                }
+            }
             // A completed batch may have corrected old records. No host is
             // running yet, so its parent/history cache will be built afresh.
             self.frame_outflows.lock().unwrap_or_else(|e| e.into_inner()).clear();

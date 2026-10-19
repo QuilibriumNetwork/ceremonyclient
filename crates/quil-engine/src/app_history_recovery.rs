@@ -650,6 +650,166 @@ async fn recover_with_headers(
     Ok(progress.done == expected_cursor)
 }
 
+/// Fill the accumulator records of the carry window below this member's tip
+/// that it never executed or recovered, from authenticated headers only.
+///
+/// The field of header `cursor + 1` reads the reports of frames
+/// `cursor - CARRY_WINDOW_FRAMES ..= cursor`
+/// ([`crate::app_engine::accumulator_field`]). A member that joined at or near
+/// the tip holds no record below its first executed or recovered frame: an
+/// archive bootstrap replays only its anchor, and [`recover`] audits only a
+/// session's own frames. Its fee and settlement checks still pass from the
+/// certified relay windows it adopted, so it nullifies every next header over
+/// the accumulator field alone, and the heartbeat that would settle the field
+/// is never reached while too many members do so.
+///
+/// A missing frame `k` is resolved by the rules [`recover`] applies: header
+/// `k + 1` carries its report or is a heartbeat; header `k + 1`'s pre-state
+/// roots equal a state whose report is known (this member's committed tip);
+/// or a later header omitted a nonempty report, which fixes the frames of its
+/// carry window. Anything else stays unknown. Existing records are never
+/// replaced, and one that contradicts the certified headers fails the whole
+/// batch. Returns the frames written and the first frame left unresolved.
+pub async fn recover_carry_window(
+    filter: &[u8],
+    manager: Arc<ExecutionEngineManager>,
+    clock: Arc<dyn ClockStore>,
+    validator: Arc<BlsAppFrameValidator>,
+    source: Option<&DeliveryFrameSource>,
+    cursor: u64,
+) -> Result<(usize, Option<u64>)> {
+    let headers = Headers {
+        filter,
+        clock: clock.as_ref(),
+        validator: validator.as_ref(),
+        source,
+    };
+    recover_carry_window_with_headers(filter, manager, clock.as_ref(), &headers, cursor).await
+}
+
+async fn recover_carry_window_with_headers(
+    filter: &[u8],
+    manager: Arc<ExecutionEngineManager>,
+    clock: &dyn ClockStore,
+    headers: &dyn VerifiedHeaders,
+    cursor: u64,
+) -> Result<(usize, Option<u64>)> {
+    if cursor <= 1 {
+        return Ok((0, None));
+    }
+    let low = cursor.saturating_sub(CARRY_WINDOW_FRAMES).max(1);
+    let shard = manager.crdt();
+    let snapshot = shard.capture_committed_shard(filter)?;
+    let cursor_key = encoding::consensus_materialized_cursor_key(filter);
+    if snapshot.records.read_record(&cursor_key)?.as_deref() != Some(cursor.to_be_bytes().as_slice()) {
+        return Err(unavailable("engine cursor differs from committed state"));
+    }
+    let digest_of = |frame: u64| {
+        snapshot
+            .records
+            .read_record(&encoding::clock_shard_frame_accumulator_key(filter, frame))
+    };
+    // An empty tip report is never carried, so the field does not read the
+    // window; without a tip record the field is unknown for another reason.
+    match digest_of(cursor)? {
+        Some(digest) if !digest.is_empty() => {}
+        _ => return Ok((0, None)),
+    }
+    if (low..cursor)
+        .map(&digest_of)
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .all(Option::is_some)
+    {
+        return Ok((0, None));
+    }
+    // The tip's record was committed with the state this snapshot holds.
+    let tip = recorded_report(snapshot.records.as_ref(), filter, cursor)?;
+    let mut progress = Progress {
+        version: 1,
+        session: [0; 32],
+        done: 0,
+        target: 0,
+        next: 0,
+        carry: 0,
+        last_report: tip.clone(),
+        reports: Vec::new(),
+        implied: None,
+    };
+    progress.remember(snapshot.roots, tip)?;
+    let mut records = Vec::new();
+    let mut written = 0;
+    let mut unresolved = None;
+    let mut blocked = None;
+    let mut frame = cursor;
+    while frame > low {
+        frame -= 1;
+        if crate::app_engine::legacy_relay_frame(clock, filter, frame) {
+            break;
+        }
+        let (derived, omitted) = if progress.carry > 0 {
+            (Some(progress.last_report.clone()), None)
+        } else {
+            let header = match headers.get(frame + 1).await {
+                Ok(header) => header,
+                Err(error) => {
+                    unresolved = Some(frame);
+                    blocked = Some(error);
+                    break;
+                }
+            };
+            let report = progress.resolve(&header)?;
+            if let Some(report) = report.as_ref() {
+                progress.remember(header_roots(&header)?, report.clone())?;
+            }
+            (report, Some(header.accumulator.is_empty()))
+        };
+        let recorded = match digest_of(frame)? {
+            Some(_) => Some(recorded_report(snapshot.records.as_ref(), filter, frame)?),
+            None => None,
+        };
+        let report = match (derived, recorded) {
+            (Some(derived), Some(recorded)) if derived != recorded => {
+                return Err(unavailable(format!(
+                    "frame {frame}'s accumulator record differs from its certified carry window"
+                )));
+            }
+            (_, Some(recorded)) => recorded,
+            (Some(derived), None) => {
+                let digest = accumulator_header::report_digest(&derived);
+                records.push((
+                    encoding::clock_shard_frame_accumulator_key(filter, frame),
+                    digest.clone(),
+                ));
+                if !digest.is_empty() {
+                    records.push((
+                        encoding::clock_shard_accumulator_report_key(filter, &digest),
+                        derived.clone(),
+                    ));
+                }
+                written += 1;
+                derived
+            }
+            (None, None) => {
+                unresolved = Some(frame);
+                break;
+            }
+        };
+        progress.carry = if omitted == Some(true) && !report.is_empty() {
+            CARRY_WINDOW_FRAMES
+        } else {
+            progress.carry.saturating_sub(1)
+        };
+        progress.last_report = report;
+    }
+    if !records.is_empty() {
+        shard.checkpoint_shard_records(filter, &snapshot.roots, &cursor_key, cursor, &records)?;
+    } else if let Some(error) = blocked {
+        return Err(error);
+    }
+    Ok((written, unresolved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,5 +1593,120 @@ mod tests {
                 Some(vec![9; 32])
             );
         }
+    }
+
+    /// A member that joined at the tip: the tip's nonempty report and the
+    /// certified fee and settlement records, none for the carry window.
+    fn joined_at_tip(
+        manager: &Arc<ExecutionEngineManager>,
+        session: &Session,
+        cursor: u64,
+        tip_report: &[u8],
+    ) {
+        let filter = &session.filter;
+        let digest = accumulator_header::report_digest(tip_report);
+        let accumulator = encoding::clock_shard_frame_accumulator_key(filter, cursor);
+        let mut records: Vec<_> = tip(session, cursor).into_iter().filter(|(key, _)| *key != accumulator).collect();
+        records.push((accumulator, digest.clone()));
+        records.push((encoding::clock_shard_accumulator_report_key(filter, &digest), tip_report.to_vec()));
+        manager
+            .crdt()
+            .commit_with_frame_cursor_and_records(cursor, &encoding::consensus_materialized_cursor_key(filter), &records)
+            .unwrap();
+    }
+
+    // Header 100 builds on the state the tip frame left unchanged, so frame
+    // 99 holds the tip's report; header 100 omitted that nonempty report, so
+    // frames 91..=98 hold it too. Before, the member nullified header 101.
+    #[tokio::test]
+    async fn the_carry_window_below_a_joined_tip_is_recovered_from_certified_headers() {
+        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(Some(0));
+        let directory = Directory::new();
+        let session = session();
+        let filter = session.filter.clone();
+        let (db, _, manager) = open(&directory.0);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let tip_report = report(1);
+        let digest = accumulator_header::report_digest(&tip_report);
+        joined_at_tip(&manager, &session, 100, &tip_report);
+        let field = || {
+            crate::app_engine::accumulator_field(&crate::app_engine::FrameOutflows::default(), &clock, &filter, 101)
+        };
+        assert_eq!(field(), None, "without the window the next field is unknown");
+        let headers = VerifiedFixture {
+            frames: (90..=100)
+                .map(|n| (n, header(&session, n, if n == 100 { [[0; 32]; 4] } else { [[n as u8; 32]; 4] })))
+                .collect(),
+            fail_at: Mutex::new(None),
+            reads: Mutex::new(vec![]),
+        };
+        assert_eq!(
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100).await.unwrap(),
+            (8, None)
+        );
+        assert_eq!(*headers.reads.lock().unwrap(), vec![100], "the omission at header 100 decides the rest");
+        for n in 92..=99 {
+            assert_eq!(clock.get_shard_frame_accumulator(&filter, n).unwrap(), Some(digest.clone()), "frame {n}");
+        }
+        assert!(clock.get_shard_frame_accumulator(&filter, 91).unwrap().is_none(), "nothing below the window");
+        assert_eq!(field(), Some(vec![]), "an unchanged report off the heartbeat is not carried");
+        assert_eq!(
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100).await.unwrap(),
+            (0, None)
+        );
+        assert_eq!(headers.reads.lock().unwrap().len(), 1, "a complete window reads no header");
+    }
+
+    #[tokio::test]
+    async fn an_undecided_or_contradicted_carry_window_stays_unknown() {
+        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(Some(0));
+        let directory = Directory::new();
+        let session = session();
+        let filter = session.filter.clone();
+        let (db, _, manager) = open(&directory.0);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        joined_at_tip(&manager, &session, 100, &report(1));
+        let field = || {
+            crate::app_engine::accumulator_field(&crate::app_engine::FrameOutflows::default(), &clock, &filter, 101)
+        };
+        // The tip frame changed the state: frame 99's report is not known.
+        let changed = VerifiedFixture {
+            frames: (90..=100).map(|n| (n, header(&session, n, [[n as u8; 32]; 4]))).collect(),
+            fail_at: Mutex::new(None),
+            reads: Mutex::new(vec![]),
+        };
+        assert_eq!(
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &changed, 100).await.unwrap(),
+            (0, Some(99))
+        );
+        assert_eq!(field(), None);
+        // A record the certified window contradicts is kept, and nothing is
+        // written over the batch.
+        let other = report(2);
+        let other_digest = accumulator_header::report_digest(&other);
+        manager
+            .crdt()
+            .checkpoint_shard_records(
+                &filter,
+                &[[0; 32]; 4],
+                &encoding::consensus_materialized_cursor_key(&filter),
+                100,
+                &[
+                    (encoding::clock_shard_frame_accumulator_key(&filter, 95), other_digest.clone()),
+                    (encoding::clock_shard_accumulator_report_key(&filter, &other_digest), other),
+                ],
+            )
+            .unwrap();
+        let unchanged = VerifiedFixture {
+            frames: (90..=100)
+                .map(|n| (n, header(&session, n, if n == 100 { [[0; 32]; 4] } else { [[n as u8; 32]; 4] })))
+                .collect(),
+            fail_at: Mutex::new(None),
+            reads: Mutex::new(vec![]),
+        };
+        assert!(recover_carry_window_with_headers(&filter, manager.clone(), &clock, &unchanged, 100).await.is_err());
+        assert_eq!(clock.get_shard_frame_accumulator(&filter, 95).unwrap(), Some(other_digest));
+        assert!(clock.get_shard_frame_accumulator(&filter, 99).unwrap().is_none());
+        assert_eq!(field(), None);
     }
 }
