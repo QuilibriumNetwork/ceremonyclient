@@ -757,6 +757,16 @@ impl ProverLifecycle {
         self.shard_info_loaded.store(true, Ordering::Relaxed);
     }
 
+    /// The shard list of the last archive refresh: each filter with its
+    /// byte size and data-shard count, `None` before the first refresh. A
+    /// regular node's current grid (its shards store keeps the genesis one).
+    pub fn remote_shard_metrics(&self) -> Option<HashMap<Vec<u8>, (u64, u64)>> {
+        if !self.shard_info_loaded() {
+            return None;
+        }
+        self.remote_shard_sizes.read().ok().map(|sizes| sizes.clone())
+    }
+
     /// Replace the shards the last archive refresh reported frozen by a
     /// pending split or merge. See `frozen_shards`.
     pub fn set_frozen_shards(&self, frozen: std::collections::HashSet<Vec<u8>>) {

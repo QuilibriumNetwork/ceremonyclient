@@ -4,7 +4,7 @@
 //! trailing newline) for frames/certified/keys, and Go-`encoding/json`
 //! style (snake_case structs, trailing `\n`) for everything else.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverInfo, P
 use quil_types::error::QuilError;
 use quil_types::protojson;
 
+use crate::production;
 use crate::ExplorerState;
 
 const CACHE_LONG: &str = "public, max-age=31536000, immutable";
@@ -1208,6 +1209,10 @@ struct StatsResponse {
     at_risk: u64,
     /// Shards currently in a full coverage halt (eviction-exempt).
     halted_shards: u64,
+    /// The `/shards/production` summary of the indexer's latest snapshot;
+    /// appended last, so the keys above keep their order. `null` until the
+    /// first snapshot.
+    app_shards: Option<production::AppShardsStats>,
 }
 
 pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) -> Response {
@@ -1245,6 +1250,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         }
     }
     let halted_shards = halts.values().filter(|&&v| v == u64::MAX).count() as u64;
+    let app_shards = state.production_snapshot.read().as_ref().map(|s| s.report.stats());
 
     let response = StatsResponse {
         current_frame: frame,
@@ -1255,8 +1261,148 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         eviction_pending,
         at_risk,
         halted_shards,
+        app_shards,
     };
     json_ok(&response, None)
+}
+
+// ---------------------------------------------------------------------------
+// /shards/production
+// ---------------------------------------------------------------------------
+
+/// Each shard's head session and GLOBAL's executed tip of it, from one
+/// committed GLOBAL snapshot (as `committed_global_app_heads` reads them).
+fn committed_heads(
+    state: &ExplorerState,
+    filters: &BTreeSet<Vec<u8>>,
+) -> HashMap<Vec<u8>, production::Committed> {
+    use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+    let Ok(view) = CommittedView::capture(&state.crdt) else {
+        return HashMap::new();
+    };
+    filters
+        .iter()
+        .filter_map(|filter| {
+            let session = handoff::head(&view, filter).ok()??;
+            let tip = handoff::session_tip(&view, &session.id().ok()?).ok()?;
+            let committed = production::Committed {
+                app_head: tip.map_or(session.base_frame, |tip| tip.frame),
+                generation: session.generation,
+                members: session.members.len() as u64,
+            };
+            Some((filter.clone(), committed))
+        })
+        .collect()
+}
+
+/// The live set and the grid, read again once [`PROVER_CACHE_TTL`] old (as
+/// `/provers/shards` caches its shard sizes), and on every build while
+/// unavailable.
+#[derive(Default)]
+pub(crate) struct ShardSets {
+    refreshed: Option<Instant>,
+    grid: production::GridView,
+}
+
+#[cfg(test)]
+impl ShardSets {
+    pub(crate) fn grid_view(&self) -> &production::GridView {
+        &self.grid
+    }
+}
+
+/// Build the production report for `view`: the indexer task's work, never a
+/// request's. Blocking: registry, shards-store and committed-state reads.
+pub(crate) fn build_production_report(
+    state: &ExplorerState,
+    head: u64,
+    view: &production::IndexView,
+    sets: &mut ShardSets,
+) -> (production::ProductionReport, production::BuildTimings) {
+    let started = Instant::now();
+    let mut stage = Instant::now();
+    let mut lap = || std::mem::replace(&mut stage, Instant::now()).elapsed();
+    let stale = sets.refreshed.is_none_or(|at| at.elapsed() >= PROVER_CACHE_TTL);
+    if stale || sets.grid.unavailable.is_some() {
+        let registry: Vec<Vec<u8>> = state
+            .prover_registry
+            .get_prover_shard_summaries(head)
+            .map(|summaries| summaries.into_iter().map(|s| s.filter).collect())
+            .unwrap_or_default();
+        sets.grid = match &state.archive_grid {
+            Some(cache) => production::grid_from_cache(&registry, cache()),
+            None => production::grid_from_store(
+                &registry,
+                &compute_shard_sizes(state),
+                &state.shards_store.range_app_shards().unwrap_or_default(),
+            ),
+        };
+        sets.refreshed = Some(Instant::now());
+    }
+    let shard_sets = lap();
+    let active = active_allocations_by_filter(&all_provers(state, head), head);
+    let census = lap();
+    let halted: BTreeSet<Vec<u8>> = current_halts(state, head)
+        .into_iter()
+        .filter(|(_, halt)| *halt == u64::MAX)
+        .map(|(filter, _)| filter)
+        .collect();
+    let halts = lap();
+    let committed = committed_heads(state, &sets.grid.live);
+    let committed_time = lap();
+    let report = production::assemble(
+        view,
+        &production::Inputs {
+            head_frame: head,
+            grid: &sets.grid,
+            active: &active,
+            halted: &halted,
+            committed: &committed,
+            quil: quil_str,
+        },
+    );
+    let assemble = lap();
+    let timings = production::BuildTimings {
+        shard_sets,
+        census,
+        halts,
+        committed: committed_time,
+        assemble,
+        total: started.elapsed(),
+        grid_source: sets.grid.source,
+        grid_unavailable: sets.grid.unavailable,
+    };
+    (report, timings)
+}
+
+/// `/shards/production`: per live shard (the `/provers/shards` set), whether
+/// GLOBAL applied its app frames over the last `WINDOW_FRAMES` GLOBAL
+/// frames, with the network summary. Optional `class` (`no_data`,
+/// `producing`, `below_quorum`, `staffed_not_producing`) and `filter` (hex)
+/// select shards; the summary covers every live shard. Fees only, no
+/// rewards. Serves the indexer's latest snapshot; 503 until its first.
+pub async fn handle_shard_production(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let (class, filter) = match production::parse_selection(&params) {
+        Ok(selection) => selection,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let Some(snapshot) = state.production_snapshot.read().clone() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "production index not built yet");
+    };
+    if class.is_none() && filter.is_none() {
+        return build_response(StatusCode::OK, snapshot.body.clone(), Some(production::CACHE_CONTROL));
+    }
+    json_ok(
+        &snapshot.report.response(class, filter.as_deref()),
+        Some(production::CACHE_CONTROL),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,7 +1429,7 @@ fn parse_hex_32(input: &str) -> Result<[u8; 32], &'static str> {
 
 /// Exact sub-units → QUIL decimal string. `QUIL_TOKEN_UNITS = 8e9 = 2^12·5^9`,
 /// so the expansion terminates in ≤12 places: value·10^12/8e9 = value·125.
-fn quil_str(sub: u128) -> String {
+pub(crate) fn quil_str(sub: u128) -> String {
     let scaled = sub.saturating_mul(125); // sub × 10^12 / 8e9
     let whole = scaled / 1_000_000_000_000u128;
     let frac = scaled % 1_000_000_000_000u128;
@@ -2035,6 +2181,48 @@ mod tests {
         assert_eq!(
             to_str(&summary),
             r#"{"filter":"ab","counts":{"active":2,"joining":1},"size_bytes":"1024","active_workers":3,"data_shards":224}"#
+        );
+    }
+
+    #[test]
+    fn stats_keeps_its_keys_and_appends_app_shards() {
+        let stats = |app_shards: Option<production::AppShardsStats>| StatsResponse {
+            current_frame: 7,
+            eviction_threshold: 360,
+            total_provers: 2,
+            by_status: BTreeMap::from([("active".to_string(), 2i64)]),
+            total_seniority: 5,
+            eviction_pending: 1,
+            at_risk: 1,
+            halted_shards: 0,
+            app_shards,
+        };
+        let old = r#"{"current_frame":7,"eviction_threshold":360,"total_provers":2,"by_status":{"active":2},"total_seniority":5,"eviction_pending":1,"at_risk":1,"halted_shards":0"#;
+        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null}}"#));
+
+        let (none, empty) = (HashMap::new(), BTreeSet::new());
+        let grid = production::GridView { grid: Some(BTreeSet::new()), ..Default::default() };
+        let report = production::assemble(
+            &production::IndexView::default(),
+            &production::Inputs {
+                head_frame: 9,
+                grid: &grid,
+                active: &none,
+                halted: &empty,
+                committed: &HashMap::new(),
+                quil: quil_str,
+            },
+        );
+        let s = to_str(&stats(Some(report.stats())));
+        assert!(
+            s.starts_with(&format!(
+                r#"{old},"app_shards":{{"head_frame":9,"indexed_through":null,"window_frames":240,"window_complete":false,"index_waiting_frame":null,"median_frame_interval_ms":null,"live_shards":0,"#
+            )),
+            "{s}"
+        );
+        assert!(
+            s.ends_with(r#""grid_source":"local_store","grid_shards":0,"grid_digest":"e3b0c442","grid_unavailable":null}}"#),
+            "{s}"
         );
     }
 
