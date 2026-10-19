@@ -136,6 +136,38 @@ pub struct ArchiveClient {
     endpoint: String,
 }
 
+/// Failing connections per archive address. A node retries an archive
+/// that refuses connections many times a minute, which logged one warning
+/// per attempt (thousands an hour while an archive was down); each address
+/// now logs one outage: its start, a repeat at most every
+/// [`OUTAGE_LOG_EVERY`](quil_engine::outage::OUTAGE_LOG_EVERY) and its end.
+static CONNECT_OUTAGES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, quil_engine::outage::Outage>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Record one connection attempt to `addr`; returns the transition to log.
+fn connect_outage(addr: &str, ok: bool) -> Option<quil_engine::outage::OutageEvent> {
+    let now = std::time::Instant::now();
+    let mut outages = CONNECT_OUTAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        outages.remove(addr)?.observe(now, true)
+    } else {
+        outages.entry(addr.to_string()).or_default().observe(now, false)
+    }
+}
+
+fn log_connect_outage(addr: &str, event: Option<quil_engine::outage::OutageEvent>, error_chain: &str) {
+    use quil_engine::outage::OutageEvent;
+    match event {
+        Some(OutageEvent::Began) => tracing::warn!(%addr, error_chain, scope = "peer", action = "wait",
+            "archive connection failing; retried until the archive accepts connections again"),
+        Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(%addr, secs, failures, error_chain,
+            scope = "peer", action = "wait", "archive connection still failing"),
+        Some(OutageEvent::Ended { secs, failures }) => info!(%addr, secs, failures, "archive connection recovered"),
+        None => {}
+    }
+}
+
 impl ArchiveClient {
     /// Connect to an archive node at the given `host:port` over plaintext gRPC.
     /// Useful for local testing only — production archive nodes require mTLS.
@@ -242,11 +274,12 @@ impl ArchiveClient {
                     chain.push_str(&format!("{}", s));
                     src = s.source();
                 }
-                tracing::warn!(%addr, error_chain = %chain, "connect_mtls failed (full chain)");
+                log_connect_outage(addr, connect_outage(addr, false), &chain);
                 return Err(e.into());
             }
         };
         debug!(%addr, "archive client connected (mTLS)");
+        log_connect_outage(addr, connect_outage(addr, true), "");
         Ok(Self {
             // 64 MiB decode/encode limit (tonic defaults to 4 MiB). Full
             // global frames and app-shard size sets routinely exceed 4 MiB;
@@ -1167,6 +1200,22 @@ mod tests {
             "legitimate handshake must succeed (server side): {:?}",
             server_res.err(),
         );
+    }
+
+    /// Each archive address has its own outage: failures warn once when
+    /// they begin, and a success ends only that address's outage.
+    #[test]
+    fn connection_failures_are_one_outage_per_archive() {
+        use quil_engine::outage::OutageEvent;
+        let (a, b) = ("192.0.2.1:8340", "192.0.2.2:8340");
+        assert_eq!(super::connect_outage(a, true), None, "a success without failures logs nothing");
+        assert_eq!(super::connect_outage(a, false), Some(OutageEvent::Began));
+        assert_eq!(super::connect_outage(a, false), None, "repeats are bounded");
+        assert_eq!(super::connect_outage(b, false), Some(OutageEvent::Began), "another archive is separate");
+        assert!(matches!(super::connect_outage(a, true), Some(OutageEvent::Ended { failures: 2, .. })));
+        assert_eq!(super::connect_outage(a, true), None);
+        assert_eq!(super::connect_outage(a, false), Some(OutageEvent::Began), "a new failure begins anew");
+        assert!(matches!(super::connect_outage(b, true), Some(OutageEvent::Ended { failures: 1, .. })));
     }
 }
 
