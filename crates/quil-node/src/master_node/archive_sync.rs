@@ -3614,6 +3614,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let mc_for_refresh = message_collector.clone();
             sup.spawn("archive-shard-info-refresh", move |cancel| async move {
                 let mut last_refresh_frame: u64 = 0;
+                // Starts empty, so a start without frozen shards logs nothing.
+                let mut last_frozen: Vec<Vec<u8>> = Vec::new();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 interval.set_missed_tick_behavior(
                     tokio::time::MissedTickBehavior::Skip,
@@ -3644,6 +3646,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         Ok(found) => {
                             let count = found.sizes.len();
                             let frozen = found.frozen.len();
+                            // Each refresh asks one archive and replaces the
+                            // set: name the shards when it changes.
+                            let mut frozen_filters: Vec<Vec<u8>> = found.frozen.iter().cloned().collect();
+                            frozen_filters.sort();
+                            if last_frozen != frozen_filters {
+                                let list = |filters: &[Vec<u8>]| filters.iter().map(hex::encode).collect::<Vec<_>>().join(",");
+                                info!(frame = now_frame, frozen = %list(&frozen_filters),
+                                    previous = %list(&last_frozen),
+                                    "shard_info refresh: frozen shards changed");
+                                last_frozen = frozen_filters;
+                            }
                             lifecycle.set_frozen_shards(found.frozen);
                             lifecycle.set_remote_shard_metrics(found.sizes.into_iter()
                                 .map(|(filter, bytes)| {
