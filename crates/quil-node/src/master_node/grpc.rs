@@ -1216,20 +1216,31 @@ pub(crate) fn spawn_all(
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         }) as quil_rpc::global_service::ShardDirectRelay
     })
-    // A standalone worker's finalized shard frame headers (reward proofs) and
-    // closing seals, sent on through this node's archive transport exactly as
-    // its thread workers' are. A standalone worker has no transport of its own,
-    // and GLOBAL_PROVER gossip needs a subscription regular nodes do not hold.
+    // A standalone worker's finalized shard frame headers (reward proofs),
+    // closing seals and presence reports, sent on through this node's archive
+    // transport exactly as its thread workers' are. A standalone worker has no
+    // transport of its own, and GLOBAL_PROVER gossip needs a subscription
+    // regular nodes do not hold. Its presence reports, relayed only while the
+    // presence report frame is set, are registered with the own-operation
+    // tracker here, which logs whether a GLOBAL frame includes them, as it
+    // does for a thread worker's.
     .with_historical_committees(super::worker_manager::historical_committee_source(historical_committees.clone()))
     .with_worker_prover_submitter({
         let transport = prover_pipeline.transport.clone();
         let halt = halt_state.clone();
+        let frames = current_frame.clone();
         Arc::new(move |core_id: u32, request: Vec<u8>| {
-            let (transport, halt) = (transport.clone(), halt.clone());
+            let (transport, halt, frames) = (transport.clone(), halt.clone(), frames.clone());
             Box::pin(async move {
-                use super::reward_proofs::{log_reward_proof, prover_bundle, worker_submission, WorkerSubmission};
+                use super::reward_proofs::{
+                    describe_request, log_reward_proof, prover_bundle, track_worker_request, unpublished,
+                    worker_submission, WorkerSubmission,
+                };
                 let kind = worker_submission(&request)
-                    .ok_or_else(|| "not a frame header or committee-handoff submission".to_string())?;
+                    .ok_or_else(|| "not a frame header, committee-handoff submission or presence report".to_string())?;
+                if !kind.active() {
+                    return Err("presence reports are not active on this node".to_string());
+                }
                 if halt.any_halted() {
                     tracing::debug!(core_id, "holding back a standalone worker's GLOBAL submission — coverage halt active");
                     return Ok(false);
@@ -1237,10 +1248,29 @@ pub(crate) fn spawn_all(
                 if kind == WorkerSubmission::FrameHeader {
                     log_reward_proof(core_id, "standalone", &request);
                 }
+                let copy = request.clone();
                 let bundle = prover_bundle(request)?;
+                let tracked = track_worker_request(&copy, Some(frames.effective()));
+                let failed = move |error: &dyn std::fmt::Display| {
+                    unpublished(&copy, tracked);
+                    let (kind, filter) = describe_request(&copy);
+                    tracing::warn!(core_id, kind, filter = %filter, error = %error,
+                        "standalone worker submission: transport submission failed");
+                };
+                if kind == WorkerSubmission::PresenceReport {
+                    // Published before answering, so that the worker learns
+                    // whether its report went out, and keeps its budget if not.
+                    return match transport.publish_prover_bundle(bundle).await {
+                        Ok(()) => Ok(true),
+                        Err(error) => {
+                            failed(&error);
+                            Err(format!("presence report not published: {error}"))
+                        }
+                    };
+                }
                 tokio::spawn(async move {
-                    if let Err(e) = transport.publish_prover_bundle(bundle).await {
-                        tracing::warn!(core_id, error = %e, "standalone worker submission: transport submission failed");
+                    if let Err(error) = transport.publish_prover_bundle(bundle).await {
+                        failed(&error);
                     }
                 });
                 Ok(true)
