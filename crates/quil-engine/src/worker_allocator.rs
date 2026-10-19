@@ -454,6 +454,13 @@ pub struct WorkerAllocator {
     /// Shard operations in progress, shared with the lifecycle that
     /// dispatches them.
     pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
+    /// Seats a worker still served when this process started although their
+    /// storage registration had lapsed past its recovery epoch: a renewal
+    /// was running when the node stopped, or the node was down for an epoch.
+    /// `None` until the first reconcile that finds this prover registered.
+    interrupted_seats: std::sync::Mutex<Option<std::collections::HashSet<Vec<u8>>>>,
+    /// The lifecycle has decided renewals since this process started.
+    renewals_offered: std::sync::atomic::AtomicBool,
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
@@ -523,6 +530,32 @@ impl WorkerAllocator {
                 && self.submission_attempts.owned(&allocation.confirmation_filter, frame))
     }
 
+    /// Whether a lapsed seat keeps its worker until the lifecycle first
+    /// decides renewals after this process started. What keeps the worker of
+    /// a running renewal past the recovery epoch ([`Self::renewal_recovering`])
+    /// lives in memory, so after a restart the first reconcile, which runs
+    /// before the first evaluation, released the worker: the seat then got
+    /// no renewal, which renews bound seats only, and the orphan sweep
+    /// proposed leaving it. Only seats a worker was bound to at startup are
+    /// kept; a renewal dispatched for one keeps it from then on as before.
+    fn awaits_renewal_offer(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> bool {
+        !self.renewals_offered.load(std::sync::atomic::Ordering::Acquire)
+            && allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+            && self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|seats| seats.contains(&allocation.confirmation_filter))
+    }
+
+    /// The lifecycle has decided which seats renew; see
+    /// [`Self::awaits_renewal_offer`].
+    pub(crate) fn note_renewals_offered(&self) {
+        self.renewals_offered.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Free a worker, unless its committee session is still closing.
     fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
         if retained {
@@ -562,6 +595,8 @@ impl WorkerAllocator {
         Self {
             reconcile_lock: std::sync::Mutex::new(()),
             submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
+            interrupted_seats: std::sync::Mutex::new(None),
+            renewals_offered: std::sync::atomic::AtomicBool::new(false),
             worker_manager,
             prover_registry,
             local_prover_address,
@@ -929,6 +964,28 @@ impl WorkerAllocator {
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
 
+        // The seats the first reconcile finds bound although lapsed past
+        // recovery; see `awaits_renewal_offer`.
+        if prover_info.is_some() {
+            let mut seats = self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner());
+            if seats.is_none() {
+                let found: std::collections::HashSet<Vec<u8>> = workers.iter()
+                    .filter(|w| !w.filter.is_empty())
+                    .filter(|w| alloc_by_filter.get(&w.filter).is_some_and(|a|
+                        a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                            && !self.renewal_recovering(a, frame_number)))
+                    .map(|w| w.filter.clone())
+                    .collect();
+                if !found.is_empty() {
+                    info!(frame = frame_number, seats = found.len(),
+                        filters = ?found.iter().map(hex::encode).collect::<Vec<_>>(),
+                        "seats lapsed past their recovery epoch keep their workers until the lifecycle \
+                         decides renewals after this start");
+                }
+                *seats = Some(found);
+            }
+        }
+
         // FIX (split-parent rebind, local-only): after an epoch-aligned split
         // rekeys this prover's allocation from a parent filter onto a child
         // filter, a worker still pinned to the now-defunct parent can sit idle
@@ -1028,6 +1085,7 @@ impl WorkerAllocator {
                                 | EffectiveStatus::Joining
                                 | EffectiveStatus::Leaving
                         ) || self.renewal_recovering(a, frame_number)
+                            || self.awaits_renewal_offer(a, frame_number)
                     })
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
@@ -1060,6 +1118,7 @@ impl WorkerAllocator {
                     if alloc.effective_status(frame_number)
                         == quil_types::consensus::EffectiveStatus::ExpiredEpoch
                         && !self.renewal_recovering(alloc, frame_number)
+                        && !self.awaits_renewal_offer(alloc, frame_number)
                         && !retained
                     {
                         info!(
@@ -2269,6 +2328,46 @@ mod tests {
         }
     }
 
+    /// After a restart, a worker still bound to a seat lapsed past its
+    /// recovery epoch keeps it until the lifecycle first decides renewals:
+    /// the record of the renewal that kept it was in memory. Decided without
+    /// a renewal, the seat is released; with one running, it stays. A seat
+    /// unbound at startup is not bound for it.
+    #[test]
+    fn a_restart_keeps_a_lapsed_seat_until_renewals_are_decided() {
+        let filter = vec![0x01; 32];
+        let e = epoch_length_frames();
+        for renewing in [false, true] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filter).unwrap();
+            let mut lapsed = make_alloc(filter.clone());
+            lapsed.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            for frame in [3 * e, 3 * e + 1] {
+                allocator.on_new_frame(frame).unwrap();
+                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
+                    "renewals not decided yet; renewing={renewing}");
+            }
+            let renewal = renewing.then(|| allocator.submission_attempts
+                .begin(std::slice::from_ref(&filter), 3 * e + 1).unwrap());
+            allocator.note_renewals_offered();
+            allocator.on_new_frame(3 * e + 2).unwrap();
+            assert_eq!(wm.range_workers().unwrap()[0].filter.is_empty(), !renewing,
+                "renewing={renewing}");
+            drop(renewal);
+        }
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let mut lapsed = make_alloc(filter.clone());
+        lapsed.epoch = 0;
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        allocator.on_new_frame(3 * e).unwrap();
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "an unbound lapsed seat is not bound");
+    }
+
     #[test]
     fn rejected_leave_keeps_or_rebinds_worker_until_recovery_epoch_ends() {
         use quil_types::consensus::EffectiveStatus;
@@ -2320,6 +2419,9 @@ mod tests {
         };
         let reg = Arc::new(TestProverRegistry::with_prover(prover));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        // Renewals were decided since start; the restart case is
+        // `a_restart_keeps_a_lapsed_seat_until_renewals_are_decided`.
+        alloc.note_renewals_offered();
 
         alloc.on_new_frame(frame).unwrap();
 

@@ -1716,6 +1716,8 @@ impl ProverLifecycle {
                 })
                 .collect()
         };
+        // Seats a worker served at startup keep it until this decision.
+        self.allocator.note_renewals_offered();
         if !renewal_filters.is_empty() {
             // Never renew an abandoned orphan we may propose leaving below.
             // The pipeline reserves filters before spawning; failed preparation
