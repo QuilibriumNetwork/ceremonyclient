@@ -502,8 +502,21 @@ fn cache_get(state: &ExplorerState, key: &str) -> Option<Vec<u8>> {
 }
 
 fn cache_put(state: &ExplorerState, key: String, body: Vec<u8>) {
-    let mut cache = state.cache.write();
-    cache.insert(key, (Instant::now() + PROVER_CACHE_TTL, body));
+    cache_insert(&mut state.cache.write(), Instant::now(), key, body);
+}
+
+/// Insert `body` under `key`, first dropping expired entries: `cache_get`
+/// only skips them, so every distinct key (each `/provers` filter and
+/// status combination, each shard detail) would otherwise keep its body
+/// for the node's lifetime.
+fn cache_insert(
+    cache: &mut HashMap<String, (Instant, Vec<u8>)>,
+    now: Instant,
+    key: String,
+    body: Vec<u8>,
+) {
+    cache.retain(|_, (expiry, _)| *expiry > now);
+    cache.insert(key, (now + PROVER_CACHE_TTL, body));
 }
 
 pub async fn handle_provers(
@@ -2044,6 +2057,20 @@ mod tests {
         assert_eq!(body, b"[1,2,3]\n");
         let resp = error(StatusCode::BAD_REQUEST, "bad thing");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn cache_insert_drops_expired_entries() {
+        let mut cache = HashMap::new();
+        let t0 = Instant::now();
+        cache_insert(&mut cache, t0, "old".into(), vec![1]);
+        cache_insert(&mut cache, t0 + PROVER_CACHE_TTL / 2, "live".into(), vec![2]);
+        // Past the first entry's expiry, before the second's.
+        let now = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
+        cache_insert(&mut cache, now, "new".into(), vec![3]);
+        assert!(!cache.contains_key("old"));
+        assert_eq!(cache.get("live").map(|(_, body)| body.clone()), Some(vec![2]));
+        assert!(cache.contains_key("new"));
     }
 
     #[test]
