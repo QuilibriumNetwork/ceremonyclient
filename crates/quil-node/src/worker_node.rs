@@ -95,8 +95,7 @@ pub(crate) async fn start(
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "worker".into());
     }
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, "worker");
-    crate::clock_retention::spawn_staged_cleanup(
-        Arc::new(quil_store::RocksClockStore::new(db_arc.inner())), "worker".into());
+    crate::clock_retention::spawn_staged_cleanup(&db_arc.inner(), "worker".into());
     // Same crypto setup as the master node — bulletproof is real;
     // Decaf / circuit compiler are still noop stubs pending production
     // impls. See the master block earlier in this file for rationale.
