@@ -12,6 +12,7 @@
 //! `approve`, `deny`) are in [`super::diagnostics_logs`].
 
 use std::fmt::Write as _;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
@@ -66,11 +67,16 @@ pub enum DiagnosticsCommand {
     /// with --identity ask no local node, so resolve the address first and
     /// pass it on, e.g. `qclient node diagnostics health <peer> --identity
     /// <file> --addr "$(qclient node diagnostics resolve <peer>)"`. A peer
-    /// this node has not heard from has no peer info here.
+    /// this node has not heard from has no peer info here. A private,
+    /// loopback, link-local or shared (CGNAT) address is unreachable from
+    /// outside the peer's network: resolve skips it, and says so when the
+    /// peer publishes nothing else.
     ///
     /// With --all it lists every address the peer publishes instead:
-    /// KIND stream or pubsub, ADDRESS its host:port, MULTIADDR as
-    /// published, FILTER master or the worker's shard filter.
+    /// KIND stream or pubsub, ADDRESS its host:port, REACH public, private
+    /// (unreachable from outside the peer's network) or - (a DNS name or no
+    /// IP address), MULTIADDR as published, FILTER master or the worker's
+    /// shard filter.
     Resolve(ResolveArgs),
     /// Ask a peer for its redacted logs of a window of at most 24 h.
     ///
@@ -120,7 +126,7 @@ pub enum DiagnosticsCommand {
 pub struct ResolveArgs {
     /// The peer's peer ID (base58).
     pub peer: String,
-    /// List every address the peer publishes, with its kind and filter.
+    /// List every address the peer publishes, with its kind, reach and filter.
     #[arg(long)]
     pub all: bool,
 }
@@ -221,17 +227,90 @@ fn known_peer<'a>(peers: &'a [PeerInfo], target: &PeerId) -> anyhow::Result<&'a 
     })
 }
 
-/// The `host:port` of the stream address `target` publishes for its master
-/// (the [`MASTER_FILTER`] reachability) in this node's peer info.
+/// The `host:port` of the first stream address `target` publishes for its
+/// master (the [`MASTER_FILTER`] reachability) in this node's peer info
+/// that is not [`Reach::Private`]: a private one cannot be dialed from
+/// outside the peer's network.
 pub(crate) fn resolve_stream_addr(peers: &[PeerInfo], target: &PeerId) -> anyhow::Result<String> {
-    let addr = known_peer(peers, target)?
+    let addrs: Vec<&String> = known_peer(peers, target)?
         .reachability
         .iter()
         .filter(|reachability| reachability.filter == MASTER_FILTER)
         .flat_map(|reachability| reachability.stream_multiaddrs.iter())
-        .find(|addr| !addr.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{target} publishes no stream address"))?;
-    rpc::grpc_multiaddr_to_host_port(addr)
+        .filter(|addr| !addr.is_empty())
+        .collect();
+    let Some(first) = addrs.first() else {
+        anyhow::bail!("{target} publishes no stream address");
+    };
+    match addrs.iter().find(|addr| address_reach(addr) != Reach::Private) {
+        Some(addr) => rpc::grpc_multiaddr_to_host_port(addr),
+        None => {
+            let shown = rpc::grpc_multiaddr_to_host_port(first).map_or_else(|_| printable(first), |a| printable(&a));
+            anyhow::bail!(
+                "{target} publishes only a private stream address ({shown}), unreachable from outside its \
+                 network; ask its operator for a reachable host:port"
+            )
+        }
+    }
+}
+
+/// Whether an address a peer publishes can be dialed from outside its
+/// network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// A globally routable IP address (documentation ranges included).
+    Public,
+    /// A private, loopback, link-local, shared (CGNAT) or unspecified IP
+    /// address.
+    Private,
+    /// A DNS name, or no IP address at all: it may be either.
+    Unknown,
+}
+
+impl Reach {
+    fn label(self) -> &'static str {
+        match self {
+            Reach::Public => "public",
+            Reach::Private => "private",
+            Reach::Unknown => "-",
+        }
+    }
+}
+
+/// The [`Reach`] of a multiaddr, from its first host component.
+pub(crate) fn address_reach(multiaddr: &str) -> Reach {
+    let parts: Vec<&str> = multiaddr.trim_matches('/').split('/').collect();
+    for pair in parts.chunks(2) {
+        match pair {
+            ["ip4", host] => return host.parse().map_or(Reach::Unknown, ipv4_reach),
+            ["ip6", host] => return host.parse().map_or(Reach::Unknown, ipv6_reach),
+            ["dns" | "dns4" | "dns6" | "dnsaddr", _] => return Reach::Unknown,
+            _ => {}
+        }
+    }
+    Reach::Unknown
+}
+
+fn ipv4_reach(ip: Ipv4Addr) -> Reach {
+    // 100.64.0.0/10 is shared address space for carrier-grade NAT (RFC
+    // 6598); `Ipv4Addr::is_shared` is not stable.
+    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40;
+    if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || shared {
+        Reach::Private
+    } else {
+        Reach::Public
+    }
+}
+
+fn ipv6_reach(ip: Ipv6Addr) -> Reach {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_reach(v4);
+    }
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local() {
+        Reach::Private
+    } else {
+        Reach::Public
+    }
 }
 
 /// [`resolve_stream_addr`] for a command that also takes `--addr`.
@@ -240,9 +319,10 @@ pub(crate) fn published_stream_addr(peers: &[PeerInfo], target: &PeerId) -> anyh
 }
 
 /// Every address `target` publishes in this node's peer info, in its
-/// announced order: a summary line, then one line per address with its
-/// kind, `host:port` (`-` when it has none), multiaddr and filter. The
-/// addresses are the peer's text, printed without control characters.
+/// announced order: a summary line with the count of private ones, then one
+/// line per address with its kind, `host:port` (`-` when it has none),
+/// [`Reach`], multiaddr and filter. The addresses are the peer's text,
+/// printed without control characters.
 pub(crate) fn render_addresses(peers: &[PeerInfo], target: &PeerId, label: &str) -> anyhow::Result<String> {
     let mut rows = Vec::new();
     for reachability in &known_peer(peers, target)?.reachability {
@@ -254,23 +334,28 @@ pub(crate) fn render_addresses(peers: &[PeerInfo], target: &PeerId, label: &str)
         for (kind, addrs) in [("stream", &reachability.stream_multiaddrs), ("pubsub", &reachability.pubsub_multiaddrs)] {
             for addr in addrs.iter().filter(|addr| !addr.is_empty()) {
                 let host_port = rpc::grpc_multiaddr_to_host_port(addr).map_or_else(|_| "-".to_string(), |a| printable(&a));
-                rows.push([kind.to_string(), host_port, printable(addr), filter.clone()]);
+                let reach = address_reach(addr).label().to_string();
+                rows.push([kind.to_string(), host_port, reach, printable(addr), filter.clone()]);
             }
         }
     }
     anyhow::ensure!(!rows.is_empty(), "{target} publishes no addresses");
-    let header = ["KIND", "ADDRESS", "MULTIADDR", "FILTER"].map(String::from);
+    let private = rows.iter().filter(|row| row[2] == Reach::Private.label()).count();
+    let header = ["KIND", "ADDRESS", "REACH", "MULTIADDR", "FILTER"].map(String::from);
     let mut widths = header.clone().map(|title| title.len());
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
     }
-    let mut out = format!("Addresses {label} publishes in this node's peer info: {}.\n", rows.len());
+    let mut out = format!("Addresses {label} publishes in this node's peer info: {} ({private} private).\n", rows.len());
     for cells in std::iter::once(&header).chain(&rows) {
-        let [kind, host_port, multiaddr, filter] = cells;
-        let [kind_width, host_port_width, multiaddr_width, _] = widths;
-        let _ = writeln!(out, "{kind:<kind_width$}  {host_port:<host_port_width$}  {multiaddr:<multiaddr_width$}  {filter}");
+        let [kind, host_port, reach, multiaddr, filter] = cells;
+        let [kind_width, host_port_width, reach_width, multiaddr_width, _] = widths;
+        let _ = writeln!(
+            out,
+            "{kind:<kind_width$}  {host_port:<host_port_width$}  {reach:<reach_width$}  {multiaddr:<multiaddr_width$}  {filter}"
+        );
     }
     Ok(out)
 }
@@ -662,13 +747,13 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
         ];
         let w = "01".repeat(32);
         assert_eq!(render_addresses(&peers, &target, "…Ab12cd").unwrap(), format!("\
-Addresses …Ab12cd publishes in this node's peer info: 5.
-KIND    ADDRESS             MULTIADDR                          FILTER
-stream  192.0.2.4:8340      /ip4/192.0.2.4/tcp/8340            master
-pubsub  192.0.2.4:8336      /ip4/192.0.2.4/udp/8336/quic-v1    master
-stream  192.0.2.5:50001     /ip4/192.0.2.5/tcp/50001           {w}
-pubsub  [2001:db8::1]:8336  /ip6/2001:db8::1/udp/8336/quic-v1  -
-pubsub  -                   /p2p-circuit                       -
+Addresses …Ab12cd publishes in this node's peer info: 5 (0 private).
+KIND    ADDRESS             REACH   MULTIADDR                          FILTER
+stream  192.0.2.4:8340      public  /ip4/192.0.2.4/tcp/8340            master
+pubsub  192.0.2.4:8336      public  /ip4/192.0.2.4/udp/8336/quic-v1    master
+stream  192.0.2.5:50001     public  /ip4/192.0.2.5/tcp/50001           {w}
+pubsub  [2001:db8::1]:8336  public  /ip6/2001:db8::1/udp/8336/quic-v1  -
+pubsub  -                   -       /p2p-circuit                       -
 "));
     }
 
@@ -686,5 +771,105 @@ pubsub  -                   /p2p-circuit                       -
         assert!(error.contains("publishes no addresses"), "{error}");
         let error = render_addresses(&peers, &unknown, "…Ab12cd").unwrap_err().to_string();
         assert!(error.contains("no peer info"), "{error}");
+    }
+
+    #[test]
+    fn addresses_are_classified_by_whether_they_reach_outside_their_network() {
+        let cases = [
+            ("/ip4/192.0.2.4/tcp/8340", Reach::Public),
+            ("/ip4/198.51.100.7/tcp/8340", Reach::Public),
+            ("/ip4/8.8.8.8/tcp/8340", Reach::Public),
+            ("/ip4/9.255.255.255/tcp/8340", Reach::Public),
+            ("/ip4/10.0.0.1/tcp/8340", Reach::Private),
+            ("/ip4/10.255.255.255/tcp/8340", Reach::Private),
+            ("/ip4/11.0.0.0/tcp/8340", Reach::Public),
+            ("/ip4/172.15.255.255/tcp/8340", Reach::Public),
+            ("/ip4/172.16.0.1/tcp/8340", Reach::Private),
+            ("/ip4/172.31.255.255/tcp/8340", Reach::Private),
+            ("/ip4/172.32.0.0/tcp/8340", Reach::Public),
+            ("/ip4/192.167.255.255/tcp/8340", Reach::Public),
+            ("/ip4/192.168.1.5/tcp/8336", Reach::Private),
+            ("/ip4/192.169.0.0/tcp/8340", Reach::Public),
+            ("/ip4/100.63.255.255/tcp/8340", Reach::Public),
+            ("/ip4/100.64.0.1/tcp/8340", Reach::Private),
+            ("/ip4/100.127.255.255/tcp/8340", Reach::Private),
+            ("/ip4/100.128.0.0/tcp/8340", Reach::Public),
+            ("/ip4/127.0.0.1/tcp/8340", Reach::Private),
+            ("/ip4/169.254.1.1/tcp/8340", Reach::Private),
+            ("/ip4/0.0.0.0/tcp/8340", Reach::Private),
+            ("/ip6/2001:db8::1/udp/8336/quic-v1", Reach::Public),
+            ("/ip6/2606:4700::1/tcp/8340", Reach::Public),
+            ("/ip6/::1/tcp/8340", Reach::Private),
+            ("/ip6/::/tcp/8340", Reach::Private),
+            ("/ip6/fc00::1/tcp/8340", Reach::Private),
+            ("/ip6/fd00::1/tcp/8340", Reach::Private),
+            ("/ip6/fbff:ffff::1/tcp/8340", Reach::Public),
+            ("/ip6/fe80::1/tcp/8340", Reach::Private),
+            ("/ip6/febf::1/tcp/8340", Reach::Private),
+            ("/ip6/fec0::1/tcp/8340", Reach::Public),
+            ("/ip6/::ffff:192.168.1.5/tcp/8340", Reach::Private),
+            ("/ip6/::ffff:192.0.2.4/tcp/8340", Reach::Public),
+            ("/dns4/node.example.invalid/tcp/8340", Reach::Unknown),
+            ("/dns/localhost/tcp/8340", Reach::Unknown),
+            ("/p2p-circuit", Reach::Unknown),
+            ("/ip4/not-an-ip/tcp/8340", Reach::Unknown),
+            ("", Reach::Unknown),
+        ];
+        for (addr, reach) in cases {
+            assert_eq!(address_reach(addr), reach, "{addr}");
+        }
+    }
+
+    #[test]
+    fn resolve_skips_a_private_stream_address_and_says_when_only_private_ones_remain() {
+        let (mixed, private_only, named) = (peer(), peer(), peer());
+        let peers = vec![
+            info(
+                &mixed,
+                vec![
+                    reach(vec![0xff; 32], &["/ip4/192.168.1.5/tcp/8340", "/ip6/fd00::5/tcp/8340"], &["/ip4/192.168.1.5/tcp/8336"]),
+                    reach(vec![0xff; 32], &["/ip4/192.0.2.4/tcp/8340"], &[]),
+                ],
+            ),
+            info(
+                &private_only,
+                vec![reach(vec![0xff; 32], &["", "/ip4/10.1.2.3/tcp/8340", "/ip4/100.64.0.1/tcp/8340"], &["/ip4/192.0.2.8/tcp/8336"])],
+            ),
+            info(&named, vec![reach(vec![0xff; 32], &["/ip4/127.0.0.1/tcp/8340", "/dns4/node.example.invalid/tcp/8340"], &[])]),
+        ];
+        assert_eq!(resolve_stream_addr(&peers, &mixed).unwrap(), "192.0.2.4:8340");
+        assert_eq!(published_stream_addr(&peers, &mixed).unwrap(), "192.0.2.4:8340");
+        assert_eq!(resolve_stream_addr(&peers, &named).unwrap(), "node.example.invalid:8340");
+        let error = resolve_stream_addr(&peers, &private_only).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "{private_only} publishes only a private stream address (10.1.2.3:8340), unreachable from outside its \
+                 network; ask its operator for a reachable host:port"
+            )
+        );
+        let error = published_stream_addr(&peers, &private_only).unwrap_err().to_string();
+        assert!(error.contains("publishes only a private stream address") && error.ends_with("; pass --addr host:port"), "{error}");
+    }
+
+    #[test]
+    fn all_marks_the_private_addresses_a_peer_publishes() {
+        let target = peer();
+        let peers = vec![info(
+            &target,
+            vec![
+                reach(vec![0xff; 32], &["/ip4/192.0.2.4/tcp/8340", "/ip4/192.168.1.5/tcp/8340"], &["/ip4/172.16.0.1/tcp/8336"]),
+                reach(Vec::new(), &[], &["/ip6/fe80::1/udp/8336/quic-v1", "/dns4/node.example.invalid/tcp/8336"]),
+            ],
+        )];
+        assert_eq!(render_addresses(&peers, &target, "…Ab12cd").unwrap(), "\
+Addresses …Ab12cd publishes in this node's peer info: 5 (3 private).
+KIND    ADDRESS                    REACH    MULTIADDR                            FILTER
+stream  192.0.2.4:8340             public   /ip4/192.0.2.4/tcp/8340              master
+stream  192.168.1.5:8340           private  /ip4/192.168.1.5/tcp/8340            master
+pubsub  172.16.0.1:8336            private  /ip4/172.16.0.1/tcp/8336             master
+pubsub  [fe80::1]:8336             private  /ip6/fe80::1/udp/8336/quic-v1        -
+pubsub  node.example.invalid:8336  -        /dns4/node.example.invalid/tcp/8336  -
+");
     }
 }
