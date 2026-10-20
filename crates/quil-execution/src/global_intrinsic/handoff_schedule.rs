@@ -11,7 +11,8 @@
 //! the grid flips and allocations move.
 //!
 //! A source committee that can no longer assemble a quorum never seals. After
-//! [`FENCE_AFTER_EPOCHS`] epochs GLOBAL fences it instead
+//! [`FENCE_AFTER_EPOCHS`] epochs (one from [`super::early_fence_frame`]:
+//! [`fence_due_frame`]) GLOBAL fences it instead
 //! ([`fence_stalled_sources`]): the session ends at the last data frame GLOBAL
 //! executed for it (its `tip`), frames beyond that are refused like frames after
 //! a seal, and the successor is authorized from that checkpoint. A fenced
@@ -624,11 +625,36 @@ pub fn recover_topology_change(
 /// Epochs a closing session may take to seal before GLOBAL fences it.
 pub const FENCE_AFTER_EPOCHS: u64 = 4;
 
+/// Epochs a closing session requested at or after
+/// [`super::early_fence_frame`] may take to seal before GLOBAL fences it.
+pub const EARLY_FENCE_AFTER_EPOCHS: u64 = 1;
+
+/// Epochs a closing session whose request GLOBAL made at `request_frame` may
+/// take to seal before GLOBAL fences it. The request's committed frame
+/// selects the rule, so a request's timeout never changes once it is made.
+pub fn fence_after_epochs(request_frame: u64) -> u64 {
+    if request_frame >= super::early_fence_frame() {
+        EARLY_FENCE_AFTER_EPOCHS
+    } else {
+        FENCE_AFTER_EPOCHS
+    }
+}
+
+/// The first GLOBAL frame at which [`fence_stalled_sources`] fences a
+/// closing session whose request GLOBAL made at `request_frame` and which has
+/// not sealed. Members date a fence by it too (the engine's fence rewind),
+/// so they and GLOBAL agree on it.
+pub fn fence_due_frame(request_frame: u64) -> u64 {
+    request_frame.saturating_add(
+        fence_after_epochs(request_frame).saturating_mul(quil_types::consensus::epoch_length_frames()),
+    )
+}
+
 /// Fence every closing source among `filters`' head sessions whose request is
-/// [`FENCE_AFTER_EPOCHS`] epochs old and which has not sealed, then authorize
-/// the successors of any request that thereby has every source ended. Reads
-/// committed state only, so every materializing node fences the same sessions.
-/// Returns how many sessions were fenced.
+/// [`fence_after_epochs`] epochs old ([`fence_due_frame`]) and which has not
+/// sealed, then authorize the successors of any request that thereby has
+/// every source ended. Reads committed state only, so every materializing
+/// node fences the same sessions. Returns how many sessions were fenced.
 ///
 /// The fence is the session's executed tip: its frame, view and digest, with
 /// zero state and history roots (nothing certifies the state after the tip).
@@ -651,7 +677,6 @@ pub fn fence_stalled_sources(
     filters: &[Vec<u8>],
     mut eligible: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>>,
 ) -> Result<usize> {
-    let timeout = FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames());
     let mut fenced = 0;
     for filter in filters {
         let Some(session) = head(state, filter)? else { continue };
@@ -663,7 +688,7 @@ pub fn fence_stalled_sources(
         }
         let pending = request(state, &request_id)?
             .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
-        if frame < pending.frame.saturating_add(timeout) {
+        if frame < fence_due_frame(pending.frame) {
             continue;
         }
         let checkpoint = match session_tip(state, &id)? {
@@ -705,6 +730,7 @@ pub fn fence_stalled_sources(
             generation = session.generation,
             fenced_at = checkpoint.frame,
             request = hex::encode(request_id),
+            after_epochs = fence_after_epochs(pending.frame),
             "committee handoff: closing session did not seal in time; fenced at its executed tip"
         );
         fenced += 1;
@@ -723,10 +749,11 @@ pub fn fence_stalled_sources(
 }
 
 /// The committee a fence's membership successor takes: its shard's eligible
-/// provers now. Its request fixed the committee when it was scheduled, four
-/// epochs earlier, from provers that have since mostly moved on, so it could
-/// not reach quorum; and the same pass's reconciliation found it unlike
-/// current eligibility and asked it to close at once (decided 2026-10-16).
+/// provers now. Its request fixed the committee when it was scheduled,
+/// [`fence_after_epochs`] epochs earlier, from provers that have since
+/// mostly moved on, so it could not reach quorum; and the same pass's
+/// reconciliation found it unlike current eligibility and asked it to close
+/// at once (decided 2026-10-16).
 /// `None` keeps the request's committee: a split's or merge's, one whose
 /// shard has no valid eligible committee now, or one that still matches.
 fn fenced_committee(

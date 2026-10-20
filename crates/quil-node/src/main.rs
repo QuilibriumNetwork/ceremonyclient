@@ -779,6 +779,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         presence_report_frame = %if presence_report_from == u64::MAX { "never".to_string() } else { presence_report_from.to_string() },
         "committee presence reports validated"
     );
+    let early_fence_from = quil_execution::global_intrinsic::handoff::init_early_fence_frame(args.network);
+    info!(
+        early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
+        "committee handoff fences of unsealed closing sessions one epoch after their request"
+    );
     let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
     info!(
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
