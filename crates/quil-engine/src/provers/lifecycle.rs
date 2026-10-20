@@ -483,6 +483,8 @@ pub struct ProverLifecycle {
     /// Whether evaluations keep failing: a failed evaluation decides no
     /// joins, confirms or leaves for its frame.
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
+    /// The contents and time of the last `lifecycle allocation buckets` line.
+    buckets_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
     /// How long each bound seat's worker has not hosted the committee
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
@@ -650,6 +652,7 @@ impl ProverLifecycle {
             proof_in_progress: AtomicBool::new(false),
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
+            buckets_logged: std::sync::Mutex::new(None),
             session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
@@ -1361,19 +1364,28 @@ impl ProverLifecycle {
         // still on-chain Active, so it is a valid Leave target when nothing is
         // working it.
         let expired_epoch_filters = buckets.expired_epoch;
-        tracing::info!(
-            frame = frame_number,
-            epoch = quil_types::consensus::epoch_for_frame(frame_number),
-            have_prover_info = prover_info.is_some(),
-            allocations = prover_info.as_ref().map(|p| p.allocations.len()).unwrap_or(0),
-            joining = joining_filters.len(),
-            active = active_filters.len(),
-            leaving = leaving_filters.len(),
-            expired_epoch = expired_epoch_filters.len(),
-            allocation_epochs = ?prover_info.as_ref().map(|p| p.allocations.iter()
-                .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>()),
-            "lifecycle allocation buckets"
-        );
+        let allocations = prover_info.as_ref().map(|p| p.allocations.len()).unwrap_or(0);
+        let allocation_epochs = prover_info.as_ref().map(|p| p.allocations.iter()
+            .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>());
+        let contents = format!("{:?}", (prover_info.is_some(), allocations, joining_filters.len(),
+            active_filters.len(), leaving_filters.len(), expired_epoch_filters.len(), &allocation_epochs));
+        let due = self.buckets_logged.lock()
+            .map(|mut last| buckets_line_due(&mut last, contents, std::time::Instant::now()))
+            .unwrap_or(true);
+        if due {
+            tracing::info!(
+                frame = frame_number,
+                epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                have_prover_info = prover_info.is_some(),
+                allocations,
+                joining = joining_filters.len(),
+                active = active_filters.len(),
+                leaving = leaving_filters.len(),
+                expired_epoch = expired_epoch_filters.len(),
+                allocation_epochs = ?allocation_epochs,
+                "lifecycle allocation buckets"
+            );
+        }
         // A missed renewal or rejected leave needs bounded recovery before
         // cleanup, even if reconciliation has not restored the worker yet.
         // Use the same grace as the allocator so releasing a worker cannot
@@ -3144,6 +3156,25 @@ fn build_decide_descriptors(
 }
 
 
+/// How often an unchanged `lifecycle allocation buckets` line repeats.
+const BUCKETS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether the buckets line is due: its contents differ from the last line's,
+/// or that line is [`BUCKETS_LOG_EVERY`] old. Records `contents` when due.
+fn buckets_line_due(
+    last: &mut Option<(String, std::time::Instant)>,
+    contents: String,
+    now: std::time::Instant,
+) -> bool {
+    let due = last.as_ref().is_none_or(|(logged, at)| {
+        *logged != contents || now.duration_since(*at) >= BUCKETS_LOG_EVERY
+    });
+    if due {
+        *last = Some((contents, now));
+    }
+    due
+}
+
 #[cfg(test)]
 mod buckets_tests {
     use super::*;
@@ -3586,6 +3617,21 @@ mod buckets_tests {
             b.expired_epoch.is_empty(),
             "global empty-filter alloc must never re-confirm",
         );
+    }
+
+    /// The buckets line logs a change at once and repeats unchanged contents
+    /// only every ten minutes, instead of at every evaluation.
+    #[test]
+    fn the_buckets_line_logs_changes_and_a_bounded_heartbeat() {
+        let start = std::time::Instant::now();
+        let mut last = None;
+        let at = |secs| start + std::time::Duration::from_secs(secs);
+        assert!(super::buckets_line_due(&mut last, "15 active".into(), at(0)));
+        assert!(!super::buckets_line_due(&mut last, "15 active".into(), at(10)));
+        assert!(super::buckets_line_due(&mut last, "14 active".into(), at(20)), "a change logs at once");
+        assert!(!super::buckets_line_due(&mut last, "14 active".into(), at(619)));
+        assert!(super::buckets_line_due(&mut last, "14 active".into(), at(620)), "unchanged repeats after ten minutes");
+        assert!(!super::buckets_line_due(&mut last, "14 active".into(), at(630)));
     }
 }
 
