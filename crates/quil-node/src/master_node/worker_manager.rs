@@ -5,6 +5,8 @@ use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
+// ClockStore trait — the GLOBAL head a tracked presence report is followed from.
+use quil_types::store::ClockStore as _;
 
 use quil_lifecycle::Supervisor;
 

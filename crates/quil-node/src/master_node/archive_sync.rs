@@ -2713,7 +2713,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             warn!(executed, canonical, holes = ?gaps,
                                                 "GLOBAL execution stalled with frame-record holes below it; backfilling");
                                             backfill_record_gaps(gap_pool.clone(), gap_cs.clone(), gap_validate.clone(),
-                                                (*seed).clone(), gap_cancel.clone(), gaps).await;
+                                                (*seed).clone(), gap_cancel.clone(), gaps, gap_backfill_floor(network as u32)).await;
                                         }
                                     }
                                     previous = executed;
