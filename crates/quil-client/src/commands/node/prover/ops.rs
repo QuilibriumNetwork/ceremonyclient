@@ -11,7 +11,7 @@
 
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{
-    message_request::Request, AltShardUpdate, MessageRequest, ProverConfirm, ProverLeave,
+    message_request::Request, AltShardUpdate, MessageRequest, ProverLeave,
     ProverPause, ProverReject, ProverResume, ProverUpdate,
 };
 
@@ -55,29 +55,21 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
-// `filter` is deprecated in global.proto in favour of the repeated `filters`,
-// but it is still on the wire: peers that predate the change send it, and
-// dropping it here would change the encoded bytes. Carried through verbatim
-// until the field is retired from the proto.
-#[allow(deprecated)]
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let sig = sign::confirm_sig(&pc.key_manager, &filters, frame)?;
-    let op = ProverConfirm {
-        filter: Vec::new(), // deprecated field
-        frame_number: frame,
-        public_key_signature_bls48581: Some(sig),
-        filters,
-        leaf_roots: Vec::new(),
-    };
+    let op = sign::confirm_op(&pc.key_manager, &filters, frame)?;
     pc.send_global(&mut client, wrap(Request::Confirm(op))).await?;
     println!("Prover confirm sent successfully");
     Ok(())
 }
 
-#[allow(deprecated)] // see `confirm`
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire: peers that predate the change send it, and
+// dropping it here would change the encoded bytes. Carried through verbatim
+// until the field is retired from the proto.
+#[allow(deprecated)]
 pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;

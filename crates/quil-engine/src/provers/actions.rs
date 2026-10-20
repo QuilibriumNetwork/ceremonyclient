@@ -92,10 +92,13 @@ pub fn build_confirm_bundle_with_leaf_roots(
     prover_address: &[u8],
     leaf_roots: &[quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots],
 ) -> Result<Vec<u8>> {
+    // This build's release, from the confirm release frame.
+    let release = quil_execution::global_intrinsic::prover_release::release_for_confirm(frame_number);
     let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
         filters,
         frame_number,
         leaf_roots,
+        release.as_ref(),
     );
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
@@ -113,6 +116,7 @@ pub fn build_confirm_bundle_with_leaf_roots(
         }),
         filters: filters.to_vec(),
         leaf_roots: leaf_roots.to_vec(),
+        release,
     };
 
     wrap_in_bundle(confirm.to_canonical_bytes()?)
@@ -459,17 +463,37 @@ mod tests {
             &confirm.filters,
             confirm.frame_number,
             &confirm.leaf_roots,
+            confirm.release.as_ref(),
         );
         let tampered_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
             &confirm.filters,
             confirm.frame_number,
             &[],
+            None,
         );
         assert_ne!(
             signed_msg, tampered_msg,
             "non-empty leaf roots must change the signed message vs the legacy form"
         );
         assert!(!sig.signature.is_empty());
+    }
+
+    #[test]
+    fn confirm_bundle_carries_this_builds_release_only_from_the_release_frame() {
+        use quil_execution::global_intrinsic::prover_release::{set_confirm_release_frame_for_thread, Release};
+        let (signer, _pk) = bls_keypair();
+        let filters = vec![vec![0x05u8; 32]];
+        let address = vec![0x42u8; 32];
+        let decode = |frame_number| {
+            let bytes = build_confirm_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+            ProverConfirm::from_canonical_bytes(&decode_single_inner(&bytes)).expect("confirm decodes")
+        };
+        set_confirm_release_frame_for_thread(None);
+        assert_eq!(decode(779).release, None);
+        set_confirm_release_frame_for_thread(Some(780));
+        assert_eq!(decode(779).release, None);
+        assert_eq!(decode(780).release, Some(Release::current()));
+        set_confirm_release_frame_for_thread(None);
     }
 
     #[test]

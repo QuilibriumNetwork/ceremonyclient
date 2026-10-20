@@ -707,6 +707,7 @@ fn build_confirm(
         public_key_signature_bls48581: Some(AddressedSignature { signature: sig, address: addr.to_vec() }),
         filters: filters.to_vec(),
         leaf_roots: Vec::new(),
+        release: None,
     }.to_canonical_bytes()
 }
 

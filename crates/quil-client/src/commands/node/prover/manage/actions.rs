@@ -11,7 +11,7 @@ use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
 use quil_types::proto::global::{
-    message_request::Request, MessageRequest, ProverConfirm, ProverLeave, ProverPause,
+    message_request::Request, MessageRequest, ProverLeave, ProverPause,
     ProverReject, ProverResume,
 };
 use quil_types::proto::node::{
@@ -210,7 +210,7 @@ pub async fn do_join(mut client: Client, filters: Vec<Vec<u8>>) -> Msg {
 // ── Signed lifecycle ops (Leave / Confirm / Reject / Pause / Resume) ─────
 
 /// Build the signed `MessageRequest` for a lifecycle action.
-#[allow(deprecated)] // ProverConfirm/ProverReject.filter is a deprecated wire field.
+#[allow(deprecated)] // ProverReject.filter is a deprecated wire field.
 fn build_request(
     km: &FileKeyManager,
     action: &str,
@@ -226,16 +226,7 @@ fn build_request(
                 public_key_signature_bls48581: Some(sig),
             })
         }
-        "Confirm" => {
-            let sig = sign::confirm_sig(km, filters, frame)?;
-            Request::Confirm(ProverConfirm {
-                filter: Vec::new(),
-                frame_number: frame,
-                public_key_signature_bls48581: Some(sig),
-                filters: filters.to_vec(),
-                leaf_roots: Vec::new(),
-            })
-        }
+        "Confirm" => Request::Confirm(sign::confirm_op(km, filters, frame)?),
         "Reject" => {
             let sig = sign::reject_sig(km, filters, frame)?;
             Request::Reject(ProverReject {

@@ -74,6 +74,17 @@ message ProverConfirm {
   // a confirm is the prover's per-epoch storage re-registration). Bound into the
   // confirm's signing message.
   repeated ConfirmLeafRoots leaf_roots = 5;
+  // The sender's release, signed and recorded from the confirm release frame;
+  // absent before it and from senders that do not report one.
+  ReleaseInfo release = 6;
+}
+
+// A build's release: version major.minor.patch, patch number and subpatch.
+message ReleaseInfo {
+  // Three bytes: major, minor, patch.
+  bytes version = 1;
+  uint32 patch_number = 2;
+  uint32 subpatch = 3;
 }
 
 message ProverUpdate {
