@@ -2173,6 +2173,9 @@ pub struct AppConsensusEngine {
     /// member that cannot re-derive its sealed history locally.
     outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
     global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    /// How long the shard head has lain past its session fence without a
+    /// local rewind, for bounded logging.
+    unrewindable_fence: UnrewindableFenceBlock,
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
@@ -2390,6 +2393,7 @@ impl AppConsensusEngine {
             storage_history_source: None,
             outgoing_history_source: None,
             global_anchor_source: None,
+            unrewindable_fence: UnrewindableFenceBlock::default(),
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
             start_block: StartBlock::default(),
@@ -2603,9 +2607,12 @@ impl AppConsensusEngine {
 
     /// When this shard's session was authorized from a GLOBAL fence below
     /// the local head, rewind the shard to the fence
-    /// ([`crate::app_handoff::rewind_past_fence`]) and bring the engine's own
+    /// ([`crate::app_handoff::fence_rewind`]) and bring the engine's own
     /// view back with it: materialized frame, head, fee window and the
-    /// finalized records of the discarded frames. True when it rewound.
+    /// finalized records of the discarded frames. True when it rewound. A
+    /// head past the fence that cannot be rewound here is warned about
+    /// ([`Self::note_unrewindable_fence`]) and, as before, not rewound, or
+    /// fails with the rewind's refusal.
     fn rewind_past_fence(&mut self) -> Result<bool> {
         let (Some(global), Some(shard)) = (
             self.global_hypergraph.clone(), self.execution_engine.as_ref().map(|m| m.crdt()),
@@ -2622,9 +2629,21 @@ impl AppConsensusEngine {
         else {
             return Ok(false);
         };
-        let Some(fence) = crate::app_handoff::rewind_past_fence(&global, &shard, self.clock_store.as_ref(), &session)? else {
-            return Ok(false);
+        let fence = match crate::app_handoff::fence_rewind(&global, &shard, self.clock_store.as_ref(), &session)? {
+            crate::app_handoff::FenceRewind::Rewound(fence) => fence,
+            crate::app_handoff::FenceRewind::Untouched => {
+                self.end_unrewindable_fence("nothing past the fence to rewind", std::time::Instant::now());
+                return Ok(false);
+            }
+            crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
+                self.note_unrewindable_fence(&fence, std::time::Instant::now());
+                return match error {
+                    Some(error) => Err(error),
+                    None => Ok(false),
+                };
+            }
         };
+        self.end_unrewindable_fence("rewound to the fence", std::time::Instant::now());
         self.set_materialized_frame(fence);
         self.shard_frame_number = fence;
         let _ = self.fee_manager.rewind_to_frame(&self.filter, fence);
@@ -2635,6 +2654,29 @@ impl AppConsensusEngine {
             }
         }
         Ok(true)
+    }
+
+    /// Name a shard head past its session fence that this node cannot rewind
+    /// ([`crate::app_handoff::UnrewindableFence`]) when first found or its
+    /// reason changes, then every [`UNREWINDABLE_FENCE_REPEAT`] with how long
+    /// it has lasted.
+    fn note_unrewindable_fence(&mut self, fence: &crate::app_handoff::UnrewindableFence, now: std::time::Instant) {
+        let Some(elapsed) = self.unrewindable_fence.observe(now, &self.filter, fence.reason) else { return };
+        let session_tip = fence.session_tip.map_or_else(|| "none".to_string(), |n| n.to_string());
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = fence.generation,
+            local_head = fence.local_head, fence = fence.fence, session_tip = %session_tip, reason = fence.reason,
+            action = "needs a re-anchor at the fence from an archive; report it if it persists",
+            elapsed_secs = elapsed.as_secs(),
+            "local shard head lies past the session fence and cannot be rewound locally");
+    }
+
+    /// Once a head warned about no longer lies past the fence unrewound (it
+    /// rewound, or a sync replaced its state), say so and how long it lasted.
+    fn end_unrewindable_fence(&mut self, outcome: &'static str, now: std::time::Instant) {
+        if let Some(elapsed) = self.unrewindable_fence.cleared(now) {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
+                elapsed_secs = elapsed.as_secs(), "local shard head past the session fence resolved");
+        }
     }
 
     fn set_materialized_frame(&mut self, n: u64) {
@@ -8744,6 +8786,75 @@ mod silent_member_tests {
         silent.record(2, VOTE_CHANNEL);
         silent.record(3, VOTE_CHANNEL);
         assert_eq!(silent.report(false, at(68)), Some(SilentReport::Cleared), "every member voted");
+    }
+}
+
+/// How often a shard head past its session fence that cannot be rewound
+/// locally is warned about again while it lasts. It lasts until the shard
+/// state is replaced, so a repeat only shows it continues.
+const UNREWINDABLE_FENCE_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// A shard head past its session fence that cannot be rewound locally, from
+/// the first rewind check that found it to the first that did not.
+#[derive(Default)]
+struct UnrewindableFenceBlock {
+    since: Option<std::time::Instant>,
+    /// When it was last warned about, and for which filter and reason.
+    logged: Option<(std::time::Instant, Vec<u8>, &'static str)>,
+}
+
+impl UnrewindableFenceBlock {
+    /// Found at `now` on `filter` for `reason`: how long it has lasted, when
+    /// it is new, its filter or reason changed, or [`UNREWINDABLE_FENCE_REPEAT`]
+    /// passed since the last warning; otherwise `None`.
+    fn observe(&mut self, now: std::time::Instant, filter: &[u8], reason: &'static str) -> Option<Duration> {
+        let since = *self.since.get_or_insert(now);
+        if self.logged.as_ref().is_some_and(|(at, logged_filter, logged_reason)| {
+            logged_filter.as_slice() == filter && *logged_reason == reason
+                && now.saturating_duration_since(*at) < UNREWINDABLE_FENCE_REPEAT
+        }) {
+            return None;
+        }
+        self.logged = Some((now, filter.to_vec(), reason));
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// No longer found at `now`: how long it lasted, if it was.
+    fn cleared(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since?;
+        *self = UnrewindableFenceBlock::default();
+        Some(now.saturating_duration_since(since))
+    }
+}
+
+#[cfg(test)]
+mod unrewindable_fence_block_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+    const FILTER: [u8; 32] = [0x02; 32];
+
+    /// Named when first found and when its reason changes; the same one, on
+    /// every 10 s retry, only every repeat interval, with its whole duration.
+    #[test]
+    fn an_unrewindable_fence_is_named_once_then_repeated_at_the_interval() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = UnrewindableFenceBlock::default();
+        let missing = "no local frame at the fence";
+        assert_eq!(block.observe(at(0), &FILTER, missing), Some(Duration::ZERO));
+        for tick in 1..180u64 {
+            assert_eq!(block.observe(start + Duration::from_secs(10 * tick), &FILTER, missing), None, "tick {tick}");
+        }
+        assert_eq!(block.observe(at(30), &FILTER, missing), Some(MINUTE * 30));
+        assert_eq!(block.observe(at(31), &FILTER, missing), None);
+        let pruned = "fence state not retained locally";
+        assert_eq!(block.observe(at(32), &FILTER, pruned), Some(MINUTE * 32), "a changed reason");
+        assert_eq!(block.observe(at(33), &FILTER, pruned), None);
+        assert_eq!(block.observe(at(34), &[0x03; 32], pruned), Some(MINUTE * 34), "another filter");
+        assert_eq!(block.cleared(at(40)), Some(MINUTE * 40));
+        assert_eq!(block.cleared(at(41)), None, "named once");
+        assert_eq!(block.observe(at(50), &FILTER, pruned), Some(Duration::ZERO), "a new block");
     }
 }
 

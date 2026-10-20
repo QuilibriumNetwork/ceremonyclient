@@ -941,21 +941,65 @@ pub fn origin_anchors(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Vec
     Ok(anchors)
 }
 
-/// A member whose session GLOBAL authorized from a fenced same-filter
-/// predecessor, holding shard state past the fence while the session has
-/// executed nothing past it, holds frames the fence discarded: it can neither
-/// continue the fenced session nor start this one. Rewind the shard to the
-/// fence. The frame after the fence (this member's own, certified by the
-/// fenced session) names the fenced frame's post-state roots, and must build
-/// on the frame the fence names. State, cursor and clock head move back to the
-/// fence; the discarded frames are deleted. Returns the fence frame when it
-/// rewound.
+/// A shard head past its session's fence that this node cannot rewind: the
+/// frames above the fence are the fenced predecessor's, which the fence
+/// discarded, and the frames or state the rewind needs are not held here.
+/// It needs a re-anchor at the fence from an archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrewindableFence {
+    pub generation: u64,
+    /// The shard's materialized cursor.
+    pub local_head: u64,
+    pub fence: u64,
+    /// The frame GLOBAL has executed the session through, if any.
+    pub session_tip: Option<u64>,
+    pub reason: &'static str,
+}
+
+/// What [`fence_rewind`] found.
+#[derive(Debug)]
+pub enum FenceRewind {
+    /// Nothing to rewind: no fenced same-filter origin, a head at or below
+    /// the fence, or this session's own frames past it.
+    Untouched,
+    /// The shard was rewound to this fence frame.
+    Rewound(u64),
+    /// Discarded frames past the fence that cannot be rewound here. `error`
+    /// is the rewind's own refusal when it ran, which is still the result.
+    Unrewindable { fence: UnrewindableFence, error: Option<QuilError> },
+}
+
+/// [`fence_rewind`] as the fence frame when it rewound. A head it cannot
+/// rewind is not rewound, or fails with the rewind's refusal.
 pub fn rewind_past_fence(
     global: &Arc<HypergraphCrdt>,
     shard: &Arc<HypergraphCrdt>,
     clock: &dyn ClockStore,
     session: &Session,
 ) -> Result<Option<u64>> {
+    match fence_rewind(global, shard, clock, session)? {
+        FenceRewind::Rewound(fence) => Ok(Some(fence)),
+        FenceRewind::Unrewindable { error: Some(error), .. } => Err(error),
+        FenceRewind::Untouched | FenceRewind::Unrewindable { error: None, .. } => Ok(None),
+    }
+}
+
+/// A member whose session GLOBAL authorized from a fenced same-filter
+/// predecessor, holding shard state past the fence that is not this
+/// session's own, holds frames the fence discarded: it can neither continue
+/// the fenced session nor start this one. Rewind the shard to the fence. The
+/// frame after the fence (this member's own, certified by the fenced
+/// session) names the fenced frame's post-state roots, and must build on the
+/// frame the fence names. State, cursor and clock head move back to the
+/// fence; the discarded frames are deleted. A member without those frames or
+/// the fenced state is named as such ([`UnrewindableFence`]) and left as it
+/// is.
+pub fn fence_rewind(
+    global: &Arc<HypergraphCrdt>,
+    shard: &Arc<HypergraphCrdt>,
+    clock: &dyn ClockStore,
+    session: &Session,
+) -> Result<FenceRewind> {
     let view = CommittedView::capture(global)?;
     for (source, checkpoint) in effective_origins(&view, session)?.origins {
         if source.filter != session.filter || !handoff::is_fenced(&view, &source.id()?)? {
@@ -966,18 +1010,70 @@ pub fn rewind_past_fence(
         let cursor = local.records.read_record(&cursor_key)?
             .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes))
             .unwrap_or(0);
-        if cursor <= checkpoint.frame
-            || handoff::session_tip(&view, &session.id()?)?.is_some_and(|tip| tip.frame > checkpoint.frame)
-        {
-            return Ok(None);
+        if cursor <= checkpoint.frame {
+            return Ok(FenceRewind::Untouched);
         }
-        // A member that holds no frame at the fence joined after it (by an
-        // archive sync onto this session's chain); nothing here to rewind.
-        let (Ok(fenced), Ok(next)) = (
-            clock.get_shard_clock_frame(&session.filter, checkpoint.frame, false),
-            clock.get_shard_clock_frame(&session.filter, checkpoint.frame + 1, false),
-        ) else {
-            return Ok(None);
+        // Past the fence is this session's own chain once GLOBAL has executed
+        // the session's frames past it and the local frame at that tip is the
+        // one GLOBAL executed, as `successor_state_matches` accepts it. A
+        // member behind that tip, or whose frame there differs, may still
+        // hold the predecessor's discarded frames once the successor has
+        // produced: the anchor check below tells them apart.
+        let executed = handoff::session_tip(&view, &session.id()?)?;
+        let at_tip = executed.as_ref().filter(|tip| tip.frame > checkpoint.frame).and_then(|tip| {
+            let frame = clock.get_shard_clock_frame(&session.filter, tip.frame, false).ok()?;
+            let digest = quil_crypto::poseidon::hash_bytes_to_32(&frame.header?.output).ok()?;
+            Some(digest == tip.digest)
+        });
+        if at_tip == Some(true) {
+            return Ok(FenceRewind::Untouched);
+        }
+        let unrewindable = |reason: &'static str, error: Option<QuilError>| FenceRewind::Unrewindable {
+            fence: UnrewindableFence {
+                generation: session.generation, local_head: cursor, fence: checkpoint.frame,
+                session_tip: executed.as_ref().map(|tip| tip.frame), reason,
+            },
+            error,
+        };
+        // The fenced session's frames anchor before GLOBAL fenced it (its
+        // closing request plus the timeout); this session's at or after that.
+        let fenced_at = || -> Result<Option<u64>> {
+            let request = match handoff::status(&view, &source.id()?)? {
+                Status::Sealing(request) | Status::Closed(request) => handoff::request(&view, &request)?,
+                Status::Active => None,
+            };
+            Ok(request.map(|request| request.frame.saturating_add(
+                schedule::FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames()))))
+        };
+        let fenced = clock.get_shard_clock_frame(&session.filter, checkpoint.frame, false);
+        let next = clock.get_shard_clock_frame(&session.filter, checkpoint.frame + 1, false);
+        let (fenced, next) = match (fenced, next) {
+            (Ok(fenced), Ok(next)) => (fenced, next),
+            (fenced, next) => {
+                // A member that holds no frame at the fence or after it
+                // joined after it (by an archive sync onto this session's
+                // chain), with nothing here to rewind, or holds the
+                // predecessor's discarded frames without the ones a rewind
+                // needs (an archive-installed head). A frame past the fence
+                // anchored before GLOBAL fenced it, or a frame at the
+                // session's executed tip that differs from GLOBAL's, says
+                // which. Unknown counts as a joiner.
+                let discarded = at_tip == Some(false) || fenced_at().ok().flatten().is_some_and(|due| {
+                    let before = |frame: Result<quil_types::proto::global::AppShardFrame>| {
+                        frame.ok().and_then(|frame| frame.header).is_some_and(|header| {
+                            header.frame_number > checkpoint.frame && header.global_frame_number < due
+                        })
+                    };
+                    before(next)
+                        || before(clock.get_shard_clock_frame(&session.filter, cursor, false))
+                        || before(clock.get_latest_shard_clock_frame(&session.filter))
+                });
+                if !discarded {
+                    return Ok(FenceRewind::Untouched);
+                }
+                let reason = if fenced.is_err() { "no local frame at the fence" } else { "no local frame after the fence" };
+                return Ok(unrewindable(reason, None));
+            }
         };
         let fenced = fenced.header.ok_or_else(|| unavailable("fenced frame has no header"))?;
         let header = next.header.ok_or_else(|| unavailable("frame after the fence has no header"))?;
@@ -986,25 +1082,25 @@ pub fn rewind_past_fence(
         {
             return Err(QuilError::Consensus("local frames at the fence differ from the fenced frame".into()));
         }
-        // This session's own first frame also builds on the fence. The fenced
-        // session's frames anchor before GLOBAL fenced it (its closing request
-        // plus the timeout); this session's anchor at or after that.
-        let request = match handoff::status(&view, &source.id()?)? {
-            Status::Sealing(request) | Status::Closed(request) => handoff::request(&view, &request)?,
-            Status::Active => None,
-        }
-        .ok_or_else(|| unavailable("fenced predecessor has no closing request"))?;
-        let fenced_at = request.frame
-            .saturating_add(schedule::FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames()));
+        // This session's own first frame also builds on the fence, anchored
+        // at or after the fenced predecessor's.
+        let fenced_at = fenced_at()?.ok_or_else(|| unavailable("fenced predecessor has no closing request"))?;
         if header.global_frame_number >= fenced_at {
-            return Ok(None);
+            return Ok(FenceRewind::Untouched);
         }
         let roots: [[u8; 32]; 4] = header.state_roots.iter()
             .map(|root| <[u8; 32]>::try_from(root.as_slice()).ok())
             .collect::<Option<Vec<_>>>()
             .and_then(|roots| roots.try_into().ok())
             .ok_or_else(|| QuilError::Consensus("frame after the fence carries malformed state roots".into()))?;
-        shard.rewind_app_shard(&session.filter, &roots)?;
+        match shard.rewind_app_shard(&session.filter, &roots) {
+            Ok(()) => {}
+            // A member that pruned the fenced state (or never held it).
+            Err(error @ QuilError::ExecutionUnavailable(_)) if error.to_string().contains("not retained here") => {
+                return Ok(unrewindable("fence state not retained locally", Some(error)));
+            }
+            Err(error) => return Err(error),
+        }
         shard.checkpoint_frame_cursor(checkpoint.frame, &cursor_key)?;
         for frame in checkpoint.frame + 1..=cursor {
             shard.invalidate_domain_shard_commit(frame, &session.filter[..32])?;
@@ -1019,9 +1115,9 @@ pub fn rewind_past_fence(
             from = cursor, to = checkpoint.frame,
             "rewound shard state to the checkpoint GLOBAL fenced its predecessor at",
         );
-        return Ok(Some(checkpoint.frame));
+        return Ok(FenceRewind::Rewound(checkpoint.frame));
     }
-    Ok(None)
+    Ok(FenceRewind::Untouched)
 }
 
 #[cfg(test)]
@@ -1584,6 +1680,172 @@ mod successor_tests {
         let joiner = crdt();
         joiner.commit_with_frame_cursor_and_records(5, &cursor_key, &outflow_records(&filter, 5)).unwrap();
         assert_eq!(rewind_past_fence(&global, &joiner, &joiner_clock, &successor).unwrap(), None);
+    }
+
+    /// A successor member that had materialized the predecessor's frame 4
+    /// past the fence GLOBAL set at frame 3, as in
+    /// `a_member_past_a_fence_rewinds_its_shard_to_the_fenced_frame`: shard
+    /// state, cursor and frames 3 and 4 as the fenced session left them.
+    struct PastFence {
+        global: Arc<HypergraphCrdt>,
+        state: HypergraphState,
+        shard: Arc<HypergraphCrdt>,
+        clock: quil_store::RocksClockStore,
+        _clock_db: quil_store::RocksDb,
+        successor: Session,
+        filter: Vec<u8>,
+        fenced_digest: [u8; 32],
+        fenced_roots: [[u8; 32]; 4],
+        due: u64,
+    }
+
+    fn store_header(clock: &quil_store::RocksClockStore, header: quil_types::proto::global::FrameHeader) {
+        use quil_types::store::ClockStore as _;
+        let (filter, number) = (header.address.clone(), header.frame_number);
+        let frame = quil_types::proto::global::AppShardFrame { header: Some(header), ..Default::default() };
+        let selector = vec![number as u8; 32];
+        let txn = clock.new_transaction(false).unwrap();
+        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = clock.new_transaction(false).unwrap();
+        clock.commit_shard_clock_frame(&filter, number, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn past_fence() -> PastFence {
+        let (global, state) = global_state();
+        let filter = vec![0x02; 32];
+        let (source, _, _) = closing_session(&global, &state, &filter);
+        let clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(clock_db.inner());
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        let shard = crdt();
+        shard.set_unified_tree(true);
+        let at = |byte: u8| quil_hypergraph::Location { app_address: [0x02; 32], data_address: [byte; 32] };
+        shard.add_vertex(&at(1), b"one").unwrap();
+        shard.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&filter, 3)).unwrap();
+        let fenced_roots = shard.capture_committed_shard(&filter).unwrap().roots;
+        shard.add_vertex(&at(1), b"one, changed after the fence").unwrap();
+        shard.commit_with_frame_cursor_and_records(4, &cursor_key, &outflow_records(&filter, 4)).unwrap();
+        let fenced_digest = quil_crypto::poseidon::hash_bytes_to_32(&[0x33; 32]).unwrap();
+        store_header(&clock, quil_types::proto::global::FrameHeader {
+            address: filter.clone(), frame_number: 3, rank: 5, output: vec![0x33; 32], ..Default::default()
+        });
+        store_header(&clock, quil_types::proto::global::FrameHeader {
+            address: filter.clone(), frame_number: 4, rank: 6, output: vec![0x44; 32],
+            parent_selector: fenced_digest.to_vec(),
+            state_roots: fenced_roots.iter().map(|root| root.to_vec()).collect(),
+            ..Default::default()
+        });
+        handoff::record_session_tip(&state, 4, &source.id().unwrap(),
+            &Checkpoint { frame: 3, view: 5, digest: fenced_digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
+        let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        commit(&global, &state, due);
+        let successor = handoff::head(&state, &filter).unwrap().unwrap();
+        PastFence { global, state, shard, clock, _clock_db: clock_db, successor, filter, fenced_digest, fenced_roots, due }
+    }
+
+    impl PastFence {
+        /// GLOBAL executes the successor through frame 4, whose output is `output`.
+        fn execute_successor(&self, output: u8) {
+            handoff::record_session_tip(&self.state, self.due + 1, &self.successor.id().unwrap(), &Checkpoint {
+                frame: 4, view: 9, digest: quil_crypto::poseidon::hash_bytes_to_32(&[output; 32]).unwrap(),
+                state_roots: [[3; 32]; 4], history_root: [0; 32],
+            }).unwrap();
+            commit(&self.global, &self.state, self.due + 1);
+        }
+
+        fn cursor(&self) -> u64 {
+            self.shard.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(&self.filter)).unwrap()
+        }
+    }
+
+    // A member still holding the fenced predecessor's frames once the
+    // successor has produced past the fence was never rewound: the rewind
+    // waited for GLOBAL to have executed nothing past the fence. A member
+    // whose frame at the executed tip is not the one GLOBAL executed
+    // rewinds all the same, and then holds exactly the fenced frame.
+    #[test]
+    fn a_member_past_a_fence_rewinds_after_its_successor_has_produced() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.execute_successor(0x55);
+        assert!(successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).is_err());
+
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), Some(3));
+        assert_eq!(past.shard.capture_committed_shard(&past.filter).unwrap().roots, past.fenced_roots);
+        assert_eq!(past.cursor(), 3);
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_err(), "the discarded frame is deleted");
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // A member whose frame at the executed tip is the one GLOBAL executed
+    // holds this session's own chain, whatever its frames' anchors say.
+    #[test]
+    fn a_member_holding_the_executed_tip_is_not_rewound() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.execute_successor(0x44);
+        let roots = past.shard.capture_committed_shard(&past.filter).unwrap().roots;
+        assert!(matches!(fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), None);
+        assert_eq!(past.shard.capture_committed_shard(&past.filter).unwrap().roots, roots);
+        assert_eq!(past.cursor(), 4);
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_ok());
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // A member past the fence on the predecessor's discarded frames without
+    // the fenced frame (an archive-installed head), or without the fenced
+    // state, cannot rewind here: the check names why and leaves the shard
+    // as it was, with the rewind's refusal still its result. A joiner on
+    // the successor's chain is not named.
+    #[test]
+    fn a_member_past_a_fence_that_cannot_rewind_here_is_named() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 4).unwrap();
+        let roots = past.shard.capture_committed_shard(&past.filter).unwrap().roots;
+        match fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap() {
+            FenceRewind::Unrewindable { fence, error: None } => assert_eq!(fence, UnrewindableFence {
+                generation: past.successor.generation, local_head: 4, fence: 3, session_tip: None,
+                reason: "no local frame at the fence",
+            }),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), None);
+        assert_eq!(past.shard.capture_committed_shard(&past.filter).unwrap().roots, roots);
+        assert_eq!(past.cursor(), 4);
+
+        let past = past_fence();
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 4, rank: 6, output: vec![0x44; 32],
+            parent_selector: past.fenced_digest.to_vec(), state_roots: vec![vec![0x09; 32]; 4],
+            ..Default::default()
+        });
+        match fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap() {
+            FenceRewind::Unrewindable { fence, error: Some(QuilError::ExecutionUnavailable(_)) } => {
+                assert_eq!(fence.reason, "fence state not retained locally");
+            }
+            other => panic!("{other:?}"),
+        }
+        let error = rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+        assert!(error.to_string().contains("not retained here"), "{error}");
+        assert_eq!(past.cursor(), 4);
+
+        let joiner_clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let joiner_clock = quil_store::RocksClockStore::new(joiner_clock_db.inner());
+        let joiner = crdt();
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        joiner.commit_with_frame_cursor_and_records(5, &cursor_key, &outflow_records(&past.filter, 5)).unwrap();
+        store_header(&joiner_clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 5, rank: 9, output: vec![0x66; 32],
+            global_frame_number: past.due, ..Default::default()
+        });
+        assert!(matches!(fence_rewind(&past.global, &joiner, &joiner_clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
     }
 
     // The same rewind on a sub-shard of a split application: only the shard's
