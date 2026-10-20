@@ -9,6 +9,7 @@ use crate::context::GlobalArgs;
 
 pub mod archive;
 pub mod diagnostics;
+pub mod diagnostics_dial;
 pub mod diagnostics_logs;
 pub mod lifecycle;
 pub mod log;

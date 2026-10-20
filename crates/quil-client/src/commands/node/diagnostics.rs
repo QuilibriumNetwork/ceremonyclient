@@ -95,6 +95,36 @@ pub enum DiagnosticsCommand {
     /// Deny a peer's pending log request, or withdraw an approved bundle,
     /// fetched or not: this node deletes it and the peer sees it denied.
     Deny(super::diagnostics_logs::DecideArgs),
+    /// Dial a node's libp2p address and print what the node reports.
+    ///
+    /// Tests whether a node's libp2p listener can be reached from where
+    /// qclient runs, e.g. to check port forwarding. It contacts only the
+    /// given address, as a throwaway Ed25519 identity made for this dial
+    /// alone: it reads no key and asks no local node. It completes the
+    /// handshake the network uses (PQNoise sntrup761 and yamux over TCP, or
+    /// QUIC v1 with sntrup761 TLS), checks the peer ID when --peer or a
+    /// trailing /p2p/<peer-id> names one, asks the peer to identify itself
+    /// and pings it once.
+    ///
+    /// Output: peer is the peer ID the handshake proved, and whether it
+    /// matches the one named; connected the time to the finished handshake
+    /// (and to the TCP connection); ping one round trip; agent and protocol
+    /// the software and network version the peer announces; observed the
+    /// address the peer sees this dial come from; listen the addresses the
+    /// peer says it listens on, each public, private (unreachable from
+    /// outside the peer's network) or - (a DNS name); protocols the
+    /// protocols the peer supports, sorted.
+    ///
+    /// Failures name their cause: a refused connection (nothing listens on
+    /// the port, or it is not forwarded), no answer (filtered by a
+    /// firewall, or the host is down), a failed or stalled handshake (not a
+    /// Quilibrium libp2p listener) and a peer ID mismatch.
+    ///
+    /// The peer sees the IP address you connect from. Run under torsocks
+    /// (`torsocks qclient node diagnostics dial ...`) to dial through Tor:
+    /// the peer then sees a Tor exit, which observed shows. Tor carries TCP
+    /// only; a QUIC dial under torsocks fails.
+    Dial(super::diagnostics_dial::DialArgs),
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +147,7 @@ pub struct HealthArgs {
 
 pub async fn run(global: GlobalArgs, cmd: &DiagnosticsCommand) -> anyhow::Result<()> {
     match cmd {
+        DiagnosticsCommand::Dial(args) => super::diagnostics_dial::run(args).await,
         DiagnosticsCommand::Health(args) => health(global, args).await,
         DiagnosticsCommand::Request(args) => super::diagnostics_logs::request(global, args).await,
         DiagnosticsCommand::Status(args) => super::diagnostics_logs::status(global, args).await,
