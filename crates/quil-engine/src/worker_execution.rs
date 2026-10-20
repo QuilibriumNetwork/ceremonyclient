@@ -1,5 +1,8 @@
 //! Local engine observations, with no allocation or reward inference.
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 
 use crate::prover_tree_syncer::ShardRecoveryProgress;
@@ -15,13 +18,31 @@ pub fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SharedWorkerExecution(Arc<Mutex<WorkerExecution>>);
+pub struct SharedWorkerExecution {
+    record: Arc<Mutex<WorkerExecution>>,
+    /// This worker's successor session waits on the archive recovery of its
+    /// predecessor's state.
+    successor_blocked: Arc<AtomicBool>,
+    /// Failed recovery attempts by shard.
+    streaks: Arc<Mutex<HashMap<Vec<u8>, FailureStreak>>>,
+}
 
 impl SharedWorkerExecution {
-    pub fn snapshot(&self) -> WorkerExecution { self.0.lock().unwrap().clone() }
+    /// Whether this worker's successor session cannot start until archive
+    /// recovery brings its predecessor's state through the seal. Such a
+    /// worker takes the next recovery turn before others.
+    pub fn set_successor_blocked(&self, blocked: bool) {
+        self.successor_blocked.store(blocked, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_successor_blocked`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn successor_blocked_flag(&self) -> Arc<AtomicBool> { self.successor_blocked.clone() }
+
+    pub fn snapshot(&self) -> WorkerExecution { self.record.lock().unwrap().clone() }
 
     pub fn state(&self, state: &str, blocker: &str) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         s.state = state.into();
         s.blocker = blocker.into();
         s.observed_unix_ms = now_ms();
@@ -43,14 +64,14 @@ impl SharedWorkerExecution {
     }
 
     pub fn restored(&self, height: u64) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         s.materialized_frame = Some(height);
         s.last_advance_unix_ms = 0;
         s.observed_unix_ms = now_ms();
     }
 
     pub fn materialized(&self, height: u64) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         let now = now_ms();
         // Restoring the initial cursor is an observation, not an advance.
         if s.materialized_frame.is_some_and(|old| height > old) {
@@ -60,11 +81,11 @@ impl SharedWorkerExecution {
         s.observed_unix_ms = now;
     }
 
-    pub fn observe(&self) { self.0.lock().unwrap().observed_unix_ms = now_ms(); }
+    pub fn observe(&self) { self.record.lock().unwrap().observed_unix_ms = now_ms(); }
 
     /// This member saw its session's terminal seal finalized.
     pub fn sealed(&self, generation: u64, checkpoint: u64, view: u64) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         let now = now_ms();
         s.seal = Some(SessionSeal { generation, checkpoint, view, finalized_unix_ms: now, ..Default::default() });
         s.observed_unix_ms = now;
@@ -72,7 +93,7 @@ impl SharedWorkerExecution {
 
     /// The seal was submitted, carrying `drain` (`app_handoff::DrainedSeal::reason`).
     pub fn seal_submitted(&self, global_executed: u64, drain: &str, drain_headers: usize) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         let now = now_ms();
         if let Some(seal) = s.seal.as_mut() {
             seal.global_executed = global_executed;
@@ -86,14 +107,14 @@ impl SharedWorkerExecution {
 
     /// A successor session runs: the last seal is history.
     pub fn clear_seal(&self) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         s.seal = None;
         s.observed_unix_ms = now_ms();
     }
 
     /// GLOBAL recorded the seal, in this node's view of it.
     pub fn seal_recorded(&self) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         let now = now_ms();
         if let Some(seal) = s.seal.as_mut().filter(|seal| seal.recorded_unix_ms == 0) {
             seal.recorded_unix_ms = now;
@@ -102,7 +123,7 @@ impl SharedWorkerExecution {
     }
 
     fn recovery(&self, update: impl FnOnce(&mut ShardRecovery, u64)) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.record.lock().unwrap();
         let now = now_ms();
         update(s.recovery.get_or_insert_with(Default::default), now);
         s.observed_unix_ms = now;
@@ -149,18 +170,197 @@ impl SharedWorkerExecution {
             r.attempt_ms = now.saturating_sub(r.attempt_started_unix_ms).saturating_sub(r.permit_wait_ms);
             ended = r.clone();
         });
-        let filter = hex::encode(filter);
+        let now = Instant::now();
         let source = if ended.source.is_empty() { "none" } else { ended.source.as_str() };
+        let class = failure.as_deref().map(failure_class);
+        let (logged, classes) = {
+            let mut streaks = self.streaks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let streak = streaks.entry(filter.to_vec()).or_default();
+            // A node without any archive is one condition, summarized below
+            // for all its workers.
+            let logged = match class {
+                None => streak.succeeded(now),
+                Some(class) => streak.failed(class, now, if class == NO_ARCHIVE { u64::MAX } else { STREAK_WARN_AFTER }),
+            };
+            (logged, streak.classes())
+        };
+        note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
+        let filter = hex::encode(filter);
         match failure {
-            None => tracing::info!(%filter, outcome = %ended.last_outcome, source,
-                attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
-                installed_leaves = ended.attempt_installed_leaves, "archive recovery batch complete"),
-            Some(error) => tracing::warn!(%filter, %error, source,
-                attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
-                installed_leaves = ended.attempt_installed_leaves, consecutive_failures = ended.consecutive_failures,
-                "archive recovery failed; will retry (installed leaves are kept)"),
+            None => {
+                tracing::info!(%filter, outcome = %ended.last_outcome, source,
+                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                    installed_leaves = ended.attempt_installed_leaves, "archive recovery batch complete");
+                if let Some(StreakLog::Ended { failures, duration }) = logged {
+                    tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
+                        "archive recovery succeeded after a failure streak");
+                }
+            }
+            Some(error) => {
+                tracing::debug!(%filter, %error, source,
+                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                    installed_leaves = ended.attempt_installed_leaves, consecutive_failures = ended.consecutive_failures,
+                    "archive recovery attempt failed");
+                if let (Some(StreakLog::Failing { failures, duration }), Some(class)) = (logged, class) {
+                    let (scope, action) = failure_guidance(class);
+                    tracing::warn!(%filter, consecutive_failures = failures, failing_secs = duration.as_secs(),
+                        classes = %classes, last_class = class, last_error = %error, last_source = source,
+                        scope, action, "archive recovery failing; it retries (installed leaves are kept)");
+                }
+            }
         }
         result
+    }
+}
+
+/// Consecutive failed attempts of one shard before they are warned about:
+/// a failure between successes is retried, not yet an anomaly.
+const STREAK_WARN_AFTER: u64 = 3;
+
+/// How often failing recoveries of one shard, or of the node as a whole,
+/// warn again; across streaks too, so a flapping recovery stays bounded.
+const STREAK_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// The class of a failure that found no archive at all.
+const NO_ARCHIVE: &str = "no_archive_known";
+
+/// A run of failed archive recovery attempts, from the first failure to the
+/// first success.
+#[derive(Debug, Default)]
+pub(crate) struct FailureStreak {
+    since: Option<Instant>,
+    /// When it, or an earlier streak, was last warned about.
+    warned: Option<Instant>,
+    /// This streak was warned about.
+    reported: bool,
+    failures: u64,
+    classes: BTreeMap<&'static str, u64>,
+}
+
+/// What a [`FailureStreak`] change logs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreakLog {
+    /// Once `warn_after` failures in a row, then at most every
+    /// [`STREAK_REPEAT`] while it lasts.
+    Failing { failures: u64, duration: Duration },
+    /// The success that ended a warned streak.
+    Ended { failures: u64, duration: Duration },
+}
+
+impl FailureStreak {
+    const fn new() -> Self {
+        Self { since: None, warned: None, reported: false, failures: 0, classes: BTreeMap::new() }
+    }
+
+    /// An attempt failed with `class` at `now`.
+    pub(crate) fn failed(&mut self, class: &'static str, now: Instant, warn_after: u64) -> Option<StreakLog> {
+        let since = *self.since.get_or_insert(now);
+        self.failures += 1;
+        *self.classes.entry(class).or_default() += 1;
+        if self.failures < warn_after
+            || self.warned.is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
+        {
+            return None;
+        }
+        self.warned = Some(now);
+        self.reported = true;
+        Some(StreakLog::Failing { failures: self.failures, duration: now.saturating_duration_since(since) })
+    }
+
+    /// An attempt succeeded at `now`: the end of the streak, named if it
+    /// was warned about.
+    pub(crate) fn succeeded(&mut self, now: Instant) -> Option<StreakLog> {
+        let since = self.since.take()?;
+        let failures = std::mem::take(&mut self.failures);
+        self.classes.clear();
+        std::mem::take(&mut self.reported)
+            .then(|| StreakLog::Ended { failures, duration: now.saturating_duration_since(since) })
+    }
+
+    /// The streak's failures by class, as `class=count` pairs.
+    pub(crate) fn classes(&self) -> String {
+        self.classes.iter().map(|(class, n)| format!("{class}={n}")).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// This node's recoveries finding no archive at all, across its workers.
+#[derive(Debug)]
+pub(crate) struct NoArchive {
+    streak: FailureStreak,
+    shards: BTreeSet<Vec<u8>>,
+}
+
+impl NoArchive {
+    const fn new() -> Self {
+        Self { streak: FailureStreak::new(), shards: BTreeSet::new() }
+    }
+
+    /// A recovery of `filter` found no archive at `now`: warned at once,
+    /// then at most every [`STREAK_REPEAT`], with the shards affected.
+    pub(crate) fn failed(&mut self, filter: &[u8], now: Instant) -> Option<(StreakLog, usize)> {
+        self.shards.insert(filter.to_vec());
+        Some((self.streak.failed(NO_ARCHIVE, now, 1)?, self.shards.len()))
+    }
+
+    /// A recovery reached an archive at `now`, failing or not.
+    pub(crate) fn resolved(&mut self, now: Instant) -> Option<(StreakLog, usize)> {
+        let shards = std::mem::take(&mut self.shards).len();
+        Some((self.streak.succeeded(now)?, shards))
+    }
+}
+
+static NO_ARCHIVE_KNOWN: Mutex<NoArchive> = Mutex::new(NoArchive::new());
+
+/// Log the node-wide condition of recoveries finding no archive: a recovery
+/// of `filter` at `now` that did (`reached`) or did not reach one.
+fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: Instant) {
+    let logged = {
+        let mut state = NO_ARCHIVE_KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reached { state.resolved(now) } else { state.failed(filter, now) }
+    };
+    match logged {
+        Some((StreakLog::Failing { failures, duration }, shards)) => {
+            let (scope, action) = failure_guidance(NO_ARCHIVE);
+            tracing::warn!(failures, shards, failing_secs = duration.as_secs(), last_error = error.unwrap_or("none"),
+                scope, action, "archive recovery finds no archive; recoveries retry");
+        }
+        Some((StreakLog::Ended { failures, duration }, shards)) => tracing::info!(failures, shards,
+            failing_secs = duration.as_secs(), "archive recovery reaches an archive again"),
+        None => {}
+    }
+}
+
+/// The class of a failed recovery attempt, from its error or not-ready text.
+fn failure_class(error: &str) -> &'static str {
+    if error.contains("no archive known") || error.contains("discovered an archive") || error.contains("archive discovery") {
+        NO_ARCHIVE
+    } else if error.contains("archive connect") {
+        "connect"
+    } else if error.contains("get app-shard frame") || error.contains("get_forest_head") || error.contains("resolve shard subtree") {
+        "archive_request"
+    } else if error.contains("is missing") || error.contains("the archive") {
+        "archive_state"
+    } else if error.contains("replay") {
+        "replay_mismatch"
+    } else {
+        "other"
+    }
+}
+
+/// Whose problem a failure of `class` is, and what the operator can check.
+fn failure_guidance(class: &str) -> (&'static str, &'static str) {
+    match class {
+        NO_ARCHIVE => ("this node", "this node's master knows no reachable archive yet; \
+            check its 'archive endpoint added' lines and outbound connectivity; it retries"),
+        "connect" => ("archive", "the archive refused or timed out the connection; \
+            check this node's outbound connectivity to it; the next attempt tries another archive"),
+        "archive_request" => ("archive", "the archive failed a read; the next attempt tries another archive; \
+            report it with this line if it persists"),
+        "replay_mismatch" => ("this node", "the archive's certified shard frames do not replay onto this worker's \
+            local state; report it with this line if it persists"),
+        "archive_state" => ("archive", "no archive supplied the shard state this worker needs; \
+            it retries; report it with this line if it persists"),
+        _ => ("this node", "report it with this line if it persists"),
     }
 }
 
@@ -174,8 +374,12 @@ fn enter(r: &mut ShardRecovery, phase: &str, now: u64) {
     }
 }
 
-/// The archive the recovery on this task reads from now; elsewhere nothing.
+/// The archive the recovery on this task reads from now; elsewhere, or
+/// for an empty address, nothing.
 pub fn recovery_source(source: &str) {
+    if source.is_empty() {
+        return;
+    }
     let _ = RECOVERING.try_with(|s| s.recovery(|r, _| {
         if r.source != source { r.source = source.into(); }
     }));
@@ -256,6 +460,7 @@ mod tests {
             assert_eq!(worker.snapshot().recovery.unwrap().phase, "waiting_for_permit");
             recovery_phase("installing_leaves");
             recovery_source("198.51.100.7:8340");
+            recovery_source("");
             recovery_leaves(2, 262_144, 2_517_449);
             recovery_installed(1_024);
             recovery_installed(1_024);
@@ -290,6 +495,109 @@ mod tests {
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.last_error.contains("archive discovery timed out"));
         assert_eq!(r.consecutive_failures, 2);
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A failure streak warns once it reaches the threshold, then only
+    /// every repeat interval with its count and duration, and its end is
+    /// named once.
+    #[test]
+    fn a_failure_streak_warns_after_the_threshold_and_then_at_a_bounded_rate() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.succeeded(start), None, "no streak, no end");
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("no_archive_known", start + MINUTE, 3),
+            Some(StreakLog::Failing { failures: 3, duration: MINUTE }));
+        for minute in 2..11 {
+            assert_eq!(streak.failed("no_archive_known", start + MINUTE * minute, 3), None);
+        }
+        assert_eq!(streak.failed("connect", start + MINUTE * 11, 3),
+            Some(StreakLog::Failing { failures: 13, duration: MINUTE * 11 }));
+        assert_eq!(streak.classes(), "connect=3,no_archive_known=10");
+        assert_eq!(streak.succeeded(start + MINUTE * 20),
+            Some(StreakLog::Ended { failures: 13, duration: MINUTE * 20 }));
+        assert_eq!(streak.succeeded(start + MINUTE * 21), None);
+        assert_eq!(streak.classes(), "");
+    }
+
+    /// Failures between successes do not warn, and a flapping recovery
+    /// warns at most once per repeat interval; an unwarned streak's end is
+    /// not named.
+    #[test]
+    fn a_flapping_recovery_warns_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        let mut warnings = 0;
+        for minute in 0..20 {
+            let at = start + MINUTE * minute;
+            if minute % 4 == 3 {
+                streak.succeeded(at);
+                continue;
+            }
+            warnings += usize::from(streak.failed("connect", at, 3).is_some());
+        }
+        assert_eq!(warnings, 2, "minutes 2 and 14");
+        for minute in 20..30 {
+            let at = start + MINUTE * minute;
+            assert_eq!(streak.failed("connect", at, 3), None);
+            assert_eq!(streak.succeeded(at), None);
+        }
+    }
+
+    /// Recoveries finding no archive warn once for the node, with the
+    /// shards affected, and end when any recovery reaches an archive.
+    #[test]
+    fn a_node_without_archives_warns_once_for_all_its_workers() {
+        let start = Instant::now();
+        let mut node = NoArchive::new();
+        assert_eq!(node.resolved(start), None);
+        assert_eq!(node.failed(&[1; 32], start), Some((StreakLog::Failing { failures: 1, duration: Duration::ZERO }, 1)));
+        for worker in 2..100u8 {
+            assert_eq!(node.failed(&[worker; 32], start + MINUTE), None);
+        }
+        assert_eq!(node.failed(&[1; 32], start + MINUTE * 10),
+            Some((StreakLog::Failing { failures: 100, duration: MINUTE * 10 }, 99)));
+        assert_eq!(node.resolved(start + MINUTE * 11),
+            Some((StreakLog::Ended { failures: 100, duration: MINUTE * 11 }, 99)));
+    }
+
+    /// Each shard keeps its own streak: another shard's success does not
+    /// end it, and a node without archives leaves the worker's own warning
+    /// to the node's.
+    #[tokio::test]
+    async fn streaks_are_kept_per_shard() {
+        let worker = SharedWorkerExecution::default();
+        let fail = || async { Err(quil_types::error::QuilError::Internal("archive connect: refused".into())) };
+        for _ in 0..2 {
+            let _ = worker.recovering(&[1; 32], fail()).await;
+        }
+        let _ = worker.recovering(&[2; 32], async { Ok(ShardRecoveryProgress::Anchored { frame: 3 }) }).await;
+        let _ = worker.recovering(&[1; 32], fail()).await;
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(streaks[&vec![1; 32]].failures, 3, "the other shard's success must not reset it");
+        assert!(streaks[&vec![1; 32]].reported);
+        assert_eq!(streaks[&vec![2; 32]].failures, 0);
+    }
+
+    #[test]
+    fn failures_are_classed_by_whose_problem_they_are() {
+        for (error, class) in [
+            ("execution unavailable: no archive known yet", "no_archive_known"),
+            ("internal error: archive connect: invalid endpoint: invalid URI", "connect"),
+            ("internal error: get app-shard frame: status: Unavailable", "archive_request"),
+            ("invalid argument: wrong-shard archive replay tip", "replay_mismatch"),
+            ("execution unavailable: archive replay pre-state mismatch at phase 0", "replay_mismatch"),
+            ("the archive checkpoint failed validation", "archive_state"),
+            ("execution unavailable: archive replay is missing shard frame 9", "archive_state"),
+            ("actor rejected checkpoint", "other"),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        assert_eq!(failure_guidance("no_archive_known").0, "this node");
+        assert_eq!(failure_guidance("connect").0, "archive");
     }
 
     #[tokio::test]

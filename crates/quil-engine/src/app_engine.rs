@@ -3086,6 +3086,8 @@ impl AppConsensusEngine {
     /// ([`PredecessorBlock::blocked`]), naming the predecessor and the shard
     /// sync's last anchor refusal.
     fn warn_predecessor_blocked(&mut self, now: std::time::Instant) {
+        // Its archive recoveries go first while it waits (thread_worker).
+        self.execution.set_successor_blocked(true);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
         let predecessor = self.global_hypergraph.as_ref()
             .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
@@ -3114,9 +3116,20 @@ impl AppConsensusEngine {
             "successor session blocked: predecessor state not recovered through its seal");
     }
 
+    /// Follow a consensus start attempt: whether it left this successor
+    /// waiting on its predecessor's state.
+    fn note_predecessor_block(&mut self, refused: Option<&QuilError>, now: std::time::Instant) {
+        match refused {
+            None => self.end_predecessor_block("consensus started", now),
+            Some(error) if predecessor_recovery_pending(error) => self.warn_predecessor_blocked(now),
+            Some(_) => self.end_predecessor_block("startup now waits on something else", now),
+        }
+    }
+
     /// Once this successor no longer waits on its predecessor's state, say
     /// so if it was warned about, with how long it waited.
     fn end_predecessor_block(&mut self, outcome: &'static str, now: std::time::Instant) {
+        self.execution.set_successor_blocked(false);
         if let Some(blocked) = self.predecessor_block.cleared(now) {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
                 blocked_secs = blocked.as_secs(),
@@ -3336,7 +3349,7 @@ impl AppConsensusEngine {
     ///
     /// The request made at committee build fires when the worker is spawned,
     /// which on a fresh boot is before peer discovery has put any archive in
-    /// the pool: the syncer then resolves an EMPTY endpoint ("invalid URI"),
+    /// the pool: the syncer then finds no archive ("no archive known yet"),
     /// gives up, and nothing retries it until the next committee rebuild. A
     /// node restarting into a SPLIT application has no stored frames for its
     /// child shard either, so it takes the bootstrap branch, fails it once, and
@@ -3744,7 +3757,11 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::CwTransportReady) => {
                             if !cw_transport_ready {
                                 cw_transport_ready = true;
-                                match self.start_consensus_cw((bls_signer_factory)()).await {
+                                let started = self.start_consensus_cw((bls_signer_factory)()).await;
+                                // A successor's first start may already wait on
+                                // its predecessor's state: its recoveries go first.
+                                self.note_predecessor_block(started.as_ref().err(), std::time::Instant::now());
+                                match started {
                                     Ok(handle) => {
                                         self.cw_handle = Some(handle);
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -3819,15 +3836,11 @@ impl AppConsensusEngine {
                                     filter = hex::encode(&self.filter),
                                     "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
                                 );
-                                self.end_predecessor_block("consensus started", std::time::Instant::now());
+                                self.note_predecessor_block(None, std::time::Instant::now());
                                 self.end_start_block(std::time::Instant::now());
                             }
                             Err(e) => {
-                                if predecessor_recovery_pending(&e) {
-                                    self.warn_predecessor_blocked(std::time::Instant::now());
-                                } else {
-                                    self.end_predecessor_block("startup now waits on something else", std::time::Instant::now());
-                                }
+                                self.note_predecessor_block(Some(&e), std::time::Instant::now());
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
                                 self.note_start_refused(&e, std::time::Instant::now());
@@ -8876,6 +8889,60 @@ mod session_view_lag_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A successor whose start waits on its predecessor's state takes the
+    /// next recovery turn, though its recovery queued before the refusal.
+    #[tokio::test]
+    async fn a_blocked_successor_start_moves_its_queued_recovery_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock, global_anchor_store: None, global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let held = turns.acquire(Arc::new(AtomicBool::new(false))).await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = |name: &'static str, blocked: Arc<AtomicBool>| {
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _turn = turns.acquire(blocked).await;
+                order.lock().unwrap().push(name);
+            })
+        };
+        let other = run("other", Arc::new(AtomicBool::new(false)));
+        tokio::task::yield_now().await;
+        let successor_flag = handle.execution_record().successor_blocked_flag();
+        let successor = run("successor", successor_flag.clone());
+        tokio::task::yield_now().await;
+        let pending = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
+        engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+        assert!(successor_flag.load(Ordering::Relaxed));
+        drop(held);
+        other.await.unwrap();
+        successor.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["successor", "other"]);
+        engine.note_predecessor_block(None, std::time::Instant::now());
+        assert!(!successor_flag.load(Ordering::Relaxed), "a started session no longer goes first");
+    }
+
     #[test]
     fn expected_admission_wait_is_distinct_from_preparation_failure() {
         assert!(expected_admission_wait(&QuilError::ExecutionUnavailable("awaiting allocation activation".into())));

@@ -21,10 +21,6 @@ use crate::worker::{WorkerInfo, WorkerManager};
 /// forest and commit locks, keeping each pause of its frame commits short.
 const FOREST_SCAN_BUDGET: usize = 250_000;
 
-/// Archive shard recoveries this process runs at once (see the recovery
-/// spawn below).
-static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
@@ -825,10 +821,12 @@ impl ThreadWorkerManager {
                                                                         let _release_sync = release_sync;
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
-                                                                        // time rather than all failing busy together.
+                                                                        // time rather than all failing busy together. A
+                                                                        // blocked successor session goes first.
                                                                         let attempt = async {
                                                                             crate::worker_execution::recovery_phase("waiting_for_permit");
-                                                                            let _turn = SHARD_RECOVERY_TURNS.acquire().await;
+                                                                            let blocked = lb.execution_record().successor_blocked_flag();
+                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked).await;
                                                                             crate::prover_tree_syncer::recover_shard_from_latest(
                                                                                 syncer.as_ref(), &filter, local, &lb,
                                                                             ).await
