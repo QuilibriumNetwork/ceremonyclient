@@ -763,6 +763,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         seal_checkpoint_drain_frame = %if seal_checkpoint_drain_from == u64::MAX { "never".to_string() } else { seal_checkpoint_drain_from.to_string() },
         "committee handoff drains of checkpoint frames certified only by their seal"
     );
+    let session_leader_no_drain_from = quil_engine::shard_drain::init_session_leader_no_drain_frame(args.network);
+    info!(
+        session_leader_no_drain_frame = %if session_leader_no_drain_from == u64::MAX { "never".to_string() } else { session_leader_no_drain_from.to_string() },
+        "committee session leaders proposing content on shards a frozen grid names retired"
+    );
     let fenced_successor_eligibility_from =
         quil_execution::global_intrinsic::handoff::init_fenced_successor_eligibility_frame(args.network);
     info!(

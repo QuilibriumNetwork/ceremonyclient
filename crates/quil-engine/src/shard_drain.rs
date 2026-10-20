@@ -19,7 +19,9 @@
 //! Under sessions a shard retires through its session instead: a closing
 //! request makes its members propose empty frames, the seal waits for a run of
 //! request-free frames, and GLOBAL flips the grid only after the seal. A voter
-//! therefore never refuses a proposal for a drain under sessions.
+//! therefore never refuses a proposal for a drain under sessions, and a leader
+//! stops draining from [`session_leader_no_drain_frame`], once enough voters
+//! accept its content.
 
 use quil_types::store::{PendingShardChange, ShardChangeKind, ShardsStore};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,11 +86,60 @@ pub enum DrainRole {
     Voter,
 }
 
+/// From this GLOBAL frame, under committee sessions, a leader no longer
+/// drains a shard its node's frozen grid names retired, and proposes its
+/// requests and coin deliveries. A member that still refuses such a proposal
+/// does not vote for it, so the frame must follow the upgrade of the voters
+/// (see [`DrainRole::Voter`]) by enough members of every committee. Unset on
+/// mainnet until that frame is chosen; `QUIL_SESSION_LEADER_NO_DRAIN_FRAME`
+/// elsewhere, never by default.
+pub const MAINNET_SESSION_LEADER_NO_DRAIN_FRAME: Option<u64> = None;
+
+static SESSION_LEADER_NO_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SESSION_LEADER_NO_DRAIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn session_leader_no_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SESSION_LEADER_NO_DRAIN_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's session leader no-drain frame from its network, and
+/// return it. Called at startup before any shard engine runs; the first call
+/// decides.
+pub fn init_session_leader_no_drain_frame(network: u8) -> u64 {
+    *SESSION_LEADER_NO_DRAIN_FRAME.get_or_init(|| {
+        session_leader_no_drain_frame_for(network, std::env::var("QUIL_SESSION_LEADER_NO_DRAIN_FRAME").ok().as_deref())
+    })
+}
+
+pub fn session_leader_no_drain_frame() -> u64 {
+    if let Some(frame) = SESSION_LEADER_NO_DRAIN_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SESSION_LEADER_NO_DRAIN_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SESSION_LEADER_NO_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the session leader no-drain frame for the calling thread only (tests).
+pub fn set_session_leader_no_drain_frame_for_thread(frame: Option<u64>) {
+    SESSION_LEADER_NO_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 /// Whether committee sessions make a drain verdict moot for `role` at
-/// `anchor` (see the module documentation). Leaders still drain, so a
-/// voter that does not refuse their frames can roll out first.
-fn sessions_bypass(role: DrainRole, sessions_govern: bool, _anchor: u64) -> bool {
-    sessions_govern && role == DrainRole::Voter
+/// `anchor` (see the module documentation): for a voter always, for a
+/// leader from [`session_leader_no_drain_frame`].
+fn sessions_bypass(role: DrainRole, sessions_govern: bool, anchor: u64) -> bool {
+    sessions_govern
+        && match role {
+            DrainRole::Voter => true,
+            DrainRole::Leader => anchor >= session_leader_no_drain_frame(),
+        }
 }
 
 /// A shard's drain, read from the node's committed topology (the master's
@@ -277,5 +328,31 @@ mod tests {
         assert!(sessions_bypass(DrainRole::Voter, true, 5));
         assert!(!sessions_bypass(DrainRole::Voter, false, 5));
         assert!(!sessions_bypass(DrainRole::Leader, true, 5));
+    }
+
+    /// From the session leader no-drain frame a leader proposes the shard's
+    /// content too; before it, and without sessions, it still drains.
+    #[test]
+    fn a_leader_stops_draining_for_a_frozen_grid_from_its_activation() {
+        set_session_leader_no_drain_frame_for_thread(Some(2000));
+        regular_node_drain(&[
+            (DrainRole::Leader, 1999, true, "voters may still refuse content"),
+            (DrainRole::Leader, 2000, false, "voters accept content: lead it"),
+            (DrainRole::Voter, 1999, false, "a voter never refuses under sessions"),
+        ]);
+        assert!(!sessions_bypass(DrainRole::Leader, false, 5000), "a legacy leader drains");
+        set_session_leader_no_drain_frame_for_thread(None);
+    }
+
+    /// Mainnet waits for its frame to be chosen; other networks take theirs
+    /// from the environment, and none by default.
+    #[test]
+    fn the_session_leader_no_drain_frame_is_fixed_on_mainnet_and_configured_elsewhere() {
+        assert_eq!(session_leader_no_drain_frame_for(0, Some("5")),
+            MAINNET_SESSION_LEADER_NO_DRAIN_FRAME.unwrap_or(u64::MAX));
+        assert_eq!(MAINNET_SESSION_LEADER_NO_DRAIN_FRAME, None, "chosen once the voters have upgraded");
+        assert_eq!(session_leader_no_drain_frame_for(1, Some("5")), 5);
+        assert_eq!(session_leader_no_drain_frame_for(1, None), u64::MAX);
+        assert_eq!(session_leader_no_drain_frame_for(99, Some("x")), u64::MAX);
     }
 }
