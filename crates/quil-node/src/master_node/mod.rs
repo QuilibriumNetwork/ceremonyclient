@@ -67,6 +67,14 @@ pub(crate) async fn start(
     let key_store = storage.key_store.clone();
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
+    // The grid is local and in no committed root: log it, so an operator can
+    // compare it with other archives' and see a store rewritten while down.
+    // Archives only: a regular node executes no GLOBAL frames after genesis,
+    // so its stored grid stays the genesis grid and would invite a false
+    // comparison.
+    if archive_mode {
+        quil_execution::global_intrinsic::intrinsic::log_local_shard_grid(shards_store.as_ref(), None);
+    }
 
     // NOTE: the boot-time `normalize_quil_token_grid` (force QUIL to 64-way) was
     // REMOVED. It was a one-time pebble->rocksdb migration escape (legacy 4096
