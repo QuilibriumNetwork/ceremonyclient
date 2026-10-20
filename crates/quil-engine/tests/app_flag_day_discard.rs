@@ -209,5 +209,8 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
         let view = CommittedView::capture(&global).unwrap();
         assert_eq!(session_of(&view, &head).as_ref(), Some(&first), "the stored chain is the session's");
     }
+    // Join every consensus host before the stores drop: a detached host
+    // can close RocksDB while the process exits (`AppShardHarness::shutdown`).
+    harness.shutdown().await;
     quil_types::consensus::set_committee_handoff_policy(None);
 }
