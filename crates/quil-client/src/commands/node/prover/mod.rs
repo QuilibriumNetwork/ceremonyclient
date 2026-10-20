@@ -271,15 +271,6 @@ pub(crate) fn format_gb(v: &BigInt) -> String {
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
-pub(crate) fn format_mb(v: &BigInt) -> String {
-    let mb = v.to_string().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0);
-    if v.sign() == Sign::Plus && mb < 0.05 {
-        "<0.1".to_string()
-    } else {
-        format!("{mb:.1}")
-    }
-}
-
 /// `framesPerDay` — frames in 24h at a 10s target frame time.
 const FRAMES_PER_DAY: u64 = 24 * 60 * 60 / 10; // 8640
 
@@ -325,17 +316,6 @@ mod tests {
             (50_000_000, "0.1"), (1_000_000_000, "1.0"), (1_673_583_448, "1.7")] {
             assert_eq!(format_gb(&BigInt::from(bytes)), expected);
         }
-    }
-
-    #[test]
-    fn format_mb_separates_a_small_shard_from_an_empty_one() {
-        assert_eq!(format_mb(&BigInt::from(0)), "0.0");
-        assert_eq!(format_mb(&BigInt::from(2048)), "<0.1");
-        // The rounding edge: 0.05 MB is where `{:.1}` starts printing `0.1`.
-        assert_eq!(format_mb(&BigInt::from(52_428)), "<0.1");
-        assert_eq!(format_mb(&BigInt::from(52_429)), "0.1");
-        assert_eq!(format_mb(&BigInt::from(5 * 1024 * 1024)), "5.0");
-        assert_eq!(format_mb(&BigInt::from(1024 * 1024 * 1024)), "1024.0");
     }
 
     #[test]

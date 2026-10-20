@@ -276,7 +276,7 @@ fn scenario_allocation_state_and_worker_matrix() {
                             idle_worker(1)
                         };
                         worker.manually_managed = manual;
-                        let mut scenario = Scenario::new(vec![allocation], vec![worker]);
+                        let scenario = Scenario::new(vec![allocation], vec![worker]);
                         // This matrix characterizes allocator state alone;
                         // targeted histories above exercise policy actions.
                         // Renewals were decided since start: a lapsed seat

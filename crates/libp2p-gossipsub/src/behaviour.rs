@@ -60,7 +60,6 @@ use crate::{
     mcache::MessageCache,
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
     rpc::Sender,
-    rpc_proto::proto,
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
     time_cache::DuplicateCache,
     topic::{Hasher, Topic, TopicHash},
@@ -72,6 +71,8 @@ use crate::{
     },
     FailedMessages, PublishError, SubscriptionError, TopicScoreParams, ValidationError,
 };
+#[cfg(test)]
+use crate::rpc_proto::proto;
 
 #[cfg(test)]
 mod tests;

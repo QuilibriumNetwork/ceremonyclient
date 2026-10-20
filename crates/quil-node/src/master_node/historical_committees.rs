@@ -160,16 +160,6 @@ impl HistoricalCommittees {
         self
     }
 
-    /// A source for app engines.
-    pub(crate) fn source(self: &Arc<Self>) -> quil_engine::historical_committee::HistoricalCommitteeSource {
-        let this = self.clone();
-        Arc::new(move |filter: Vec<u8>, anchor: u64| {
-            let this = this.clone();
-            Box::pin(async move { this.committees(&filter, anchor).await })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<Vec<u8>>>>> + Send>>
-        })
-    }
-
     /// The distinct committees `filter` had at `anchor` under the prover tree
     /// after each GLOBAL frame in `[anchor - BEFORE, anchor + AFTER]`.
     pub(crate) async fn committees(&self, filter: &[u8], anchor: u64) -> Result<Vec<Vec<Vec<u8>>>> {

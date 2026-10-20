@@ -14,15 +14,6 @@ pub fn state_at(s: Option<&WorkerExecution>, now: u64) -> &str {
         _ => "unknown",
     }
 }
-/// A worker whose consensus host runs: `running` from nodes that report no
-/// lifecycle phase, otherwise serving, syncing its shard data, or closing.
-pub fn hosting(state: &str) -> bool {
-    matches!(state, "running" | "serving" | "syncing" | "closing")
-}
-/// A fresh observation in a state this client knows.
-pub fn observed(state: &str) -> bool {
-    !matches!(state, "stale" | "unknown")
-}
 pub fn local_execution_state(s: Option<&WorkerExecution>) -> &str { state_at(s, now_ms()) }
 /// Compact labels share the column's nine-character budget.
 pub fn execution_label(state: &str) -> &str {
@@ -148,12 +139,7 @@ mod tests {
         for state in ["running", "serving", "syncing", "closing", "handoff", "waiting", "starting", "stopped"] {
             let s = WorkerExecution { state: state.into(), observed_unix_ms: 10_000, ..Default::default() };
             assert_eq!(state_at(Some(&s), 20_000), state);
-            assert!(observed(state_at(Some(&s), 20_000)));
         }
-        let unknown = WorkerExecution { state: "unknown".into(), observed_unix_ms: 10_000, ..Default::default() };
-        assert!(!observed(state_at(Some(&unknown), 20_000)) && !observed("stale"));
-        assert!(["running", "serving", "syncing", "closing"].into_iter().all(hosting));
-        assert!(!["starting", "handoff", "waiting", "blocked", "stopped", "stale", "unknown"].into_iter().any(hosting));
         assert!(detail(None).contains("unknown"));
         assert!(detail(Some(&s)).contains("checkpoint mismatch"));
         assert!(!detail(Some(&s)).contains("Recovery"));
