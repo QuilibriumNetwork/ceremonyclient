@@ -323,7 +323,7 @@ pub(crate) fn build_thread_worker_hypergraph(
     }
     let label = db.inner().path().display().to_string();
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, &label);
-    crate::clock_retention::spawn_staged_cleanup(Arc::new(quil_store::RocksClockStore::new(db.inner())), label);
+    crate::clock_retention::spawn_staged_cleanup(&db.inner(), label);
     crdt
 }
 

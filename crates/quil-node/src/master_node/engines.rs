@@ -77,7 +77,7 @@ pub(crate) fn init_engines(
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "master".into());
     }
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, "master");
-    crate::clock_retention::spawn_staged_cleanup(storage.clock_store.clone(), "master".into());
+    crate::clock_retention::spawn_staged_cleanup(&storage.db_arc.inner(), "master".into());
     crate::clock_retention::spawn_candidate_pruner(&storage.clock_store, "master".into());
     // Seed the forest Merkle-sum size index ONCE (marker-gated), BEFORE the first
     // `rebucket_app` — which fires immediately below in `refresh_crdt_shard_prefixes`

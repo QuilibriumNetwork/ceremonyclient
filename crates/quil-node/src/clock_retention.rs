@@ -22,6 +22,9 @@ use tracing::{info, warn};
 
 /// Staged keys examined per step of the startup cleanup.
 const STAGED_STEP: usize = 10_000;
+/// The startup cleanup waits this long first, like the periodic pruners, so
+/// a store closed soon after opening (a failed start, a test) is not scanned.
+const STAGED_START_DELAY: Duration = Duration::from_secs(60);
 /// Candidate headers examined per step of a candidate pass.
 const CANDIDATE_STEP: usize = 5_000;
 /// Never closer to the head than this, whatever is configured.
@@ -51,15 +54,22 @@ pub(crate) fn apply_snapshot_pin_limit(crdt: &quil_hypergraph::HypergraphCrdt, l
     }
 }
 
-/// `QUIL_PRUNE_STAGED_SHARD_FRAMES` (default on): one bounded pass over `clock`'s staged
-/// application frames, in the background. It holds the store until done.
-pub(crate) fn spawn_staged_cleanup(clock: Arc<quil_store::RocksClockStore>, label: String) {
+/// `QUIL_PRUNE_STAGED_SHARD_FRAMES` (default on): one bounded pass over the staged
+/// application frames in `db`, in the background, starting after
+/// [`STAGED_START_DELAY`]. It holds the store only for one step at a time and
+/// stops once the store is dropped, so it never keeps the database open past
+/// its owners (an open RocksDB at process exit aborts).
+pub(crate) fn spawn_staged_cleanup(db: &quil_forest::CoordinatedDb, label: String) {
     if !enabled("QUIL_PRUNE_STAGED_SHARD_FRAMES") {
         return;
     }
+    let db = db.downgrade();
     let spawned = std::thread::Builder::new()
         .name(format!("staged-prune-{label}"))
-        .spawn(move || prune_staged(&clock, &label));
+        .spawn(move || {
+            std::thread::sleep(STAGED_START_DELAY);
+            prune_staged(&db, &label)
+        });
     if let Err(error) = spawned {
         warn!(%error, "staged shard frame cleanup not started");
     }
@@ -119,10 +129,15 @@ pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, lab
     }
 }
 
-fn prune_staged(store: &quil_store::RocksClockStore, label: &str) {
+fn prune_staged(db: &quil_forest::WeakCoordinatedDb, label: &str) {
     let mut after: Option<Vec<u8>> = None;
     let (mut scanned, mut deleted, mut bytes, mut kept) = (0u64, 0u64, 0u64, 0u64);
     loop {
+        let Some(db) = db.upgrade() else {
+            info!(store = %label, scanned, deleted, "staged shard frame cleanup stopped: the store closed; a restart resumes it");
+            return;
+        };
+        let store = quil_store::RocksClockStore::new(db);
         match store.prune_committed_staged_shard_frames(after.as_deref(), STAGED_STEP, false) {
             Ok(pass) => {
                 scanned += pass.scanned;
@@ -136,6 +151,7 @@ fn prune_staged(store: &quil_store::RocksClockStore, label: &str) {
                 return;
             }
         }
+        drop(store);
         if after.is_none() {
             break;
         }
