@@ -2447,6 +2447,8 @@ pub struct CommittedProverScan {
     pub(crate) allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
     /// Each allocation's recorded ring key, aligned with `allocations`.
     ring_keys: Vec<Option<crate::global_intrinsic::prover_rings::RingKey>>,
+    /// Each allocation's recorded release, aligned with `allocations`.
+    releases: Vec<Option<crate::global_intrinsic::prover_release::Release>>,
     /// Each prover's committed seniority, by address.
     seniority: HashMap<Vec<u8>, u64>,
 }
@@ -2466,7 +2468,8 @@ impl CommittedProverScan {
         allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
     ) -> Self {
         let ring_keys = vec![None; allocations.len()];
-        Self { addr_to_pubkey, allocations, ring_keys, seniority: HashMap::new() }
+        let releases = vec![None; allocations.len()];
+        Self { addr_to_pubkey, allocations, ring_keys, releases, seniority: HashMap::new() }
     }
 
     /// [`Self::from_parts`] with each allocation's ring key and each prover's
@@ -2477,8 +2480,26 @@ impl CommittedProverScan {
         allocations: Vec<(Vec<u8>, ProverAllocationInfo, Option<crate::global_intrinsic::prover_rings::RingKey>)>,
         seniority: HashMap<Vec<u8>, u64>,
     ) -> Self {
-        let (allocations, ring_keys) = allocations.into_iter().map(|(a, info, key)| ((a, info), key)).unzip();
-        Self { addr_to_pubkey, allocations, ring_keys, seniority }
+        let (allocations, ring_keys): (Vec<_>, _) = allocations.into_iter().map(|(a, info, key)| ((a, info), key)).unzip();
+        let releases = vec![None; allocations.len()];
+        Self { addr_to_pubkey, allocations, ring_keys, releases, seniority }
+    }
+
+    /// This scan with `release` recorded on `address`'s allocation on
+    /// `filter`, for tests.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn with_release(
+        mut self,
+        address: &[u8],
+        filter: &[u8],
+        release: crate::global_intrinsic::prover_release::Release,
+    ) -> Self {
+        if let Some(index) = self.allocations.iter().position(|(prover, alloc)| {
+            prover.as_slice() == address && alloc.confirmation_filter == filter
+        }) {
+            self.releases[index] = Some(release);
+        }
+        self
     }
 
     /// Like [`Self::scan`], but a failed committed-state read is an error
@@ -2497,6 +2518,7 @@ impl CommittedProverScan {
         let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
         let mut ring_keys = Vec::new();
+        let mut releases = Vec::new();
         let mut seniority: HashMap<Vec<u8>, u64> = HashMap::new();
 
         // Tombstones first: `remove_vertex` leaves the "adds" blob in place, so
@@ -2531,6 +2553,9 @@ impl CommittedProverScan {
                 if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
                     allocations.push((prover_ref, alloc));
                     ring_keys.push(decode_ring_key(&root));
+                    releases.push(crate::global_intrinsic::prover_release::Release::from_bytes(
+                        &read_bytes(&root, "allocation:ProverAllocation", "Release"),
+                    ));
                 }
                 return;
             }
@@ -2547,6 +2572,7 @@ impl CommittedProverScan {
                 addr_to_pubkey,
                 allocations,
                 ring_keys,
+                releases,
                 seniority,
             },
             removes.and(adds),
@@ -2578,6 +2604,20 @@ impl CommittedProverScan {
                 self.seniority(address),
             )
         }))
+    }
+
+    /// The releases recorded on the allocations on `filter`, by prover
+    /// address; an allocation without one is absent.
+    pub fn releases_on_filter(
+        &self,
+        filter: &[u8],
+    ) -> HashMap<&[u8], crate::global_intrinsic::prover_release::Release> {
+        self.allocations
+            .iter()
+            .zip(&self.releases)
+            .filter(|((_, alloc), _)| alloc.confirmation_filter == filter)
+            .filter_map(|((prover, _), release)| release.map(|release| (prover.as_slice(), release)))
+            .collect()
     }
 
     /// Every allocation, with its prover's public key and its ring key

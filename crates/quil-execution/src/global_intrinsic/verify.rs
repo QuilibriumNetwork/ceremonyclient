@@ -727,7 +727,7 @@ pub fn verify_prover_confirm(
     })?;
 
     let message =
-        prover_verify::confirm_signing_message(&op.filters, op.frame_number, &op.leaf_roots);
+        prover_verify::confirm_signing_message(&op.filters, op.frame_number, &op.leaf_roots, op.release.as_ref());
     let domain = prover_verify::prover_confirm_domain()?;
 
     key_manager.validate_signature(
@@ -1474,7 +1474,44 @@ mod tests {
             }),
             filters: vec![vec![0xDDu8; 32]],
             leaf_roots: Vec::new(),
+            release: None,
         }
+    }
+
+    /// Accepts a signature over exactly one message.
+    struct MessageKeyManager(Vec<u8>);
+    impl KeyManager for MessageKeyManager {
+        fn validate_signature(&self, _: KeyType, _: &[u8], message: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+            Ok(message == self.0.as_slice())
+        }
+    }
+
+    #[test]
+    fn confirm_verify_ignores_a_release_before_the_release_frame_and_binds_it_after() {
+        use crate::global_intrinsic::prover_release::{set_confirm_release_frame_for_thread, Release};
+        let prover_tree = make_prover_tree();
+        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+        let mut op = sample_confirm();
+        let legacy = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+        let mut bound = legacy.clone();
+        bound.extend_from_slice(b"release");
+        bound.extend_from_slice(&[2, 1, 0, 25, 0, 92]);
+        op.release = Some(release);
+        // Unset, and before the frame: the release is not signed, so a
+        // signature over the legacy message verifies, as an older build's.
+        for frame in [None, Some(op.frame_number + 1)] {
+            set_confirm_release_frame_for_thread(frame);
+            assert!(verify_prover_confirm(&op, &prover_tree, &MessageKeyManager(legacy.clone())).unwrap());
+            assert!(!verify_prover_confirm(&op, &prover_tree, &MessageKeyManager(bound.clone())).unwrap());
+        }
+        // From the frame the signature must cover the release.
+        set_confirm_release_frame_for_thread(Some(op.frame_number));
+        assert!(verify_prover_confirm(&op, &prover_tree, &MessageKeyManager(bound.clone())).unwrap());
+        assert!(!verify_prover_confirm(&op, &prover_tree, &MessageKeyManager(legacy.clone())).unwrap());
+        // A confirm without a release still signs the legacy message.
+        op.release = None;
+        assert!(verify_prover_confirm(&op, &prover_tree, &MessageKeyManager(legacy)).unwrap());
+        set_confirm_release_frame_for_thread(None);
     }
 
     #[test]
@@ -1689,7 +1726,7 @@ mod tests {
     #[test]
     fn confirm_timing_rejects_already_confirmed_leave() {
         let mut alloc = make_alloc_tree_with_leave_frame(5 * E + 10);
-        super::super::materialize::materialize_prover_confirm(&mut alloc, 6 * E + 1).unwrap();
+        super::super::materialize::materialize_prover_confirm(&mut alloc, 6 * E + 1, None).unwrap();
         assert!(validate_confirm_timing(6 * E + 2, &alloc).is_err());
     }
 

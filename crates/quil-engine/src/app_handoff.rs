@@ -1035,15 +1035,15 @@ pub fn fence_rewind(
             },
             error,
         };
-        // The fenced session's frames anchor before GLOBAL fenced it (its
-        // closing request plus the timeout); this session's at or after that.
-        let fenced_at = || -> Result<Option<u64>> {
+        // The fenced session's frames anchor before GLOBAL fenced it, at
+        // `schedule::fence_due_frame` of its closing request's frame, as
+        // GLOBAL dates the fence; this session's at or after that.
+        let requested_at = || -> Result<Option<u64>> {
             let request = match handoff::status(&view, &source.id()?)? {
                 Status::Sealing(request) | Status::Closed(request) => handoff::request(&view, &request)?,
                 Status::Active => None,
             };
-            Ok(request.map(|request| request.frame.saturating_add(
-                schedule::FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames()))))
+            Ok(request.map(|request| request.frame))
         };
         let fenced = clock.get_shard_clock_frame(&session.filter, checkpoint.frame, false);
         let next = clock.get_shard_clock_frame(&session.filter, checkpoint.frame + 1, false);
@@ -1058,7 +1058,7 @@ pub fn fence_rewind(
                 // anchored before GLOBAL fenced it, or a frame at the
                 // session's executed tip that differs from GLOBAL's, says
                 // which. Unknown counts as a joiner.
-                let discarded = at_tip == Some(false) || fenced_at().ok().flatten().is_some_and(|due| {
+                let discarded = at_tip == Some(false) || requested_at().ok().flatten().map(schedule::fence_due_frame).is_some_and(|due| {
                     let before = |frame: Result<quil_types::proto::global::AppShardFrame>| {
                         frame.ok().and_then(|frame| frame.header).is_some_and(|header| {
                             header.frame_number > checkpoint.frame && header.global_frame_number < due
@@ -1084,8 +1084,8 @@ pub fn fence_rewind(
         }
         // This session's own first frame also builds on the fence, anchored
         // at or after the fenced predecessor's.
-        let fenced_at = fenced_at()?.ok_or_else(|| unavailable("fenced predecessor has no closing request"))?;
-        if header.global_frame_number >= fenced_at {
+        let requested = requested_at()?.ok_or_else(|| unavailable("fenced predecessor has no closing request"))?;
+        if header.global_frame_number >= schedule::fence_due_frame(requested) {
             return Ok(FenceRewind::Untouched);
         }
         let roots: [[u8; 32]; 4] = header.state_roots.iter()
@@ -1112,7 +1112,7 @@ pub fn fence_rewind(
         clock.delete_shard_clock_frame_range(&session.filter, checkpoint.frame + 1, cursor.max(stored) + 1)?;
         tracing::warn!(
             filter = hex::encode(&session.filter), generation = session.generation,
-            from = cursor, to = checkpoint.frame,
+            from = cursor, to = checkpoint.frame, after_epochs = schedule::fence_after_epochs(requested),
             "rewound shard state to the checkpoint GLOBAL fenced its predecessor at",
         );
         return Ok(FenceRewind::Rewound(checkpoint.frame));
@@ -1713,6 +1713,12 @@ mod successor_tests {
     }
 
     fn past_fence() -> PastFence {
+        past_fence_due(3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames())
+    }
+
+    /// [`past_fence`], with GLOBAL fencing the predecessor (requested at
+    /// frame 3) at `due` and not at the frame before it.
+    fn past_fence_due(due: u64) -> PastFence {
         let (global, state) = global_state();
         let filter = vec![0x02; 32];
         let (source, _, _) = closing_session(&global, &state, &filter);
@@ -1739,7 +1745,7 @@ mod successor_tests {
         });
         handoff::record_session_tip(&state, 4, &source.id().unwrap(),
             &Checkpoint { frame: 3, view: 5, digest: fenced_digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
-        let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
+        assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()], None).unwrap(), 0);
         assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
@@ -1778,6 +1784,41 @@ mod successor_tests {
         assert_eq!(past.cursor(), 3);
         assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_err(), "the discarded frame is deleted");
         successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // From the early fence frame GLOBAL fences one epoch after the closing
+    // request, and the rewind dates the fence by the same rule
+    // (`schedule::fence_due_frame`): a frame past the fence anchored the
+    // frame before it is the predecessor's and is discarded, and the
+    // successor's own first frame, anchored at the fence, stays. Dated four
+    // epochs late, the rewind would discard the successor's own frame.
+    #[test]
+    fn a_rewind_dates_an_early_fence_as_global_does() {
+        handoff::set_early_fence_frame_for_thread(Some(0));
+        let due = 3 + quil_types::consensus::epoch_length_frames();
+        assert_eq!(schedule::fence_due_frame(3), due);
+        let past = past_fence_due(due);
+        let header = |rank: u64, output: u8, anchor: u64| quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 4, rank, output: vec![output; 32],
+            parent_selector: past.fenced_digest.to_vec(), global_frame_number: anchor,
+            state_roots: past.fenced_roots.iter().map(|root| root.to_vec()).collect(),
+            ..Default::default()
+        };
+        store_header(&past.clock, header(6, 0x44, due - 1));
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), Some(3),
+            "anchored before the fence: the predecessor's");
+        assert_eq!(past.cursor(), 3);
+
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        let own = quil_hypergraph::Location { app_address: [0x02; 32], data_address: [4; 32] };
+        past.shard.add_vertex(&own, b"the successor's own").unwrap();
+        past.shard.commit_with_frame_cursor_and_records(4, &cursor_key, &outflow_records(&past.filter, 4)).unwrap();
+        store_header(&past.clock, header(7, 0x55, due));
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), None,
+            "anchored at the fence: the successor's own");
+        assert_eq!(past.cursor(), 4);
+        assert_eq!(past.shard.get_vertex_data(&own), Some(b"the successor's own".to_vec()));
+        handoff::set_early_fence_frame_for_thread(None);
     }
 
     // A member whose frame at the executed tip is the one GLOBAL executed

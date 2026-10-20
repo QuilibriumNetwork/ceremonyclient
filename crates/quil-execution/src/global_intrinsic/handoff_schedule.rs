@@ -11,7 +11,8 @@
 //! the grid flips and allocations move.
 //!
 //! A source committee that can no longer assemble a quorum never seals. After
-//! [`FENCE_AFTER_EPOCHS`] epochs GLOBAL fences it instead
+//! [`FENCE_AFTER_EPOCHS`] epochs (one from [`super::early_fence_frame`]:
+//! [`fence_due_frame`]) GLOBAL fences it instead
 //! ([`fence_stalled_sources`]): the session ends at the last data frame GLOBAL
 //! executed for it (its `tip`), frames beyond that are refused like frames after
 //! a seal, and the successor is authorized from that checkpoint. A fenced
@@ -51,10 +52,44 @@ pub enum TopologyGate {
 /// Sorted, unique Falcon keys of the provers committee-eligible on `filter`.
 /// Keys that are not well-formed Falcon public keys cannot sign in a session
 /// and are left out deterministically.
+///
+/// While a step of the release eligibility schedule applies at `frame`, the
+/// frame the session is formed at, only allocations whose recorded release is
+/// at least that step's minimum are seated; one without a recorded release is
+/// not ([`super::super::prover_release::seat_eligible`]). The recorded
+/// release is signed by the prover's own key but self-attested: the schedule
+/// removes honest but outdated provers, and a false claim gains a prover
+/// nothing an eligible member does not have. Callers keep a shard's current
+/// session when no member remains. Committee eligibility, splits, merges and
+/// reassignment do not apply the gate.
 pub fn desired_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    use super::super::prover_release::{minimum_release_at, seat_eligible};
+    if minimum_release_at(frame).is_none() {
+        return members_where(scan, filter, frame, |_| true);
+    }
+    let releases = scan.releases_on_filter(filter);
+    members_where(scan, filter, frame, |address| seat_eligible(releases.get(address), frame))
+}
+
+/// [`desired_members`] without the release gate: the committee a merge's
+/// successor takes, which, like a split's, seats every eligible prover of its
+/// sources. A merge whose successor would have no member is dropped, unlike
+/// a membership change, which keeps the current session; the next membership
+/// boundary applies the gate to the merged shard.
+fn merge_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    members_where(scan, filter, frame, |_| true)
+}
+
+fn members_where(
+    scan: &CommittedProverScan,
+    filter: &[u8],
+    frame: u64,
+    seat: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
     let mut members: Vec<Vec<u8>> = scan
         .active_on_filter(filter, frame)
         .into_iter()
+        .filter(|(_, address)| seat(address))
         .map(|(public_key, _)| public_key)
         .filter(|key| FalconPublicKey::from_bytes(key).is_some())
         .collect();
@@ -343,7 +378,7 @@ pub fn gate_topology_change_sized<'s>(
         }
         ShardChangeKind::Merge => {
             let mut members: Vec<Vec<u8>> = sources.iter()
-                .flat_map(|source| desired_members(scan, source, frame)).collect();
+                .flat_map(|source| merge_members(scan, source, frame)).collect();
             members.sort();
             members.dedup();
             new.into_iter().map(|filter| DesiredCommittee { filter, members: members.clone() }).collect()
@@ -624,11 +659,36 @@ pub fn recover_topology_change(
 /// Epochs a closing session may take to seal before GLOBAL fences it.
 pub const FENCE_AFTER_EPOCHS: u64 = 4;
 
+/// Epochs a closing session requested at or after
+/// [`super::early_fence_frame`] may take to seal before GLOBAL fences it.
+pub const EARLY_FENCE_AFTER_EPOCHS: u64 = 1;
+
+/// Epochs a closing session whose request GLOBAL made at `request_frame` may
+/// take to seal before GLOBAL fences it. The request's committed frame
+/// selects the rule, so a request's timeout never changes once it is made.
+pub fn fence_after_epochs(request_frame: u64) -> u64 {
+    if request_frame >= super::early_fence_frame() {
+        EARLY_FENCE_AFTER_EPOCHS
+    } else {
+        FENCE_AFTER_EPOCHS
+    }
+}
+
+/// The first GLOBAL frame at which [`fence_stalled_sources`] fences a
+/// closing session whose request GLOBAL made at `request_frame` and which has
+/// not sealed. Members date a fence by it too (the engine's fence rewind),
+/// so they and GLOBAL agree on it.
+pub fn fence_due_frame(request_frame: u64) -> u64 {
+    request_frame.saturating_add(
+        fence_after_epochs(request_frame).saturating_mul(quil_types::consensus::epoch_length_frames()),
+    )
+}
+
 /// Fence every closing source among `filters`' head sessions whose request is
-/// [`FENCE_AFTER_EPOCHS`] epochs old and which has not sealed, then authorize
-/// the successors of any request that thereby has every source ended. Reads
-/// committed state only, so every materializing node fences the same sessions.
-/// Returns how many sessions were fenced.
+/// [`fence_after_epochs`] epochs old ([`fence_due_frame`]) and which has not
+/// sealed, then authorize the successors of any request that thereby has
+/// every source ended. Reads committed state only, so every materializing
+/// node fences the same sessions. Returns how many sessions were fenced.
 ///
 /// The fence is the session's executed tip: its frame, view and digest, with
 /// zero state and history roots (nothing certifies the state after the tip).
@@ -651,7 +711,6 @@ pub fn fence_stalled_sources(
     filters: &[Vec<u8>],
     mut eligible: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>>,
 ) -> Result<usize> {
-    let timeout = FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames());
     let mut fenced = 0;
     for filter in filters {
         let Some(session) = head(state, filter)? else { continue };
@@ -663,7 +722,7 @@ pub fn fence_stalled_sources(
         }
         let pending = request(state, &request_id)?
             .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
-        if frame < pending.frame.saturating_add(timeout) {
+        if frame < fence_due_frame(pending.frame) {
             continue;
         }
         let checkpoint = match session_tip(state, &id)? {
@@ -705,6 +764,7 @@ pub fn fence_stalled_sources(
             generation = session.generation,
             fenced_at = checkpoint.frame,
             request = hex::encode(request_id),
+            after_epochs = fence_after_epochs(pending.frame),
             "committee handoff: closing session did not seal in time; fenced at its executed tip"
         );
         fenced += 1;
@@ -723,10 +783,11 @@ pub fn fence_stalled_sources(
 }
 
 /// The committee a fence's membership successor takes: its shard's eligible
-/// provers now. Its request fixed the committee when it was scheduled, four
-/// epochs earlier, from provers that have since mostly moved on, so it could
-/// not reach quorum; and the same pass's reconciliation found it unlike
-/// current eligibility and asked it to close at once (decided 2026-10-16).
+/// provers now. Its request fixed the committee when it was scheduled,
+/// [`fence_after_epochs`] epochs earlier, from provers that have since
+/// mostly moved on, so it could not reach quorum; and the same pass's
+/// reconciliation found it unlike current eligibility and asked it to close
+/// at once (decided 2026-10-16).
 /// `None` keeps the request's committee: a split's or merge's, one whose
 /// shard has no valid eligible committee now, or one that still matches.
 fn fenced_committee(

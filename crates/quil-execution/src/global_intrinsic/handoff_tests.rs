@@ -890,7 +890,59 @@ fn scheduler_authorizes_first_sessions_and_membership_successors_once() {
     assert!(schedule::closing_request(&state, &first).is_err(), "a retired session has no parent");
     let second = head(&state, &filter).unwrap().unwrap();
     assert_eq!((second.generation, second.base_frame, second.members.clone()), (2, 3, members(&new)));
+    assert_eq!(scheduled_frame(&state, &second.id().unwrap()).unwrap(), Some(4), "its committee was chosen at 4");
+    assert_eq!(scheduled_frame(&state, &first.id().unwrap()).unwrap(), None, "no request authorized a first session");
     assert_eq!(schedule::reconcile_membership(&state, 7, &policy(), &filters, &changed).unwrap(), 0);
+}
+
+/// From a release eligibility step's frame new sessions seat only
+/// allocations whose recorded release is at least its minimum: one with an
+/// older release or none recorded is not desired, and a shard left with no
+/// such member keeps its current session.
+#[test]
+fn release_eligibility_seats_only_recorded_minimum_releases() {
+    use crate::global_intrinsic::prover_release::{set_release_eligibility_for_thread, Release, ReleaseMinimum};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    commit(&state, 1);
+    let filter = vec![7u8; 32];
+    let filters = vec![filter.clone()];
+    let provers = keys();
+    let address = |key: &FalconPrivateKey| {
+        quil_crypto::poseidon::hash_bytes_to_32(key.public_key().as_ref()).unwrap().to_vec()
+    };
+    let minimum = Release { version: [2, 1, 0], patch: 25, subpatch: 90 };
+    let older = Release { subpatch: 89, ..minimum };
+    let recorded = |releases: &[Option<Release>]| {
+        provers.iter().zip(releases).fold(scan_of(&[(&filter, &provers)]), |scan, (key, release)| match release {
+            Some(release) => scan.with_release(&address(key), &filter, *release),
+            None => scan,
+        })
+    };
+    let current = Some(minimum);
+    // Two current, one older, one absent (its last confirm recorded none).
+    let mixed = recorded(&[current, current, Some(older), None]);
+    set_release_eligibility_for_thread(None).unwrap();
+    assert_eq!(schedule::desired_members(&mixed, &filter, 10), members(&provers), "unset: the gate never applies");
+    set_release_eligibility_for_thread(Some(vec![ReleaseMinimum { from_frame: 10, minimum }])).unwrap();
+    assert_eq!(schedule::desired_members(&mixed, &filter, 9), members(&provers), "not before its frame");
+    assert_eq!(schedule::desired_members(&mixed, &filter, 10), members(&provers[..2]),
+        "an older or absent release is not seated");
+    assert!(schedule::desired_members(&recorded(&[None; 4]), &filter, 10).is_empty(), "absent fails closed");
+    assert_eq!(mixed.active_on_filter(&filter, 10).len(), 4, "committee eligibility is unchanged");
+
+    assert_eq!(schedule::reconcile_membership(&state, 10, &policy(), &filters, &mixed).unwrap(), 1);
+    commit(&state, 10);
+    let first = head(&state, &filter).unwrap().unwrap();
+    assert_eq!(first.members, members(&provers[..2]));
+    assert_eq!(schedule::reconcile_membership(&state, 11, &policy(), &filters, &recorded(&[None; 4])).unwrap(), 0,
+        "no member left keeps the current session");
+    assert_eq!(head(&state, &filter).unwrap().unwrap(), first);
+    assert_eq!(status(&state, &first.id().unwrap()).unwrap(), Status::Active);
+    assert_eq!(schedule::reconcile_membership(&state, 12, &policy(), &filters, &recorded(&[current; 4])).unwrap(), 1,
+        "members that record a current release are seated by the next session");
+    set_release_eligibility_for_thread(None).unwrap();
 }
 
 /// From `membership_boundary_frame` a changed eligible set replaces a session
@@ -1739,6 +1791,59 @@ fn fenced_successor_eligibility_activates_only_at_a_scheduled_frame() {
     assert_eq!(fenced_successor_eligibility_frame_for(1, Some("7")), 7);
     assert_eq!(fenced_successor_eligibility_frame_for(1, Some("soon")), u64::MAX);
     assert_eq!(fenced_successor_eligibility_frame_for(1, None), u64::MAX);
+}
+
+/// From the early fence frame GLOBAL fences a closing session that has not
+/// sealed one epoch after its request, and not before: stale seats stay
+/// eligible until the next epoch boundary (GLOBAL frame 907,920: six app
+/// committees whose older-build members refused every closing seal sat
+/// closing for the full four epochs). The request's frame selects the rule:
+/// a request made before the frame keeps four epochs, even past the frame.
+#[test]
+fn an_unsealed_close_is_fenced_one_epoch_after_its_request_from_the_early_fence_frame() {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let fenced_after = |activation: Option<u64>, requested: u64| -> u64 {
+        set_early_fence_frame_for_thread(activation);
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let (_, state) = make_state(&db);
+        let keys = keys();
+        let filter = vec![0x6e; 32];
+        let first = initial(filter.clone(), &keys);
+        initialize(&state, 1, &first).unwrap();
+        schedule(&state, requested, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+        let due = schedule::fence_due_frame(requested);
+        for early in [requested + epoch - 1, requested + epoch, due - 1] {
+            if early < due {
+                assert_eq!(schedule::fence_stalled_sources(&state, early, &[filter.clone()], None).unwrap(), 0,
+                    "not at {early}, before {due}");
+            }
+        }
+        assert!(!is_fenced(&state, &first.id().unwrap()).unwrap());
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        assert!(is_fenced(&state, &first.id().unwrap()).unwrap());
+        set_early_fence_frame_for_thread(None);
+        due - requested
+    };
+    // Without a setting, never (assumes QUIL_EARLY_FENCE_FRAME is unset).
+    assert_eq!(fenced_after(None, 2), 4 * epoch, "by default four epochs");
+    assert_eq!(fenced_after(Some(0), 2), epoch);
+    assert_eq!(fenced_after(Some(2), 2), epoch, "a request at the frame");
+    assert_eq!(fenced_after(Some(3), 2), 4 * epoch, "a request before the frame keeps four epochs");
+}
+
+/// Early fences are GLOBAL consensus and not scheduled on mainnet: by
+/// default every closing session keeps the four-epoch timeout.
+#[test]
+fn early_fences_are_not_scheduled_by_default() {
+    assert_eq!(MAINNET_EARLY_FENCE_FRAME, None);
+    assert_eq!(early_fence_frame_for(0, None), u64::MAX);
+    assert_eq!(early_fence_frame_for(0, Some("7")), u64::MAX);
+    assert_eq!(early_fence_frame_for(1, Some("7")), 7);
+    assert_eq!(early_fence_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(early_fence_frame_for(1, None), u64::MAX);
+    set_early_fence_frame_for_thread(None);
+    assert_eq!(schedule::fence_after_epochs(u64::MAX - 1), schedule::FENCE_AFTER_EPOCHS);
+    assert_eq!(schedule::fence_due_frame(2), 2 + fence_timeout());
 }
 
 /// A stalled session GLOBAL never executed a frame of is fenced at its base

@@ -644,6 +644,109 @@ mod tests {
         assert_eq!(failure_guidance("connect").0, "archive");
     }
 
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A failure streak warns once it reaches the threshold, then only
+    /// every repeat interval with its count and duration, and its end is
+    /// named once.
+    #[test]
+    fn a_failure_streak_warns_after_the_threshold_and_then_at_a_bounded_rate() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.succeeded(start), None, "no streak, no end");
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("no_archive_known", start + MINUTE, 3),
+            Some(StreakLog::Failing { failures: 3, duration: MINUTE }));
+        for minute in 2..11 {
+            assert_eq!(streak.failed("no_archive_known", start + MINUTE * minute, 3), None);
+        }
+        assert_eq!(streak.failed("connect", start + MINUTE * 11, 3),
+            Some(StreakLog::Failing { failures: 13, duration: MINUTE * 11 }));
+        assert_eq!(streak.classes(), "connect=3,no_archive_known=10");
+        assert_eq!(streak.succeeded(start + MINUTE * 20),
+            Some(StreakLog::Ended { failures: 13, duration: MINUTE * 20 }));
+        assert_eq!(streak.succeeded(start + MINUTE * 21), None);
+        assert_eq!(streak.classes(), "");
+    }
+
+    /// Failures between successes do not warn, and a flapping recovery
+    /// warns at most once per repeat interval; an unwarned streak's end is
+    /// not named.
+    #[test]
+    fn a_flapping_recovery_warns_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        let mut warnings = 0;
+        for minute in 0..20 {
+            let at = start + MINUTE * minute;
+            if minute % 4 == 3 {
+                streak.succeeded(at);
+                continue;
+            }
+            warnings += usize::from(streak.failed("connect", at, 3).is_some());
+        }
+        assert_eq!(warnings, 2, "minutes 2 and 14");
+        for minute in 20..30 {
+            let at = start + MINUTE * minute;
+            assert_eq!(streak.failed("connect", at, 3), None);
+            assert_eq!(streak.succeeded(at), None);
+        }
+    }
+
+    /// Recoveries finding no archive warn once for the node, with the
+    /// shards affected, and end when any recovery reaches an archive.
+    #[test]
+    fn a_node_without_archives_warns_once_for_all_its_workers() {
+        let start = Instant::now();
+        let mut node = NoArchive::new();
+        assert_eq!(node.resolved(start), None);
+        assert_eq!(node.failed(&[1; 32], start), Some((StreakLog::Failing { failures: 1, duration: Duration::ZERO }, 1)));
+        for worker in 2..100u8 {
+            assert_eq!(node.failed(&[worker; 32], start + MINUTE), None);
+        }
+        assert_eq!(node.failed(&[1; 32], start + MINUTE * 10),
+            Some((StreakLog::Failing { failures: 100, duration: MINUTE * 10 }, 99)));
+        assert_eq!(node.resolved(start + MINUTE * 11),
+            Some((StreakLog::Ended { failures: 100, duration: MINUTE * 11 }, 99)));
+    }
+
+    /// Each shard keeps its own streak: another shard's success does not
+    /// end it, and a node without archives leaves the worker's own warning
+    /// to the node's.
+    #[tokio::test]
+    async fn streaks_are_kept_per_shard() {
+        let worker = SharedWorkerExecution::default();
+        let fail = || async { Err(quil_types::error::QuilError::Internal("archive connect: refused".into())) };
+        for _ in 0..2 {
+            let _ = worker.recovering(&[1; 32], fail()).await;
+        }
+        let _ = worker.recovering(&[2; 32], async { Ok(ShardRecoveryProgress::Anchored { frame: 3 }) }).await;
+        let _ = worker.recovering(&[1; 32], fail()).await;
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(streaks[&vec![1; 32]].failures, 3, "the other shard's success must not reset it");
+        assert!(streaks[&vec![1; 32]].reported);
+        assert_eq!(streaks[&vec![2; 32]].failures, 0);
+    }
+
+    #[test]
+    fn failures_are_classed_by_whose_problem_they_are() {
+        for (error, class) in [
+            ("execution unavailable: no archive known yet", "no_archive_known"),
+            ("internal error: archive connect: invalid endpoint: invalid URI", "connect"),
+            ("internal error: get app-shard frame: status: Unavailable", "archive_request"),
+            ("invalid argument: wrong-shard archive replay tip", "replay_mismatch"),
+            ("execution unavailable: archive replay pre-state mismatch at phase 0", "replay_mismatch"),
+            ("the archive checkpoint failed validation", "archive_state"),
+            ("execution unavailable: archive replay is missing shard frame 9", "archive_state"),
+            ("actor rejected checkpoint", "other"),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        assert_eq!(failure_guidance("no_archive_known").0, "this node");
+        assert_eq!(failure_guidance("connect").0, "archive");
+    }
+
     #[tokio::test]
     async fn permit_wait_is_measured_apart_from_the_attempt() {
         let worker = SharedWorkerExecution::default();

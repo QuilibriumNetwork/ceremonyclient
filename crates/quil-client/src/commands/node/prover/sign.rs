@@ -13,6 +13,7 @@
 
 use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
+use quil_types::proto::global::ProverConfirm;
 use quil_types::proto::keys::Bls48581AddressedSignature;
 
 use quil_execution::global_intrinsic::prover_update_materialize::prover_update_domain;
@@ -61,6 +62,25 @@ pub fn leave_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_leave_domain().map_err(|e| anyhow::anyhow!("leave domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
+}
+
+/// A signed ProverConfirm as qclient sends it: no leaf roots and no
+/// release, so it signs and encodes as a legacy confirm. qclient is not the
+/// node and cannot attest the node's build; it never consults the confirm
+/// release frame. A confirm without a release keeps the allocation's
+/// recorded one.
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire; it is sent empty, as before.
+#[allow(deprecated)]
+pub fn confirm_op(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<ProverConfirm> {
+    Ok(ProverConfirm {
+        filter: Vec::new(),
+        frame_number: frame,
+        public_key_signature_bls48581: Some(confirm_sig(km, filters, frame)?),
+        filters: filters.to_vec(),
+        leaf_roots: Vec::new(),
+        release: None,
+    })
 }
 
 /// ProverConfirm signature (multi filter; CLI registers no leaf roots, so
@@ -130,6 +150,46 @@ mod tests {
             sig.address,
             quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap().to_vec()
         );
+    }
+
+    /// A qclient confirm carries no release and signs and encodes as a legacy
+    /// confirm, whatever the environment sets for the node's release frames.
+    #[test]
+    #[allow(deprecated)] // the legacy encoding writes the deprecated `filter` placeholder
+    fn a_qclient_confirm_signs_and_encodes_as_legacy_whatever_the_environment_says() {
+        use quil_execution::global_intrinsic::{addressed_signature::AddressedSignature, conversions, prover_release};
+        // Nextest runs each test in its own process; qclient calls no `init_*`.
+        std::env::set_var("QUIL_CONFIRM_RELEASE_FRAME", "0");
+        std::env::set_var("QUIL_RELEASE_ELIGIBILITY", "0=2.1.0.25.0");
+        let (km, _d) = km_with_prover_key();
+        let filters = vec![vec![0xFFu8; 32], vec![0xEEu8; 32]];
+        let frame = 4242u64;
+        let op = confirm_op(&km, &filters, frame).unwrap();
+        assert_eq!(op.release, None);
+        assert!(op.leaf_roots.is_empty() && op.filter.is_empty());
+        assert_eq!(prover_release::confirm_release_frame(), u64::MAX, "the environment is not read");
+
+        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
+        let sig = op.public_key_signature_bls48581.clone().unwrap();
+        let legacy_message = multi_filter_signing_message(&filters, frame);
+        assert!(km
+            .validate_signature(KeyType::Falcon512, &pubkey, &legacy_message, &sig.signature, &prover_confirm_domain().unwrap())
+            .unwrap());
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&0x0305u32.to_be_bytes());
+        legacy.extend_from_slice(&32u32.to_be_bytes());
+        legacy.extend_from_slice(b"reservedreservedreservedreserved");
+        legacy.extend_from_slice(&frame.to_be_bytes());
+        let sig_bytes = AddressedSignature { signature: sig.signature, address: sig.address }.to_canonical_bytes().unwrap();
+        legacy.extend_from_slice(&(sig_bytes.len() as u32).to_be_bytes());
+        legacy.extend_from_slice(&sig_bytes);
+        legacy.extend_from_slice(&(filters.len() as u32).to_be_bytes());
+        for filter in &filters {
+            legacy.extend_from_slice(&(filter.len() as u32).to_be_bytes());
+            legacy.extend_from_slice(filter);
+        }
+        assert_eq!(conversions::prover_confirm_from_proto(&op).to_canonical_bytes().unwrap(), legacy);
     }
 
     #[test]
