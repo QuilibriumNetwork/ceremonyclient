@@ -704,6 +704,45 @@ pub struct ProverShardSummary {
 /// eviction-risk display so they agree exactly.
 pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 
+/// First mainnet GLOBAL frame finalized by the successor GLOBAL committee:
+/// the four genesis archives still running after QmQfp3 was decommissioned
+/// (2026-10-20), in consensus epoch 1, with a quorum of 3 of 4. Every earlier
+/// frame is finalized by all five genesis archives (4 of 5) in epoch 0, and is
+/// verified against them for good. The first frame of epoch 1,261; decided
+/// 2026-10-20.
+pub const MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME: u64 = 907_920;
+
+static GLOBAL_COMMITTEE_SUCCESSION_FRAME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Pin the GLOBAL committee succession from the network id at node startup,
+/// like [`init_committee_handoff_for_network`]. Only mainnet has one, and its
+/// frame cannot be changed.
+pub fn init_global_committee_succession_for_network(network: u8) {
+    set_global_committee_succession_frame(if network == 0 {
+        MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME
+    } else {
+        u64::MAX
+    });
+}
+
+/// Set the succession frame directly (tests). `u64::MAX`: no succession.
+pub fn set_global_committee_succession_frame(frame: u64) {
+    GLOBAL_COMMITTEE_SUCCESSION_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The first GLOBAL frame the successor committee finalizes; `u64::MAX` when
+/// this network has none.
+pub fn global_committee_succession_frame() -> u64 {
+    GLOBAL_COMMITTEE_SUCCESSION_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The GLOBAL consensus epoch, and so the committee, that finalizes GLOBAL
+/// frame `frame`: 0 below the succession frame, 1 from it on.
+pub fn global_committee_epoch(frame: u64) -> u64 {
+    u64::from(frame >= global_committee_succession_frame())
+}
+
 /// First GLOBAL frame whose included app frames record each signer's
 /// `LastSignedFrameNumber` on its allocation. One inactivity threshold later,
 /// when every member has had a full window to sign, the eviction stall census
@@ -1444,6 +1483,25 @@ pub(crate) mod epoch_tests {
         assert_eq!(members.activating, vec![vec![2]]);
         assert_eq!(members.leaving, vec![vec![6]]);
         assert_eq!(members.staying(), 2);
+    }
+}
+
+#[cfg(test)]
+mod global_committee_succession_tests {
+    use super::*;
+
+    // The only test in this crate that sets the succession frame.
+    #[test]
+    fn only_mainnet_hands_global_consensus_to_the_successor_committee_at_its_frame() {
+        init_global_committee_succession_for_network(1);
+        assert_eq!(global_committee_epoch(u64::MAX - 1), 0);
+        init_global_committee_succession_for_network(0);
+        assert_eq!(global_committee_succession_frame(), 907_920);
+        assert_eq!(global_committee_epoch(907_919), 0);
+        assert_eq!(global_committee_epoch(907_920), 1);
+        assert_eq!(global_committee_epoch(907_921), 1);
+        set_global_committee_succession_frame(u64::MAX);
+        assert_eq!(global_committee_epoch(907_920), 0);
     }
 }
 

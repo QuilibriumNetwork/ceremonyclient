@@ -876,6 +876,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 );
                                                 continue;
                                             }
+                                            // A decommissioned genesis archive is never
+                                            // polled or dialed, even from a PeerInfo
+                                            // still circulating after it went away.
+                                            if network_for_recv == 0
+                                                && quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&peer_hex.as_str())
+                                            {
+                                                debug!(peer = peer_hex, "ignoring decommissioned genesis archive");
+                                                continue;
+                                            }
                                             let is_new = archive_peers_seen.insert(info.peer_id.clone());
                                             if is_new {
                                                 info!(

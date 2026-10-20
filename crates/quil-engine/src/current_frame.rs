@@ -57,6 +57,9 @@ pub struct CurrentFrame {
     /// handler tagged messages with the (larger) frame number and the
     /// leader's `collect_for_rank` never saw them → empty frames.
     rank: AtomicU64,
+    /// The GLOBAL consensus epoch `rank` is a view of. Each epoch numbers its
+    /// views from the start again, so a rank only compares within its epoch.
+    rank_epoch: AtomicU64,
 }
 
 impl CurrentFrame {
@@ -107,6 +110,45 @@ impl CurrentFrame {
         self.rank.fetch_max(rank, Ordering::Relaxed);
     }
 
+    /// [`Self::observe_rank`] for the rank of GLOBAL frame `frame_number`,
+    /// in the epoch of the committee that finalizes it
+    /// ([`quil_types::consensus::global_committee_epoch`]). A rank from an
+    /// earlier epoch is ignored; one from a later epoch replaces the rank.
+    pub fn observe_frame_rank(&self, frame_number: u64, rank: u64) {
+        let epoch = quil_types::consensus::global_committee_epoch(frame_number);
+        let current = self.rank_epoch.load(Ordering::Acquire);
+        if epoch < current {
+            return;
+        }
+        if epoch > current {
+            if self.rank_epoch.compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                self.rank.store(rank, Ordering::Release);
+                return;
+            }
+            return self.observe_frame_rank(frame_number, rank);
+        }
+        self.observe_rank(rank);
+    }
+
+    /// Start `epoch`'s views: from now on ranks are views of `epoch`, from 0.
+    /// True when this moved to a later epoch, so ranks recorded earlier no
+    /// longer compare with new ones (the caller re-files what it keyed by them).
+    pub fn enter_rank_epoch(&self, epoch: u64) -> bool {
+        let current = self.rank_epoch.load(Ordering::Acquire);
+        if epoch <= current
+            || self.rank_epoch.compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return false;
+        }
+        self.rank.store(0, Ordering::Release);
+        true
+    }
+
+    /// The GLOBAL consensus epoch [`Self::effective_rank`] is a view of.
+    pub fn rank_epoch(&self) -> u64 {
+        self.rank_epoch.load(Ordering::Acquire)
+    }
+
     /// The latest consensus rank seen. Use this — NOT `effective()` —
     /// to tag messages for the rank-keyed message collector.
     pub fn effective_rank(&self) -> u64 {
@@ -145,6 +187,31 @@ impl CurrentFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every test in this crate that needs a GLOBAL committee succession uses
+    /// this frame, far above any other test's frames, and never unsets it.
+    const TEST_SUCCESSION: u64 = 1_000_000_000_000;
+
+    #[test]
+    fn a_rank_compares_only_within_its_global_epoch() {
+        quil_types::consensus::set_global_committee_succession_frame(TEST_SUCCESSION);
+        let cf = CurrentFrame::new();
+        cf.observe_frame_rank(TEST_SUCCESSION - 1, 408_626);
+        assert_eq!((cf.rank_epoch(), cf.effective_rank()), (0, 408_626));
+        assert!(cf.enter_rank_epoch(1), "the successor's views start");
+        assert_eq!((cf.rank_epoch(), cf.effective_rank()), (1, 0));
+        cf.observe_frame_rank(TEST_SUCCESSION - 2, 408_627);
+        assert_eq!(cf.effective_rank(), 0, "an epoch-0 rank no longer counts");
+        cf.observe_frame_rank(TEST_SUCCESSION, 3);
+        cf.observe_frame_rank(TEST_SUCCESSION + 1, 2);
+        assert_eq!(cf.effective_rank(), 3);
+        assert!(!cf.enter_rank_epoch(1) && !cf.enter_rank_epoch(0));
+
+        let fresh = CurrentFrame::new();
+        fresh.observe_frame_rank(TEST_SUCCESSION - 1, 408_626);
+        fresh.observe_frame_rank(TEST_SUCCESSION, 1);
+        assert_eq!((fresh.rank_epoch(), fresh.effective_rank()), (1, 1), "a later epoch's rank replaces it");
+    }
 
     #[test]
     fn fresh_current_frame_reads_zero() {

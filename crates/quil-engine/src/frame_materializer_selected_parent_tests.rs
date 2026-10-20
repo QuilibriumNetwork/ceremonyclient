@@ -833,6 +833,82 @@ fn canonical_execution_base_requires_a_certificate_in_the_current_epoch_and_a_ma
     );
 }
 
+/// The GLOBAL committee succession frame every test in this crate uses: far
+/// above any other test's frames, and never unset (see `current_frame` tests).
+const TEST_SUCCESSION: u64 = 1_000_000_000_000;
+
+/// Each GLOBAL frame has one committee and one epoch: the genesis committee
+/// in epoch 0 below the succession frame, the successor in epoch 1 from it.
+#[test]
+fn a_global_frame_verifies_only_against_the_committee_of_its_frame() {
+    quil_types::consensus::set_global_committee_succession_frame(TEST_SUCCESSION);
+    let genesis = quil_crypto::FalconSigner::generate();
+    let successor = quil_crypto::FalconSigner::generate();
+    let verifier = GlobalFrameVerifier::new(Arc::new(TestFrameProver))
+        .with_global_committee(vec![genesis.public_key().to_vec()])
+        .with_global_committee_successor(vec![successor.public_key().to_vec()]);
+    let signed = |number: u64, signer: &quil_crypto::FalconSigner, epoch: u64| {
+        let mut frame = GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: number, rank: 9, output: vec![3; 32], ..Default::default() }),
+            requests: Vec::new(),
+        };
+        certify_parent(&mut frame, signer, epoch, 8);
+        frame.header.unwrap()
+    };
+    let last = TEST_SUCCESSION - 1;
+    assert!(verifier.verify_global_finalization_cert(&signed(last, &genesis, 0)));
+    assert_eq!(verifier.global_finalization_parent(&signed(last, &genesis, 0)), Some(8));
+    assert!(verifier.verify_global_finalization_cert(&signed(TEST_SUCCESSION, &successor, 1)));
+    assert_eq!(verifier.global_finalization_parent(&signed(TEST_SUCCESSION, &successor, 1)), Some(8));
+    for (number, signer, epoch) in [
+        (last, &genesis, 1),
+        (last, &successor, 0),
+        (last, &successor, 1),
+        (TEST_SUCCESSION, &genesis, 0),
+        (TEST_SUCCESSION, &genesis, 1),
+        (TEST_SUCCESSION, &successor, 0),
+    ] {
+        assert!(!verifier.verify_global_finalization_cert(&signed(number, signer, epoch)), "frame {number} epoch {epoch}");
+    }
+    let no_successor = GlobalFrameVerifier::new(Arc::new(TestFrameProver))
+        .with_global_committee(vec![genesis.public_key().to_vec()]);
+    assert!(!no_successor.verify_global_finalization_cert(&signed(TEST_SUCCESSION, &successor, 1)));
+    assert!(no_successor.verify_global_finalization_cert(&signed(last, &genesis, 0)));
+}
+
+/// A consensus instance builds and votes only on its own committee's frames,
+/// and the frame it starts from is its view 0, whatever that frame's rank.
+#[test]
+fn a_consensus_instance_starts_at_view_zero_on_its_first_frame_and_keeps_to_its_committee() {
+    quil_types::consensus::set_global_committee_succession_frame(TEST_SUCCESSION);
+    let rig = Rig::new();
+    let mut parent = rig.deploy();
+    save(rig.clock.as_ref(), &parent);
+    rig.source.materialize(&parent).unwrap();
+    certify(&mut parent, &rig.signer, 0);
+    save(rig.clock.as_ref(), &parent);
+    let number = parent.header.as_ref().unwrap().frame_number;
+    let instance = |epoch: u64| GlobalParentExecutor::new(
+        rig.source.clone(), rig.leader.clone(), epoch, number, id(&parent),
+        GlobalParentLimits { branch: limits(), ..GlobalParentLimits::default() },
+    );
+    let at_rank = rig.context(&parent);
+    let at_view_zero = ProposalContext { parent_view: 0, ..at_rank };
+    let seeded = instance(0);
+    assert!(seeded.prepare(at_rank, number, &rig.blocks, &rig.verifier, false).is_err());
+    assert!(seeded.prepare(at_view_zero, number, &rig.blocks, &rig.verifier, false).is_ok());
+    assert!(rig.executor.prepare(at_rank, number, &rig.blocks, &rig.verifier, false).is_ok(),
+        "an instance started elsewhere sees the frame at its rank");
+
+    fn refused<T>(result: Result<T>) -> bool {
+        result.err().is_some_and(|error: QuilError| error.to_string().contains("another committee"))
+    }
+    assert!(refused(rig.executor.prepare(at_rank, TEST_SUCCESSION - 1, &rig.blocks, &rig.verifier, false)),
+        "epoch 0 builds nothing from the succession frame on");
+    assert!(refused(instance(1).prepare(ProposalContext { epoch: 1, ..at_view_zero }, number, &rig.blocks, &rig.verifier, false)),
+        "epoch 1 builds nothing below it");
+}
+
 #[test]
 fn selected_vote_binds_child_height_roots_body_and_full_consensus_context() {
     let rig = Rig::new();

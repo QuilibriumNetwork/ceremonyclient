@@ -15,6 +15,7 @@ pub(crate) fn initialize(network: u8) {
     let frames = epoch_length(network, local_override.as_deref());
     quil_types::consensus::set_epoch_length_frames(frames);
     quil_types::consensus::init_committee_handoff_for_network(network);
+    quil_types::consensus::init_global_committee_succession_for_network(network);
     if network != 0 && frames != quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES {
         tracing::warn!(
             frames,

@@ -383,7 +383,11 @@ impl GlobalParentExecutor {
             return Err(unavailable("GLOBAL canonical clock is ahead of execution"));
         }
         let digest = identity(header)?;
-        let implicit_genesis = cursor == 0 && self.genesis_number == 0 && digest == self.genesis;
+        // The frame this consensus instance starts from is its view 0. For
+        // epoch 1 that is the last frame epoch 0 finalized, which keeps its
+        // epoch-0 certificate (checked below) but no view in this epoch.
+        let epoch_genesis = cursor == self.genesis_number && digest == self.genesis;
+        let implicit_genesis = epoch_genesis && cursor == 0;
         let checkpoint = branch.completed_checkpoint()?;
         // A store executed before receipts existed has none. Its certified
         // canonical head (checked below) is accepted as the base without
@@ -403,15 +407,15 @@ impl GlobalParentExecutor {
             }
         }
         if !implicit_genesis
-            && (!verifier.verify_global_execution_base(header, self.epoch)
+            && (!verifier.verify_global_execution_base(header)
                 || !verifier.validate(&frame)?
                 || !verifier.verify_global_requests_root(header, &frame.requests))
         {
             return Err(unavailable(
-                "GLOBAL execution base is not finalized in this epoch",
+                "GLOBAL execution base is not finalized by its committee",
             ));
         }
-        let view = if implicit_genesis { 0 } else { header.rank };
+        let view = if epoch_genesis { 0 } else { header.rank };
         Ok(ExecutedGlobalBase {
             frame,
             digest,
@@ -550,7 +554,7 @@ impl GlobalParentExecutor {
             .as_ref()
             .ok_or_else(|| unavailable("finalized GLOBAL frame has no header"))?;
         let parent_view = verifier
-            .global_finalization_parent(header, self.epoch)
+            .global_finalization_parent(header)
             .ok_or_else(|| unavailable("GLOBAL finalization certificate epoch/view mismatch"))?;
         if !verifier.validate(frame)?
             || !verifier.verify_global_requests_root(header, &frame.requests)
@@ -692,6 +696,11 @@ impl GlobalParentExecutor {
         if !self.accepts_context(context) {
             return Err(unavailable("selected GLOBAL consensus coordinates differ"));
         }
+        // Each committee finalizes only its own frames: epoch 0 stops below the
+        // succession frame, and epoch 1 starts at it. `number` is the parent.
+        if quil_types::consensus::global_committee_epoch(number.saturating_add(1)) != self.epoch {
+            return Err(unavailable("selected GLOBAL frame belongs to another committee"));
+        }
         if self.limits.max_ancestors == 0 || self.limits.max_elapsed.is_zero() {
             return Err(unavailable("selected GLOBAL execution limits are empty"));
         }
@@ -739,6 +748,13 @@ impl GlobalParentExecutor {
         if !self.within_window(cursor, number) {
             return Err(unavailable(
                 "selected GLOBAL parent is outside the execution window",
+            ));
+        }
+        // A later instance starts from the frame the one before it finalized
+        // last; its views do not reach below it.
+        if cursor < self.genesis_number {
+            return Err(unavailable(
+                "GLOBAL execution is below this consensus instance's first frame",
             ));
         }
         let clock = branch.execution().clock_store().clone();

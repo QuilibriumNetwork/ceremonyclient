@@ -151,12 +151,24 @@ impl Default for P2PConfig {
 /// mismatch, the node never joins the gossip mesh, no PeerInfo is learned, and
 /// archive `:8340` discovery (and thus prover submits) silently dies.
 /// Update when an operator rotates IPs.
+///
+/// A decommissioned archive leaves this list but stays in the genesis
+/// `archive_peers` (see [`DECOMMISSIONED_GENESIS_ARCHIVES`]).
 pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
     "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
     "/ip4/147.124.202.2/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
-    "/ip4/109.94.96.183/udp/8336/quic-v1/p2p/QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
     "/ip4/23.239.107.34/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
     "/ip4/146.71.104.122/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
+];
+
+/// Genesis archives no longer dialed, bootstrapped from or asked for frames.
+/// They stay in the genesis `archive_peers`, which verify every frame before
+/// the GLOBAL committee succession; from it on they are not in the committee
+/// (`quil_types::consensus::MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`).
+///
+/// QmQfp3 (109.94.96.183) was decommissioned 2026-10-20.
+pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] = &[
+    "QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
 ];
 
 impl P2PConfig {

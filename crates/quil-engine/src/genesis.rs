@@ -166,6 +166,19 @@ pub fn genesis_archive_peers() -> Result<Vec<(String, Vec<u8>)>> {
     Ok(peers)
 }
 
+/// The mainnet GLOBAL committee from
+/// [`quil_types::consensus::MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`] on:
+/// the genesis archives less the decommissioned ones
+/// ([`quil_config::DECOMMISSIONED_GENESIS_ARCHIVES`]). The genesis
+/// `archive_peers` themselves never change; frames before the succession stay
+/// verified against all of them.
+pub fn genesis_archive_successor_peers() -> Result<Vec<(String, Vec<u8>)>> {
+    Ok(genesis_archive_peers()?
+        .into_iter()
+        .filter(|(peer_id, _)| !quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&peer_id.as_str()))
+        .collect())
+}
+
 /// Static QUIC multiaddrs for the genesis archive peers.
 ///
 /// `genesis_archive_peers()` only carries `(peer_id, bls_pubkey)` —
@@ -1433,10 +1446,16 @@ mod tests {
             .iter()
             .map(|ma| ma.rsplit("/p2p/").next().unwrap().to_string())
             .collect();
+        let decommissioned: BTreeSet<String> = quil_config::DECOMMISSIONED_GENESIS_ARCHIVES
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
         assert_eq!(derived.len(), 5, "expected 5 genesis archives");
+        assert!(boot.is_disjoint(&decommissioned), "a decommissioned archive must not be dialed");
         assert_eq!(
-            boot, derived,
-            "bootstrap peer IDs must be exactly the derived Falcon archive IDs the archives present"
+            boot.union(&decommissioned).cloned().collect::<BTreeSet<_>>(),
+            derived,
+            "bootstrap peer IDs must be exactly the derived Falcon archive IDs the live archives present"
         );
     }
 
@@ -1571,6 +1590,15 @@ mod tests {
     #[test]
     fn expected_genesis_frame_number_testnet() {
         assert_eq!(expected_genesis_frame_number(1), 0);
+    }
+
+    #[test]
+    fn the_successor_committee_is_the_genesis_archives_less_the_decommissioned() {
+        let genesis = genesis_archive_peers().unwrap();
+        let successor = genesis_archive_successor_peers().unwrap();
+        assert_eq!(successor.len(), 4);
+        assert!(successor.iter().all(|peer| genesis.contains(peer)));
+        assert!(!successor.iter().any(|(peer_id, _)| peer_id == "QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr"));
     }
 
     #[test]

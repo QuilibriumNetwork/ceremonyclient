@@ -65,6 +65,11 @@ pub struct ArchiveAppShardIngest {
     /// Frames asked for per address, when, and whether on `gap_requests`, so a
     /// gap that persists across many inbound frames or passes asks once.
     requested: HashMap<Vec<u8>, BTreeMap<u64, (Instant, bool)>>,
+    /// Frames received whose anchoring GLOBAL frame is not stored here, per
+    /// address: frame → that GLOBAL frame. Not asked for again until it is.
+    awaiting_anchor: HashMap<Vec<u8>, BTreeMap<u64, u64>>,
+    /// The GLOBAL frames [`Self::awaiting_anchor`] has logged waiting on.
+    anchors_noted: std::collections::BTreeSet<u64>,
     /// Frames are materialized only through [`Self::materialize_through`], at
     /// the points the GLOBAL chain sequences, never on arrival.
     sequenced: bool,
@@ -137,6 +142,8 @@ impl ArchiveAppShardIngest {
             gap_requests: None,
             prefetch_requests: None,
             requested: HashMap::new(),
+            awaiting_anchor: HashMap::new(),
+            anchors_noted: std::collections::BTreeSet::new(),
             sequenced: false,
             missing_since: HashMap::new(),
             empty_body_grace: EMPTY_FRAME_BODY_GRACE,
@@ -210,6 +217,26 @@ impl ArchiveAppShardIngest {
             execution_manager: self.execution_manager.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
             has_forest: self.hypergraph.has_forest(),
+            clock_store: self.clock_store.clone(),
+        }
+    }
+
+    /// Park frame `number` of `address` until GLOBAL frame `anchor`, which it
+    /// is anchored to and which this archive has not stored, is stored: no
+    /// request for it goes out before then ([`ArchiveFrameVerifier::missing_anchor`]).
+    ///
+    /// Every such frame fails validation, so asking for it again only loads
+    /// the shard's members: an archive missing GLOBAL frames 907,473–907,511
+    /// fetched and refused about 200 frames a second (2026-10-20).
+    pub fn await_anchor(&mut self, address: &[u8], number: u64, anchor: u64) {
+        if self.materialized_height(address).is_ok_and(|height| number <= height) {
+            return;
+        }
+        self.awaiting_anchor.entry(address.to_vec()).or_default().insert(number, anchor);
+        if self.anchors_noted.insert(anchor) {
+            info!(anchor, frame = number, address = %hex::encode(&address[..address.len().min(8)]),
+                "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
+                 they are asked for again once it is");
         }
     }
 
@@ -234,6 +261,14 @@ impl ArchiveAppShardIngest {
             if requested.is_empty() {
                 self.requested.remove(address);
             }
+        }
+        if let Some(waiting) = self.awaiting_anchor.get_mut(address) {
+            *waiting = waiting.split_off(&(frame + 1));
+            if waiting.is_empty() {
+                self.awaiting_anchor.remove(address);
+            }
+            let awaiting = &self.awaiting_anchor;
+            self.anchors_noted.retain(|anchor| awaiting.values().any(|waiting| waiting.values().any(|a| a == anchor)));
         }
         self.missing_since.remove(address);
     }
@@ -311,7 +346,12 @@ impl ArchiveAppShardIngest {
             return;
         }
 
-        let Some(certified) = self.verifier().verify(&frame) else { return };
+        let verifier = self.verifier();
+        if let Some(anchor) = verifier.missing_anchor(&frame) {
+            self.await_anchor(&address, frame_number, anchor);
+            return;
+        }
+        let Some(certified) = verifier.verify(&frame) else { return };
         self.admit(&address, frame, certified);
         if !self.sequenced {
             self.try_materialize(&address);
@@ -593,11 +633,29 @@ impl ArchiveAppShardIngest {
         let sender = if urgent { self.gap_requests.clone() } else { self.prefetch_requests.clone() };
         let Some(sender) = sender else { return 0 };
         let mut sent = 0;
+        let mut stored: HashMap<u64, bool> = HashMap::new();
         for number in frames {
             if self.buffered.get(address).is_some_and(|buffered| buffered.contains_key(&number))
                 || self.is_held(address, number)
             {
                 continue;
+            }
+            if let Some(anchor) = self.awaiting_anchor.get(address).and_then(|waiting| waiting.get(&number)).copied() {
+                let clock = &self.clock_store;
+                if !*stored.entry(anchor).or_insert_with(|| clock.get_global_clock_frame_header(anchor).is_ok()) {
+                    continue;
+                }
+                // The anchor arrived: the frame can validate now, so ask at once.
+                if let Some(waiting) = self.awaiting_anchor.get_mut(address) {
+                    waiting.remove(&number);
+                    if waiting.is_empty() {
+                        self.awaiting_anchor.remove(address);
+                    }
+                }
+                self.anchors_noted.remove(&anchor);
+                if let Some(requested) = self.requested.get_mut(address) {
+                    requested.remove(&number);
+                }
             }
             let due = self.requested.get(address).and_then(|requested| requested.get(&number))
                 .is_none_or(|&(at, was_urgent)| (urgent && !was_urgent) || at.elapsed() >= interval);
@@ -691,9 +749,18 @@ pub struct ArchiveFrameVerifier {
     execution_manager: Arc<quil_execution::ExecutionEngineManager>,
     inclusion_prover: Arc<dyn InclusionProver>,
     has_forest: bool,
+    clock_store: Arc<dyn quil_types::store::ClockStore>,
 }
 
 impl ArchiveFrameVerifier {
+    /// The GLOBAL frame `frame` is anchored to, when this archive has not
+    /// stored it. Validation derives the frame's output from that GLOBAL
+    /// frame, so it cannot pass before the GLOBAL frame is stored.
+    pub fn missing_anchor(&self, frame: &AppShardFrame) -> Option<u64> {
+        let anchor = frame.header.as_ref()?.global_frame_number;
+        (anchor > 0 && self.clock_store.get_global_clock_frame_header(anchor).is_err()).then_some(anchor)
+    }
+
     /// `Some(certified)` when `frame` may be admitted, `certified` saying
     /// whether it carries its own certificate; `None` (logged) when refused.
     pub fn verify(&self, frame: &AppShardFrame) -> Option<bool> {
@@ -1095,6 +1162,67 @@ mod tests {
         assert!(ingest.buffered.get(&filter).is_none_or(|buffered| !buffered.contains_key(&3)), "below the cursor");
         ingest.admit_verified(verified_frame(&filter, 41), true);
         assert!(ingest.buffered[&filter].contains_key(&41));
+    }
+
+    /// A frame anchored to a GLOBAL frame this archive has not stored cannot
+    /// validate, so it is not asked for again, however long a GLOBAL frame
+    /// waits on it, until that GLOBAL frame is stored; then it is asked for
+    /// at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_anchored_to_a_missing_global_frame_is_asked_for_once_that_frame_is_stored() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock: Arc<dyn quil_types::store::ClockStore> = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = ingest.with_gap_fetch(tx).sequenced();
+        let drain = |rx: &mut tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>| {
+            let mut frames = Vec::new();
+            while let Ok((_, number)) = rx.try_recv() {
+                frames.push(number);
+            }
+            frames
+        };
+        let all_due = |ingest: &mut ArchiveAppShardIngest| {
+            for request in ingest.requested.get_mut(&filter).unwrap().values_mut() {
+                request.0 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
+            }
+        };
+        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        assert!(!ingest.materialize_through(&filter, 3).unwrap());
+        assert_eq!(drain(&mut rx), vec![2, 3]);
+
+        let mut anchored = verified_frame(&filter, 2);
+        anchored.header.as_mut().unwrap().global_frame_number = 907_473;
+        let verifier = ingest.verifier();
+        assert_eq!(verifier.missing_anchor(&anchored), Some(907_473));
+        assert_eq!(verifier.missing_anchor(&verified_frame(&filter, 2)), None, "a frame anchored to no GLOBAL frame");
+        ingest.await_anchor(&filter, 2, 907_473);
+        ingest.await_anchor(&filter, 1, 907_473);
+        assert_eq!(ingest.awaiting_anchor[&filter].keys().copied().collect::<Vec<_>>(), vec![2], "not at or below the cursor");
+
+        all_due(&mut ingest);
+        assert!(!ingest.materialize_through(&filter, 3).unwrap());
+        assert_eq!(drain(&mut rx), vec![3], "the parked frame is not asked for again");
+
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: 907_473, ..Default::default() }),
+            requests: Vec::new(),
+        }, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(verifier.missing_anchor(&anchored), None);
+        assert!(!ingest.materialize_through(&filter, 3).unwrap());
+        assert_eq!(drain(&mut rx), vec![2], "asked for at once, ahead of its retry interval");
+        assert!(ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty());
+
+        ingest.await_anchor(&filter, 3, 907_480);
+        for number in 2..=3 {
+            ingest.buffered.entry(filter.clone()).or_default().insert(number, verified_frame(&filter, number));
+        }
+        assert!(ingest.materialize_through(&filter, 3).unwrap());
+        assert!(ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty(),
+            "frames at or below the cursor no longer wait");
     }
 
     /// A frame no endpoint serves is materialized from the certified header the

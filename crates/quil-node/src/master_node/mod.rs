@@ -294,7 +294,7 @@ pub(crate) async fn start(
             // at it before this process finalizes a frame: unseeded, every
             // archive restarted during the 880,560 halt (2026-10-14) answered
             // "rank 0, executed 0" for as long as it lasted.
-            current_frame.observe_rank(h.rank);
+            current_frame.observe_frame_rank(h.frame_number, h.rank);
             // Committee-handoff flag day: a master starting past activation
             // discards its legacy app frame chains before any worker, ingest
             // or mirror runs (the running paths discard at the crossing).
@@ -1156,11 +1156,12 @@ pub(crate) async fn start(
     // follow the chain over gossip. The poller's own verifier is already
     // committee-bound (see archive_sync); this gives the gossip path parity.
     let frame_validator = {
-        let committee: Vec<Vec<u8>> = consensus_committee
-            .iter()
-            .filter_map(|s| hex::decode(s).ok())
-            .collect();
-        frame_validator.with_global_committee(committee)
+        let decode = |keys: &[String]| -> Vec<Vec<u8>> { keys.iter().filter_map(|s| hex::decode(s).ok()).collect() };
+        let (successor, _) =
+            archive_sync::global_committee_successor(network, &consensus_committee, &consensus_committee_peer_ids);
+        frame_validator
+            .with_global_committee(decode(&consensus_committee))
+            .with_global_committee_successor(decode(&successor))
     };
 
     // Broadcast channel for GlobalService::StreamGlobalMessages. Created here
@@ -1409,6 +1410,11 @@ pub(crate) async fn start(
                     drop(attempts);
                     match recovered {
                         Some((source, frame)) => {
+                            // A frame anchored to a GLOBAL frame this archive has
+                            // not stored cannot validate: it is parked below,
+                            // unprepared, until that GLOBAL frame is stored.
+                            let anchored = ingest.as_ref()
+                                .is_none_or(|(_, verifier)| verifier.missing_anchor(&frame).is_none());
                             // Validation needs the storage registrations the
                             // frames' GLOBAL anchors name; an archive whose
                             // execution is behind those anchors fetches them
@@ -1416,7 +1422,7 @@ pub(crate) async fn start(
                             // certificate comes with the run up to its
                             // certified descendant, the source asked first.
                             let frames = match validator.as_ref() {
-                                Some(validator) => {
+                                Some(validator) if anchored => {
                                     let fetch = |number: u64| {
                                         let order: Vec<String> = std::iter::once(source.clone())
                                             .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
@@ -1441,7 +1447,7 @@ pub(crate) async fn start(
                                     }
                                     frames
                                 }
-                                None => vec![frame],
+                                _ => vec![frame],
                             };
                             let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
                             tracing::info!(filter = %hex::encode(&filter), frame = frame_number, through, %source,
@@ -1450,9 +1456,14 @@ pub(crate) async fn start(
                                 // Checked on the blocking pool, concurrently with
                                 // other fetches; the ingest is held only to admit.
                                 Some((ingest, verifier)) => {
+                                    let address = filter.clone();
                                     let admitted = tokio::task::spawn_blocking(move || {
                                         for frame in frames {
-                                            if let Some(certified) = verifier.verify(&frame) {
+                                            if let Some(anchor) = verifier.missing_anchor(&frame) {
+                                                let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+                                                ingest.lock().unwrap_or_else(|p| p.into_inner())
+                                                    .await_anchor(&address, number, anchor);
+                                            } else if let Some(certified) = verifier.verify(&frame) {
                                                 ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
                                             }
                                         }

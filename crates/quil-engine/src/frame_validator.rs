@@ -23,7 +23,13 @@ pub struct GlobalFrameVerifier {
     /// magic in the header sig field) is verified against it — defense-in-depth
     /// over the VDF, which is publicly computable. Empty ⇒ cert check skipped
     /// (legacy / callers that don't know the committee).
+    ///
+    /// It finalizes the frames of GLOBAL consensus epoch 0, those below
+    /// [`quil_types::consensus::global_committee_succession_frame`].
     global_committee: Vec<Vec<u8>>,
+    /// The committee that finalizes every later frame, in epoch 1. Empty when
+    /// the network has no succession; a frame of epoch 1 is then refused.
+    successor_committee: Vec<Vec<u8>>,
 }
 
 /// Whether `child` extends `parent` on one app shard: the same shard, the
@@ -107,18 +113,59 @@ pub fn global_frame_body_matches_requests_root(
 
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
-        Self { frame_prover, bls_constructor: None, global_committee: Vec::new() }
+        Self { frame_prover, bls_constructor: None, global_committee: Vec::new(), successor_committee: Vec::new() }
     }
 
     /// Create with BLS signature verification enabled.
     pub fn with_bls(frame_prover: Arc<dyn FrameProver>, bls_constructor: Arc<dyn BlsConstructor>) -> Self {
-        Self { frame_prover, bls_constructor: Some(bls_constructor), global_committee: Vec::new() }
+        Self {
+            frame_prover,
+            bls_constructor: Some(bls_constructor),
+            global_committee: Vec::new(),
+            successor_committee: Vec::new(),
+        }
     }
 
     /// Attach the fixed global committee so CW finalization certs are verified.
     pub fn with_global_committee(mut self, committee: Vec<Vec<u8>>) -> Self {
         self.global_committee = committee;
         self
+    }
+
+    /// Attach the committee that finalizes the frames from the succession
+    /// frame on ([`quil_types::consensus::global_committee_epoch`]).
+    pub fn with_global_committee_successor(mut self, committee: Vec<Vec<u8>>) -> Self {
+        self.successor_committee = committee;
+        self
+    }
+
+    /// The committee that finalizes GLOBAL frame `frame_number`, and the
+    /// consensus epoch it does so in.
+    pub fn committee_for_frame(&self, frame_number: u64) -> (u64, &[Vec<u8>]) {
+        match quil_types::consensus::global_committee_epoch(frame_number) {
+            0 => (0, &self.global_committee),
+            epoch => (epoch, &self.successor_committee),
+        }
+    }
+
+    /// `header`'s finalization certificate, verified against the committee
+    /// that finalizes its frame, in that committee's epoch. A certificate from
+    /// the other committee or epoch is refused: each frame has one committee.
+    fn verified_finalization(
+        &self,
+        header: &GlobalFrameHeader,
+    ) -> Option<quil_cw_consensus::app_cert::VerifiedFinalization> {
+        let cert = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))?;
+        let (epoch, committee) = self.committee_for_frame(header.frame_number);
+        if committee.is_empty() {
+            return None;
+        }
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()?;
+        quil_cw_consensus::app_cert::verify_finalization_details(cert, committee, b"global", digest)
+            .filter(|verified| verified.finalization.proposal.round.epoch().get() == epoch)
     }
 
     /// Whether finalization certificates can be checked at all.
@@ -139,44 +186,23 @@ impl GlobalFrameVerifier {
     /// no cert, or an invalid cert ⇒ reject. Callers should run it BEFORE the
     /// (more expensive) VDF verify so forged frames are dropped cheaply.
     pub fn verify_global_finalization_cert(&self, header: &GlobalFrameHeader) -> bool {
-        if self.global_committee.is_empty() {
-            // A node that doesn't know the committee cannot authenticate a
-            // gossiped frame — refuse it and let the mTLS poller be the source.
-            return false;
-        }
-        let Some(cert) = header
-            .public_key_signature_bls48581
-            .as_ref()
-            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
-        else {
-            return false;
-        };
-        let output_digest =
-            quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap_or_default();
-        quil_cw_consensus::app_cert::verify_finalization(
-            cert,
-            &self.global_committee,
-            b"global",
-            output_digest,
-        )
-        .is_some()
+        // A node that doesn't know the committee cannot authenticate a
+        // gossiped frame — refuse it and let the mTLS poller be the source.
+        self.verified_finalization(header).is_some()
     }
 
-    /// Authentication of the durable execution base for a running GLOBAL epoch.
-    /// A certificate from another epoch/view cannot authorize the local cursor.
-    pub(crate) fn verify_global_execution_base(&self, header: &GlobalFrameHeader, epoch: u64) -> bool {
-        self.global_finalization_parent(header, epoch).is_some()
+    /// Authentication of a durable execution base: finalized by the committee
+    /// of its frame, in that committee's epoch, at the header's view.
+    pub(crate) fn verify_global_execution_base(&self, header: &GlobalFrameHeader) -> bool {
+        self.global_finalization_parent(header).is_some()
     }
 
-    /// Authenticated parent view from a finalization in the requested epoch and
-    /// the header's view. Callers also bind its digest, height and state roots.
-    pub(crate) fn global_finalization_parent(&self, header: &GlobalFrameHeader, epoch: u64) -> Option<u64> {
-        let Some(cert) = header.public_key_signature_bls48581.as_ref()
-            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature)) else { return None };
-        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return None };
-        quil_cw_consensus::app_cert::verify_finalization_details(cert, &self.global_committee, b"global", digest)
-            .filter(|verified| verified.finalization.proposal.round.epoch().get() == epoch
-                && verified.finalization.proposal.round.view().get() == header.rank)
+    /// Authenticated parent view from a finalization by the committee of the
+    /// header's frame, in its epoch and at the header's view. Callers also
+    /// bind its digest, height and state roots.
+    pub(crate) fn global_finalization_parent(&self, header: &GlobalFrameHeader) -> Option<u64> {
+        self.verified_finalization(header)
+            .filter(|verified| verified.finalization.proposal.round.view().get() == header.rank)
             .map(|verified| verified.finalization.proposal.parent.get())
     }
 
@@ -239,21 +265,14 @@ impl GlobalFrameVerifier {
         // that someone solved the (publicly computable) VDF. No committee ⇒ skip
         // (legacy behavior); a present-but-invalid cert is rejected.
         if !self.global_committee.is_empty() {
-            if let Some(cert) = header
+            if header
                 .public_key_signature_bls48581
                 .as_ref()
                 .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+                .is_some()
             {
-                let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                    .unwrap_or_default();
-                if quil_cw_consensus::app_cert::verify_finalization(
-                    cert,
-                    &self.global_committee,
-                    b"global",
-                    output_digest,
-                )
-                .is_none()
-                {
+                // Against the committee of this frame, in its epoch.
+                if self.verified_finalization(header).is_none() {
                     warn!(
                         frame = header.frame_number,
                         "global CW finalization cert verification failed",

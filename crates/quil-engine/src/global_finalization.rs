@@ -236,8 +236,8 @@ impl GlobalFinalizationPipeline {
         number > head && number - head <= self.limits.max_ahead
     }
 
-    /// A validated frame fetched from a peer archive. When it carries this
-    /// epoch's finalization certificate and is admitted, keep it as a durable
+    /// A validated frame fetched from a peer archive. When it carries the
+    /// finalization certificate of its frame's committee and is admitted, keep it as a durable
     /// certified candidate and queue it, so it is published with its execution
     /// state. False: the caller stores it canonically (legacy order).
     pub fn offer_synced(&self, frame: &GlobalFrame) -> bool {
@@ -247,7 +247,7 @@ impl GlobalFinalizationPipeline {
         if !self.admits(header.frame_number)
             || self
                 .verifier
-                .global_finalization_parent(header, self.executor.epoch())
+                .global_finalization_parent(header)
                 .is_none()
         {
             return false;
@@ -301,7 +301,7 @@ impl GlobalFinalizationPipeline {
         }
         let Some(header) = top.header.as_ref() else { return false };
         if !self.admits(header.frame_number)
-            || self.verifier.global_finalization_parent(header, self.executor.epoch()).is_none()
+            || self.verifier.global_finalization_parent(header).is_none()
         {
             return false;
         }
@@ -519,7 +519,7 @@ impl GlobalFinalizationPipeline {
                             && !rejected.contains(&(h.frame_number, h.output.clone()))
                             && self
                                 .verifier
-                                .global_finalization_parent(h, self.executor.epoch())
+                                .global_finalization_parent(h)
                                 .is_some()
                     })
                 })
@@ -562,7 +562,7 @@ impl GlobalFinalizationPipeline {
                     && !rejected.contains(&(next, h.output.clone()))
                     && self
                         .verifier
-                        .global_finalization_parent(h, self.executor.epoch())
+                        .global_finalization_parent(h)
                         .is_some()
             })
         })?;
