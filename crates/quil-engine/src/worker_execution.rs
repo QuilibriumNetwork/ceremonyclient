@@ -169,12 +169,15 @@ impl SharedWorkerExecution {
     /// Run one recovery attempt of `filter`, attributing the phases, source
     /// and leaf progress reported on this task to this worker, then record
     /// and log how it ended. A recovery that found nothing usable is an
-    /// error, not an outcome.
+    /// error, not an outcome. A deferred one (`ShardRecoveryProgress::Deferred`)
+    /// attempted nothing: the record is left as it was, and neither the
+    /// shard's failure streak nor the node's archive state hears of it.
     pub(crate) async fn recovering(
         &self,
         filter: &[u8],
         attempt: impl std::future::Future<Output = quil_types::error::Result<ShardRecoveryProgress>>,
     ) -> quil_types::error::Result<ShardRecoveryProgress> {
+        let before = self.record.lock().unwrap().recovery.clone();
         self.recovery(|r, now| {
             r.attempt_started_unix_ms = now;
             r.permit_wait_ms = 0;
@@ -183,6 +186,11 @@ impl SharedWorkerExecution {
             r.source.clear();
         });
         let result = RECOVERING.scope(self.clone(), attempt).await;
+        if let Ok(ShardRecoveryProgress::Deferred(reason)) = &result {
+            self.record.lock().unwrap().recovery = before;
+            tracing::debug!(filter = %hex::encode(filter), reason, "archive recovery deferred");
+            return result;
+        }
         let failure = match &result {
             Ok(ShardRecoveryProgress::NotReady(reason)) => Some((*reason).to_string()),
             Ok(_) => None,
@@ -261,7 +269,7 @@ const STREAK_WARN_AFTER: u64 = 3;
 const STREAK_REPEAT: Duration = Duration::from_secs(10 * 60);
 
 /// The class of a failure that found no archive at all.
-const NO_ARCHIVE: &str = "no_archive_known";
+pub(crate) const NO_ARCHIVE: &str = "no_archive_known";
 
 /// A run of failed archive recovery attempts, from the first failure to the
 /// first success.
@@ -388,7 +396,7 @@ pub fn failure_class(error: &str) -> &'static str {
 }
 
 /// Whose problem a failure of `class` is, and what the operator can check.
-fn failure_guidance(class: &str) -> (&'static str, &'static str) {
+pub(crate) fn failure_guidance(class: &str) -> (&'static str, &'static str) {
     match class {
         NO_ARCHIVE => ("this node", "this node's master knows no reachable archive yet; \
             check its 'archive endpoint added' lines and outbound connectivity; it retries"),
@@ -606,6 +614,27 @@ mod tests {
             Some((StreakLog::Failing { failures: 100, duration: MINUTE * 10 }, 99)));
         assert_eq!(node.resolved(start + MINUTE * 11),
             Some((StreakLog::Ended { failures: 100, duration: MINUTE * 11 }, 99)));
+    }
+
+    /// A deferred sync attempted nothing: the record, the shard's streak
+    /// and its failure classes are as before it.
+    #[tokio::test]
+    async fn a_deferred_recovery_changes_no_record_or_streak() {
+        let worker = SharedWorkerExecution::default();
+        let _ = worker.recovering(&[4; 32], async {
+            Err(quil_types::error::QuilError::Internal("archive connect: refused".into()))
+        }).await;
+        let before = worker.snapshot().recovery.unwrap();
+        for _ in 0..5 {
+            let result = worker.recovering(&[4; 32], async {
+                recovery_phase("waiting_for_permit");
+                Ok(ShardRecoveryProgress::Deferred("a re-anchor at the session fence is owed and has its own attempt"))
+            }).await;
+            assert!(matches!(result, Ok(ShardRecoveryProgress::Deferred(_))));
+        }
+        assert_eq!(worker.snapshot().recovery.unwrap(), before);
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!((streaks[&vec![4; 32]].failures, streaks[&vec![4; 32]].reported), (1, false));
     }
 
     /// Each shard keeps its own streak: another shard's success does not

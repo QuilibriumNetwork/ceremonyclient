@@ -79,6 +79,14 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     async fn committed_tip(&self) -> Option<u64> {
         None
     }
+    /// Whether this shard owes a re-anchor (`app_handoff::ReanchorMarker`),
+    /// its head past its session's fence on frames the fence discarded, and
+    /// whether this sync makes the attempt.
+    async fn reanchor_fence(&self) -> ReanchorAttempt {
+        ReanchorAttempt::NotOwed
+    }
+    /// An attempt of the owed re-anchor installed nothing, for `reason`.
+    fn reanchor_failed(&self, _reason: String) {}
 }
 
 #[async_trait]
@@ -102,6 +110,25 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     async fn committed_tip(&self) -> Option<u64> {
         crate::app_engine::AppEngineHandle::committed_tip(self).await
     }
+    async fn reanchor_fence(&self) -> ReanchorAttempt {
+        crate::app_engine::AppEngineHandle::reanchor_fence(self).await
+    }
+    fn reanchor_failed(&self, reason: String) {
+        self.send(crate::app_engine::AppEngineMessage::ReanchorFailed { reason });
+    }
+}
+
+/// What a shard sync starting now does about a re-anchor at the fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReanchorAttempt {
+    /// None is owed: the sync runs as usual.
+    NotOwed,
+    /// This sync makes the owed attempt, at the fence it names.
+    Take(u64),
+    /// One is owed and another sync has its attempt: this one does nothing,
+    /// since the shard's own lineage is discarded and nothing else may write
+    /// its trees.
+    Elsewhere,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,6 +140,10 @@ pub(crate) enum ShardRecoveryProgress {
     Anchored { frame: u64 },
     Inherited { pinned: bool },
     NotReady(&'static str),
+    /// Nothing was attempted, for a reason that is no failure of the
+    /// recovery (a re-anchor at the fence has its own attempt): no counter,
+    /// streak or archive state changes.
+    Deferred(&'static str),
 }
 
 impl std::fmt::Display for ShardRecoveryProgress {
@@ -124,7 +155,7 @@ impl std::fmt::Display for ShardRecoveryProgress {
             Self::Anchored { frame } => write!(f, "installed the archive checkpoint at frame {frame}"),
             Self::Inherited { pinned: true } => f.write_str("inherited the origins' sealed state"),
             Self::Inherited { pinned: false } => f.write_str("inherited the covered archive subtree, unpinned"),
-            Self::NotReady(reason) => f.write_str(reason),
+            Self::NotReady(reason) | Self::Deferred(reason) => f.write_str(reason),
         }
     }
 }
@@ -139,6 +170,21 @@ pub(crate) async fn recover_shard_from_latest(
     target: &dyn ShardRecoveryTarget,
 ) -> Result<ShardRecoveryProgress> {
     use crate::worker_execution::recovery_phase;
+    // No archive extends a head the fence discarded: the local lineage is
+    // not replayed, and the shard is anchored again.
+    match target.reanchor_fence().await {
+        ReanchorAttempt::Take(fence) => {
+            let result = reanchor_shard_at_fence(syncer, filter, fence, target).await;
+            match &result {
+                Ok(ShardRecoveryProgress::NotReady(reason)) => target.reanchor_failed((*reason).to_string()),
+                Err(error) => target.reanchor_failed(error.to_string()),
+                Ok(_) => {}
+            }
+            return result;
+        }
+        ReanchorAttempt::Elsewhere => return Ok(ShardRecoveryProgress::Deferred(REANCHOR_ELSEWHERE)),
+        ReanchorAttempt::NotOwed => {}
+    }
     if let Some(local) = local {
         recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
@@ -165,6 +211,59 @@ pub(crate) async fn recover_shard_from_latest(
         ShardSyncResult::Inherited { pinned } => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
         ShardSyncResult::NotReady(reason) => Ok(ShardRecoveryProgress::NotReady(reason)),
     }
+}
+
+/// Why a re-anchor at the session fence installed nothing.
+pub(crate) const REANCHOR_NO_TIP: &str = "GLOBAL's committed frame of the session is not known here";
+pub(crate) const REANCHOR_UNAVAILABLE: &str = "the archive does not hold the frame GLOBAL committed or the state before it";
+pub(crate) const REANCHOR_REFUSED: &str = "the archive's copy of the frame GLOBAL committed was refused at validation";
+/// A sync that is not the owed re-anchor's attempt (`ReanchorAttempt::Elsewhere`).
+pub(crate) const REANCHOR_ELSEWHERE: &str = "a re-anchor at the session fence is owed and has its own attempt";
+/// Marks the failure of a re-anchor step that runs on this node.
+pub(crate) const REANCHOR_ON_THIS_NODE: &str = "on this node";
+
+fn on_this_node(step: &'static str) -> impl Fn(quil_types::error::QuilError) -> quil_types::error::QuilError {
+    move |error| quil_types::error::QuilError::ExecutionUnavailable(format!("re-anchor {step} {REANCHOR_ON_THIS_NODE}: {error}"))
+}
+
+/// Re-anchor a shard whose head lies past its session's fence on frames the
+/// fence discarded, which this node cannot rewind (`app_handoff::fence_rewind`).
+/// The anchor is the frame GLOBAL committed for the session
+/// (`app_handoff::committed_tip`): the fence, the successor's base, while
+/// the successor has executed nothing, its executed tip after. It is
+/// authenticated as a bootstrap's is, and the shard's trees are synced
+/// pinned to its roots; the actor then rebases the shard's frames and cursor
+/// below it and replays it. Nothing is inherited unpinned: without an
+/// archive that serves the anchor and its state, the shard waits.
+async fn reanchor_shard_at_fence(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    fence: u64,
+    target: &dyn ShardRecoveryTarget,
+) -> Result<ShardRecoveryProgress> {
+    use crate::worker_execution::recovery_phase;
+    recovery_phase("fetching_checkpoint");
+    let Some(committed) = target.committed_tip().await.filter(|&tip| tip > 0 && tip >= fence) else {
+        return Ok(ShardRecoveryProgress::NotReady(REANCHOR_NO_TIP));
+    };
+    let mut validate = |anchor, predecessor| {
+        let validated = target.validate(anchor, predecessor);
+        async move { validated.await.map_err(on_this_node("validation")) }
+    };
+    let Some(frame) = syncer.get_app_shard_frame(filter, committed).await? else {
+        return Ok(ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
+    };
+    let Some((anchor, predecessor)) = authenticated_anchor(syncer, filter, frame, Some(committed), &mut validate).await? else {
+        return Ok(ShardRecoveryProgress::NotReady(REANCHOR_REFUSED));
+    };
+    let roots = anchor.header.as_ref().map(|header| header.state_roots.clone()).unwrap_or_default();
+    recovery_phase("installing_leaves");
+    if !syncer.sync_shard_tree(filter, &roots).await? {
+        return Ok(ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
+    }
+    recovery_phase("installing_checkpoint");
+    target.install(anchor, predecessor).await.map_err(on_this_node("installation"))?;
+    Ok(ShardRecoveryProgress::Anchored { frame: committed })
 }
 
 /// Archives asked for a shard's tip when the first answer is behind GLOBAL's
@@ -876,6 +975,165 @@ mod tests {
             assert_eq!(result, ShardReplay { materialized: 130, archive_tip: Some(expected_tip), target: 130 });
             assert_eq!(*calls.lock().unwrap(), vec![0; expected_calls]);
         }
+    }
+
+    /// A worker that owes a re-anchor at `fence`, with GLOBAL's committed
+    /// frame `committed`; validates frames through `valid_through`.
+    struct Reanchoring {
+        calls: Arc<Mutex<Vec<String>>>,
+        fence: Option<u64>,
+        committed: Option<u64>,
+        valid_through: u64,
+        install_fails: bool,
+        elsewhere: bool,
+        failures: Mutex<Vec<String>>,
+    }
+
+    impl Reanchoring {
+        fn new(calls: &Arc<Mutex<Vec<String>>>, fence: Option<u64>, committed: Option<u64>) -> Self {
+            Self {
+                calls: calls.clone(), fence, committed, valid_through: 505, install_fails: false,
+                elsewhere: false, failures: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for Reanchoring {
+        fn materialized(&self) -> u64 { 507 }
+        async fn replay(&self, frame: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+            let number = frame.header.unwrap().frame_number;
+            self.calls.lock().unwrap().push(format!("replay {number}"));
+            Ok(number)
+        }
+        async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool> {
+            let number = anchor.header.unwrap().frame_number;
+            assert_eq!(predecessor.unwrap().header.unwrap().frame_number, number - 1);
+            self.calls.lock().unwrap().push(format!("validate {number}"));
+            Ok(number <= self.valid_through)
+        }
+        async fn install(&self, anchor: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("install {}", anchor.header.unwrap().frame_number));
+            if self.install_fails {
+                return Err(quil_types::error::QuilError::ExecutionUnavailable("shard engine rejected sync completion".into()));
+            }
+            Ok(())
+        }
+        fn inherited(&self) { panic!("a re-anchor never inherits unpinned state") }
+        async fn committed_tip(&self) -> Option<u64> { self.committed }
+        async fn reanchor_fence(&self) -> ReanchorAttempt {
+            match self.fence {
+                Some(_) if self.elsewhere => ReanchorAttempt::Elsewhere,
+                Some(fence) => ReanchorAttempt::Take(fence),
+                None => ReanchorAttempt::NotOwed,
+            }
+        }
+        fn reanchor_failed(&self, reason: String) { self.failures.lock().unwrap().push(reason); }
+    }
+
+    /// GLOBAL fenced the shard's last session at 505; this worker installed
+    /// the archive's 507, a frame the fence discarded. It owes a re-anchor:
+    /// its lineage is not replayed, and it anchors at the frame GLOBAL
+    /// committed (the fence), authenticated, with its trees pinned to that
+    /// frame's roots, before the actor installs it. Without a re-anchor the
+    /// same worker replays its lineage, as before.
+    #[tokio::test]
+    async fn a_head_past_the_fence_is_reanchored_at_the_committed_frame_not_replayed() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let target = Reanchoring::new(&calls, Some(505), Some(505));
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 505 });
+        assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249", "install 505"]);
+        assert!(target.failures.lock().unwrap().is_empty());
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let target = Reanchoring::new(&calls, None, Some(505));
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert!(matches!(result, ShardRecoveryProgress::Replayed { .. }), "{result:?}");
+        assert!(calls.lock().unwrap().iter().all(|call| call.starts_with("fetch 0")), "{:?}", calls.lock().unwrap());
+    }
+
+    /// Serves certified frames, but its tree sync never reaches their roots.
+    struct StatelessArchive {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for StatelessArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            self.calls.lock().unwrap().push(format!("fetch {number}"));
+            Ok(Some(frame(number)))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], roots: &[Vec<u8>]) -> Result<bool> {
+            self.calls.lock().unwrap().push(format!("sync {}", roots.first().map_or(0, |root| root[0])));
+            Ok(false)
+        }
+    }
+
+    /// A re-anchor that no archive can serve, or whose frame fails
+    /// validation, installs nothing, never syncs unpinned (the shard holds
+    /// data, and its successor refuses anything but the committed state),
+    /// and tells the actor why.
+    #[tokio::test]
+    async fn a_reanchor_waits_for_an_archive_rather_than_inherit_unpinned_state() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let frameless = FramelessArchive { calls: Arc::new(Mutex::new(Vec::new())), refuse: None };
+        let target = Reanchoring::new(&calls, Some(505), Some(505));
+        let result = recover_shard_from_latest(&frameless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
+        assert!(frameless.calls.lock().unwrap().is_empty(), "no tree sync at all");
+        assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stateless = StatelessArchive { calls: calls.clone() };
+        let target = Reanchoring::new(&calls, Some(505), Some(505));
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249"], "never installed");
+        assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stateless = StatelessArchive { calls: calls.clone() };
+        let mut target = Reanchoring::new(&calls, Some(505), Some(505));
+        target.valid_through = 504;
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_REFUSED));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505"], "no tree write");
+        assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_REFUSED]);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stateless = StatelessArchive { calls: calls.clone() };
+        let target = Reanchoring::new(&calls, Some(505), None);
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_NO_TIP));
+        assert!(calls.lock().unwrap().is_empty(), "nothing asked of an archive");
+        assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_NO_TIP]);
+
+        // A step on this node that fails says so, for the warning's scope.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let mut target = Reanchoring::new(&calls, Some(505), Some(505));
+        target.install_fails = true;
+        assert!(recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.is_err());
+        let failures = target.failures.lock().unwrap();
+        assert!(failures.len() == 1 && failures[0].contains("re-anchor installation on this node: "), "{failures:?}");
+        drop(failures);
+
+        // A sync that is not the attempt's touches nothing, lineage or not,
+        // and is no failure of the re-anchor.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let mut target = Reanchoring::new(&calls, Some(505), Some(505));
+        target.elsewhere = true;
+        for local in [Some(frame(507)), None] {
+            let result = recover_shard_from_latest(&archive, &[5; 32], local, &target).await.unwrap();
+            assert_eq!(result, ShardRecoveryProgress::Deferred(REANCHOR_ELSEWHERE));
+        }
+        assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
+        assert!(target.failures.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
