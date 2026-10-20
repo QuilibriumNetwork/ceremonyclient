@@ -1266,6 +1266,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
         }),
         filters: vec![filter.clone()],
         leaf_roots: Vec::new(),
+        release: None,
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode confirm");
 
@@ -1457,6 +1458,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         }),
         filters: vec![filter.clone()],
         leaf_roots: Vec::new(),
+        release: None,
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode");
 

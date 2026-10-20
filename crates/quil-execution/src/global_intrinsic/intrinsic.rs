@@ -1069,6 +1069,8 @@ impl GlobalIntrinsic {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 // Confirm applies to each filter in the confirm message.
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                // Signed at or after the release frame, or ignored.
+                let release = super::prover_release::confirmed_release(&op);
                 // A join confirm records the prover's seniority for its rings
                 // (`prover_rings`): committed state plus this frame's earlier
                 // changes, as every node applies them in the same order.
@@ -1137,7 +1139,7 @@ impl GlobalIntrinsic {
                                 shard_removed,
                             )?;
 
-                            materialize::materialize_prover_confirm(alloc_tree, fn_)?;
+                            materialize::materialize_prover_confirm(alloc_tree, fn_, release.as_ref())?;
                             if current_status == materialize::STATUS_JOINING && super::prover_rings::governs(fn_) {
                                 super::prover_rings::write_key(alloc_tree, super::prover_rings::joined(fn_, seniority))?;
                             }
@@ -5397,6 +5399,7 @@ mod tests {
             }),
             filters: vec![vec![0xDDu8; 32]],
             leaf_roots: Vec::new(),
+            release: None,
         }
         .to_canonical_bytes()
         .unwrap();
@@ -6163,6 +6166,7 @@ mod tests {
                         filter: (*filter).clone(),
                         entries: vec![LeafRootEntry { prefix: vec![1], leaf_root: vec![0x11; 74], num_blocks: 4 }],
                     }).collect(),
+                    release: None,
                 };
                 gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
                 set_relay_activation_frame_for_thread(None);
@@ -6237,11 +6241,45 @@ mod tests {
                 public_key_signature_bls48581: signed_by(&prover_addr),
                 filters: vec![root.clone(), children[1].clone()],
                 leaf_roots: Vec::new(),
+                release: None,
             };
             gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
             assert_eq!(read_status(&state, &stale, "allocation:ProverAllocation"), Some(materialize::STATUS_JOINING));
             let child = allocation_address(&pubkey, &children[1]).unwrap();
             assert_eq!(read_status(&state, &child, "allocation:ProverAllocation"), Some(materialize::STATUS_ACTIVE));
+        }
+
+        /// A confirm signed from the release frame records its release on each
+        /// allocation it confirms; one signed before it records none, whatever
+        /// bytes it carries, as an older build ignores them.
+        #[test]
+        fn a_confirm_records_its_release_only_when_signed_from_the_release_frame() {
+            use crate::global_intrinsic::prover_release::{read_release, set_confirm_release_frame_for_thread, Release};
+            let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+            let confirm_frame = quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
+            let filter = vec![0x73u8; 32];
+            let pubkey = vec![0xC5u8; 897];
+            let va_disc = vertex_adds_discriminator().unwrap();
+            for (release_frame, recorded) in [(None, None), (Some(confirm_frame + 1), None), (Some(confirm_frame), Some(release))] {
+                set_confirm_release_frame_for_thread(release_frame);
+                let state = make_state();
+                let (prover_addr, alloc_addr) = seed_prover(&state, &pubkey, &filter, materialize::STATUS_JOINING, true);
+                let confirm = ProverConfirm {
+                    filter: vec![],
+                    frame_number: confirm_frame,
+                    public_key_signature_bls48581: signed_by(&prover_addr),
+                    filters: vec![filter.clone()],
+                    leaf_roots: Vec::new(),
+                    release: Some(release),
+                };
+                let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+                gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
+                assert_eq!(read_status(&state, &alloc_addr, "allocation:ProverAllocation"), Some(materialize::STATUS_ACTIVE));
+                let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap().unwrap();
+                let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                assert_eq!(read_release(&tree), recorded, "release frame {release_frame:?}");
+            }
+            set_confirm_release_frame_for_thread(None);
         }
 
         #[test]

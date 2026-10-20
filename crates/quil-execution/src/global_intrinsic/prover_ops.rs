@@ -50,6 +50,12 @@ pub struct ProverConfirm {
     /// serializes + signs byte-identically to the pre-storage-attestation
     /// format. See [`super::leaf_root_registration::ConfirmLeafRoots`].
     pub leaf_roots: Vec<super::leaf_root_registration::ConfirmLeafRoots>,
+    /// The sender's release, appended after the leaf roots (an empty set
+    /// is then written as an explicit zero group count). Decoded, signed and
+    /// recorded only for a confirm signed from the release frame
+    /// ([`super::prover_release`]); `None` serializes byte-identically to the
+    /// legacy format, and a decoder that predates it ignores the bytes.
+    pub release: Option<super::prover_release::Release>,
 }
 
 impl ProverConfirm {
@@ -64,6 +70,12 @@ impl ProverConfirm {
         write_opt_addr_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
         write_filters(&mut out, &self.filters);
         super::leaf_root_registration::append_confirm_leaf_roots(&mut out, &self.leaf_roots);
+        if let Some(release) = self.release.as_ref() {
+            if self.leaf_roots.is_empty() {
+                put_u32(&mut out, 0);
+            }
+            out.extend_from_slice(&release.to_bytes());
+        }
         Ok(out)
     }
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
@@ -77,7 +89,16 @@ impl ProverConfirm {
         let sig = read_opt_addr_sig(data, &mut c)?;
         let filters = read_filters(data, &mut c)?;
         let leaf_roots = super::leaf_root_registration::read_confirm_leaf_roots(data, &mut c)?;
-        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters, leaf_roots })
+        // Like a decoder that predates it, never refuse a confirm for its
+        // tail: a short tail carries no release, and bytes after it are
+        // ignored. Before the release frame the tail is ignored entirely, so a
+        // confirm re-encodes as an older build re-encodes it.
+        let release = (frame_number >= super::prover_release::confirm_release_frame())
+            .then(|| data.get(c..))
+            .flatten()
+            .and_then(|tail| tail.get(..super::prover_release::Release::ENCODED_LEN))
+            .and_then(super::prover_release::Release::from_bytes);
+        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters, leaf_roots, release })
     }
 }
 
@@ -338,7 +359,7 @@ mod tests {
     // -- ProverConfirm --
     #[test]
     fn confirm_round_trip() {
-        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]], leaf_roots: Vec::new() };
+        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]], leaf_roots: Vec::new(), release: None };
         let b = c.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_PROVER_CONFIRM.to_be_bytes());
         let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
@@ -369,6 +390,7 @@ mod tests {
             public_key_signature_bls48581: Some(addr_sig()),
             filters: vec![vec![1u8; 8], vec![2u8; 16]],
             leaf_roots: Vec::new(),
+            release: None,
         };
         let legacy = c.to_canonical_bytes().unwrap();
         c.leaf_roots = Vec::<ConfirmLeafRoots>::new();
@@ -390,6 +412,7 @@ mod tests {
             public_key_signature_bls48581: Some(addr_sig()),
             filters: vec![vec![0xAB; 32]],
             leaf_roots: groups.clone(),
+            release: None,
         };
         let b = c.to_canonical_bytes().unwrap();
         let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
@@ -397,6 +420,144 @@ mod tests {
         // The leaf roots extend the bytes beyond the legacy tail.
         let legacy = ProverConfirm { leaf_roots: Vec::new(), ..c.clone() };
         assert!(b.len() > legacy.to_canonical_bytes().unwrap().len());
+    }
+
+    /// The confirm encoding of the base release, written out field by field.
+    fn legacy_confirm_bytes(c: &ProverConfirm) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0305u32.to_be_bytes());
+        out.extend_from_slice(&32u32.to_be_bytes());
+        out.extend_from_slice(b"reservedreservedreservedreserved");
+        out.extend_from_slice(&c.frame_number.to_be_bytes());
+        match c.public_key_signature_bls48581.as_ref() {
+            Some(sig) => {
+                let b = sig.to_canonical_bytes().unwrap();
+                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.extend_from_slice(&0u32.to_be_bytes()),
+        }
+        out.extend_from_slice(&(c.filters.len() as u32).to_be_bytes());
+        for f in &c.filters {
+            out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            out.extend_from_slice(f);
+        }
+        super::super::leaf_root_registration::append_confirm_leaf_roots(&mut out, &c.leaf_roots);
+        out
+    }
+
+    /// The base release's decoder: the legacy fields, then leaf roots if
+    /// bytes remain; anything after them is ignored.
+    fn legacy_decode(data: &[u8]) -> (u64, Option<AddressedSignature>, Vec<Vec<u8>>, Vec<super::super::leaf_root_registration::ConfirmLeafRoots>) {
+        let mut c = 0;
+        assert_eq!(read_u32(data, &mut c).unwrap(), TYPE_PROVER_CONFIRM);
+        let fl = read_u32(data, &mut c).unwrap();
+        read_bytes(data, &mut c, fl as usize).unwrap();
+        let frame_number = read_u64(data, &mut c).unwrap();
+        let sig = read_opt_addr_sig(data, &mut c).unwrap();
+        let filters = read_filters(data, &mut c).unwrap();
+        let leaf_roots = super::super::leaf_root_registration::read_confirm_leaf_roots(data, &mut c).unwrap();
+        (frame_number, sig, filters, leaf_roots)
+    }
+
+    fn release() -> super::super::prover_release::Release {
+        super::super::prover_release::Release { version: [2, 1, 0], patch: 25, subpatch: 92 }
+    }
+
+    #[test]
+    fn confirm_without_release_is_byte_identical_to_legacy() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for leaf_roots in [Vec::new(), roots] {
+            let c = ProverConfirm {
+                filter: vec![], frame_number: 42,
+                public_key_signature_bls48581: Some(addr_sig()),
+                filters: vec![vec![1u8; 8], vec![2u8; 16]],
+                leaf_roots,
+                release: None,
+            };
+            let bytes = c.to_canonical_bytes().unwrap();
+            assert_eq!(bytes, legacy_confirm_bytes(&c));
+            assert_eq!(ProverConfirm::from_canonical_bytes(&bytes).unwrap().release, None);
+        }
+    }
+
+    #[test]
+    fn confirm_with_release_round_trips_and_a_legacy_decoder_ignores_it() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        super::super::prover_release::set_confirm_release_frame_for_thread(Some(42));
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for leaf_roots in [Vec::new(), roots] {
+            let c = ProverConfirm {
+                filter: vec![], frame_number: 42,
+                public_key_signature_bls48581: Some(addr_sig()),
+                filters: vec![vec![1u8; 8]],
+                leaf_roots: leaf_roots.clone(),
+                release: Some(release()),
+            };
+            let bytes = c.to_canonical_bytes().unwrap();
+            let legacy = legacy_confirm_bytes(&c);
+            // The legacy bytes, an explicit empty leaf-root set, the release.
+            let mut expected = legacy.clone();
+            if leaf_roots.is_empty() {
+                expected.extend_from_slice(&0u32.to_be_bytes());
+            }
+            expected.extend_from_slice(&[2, 1, 0, 25, 0, 92]);
+            assert_eq!(bytes, expected);
+            let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+            assert_eq!(decoded.release, Some(release()));
+            assert_eq!(decoded.leaf_roots, leaf_roots);
+            let (frame, sig, filters, roots) = legacy_decode(&bytes);
+            assert_eq!((frame, sig, filters, roots), (42, Some(addr_sig()), vec![vec![1u8; 8]], leaf_roots));
+        }
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
+    }
+
+    #[test]
+    fn before_the_release_frame_a_confirm_re_encodes_as_a_legacy_decoder_reads_it() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for frame in [None, Some(43)] {
+            super::super::prover_release::set_confirm_release_frame_for_thread(frame);
+            for leaf_roots in [Vec::new(), roots.clone()] {
+                let early = ProverConfirm {
+                    filter: vec![], frame_number: 42,
+                    public_key_signature_bls48581: Some(addr_sig()),
+                    filters: vec![vec![1u8; 8]],
+                    leaf_roots,
+                    release: Some(release()),
+                };
+                let legacy = legacy_confirm_bytes(&early);
+                let decoded = ProverConfirm::from_canonical_bytes(&early.to_canonical_bytes().unwrap()).unwrap();
+                assert_eq!(decoded.release, None, "release frame {frame:?}");
+                assert_eq!(decoded.to_canonical_bytes().unwrap(), legacy, "release frame {frame:?}");
+            }
+        }
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
+    }
+
+    #[test]
+    fn a_confirm_tail_without_a_whole_release_decodes_without_one() {
+        super::super::prover_release::set_confirm_release_frame_for_thread(Some(0));
+        let c = ProverConfirm { filters: vec![vec![1u8; 8]], ..Default::default() };
+        let mut bytes = c.to_canonical_bytes().unwrap();
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&[2, 1, 0]);
+        let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded.release, None);
+        bytes.extend_from_slice(&[25, 0, 92, 0xEE]);
+        let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded.release, Some(release()));
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
     }
 
     // -- ProverReject --

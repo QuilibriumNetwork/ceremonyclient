@@ -350,6 +350,7 @@ roundtrip_test!(
             public_key_signature_bls48581: sig,
             filters,
             leaf_roots: Vec::new(),
+            release: None,
         })
 );
 decode_fuzz_test!(prover_confirm_decode_fuzz, ProverConfirm);

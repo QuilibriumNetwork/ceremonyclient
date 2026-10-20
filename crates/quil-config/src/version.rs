@@ -18,6 +18,27 @@ pub const VERSION_STRING: &str = "2.1.0.25";
 /// within a patch release; empty when the build had no `subpatch` file.
 pub const SUBPATCH: &str = env!("QUIL_SUBPATCH");
 
+/// [`SUBPATCH`] as a number, as a prover's epoch confirmation reports it;
+/// 0 when the build had no `subpatch` file, and saturated at `u16::MAX`.
+pub const SUBPATCH_NUMBER: u16 = subpatch_number(SUBPATCH);
+
+const fn subpatch_number(subpatch: &str) -> u16 {
+    let bytes = subpatch.as_bytes();
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            return 0;
+        }
+        value = value * 10 + (bytes[i] - b'0') as u32;
+        if value > u16::MAX as u32 {
+            return u16::MAX;
+        }
+        i += 1;
+    }
+    value as u16
+}
+
 /// The version shown to operators: `VERSION_STRING` with the subpatch as
 /// a fifth part, e.g. `2.1.0.25.87`, so builds within one patch release can
 /// be told apart. Peers still exchange `VERSION_STRING`.
@@ -61,6 +82,15 @@ mod tests {
         assert_eq!(display_version(), format!("{VERSION_STRING}.{SUBPATCH}"));
         assert_eq!(with_subpatch("2.1.0.25", "87"), "2.1.0.25.87");
         assert_eq!(with_subpatch("2.1.0.25", ""), "2.1.0.25");
+    }
+
+    #[test]
+    fn the_subpatch_number_is_the_subpatch() {
+        assert_eq!(SUBPATCH_NUMBER.to_string(), SUBPATCH);
+        assert_eq!(subpatch_number(""), 0);
+        assert_eq!(subpatch_number("92"), 92);
+        assert_eq!(subpatch_number("9x"), 0);
+        assert_eq!(subpatch_number("65536"), u16::MAX);
     }
 
     #[test]

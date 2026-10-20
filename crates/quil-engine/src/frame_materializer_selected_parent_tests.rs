@@ -368,6 +368,7 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
         }),
         filters: vec![vec![1; 32]],
         leaf_roots: Vec::new(),
+        release: None,
     };
     let bundle = quil_types::proto::global::MessageBundle {
         requests: vec![quil_types::proto::global::MessageRequest {

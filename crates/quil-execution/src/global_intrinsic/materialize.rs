@@ -446,10 +446,15 @@ pub fn update_prover_status_from_allocations(
 /// epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
 /// the byte avoids changing committee membership mid-epoch.
 ///
+/// A join confirm or re-confirm also records the confirm's `release`, when it
+/// carries one in effect ([`super::prover_release::confirmed_release`]); one
+/// without leaves the recorded release as it is.
+///
 /// Returns `Err` if the allocation is not in status 0, 1, or 3.
 pub fn materialize_prover_confirm(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
+    release: Option<&super::prover_release::Release>,
 ) -> Result<()> {
     let cls = "allocation:ProverAllocation";
     let status = read_field(allocation_tree, cls, "Status")
@@ -469,6 +474,9 @@ pub fn materialize_prover_confirm(
             write_field(allocation_tree, cls, "JoinConfirmFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
+            if let Some(release) = release {
+                super::prover_release::write_release(allocation_tree, release)?;
+            }
             Ok(())
         }
         STATUS_ACTIVE => {
@@ -480,6 +488,9 @@ pub fn materialize_prover_confirm(
             // deliberately left untouched.
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
+            if let Some(release) = release {
+                super::prover_release::write_release(allocation_tree, release)?;
+            }
             Ok(())
         }
         STATUS_LEAVING => {
@@ -2036,10 +2047,30 @@ mod tests {
     #[test]
     fn confirm_join_sets_active_and_frame_numbers() {
         let mut tree = make_allocation_tree(STATUS_JOINING);
-        materialize_prover_confirm(&mut tree, 400).unwrap();
+        materialize_prover_confirm(&mut tree, 400, None).unwrap();
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(), 400u64.to_be_bytes().to_vec());
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(), 400u64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn confirm_records_its_release_on_join_and_reconfirm_only() {
+        use super::super::prover_release::{read_release, Release};
+        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+        let frame = 5 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
+        for status in [STATUS_JOINING, STATUS_ACTIVE] {
+            let mut tree = make_allocation_tree(status);
+            materialize_prover_confirm(&mut tree, frame, None).unwrap();
+            assert_eq!(read_release(&tree), None, "no release, nothing recorded");
+            materialize_prover_confirm(&mut tree, frame + quil_types::consensus::EPOCH_LENGTH_FRAMES, Some(&release)).unwrap();
+            assert_eq!(read_release(&tree), Some(release));
+            // A later confirm without a release keeps the recorded one.
+            materialize_prover_confirm(&mut tree, frame + 2 * quil_types::consensus::EPOCH_LENGTH_FRAMES, None).unwrap();
+            assert_eq!(read_release(&tree), Some(release));
+        }
+        let mut leaving = make_allocation_tree(STATUS_LEAVING);
+        materialize_prover_confirm(&mut leaving, frame, Some(&release)).unwrap();
+        assert_eq!(read_release(&leaving), None, "a leave confirm records no release");
     }
 
     #[test]
@@ -2047,7 +2078,7 @@ mod tests {
         // Epoch-aligned: leave-confirm keeps the Leaving byte (serving notice);
         // departure is derived at the E+2 boundary by `effective_status`.
         let mut tree = make_allocation_tree(STATUS_LEAVING);
-        materialize_prover_confirm(&mut tree, 500).unwrap();
+        materialize_prover_confirm(&mut tree, 500, None).unwrap();
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 500u64.to_be_bytes().to_vec());
     }
@@ -2060,7 +2091,7 @@ mod tests {
         // ExpiredEpoch — without it a stale-epoch allocation could never return.
         let mut tree = make_allocation_tree(STATUS_ACTIVE);
         let frame = 5 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10; // epoch 5
-        materialize_prover_confirm(&mut tree, frame).unwrap();
+        materialize_prover_confirm(&mut tree, frame, None).unwrap();
         assert_eq!(
             read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
             vec![STATUS_ACTIVE],
@@ -2080,7 +2111,7 @@ mod tests {
     #[test]
     fn confirm_rejects_paused_status() {
         let mut tree = make_allocation_tree(STATUS_PAUSED);
-        assert!(materialize_prover_confirm(&mut tree, 400).is_err());
+        assert!(materialize_prover_confirm(&mut tree, 400, None).is_err());
     }
 
     // -----------------------------------------------------------------
@@ -2143,7 +2174,7 @@ mod tests {
     fn confirm_join_registers_next_epoch() {
         let mut tree = make_allocation_tree(STATUS_JOINING);
         let frame = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5; // epoch 3
-        materialize_prover_confirm(&mut tree, frame).unwrap();
+        materialize_prover_confirm(&mut tree, frame, None).unwrap();
         assert_eq!(
             read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
             4u64.to_be_bytes().to_vec(),
@@ -2159,8 +2190,8 @@ mod tests {
         let mut tree = make_allocation_tree(STATUS_JOINING);
         let f1 = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
         let f2 = 4 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
-        materialize_prover_confirm(&mut tree, f1).unwrap();
-        materialize_prover_confirm(&mut tree, f2).unwrap();
+        materialize_prover_confirm(&mut tree, f1, None).unwrap();
+        materialize_prover_confirm(&mut tree, f2, None).unwrap();
         assert_eq!(
             read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(),
             f1.to_be_bytes().to_vec(),
@@ -2178,7 +2209,7 @@ mod tests {
     #[test]
     fn confirm_and_reject_reject_terminal_status() {
         let mut t1 = make_allocation_tree(STATUS_KICKED);
-        assert!(materialize_prover_confirm(&mut t1, 400).is_err(), "confirm on byte-4 rejected");
+        assert!(materialize_prover_confirm(&mut t1, 400, None).is_err(), "confirm on byte-4 rejected");
         let mut t2 = make_allocation_tree(STATUS_KICKED);
         assert!(materialize_prover_reject(&mut t2, 400).is_err(), "reject on byte-4 rejected");
     }
@@ -2218,7 +2249,7 @@ mod tests {
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_JOINING]);
 
         // Confirm join → active
-        materialize_prover_confirm(&mut alloc, 460).unwrap();
+        materialize_prover_confirm(&mut alloc, 460, None).unwrap();
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
 
         // Pause
@@ -2234,7 +2265,7 @@ mod tests {
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
 
         // Confirm leave → keeps Leaving byte (departs at E+2 via read-side)
-        materialize_prover_confirm(&mut alloc, 1060).unwrap();
+        materialize_prover_confirm(&mut alloc, 1060, None).unwrap();
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 1060u64.to_be_bytes().to_vec());
     }
@@ -2260,7 +2291,7 @@ mod tests {
         let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xFFu8; 32], 100).unwrap();
 
         // Confirm join
-        materialize_prover_confirm(&mut alloc, 460).unwrap();
+        materialize_prover_confirm(&mut alloc, 460, None).unwrap();
         // Leave
         materialize_prover_leave(&mut alloc, 500).unwrap();
         // Reject leave → back to active

@@ -890,7 +890,59 @@ fn scheduler_authorizes_first_sessions_and_membership_successors_once() {
     assert!(schedule::closing_request(&state, &first).is_err(), "a retired session has no parent");
     let second = head(&state, &filter).unwrap().unwrap();
     assert_eq!((second.generation, second.base_frame, second.members.clone()), (2, 3, members(&new)));
+    assert_eq!(scheduled_frame(&state, &second.id().unwrap()).unwrap(), Some(4), "its committee was chosen at 4");
+    assert_eq!(scheduled_frame(&state, &first.id().unwrap()).unwrap(), None, "no request authorized a first session");
     assert_eq!(schedule::reconcile_membership(&state, 7, &policy(), &filters, &changed).unwrap(), 0);
+}
+
+/// From a release eligibility step's frame new sessions seat only
+/// allocations whose recorded release is at least its minimum: one with an
+/// older release or none recorded is not desired, and a shard left with no
+/// such member keeps its current session.
+#[test]
+fn release_eligibility_seats_only_recorded_minimum_releases() {
+    use crate::global_intrinsic::prover_release::{set_release_eligibility_for_thread, Release, ReleaseMinimum};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    commit(&state, 1);
+    let filter = vec![7u8; 32];
+    let filters = vec![filter.clone()];
+    let provers = keys();
+    let address = |key: &FalconPrivateKey| {
+        quil_crypto::poseidon::hash_bytes_to_32(key.public_key().as_ref()).unwrap().to_vec()
+    };
+    let minimum = Release { version: [2, 1, 0], patch: 25, subpatch: 90 };
+    let older = Release { subpatch: 89, ..minimum };
+    let recorded = |releases: &[Option<Release>]| {
+        provers.iter().zip(releases).fold(scan_of(&[(&filter, &provers)]), |scan, (key, release)| match release {
+            Some(release) => scan.with_release(&address(key), &filter, *release),
+            None => scan,
+        })
+    };
+    let current = Some(minimum);
+    // Two current, one older, one absent (its last confirm recorded none).
+    let mixed = recorded(&[current, current, Some(older), None]);
+    set_release_eligibility_for_thread(None).unwrap();
+    assert_eq!(schedule::desired_members(&mixed, &filter, 10), members(&provers), "unset: the gate never applies");
+    set_release_eligibility_for_thread(Some(vec![ReleaseMinimum { from_frame: 10, minimum }])).unwrap();
+    assert_eq!(schedule::desired_members(&mixed, &filter, 9), members(&provers), "not before its frame");
+    assert_eq!(schedule::desired_members(&mixed, &filter, 10), members(&provers[..2]),
+        "an older or absent release is not seated");
+    assert!(schedule::desired_members(&recorded(&[None; 4]), &filter, 10).is_empty(), "absent fails closed");
+    assert_eq!(mixed.active_on_filter(&filter, 10).len(), 4, "committee eligibility is unchanged");
+
+    assert_eq!(schedule::reconcile_membership(&state, 10, &policy(), &filters, &mixed).unwrap(), 1);
+    commit(&state, 10);
+    let first = head(&state, &filter).unwrap().unwrap();
+    assert_eq!(first.members, members(&provers[..2]));
+    assert_eq!(schedule::reconcile_membership(&state, 11, &policy(), &filters, &recorded(&[None; 4])).unwrap(), 0,
+        "no member left keeps the current session");
+    assert_eq!(head(&state, &filter).unwrap().unwrap(), first);
+    assert_eq!(status(&state, &first.id().unwrap()).unwrap(), Status::Active);
+    assert_eq!(schedule::reconcile_membership(&state, 12, &policy(), &filters, &recorded(&[current; 4])).unwrap(), 1,
+        "members that record a current release are seated by the next session");
+    set_release_eligibility_for_thread(None).unwrap();
 }
 
 /// From `membership_boundary_frame` a changed eligible set replaces a session
