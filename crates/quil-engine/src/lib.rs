@@ -3,6 +3,7 @@ pub mod storage_history;
 pub mod global_anchor;
 pub mod app_handoff;
 mod app_history_recovery;
+mod bounded_warn;
 pub mod app_glue;
 pub mod archive_ingest;
 pub mod app_shard_cache;
