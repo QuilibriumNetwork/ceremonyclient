@@ -1649,7 +1649,15 @@ pub(crate) async fn start(
                 .expect("recent_messages ring present when explorer enabled"),
             last_global_head_frame.clone(),
         );
-        let router = quil_explorer::router(state);
+        // Outside archive mode the shards store keeps the genesis grid: the
+        // production KPIs take the current one from the archive cache.
+        let state = if archive_mode {
+            state
+        } else {
+            let lifecycle = prover_lifecycle.clone();
+            state.with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
+        };
+        let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {
             Ok(listener) => {
                 info!(addr = %listen_addr, "explorer REST API listening");
@@ -1659,6 +1667,10 @@ pub(crate) async fn start(
                     })
                     .await
                     .map_err(anyhow::Error::from)
+                });
+                // App-shard production index for `/shards/production`.
+                sup.run_until_cancelled("explorer-production", move |_token| {
+                    quil_explorer::production::run_indexer(state)
                 });
             }
             Err(e) => warn!(
