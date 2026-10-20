@@ -453,19 +453,6 @@ pub async fn sync_shard_phases_verified(
     sync_shard_phases(addr, falcon_signing_key, crdt, shard_id, expected, false).await
 }
 
-/// [`sync_shard_phases_verified`] for ONLY the phases `expected` pins; an
-/// unpinned phase is left as it is rather than taken from the peer's head. A
-/// historical tree must not mix in a phase the peer chose.
-pub async fn sync_shard_phases_pinned(
-    addr: &str,
-    falcon_signing_key: &[u8],
-    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-    shard_id: &[u8],
-    expected: [&[u8]; 4],
-) -> Result<Option<u64>> {
-    sync_shard_phases(addr, falcon_signing_key, crdt, shard_id, expected, true).await
-}
-
 async fn sync_shard_phases(
     addr: &str,
     falcon_signing_key: &[u8],
@@ -481,8 +468,9 @@ async fn sync_shard_phases(
     sync_shard_phases_on(&mut client, crdt, shard_id, expected, pinned_only).await
 }
 
-/// [`sync_shard_phases_verified`] (or, with `pinned_only`,
-/// [`sync_shard_phases_pinned`]) over an already connected archive client.
+/// [`sync_shard_phases_verified`] over an already connected archive client;
+/// with `pinned_only`, only the phases `expected` pins are synced, and an
+/// unpinned phase is left as it is rather than taken from the peer's head.
 pub(crate) async fn sync_shard_phases_on(
     client: &mut ArchiveClient,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,

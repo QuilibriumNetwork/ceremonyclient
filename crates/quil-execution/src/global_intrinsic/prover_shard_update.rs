@@ -1709,7 +1709,6 @@ mod tests {
         assert_eq!(read_bal(&state, &p), BigInt::from(1700), "new frame credits again");
     }
 
-    #[test]
     /// Cost of one participant's activity update and its parts, for
     /// shard-header execution time (mainnet: ~9 ms per participant).
     #[test]

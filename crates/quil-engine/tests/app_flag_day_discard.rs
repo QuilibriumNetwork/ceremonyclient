@@ -21,7 +21,6 @@ use quil_execution::{
 use quil_types::{
     consensus::{CommitteeHandoffPolicy, LegacyHistory, ProverRegistry},
     proto::global::AppShardFrame,
-    store::ClockStore as _,
 };
 
 const APP: [u8; 32] = [0x55; 32];
