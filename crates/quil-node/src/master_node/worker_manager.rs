@@ -728,8 +728,8 @@ pub(crate) fn init(
                     Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>,
                 > = falcon_sk_for_builder.clone().map(|sk| {
                     Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                        // Unused when the pool resolves an endpoint; kept as the
-                        // fallback (empty ⇒ connect fails, logged, retried next gap).
+                        // No fixed source: with no archive in the pool the attempt
+                        // fails as "no archive known yet" and retries next gap.
                         master_stream_addr: String::new(),
                         hg_store: hg_store_concrete.clone(),
                         falcon_signing_key: sk,

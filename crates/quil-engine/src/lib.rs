@@ -61,6 +61,7 @@ pub mod worker_payload_eviction;
 pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod prover_tree_syncer;
+mod recovery_turns;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
 /// Exposed for integration tests in `tests/`; hidden from public

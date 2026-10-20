@@ -64,6 +64,115 @@ fn recently_failed(addr: &str) -> bool {
     failures.contains_key(addr)
 }
 
+/// How long an unused archive connection for shard frame reads is kept.
+const FRAME_CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A shard frame read connection's key: the dialing thread and the archive.
+/// A channel's I/O runs on the runtime that dialed it, and each in-process
+/// worker has its own single-threaded runtime, so one worker's reads never
+/// wait on another's.
+type FrameClientKey = (std::thread::ThreadId, String);
+
+struct FrameClient<C> {
+    id: u64,
+    signing_key: Vec<u8>,
+    client: C,
+    used: std::time::Instant,
+}
+
+/// Shard frame read connections, one per key and identity: a replay batch
+/// reads frame by frame, and each new connection costs the archive a
+/// PQNoise handshake.
+struct FrameClients<C> {
+    next_id: u64,
+    entries: std::collections::HashMap<FrameClientKey, FrameClient<C>>,
+}
+
+impl<C: Clone> FrameClients<C> {
+    fn new() -> Self {
+        Self { next_id: 0, entries: Default::default() }
+    }
+
+    /// The connection for `key` under `signing_key`, if used within the idle
+    /// window. Every idle connection is dropped first.
+    fn get(&mut self, key: &FrameClientKey, signing_key: &[u8], now: std::time::Instant) -> Option<C> {
+        self.entries.retain(|_, cached| now.saturating_duration_since(cached.used) < FRAME_CLIENT_IDLE);
+        let cached = self.entries.get_mut(key).filter(|cached| cached.signing_key == signing_key)?;
+        cached.used = now;
+        Some(cached.client.clone())
+    }
+
+    /// Keep `client` for `key`; its id names it to [`Self::reap`].
+    fn insert(&mut self, key: FrameClientKey, signing_key: &[u8], client: C, now: std::time::Instant) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.entries.insert(key, FrameClient { id, signing_key: signing_key.to_vec(), client, used: now });
+        id
+    }
+
+    fn evict(&mut self, key: &FrameClientKey) {
+        self.entries.remove(key);
+    }
+
+    /// Drop connection `id` of `key` once idle. True when nothing is left
+    /// to reap: it was dropped now, or earlier, or replaced.
+    fn reap(&mut self, key: &FrameClientKey, id: u64, now: std::time::Instant) -> bool {
+        let Some(cached) = self.entries.get(key).filter(|cached| cached.id == id) else { return true };
+        if now.saturating_duration_since(cached.used) < FRAME_CLIENT_IDLE {
+            return false;
+        }
+        self.entries.remove(key);
+        true
+    }
+}
+
+static FRAME_CLIENTS: std::sync::LazyLock<std::sync::Mutex<FrameClients<ArchiveClient>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FrameClients::new()));
+
+fn frame_clients() -> std::sync::MutexGuard<'static, FrameClients<ArchiveClient>> {
+    FRAME_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Close connection `id` of `key` once it has been idle, on the runtime
+/// that runs its I/O, so an idle channel does not keep pinging the archive.
+async fn reap_frame_client(key: FrameClientKey, id: u64) {
+    loop {
+        tokio::time::sleep(FRAME_CLIENT_IDLE).await;
+        if frame_clients().reap(&key, id, std::time::Instant::now()) {
+            return;
+        }
+    }
+}
+
+/// Whether a failed read leaves its connection unusable. A busy or
+/// refusing archive answered over a working connection: keep it.
+fn read_breaks_connection(error: &quil_rpc::ArchiveClientError) -> bool {
+    use tonic::Code;
+    match error {
+        quil_rpc::ArchiveClientError::Rpc(status) => matches!(
+            status.code(),
+            Code::Unavailable | Code::Unknown | Code::Cancelled | Code::DeadlineExceeded
+        ),
+        _ => true,
+    }
+}
+
+/// A shard frame read in flight. Dropped before it finishes (a caller's
+/// timeout), the read counts as failed and its connection is closed.
+struct FrameRead<'a> {
+    key: &'a FrameClientKey,
+    finished: bool,
+}
+
+impl Drop for FrameRead<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            frame_clients().evict(self.key);
+            source_failed(&self.key.1);
+        }
+    }
+}
+
 impl ProdProverTreeSyncer {
     /// Predecessor outgoing history from this syncer's archive, as the engine
     /// source for a cluster worker (whose archives are discovered through its
@@ -116,8 +225,31 @@ impl ProdProverTreeSyncer {
                 }).await.map_err(|_| QuilError::ExecutionUnavailable("archive discovery timed out".into()))?
                     .map_err(|e| QuilError::ExecutionUnavailable(format!("archive discovery: {e}")))?;
                 for endpoint in endpoints { pool.add(endpoint).await; }
-                return pool.next().await.ok_or_else(|| QuilError::ExecutionUnavailable("master has not discovered an archive yet".into()));
+                if let Some(ep) = pool.next().await {
+                    return Ok(ep);
+                }
             }
+            // The GLOBAL poller passes over every archive whose frame poll
+            // failed in the last minute; a shard read can still succeed
+            // there. Prefer one no shard read failed at recently.
+            let mut failed = None;
+            for _ in 0..pool.len().await.max(1) {
+                let Some(ep) = pool.any_known().await else { break };
+                if !recently_failed(&ep) {
+                    return Ok(ep);
+                }
+                failed.get_or_insert(ep);
+            }
+            if let Some(ep) = failed {
+                return Ok(ep);
+            }
+            if self.discover_archives_from_master {
+                return Err(QuilError::ExecutionUnavailable("master has not discovered an archive yet".into()));
+            }
+        }
+        // An empty address is no source: dialing it only fails as an invalid URI.
+        if self.master_stream_addr.is_empty() {
+            return Err(QuilError::ExecutionUnavailable("no archive known yet".into()));
         }
         Ok(self.master_stream_addr.clone())
     }
@@ -359,19 +491,34 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         frame_number: u64,
     ) -> Result<Option<quil_types::proto::global::AppShardFrame>> {
         let addr = self.resolve_addr().await?;
+        let key = (std::thread::current().id(), addr);
+        let mut read = FrameRead { key: &key, finished: false };
         let fetched = async {
-            let mut client = ArchiveClient::connect_mtls(&addr, &self.falcon_signing_key)
-                .await
-                .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+            let cached = frame_clients().get(&key, &self.falcon_signing_key, std::time::Instant::now());
+            let mut client = match cached {
+                Some(client) => client,
+                None => {
+                    let client = ArchiveClient::connect_mtls(&key.1, &self.falcon_signing_key)
+                        .await
+                        .map_err(|e| (QuilError::Internal(format!("archive connect: {e}")), true))?;
+                    let id = frame_clients().insert(key.clone(), &self.falcon_signing_key, client.clone(), std::time::Instant::now());
+                    tokio::spawn(reap_frame_client(key.clone(), id));
+                    client
+                }
+            };
             client
                 .get_app_shard_frame(filter.to_vec(), frame_number)
                 .await
-                .map_err(|e| QuilError::Internal(format!("get app-shard frame: {e}")))
+                .map_err(|e| (QuilError::Internal(format!("get app-shard frame: {e}")), read_breaks_connection(&e)))
         }.await;
-        if fetched.is_err() {
-            source_failed(&addr);
-        }
-        fetched
+        read.finished = true;
+        fetched.map_err(|(error, broken)| {
+            if broken {
+                frame_clients().evict(&key);
+            }
+            source_failed(&key.1);
+            error
+        })
     }
 }
 
@@ -460,5 +607,125 @@ mod archive_routing_tests {
         // With every known archive failing, recovery still tries one.
         source_failed(other);
         assert!([slow, other].contains(&syncer.resolve_addr().await.unwrap().as_str()));
+    }
+
+    /// An in-process worker shares its master's pool: with every archive
+    /// passed over by the GLOBAL poller it still reads one, and with none
+    /// known it reports that instead of dialing an empty address.
+    #[tokio::test]
+    async fn an_empty_or_blacklisted_pool_never_resolves_an_empty_address() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60)));
+        let mut syncer = ProdProverTreeSyncer {
+            master_stream_addr: String::new(), hg_store, crdt,
+            falcon_signing_key: vec![], archive_pool: Some(pool.clone()),
+            discover_archives_from_master: false,
+        };
+        let error = syncer.resolve_addr().await.unwrap_err();
+        assert!(error.to_string().contains("no archive known yet"), "{error}");
+        let (known, own) = ("192.0.2.9:8340", "192.0.2.10:8340");
+        pool.add(known.into()).await;
+        pool.add(own.into()).await;
+        pool.mark_own(own).await;
+        // A failed frame poll passes the archive over for the TTL.
+        pool.blacklist_for_tests(known).await;
+        assert_eq!(pool.next().await, None);
+        for _ in 0..2 {
+            assert_eq!(syncer.resolve_addr().await.unwrap(), known);
+        }
+        syncer.archive_pool = None;
+        assert!(syncer.resolve_addr().await.is_err(), "no pool and no fixed source");
+        assert!(syncer.get_app_shard_frame(&[1; 32], 0).await.unwrap_err().to_string().contains("no archive known"));
+    }
+
+    /// Past the poller's blacklist, a source a shard read failed at recently
+    /// is passed over while another is known.
+    #[tokio::test]
+    async fn the_blacklist_fallback_prefers_a_source_no_read_failed_at() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60)));
+        let syncer = ProdProverTreeSyncer {
+            master_stream_addr: String::new(), hg_store, crdt,
+            falcon_signing_key: vec![], archive_pool: Some(pool.clone()),
+            discover_archives_from_master: false,
+        };
+        let (failing, other) = ("192.0.2.21:8340", "192.0.2.22:8340");
+        for ep in [failing, other] {
+            pool.add(ep.into()).await;
+            pool.blacklist_for_tests(ep).await;
+        }
+        source_failed(failing);
+        for _ in 0..3 {
+            assert_eq!(syncer.resolve_addr().await.unwrap(), other);
+        }
+    }
+
+    /// A read cancelled by its caller's timeout counts as failed: the next
+    /// read starts at another archive and dials afresh.
+    #[tokio::test]
+    async fn a_cancelled_frame_read_counts_as_failed() {
+        // Accepts the connection and never answers the handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await { held.push(socket); }
+        });
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let syncer = ProdProverTreeSyncer {
+            master_stream_addr: addr.clone(), hg_store, crdt,
+            falcon_signing_key: quil_p2p::generate_falcon_signing_key(), archive_pool: None,
+            discover_archives_from_master: false,
+        };
+        let read = tokio::time::timeout(std::time::Duration::from_millis(300), syncer.get_app_shard_frame(&[1; 32], 0));
+        assert!(read.await.is_err(), "the silent archive must not answer");
+        assert!(recently_failed(&addr));
+        silent.abort();
+    }
+
+    /// Idle connections are dropped on any lookup; a connection belongs to
+    /// one identity, and its reaper stops once it is gone or replaced.
+    #[test]
+    fn frame_connections_expire_and_belong_to_their_identity() {
+        let start = std::time::Instant::now();
+        let key = |addr: &str| (std::thread::current().id(), addr.to_string());
+        let mut clients = FrameClients::new();
+        let a = clients.insert(key("a:1"), b"k", 1u8, start);
+        clients.insert(key("b:1"), b"k", 2u8, start + std::time::Duration::from_secs(50));
+        assert_eq!(clients.get(&key("a:1"), b"other", start), None, "another identity");
+        assert!(!clients.reap(&key("a:1"), a, start + std::time::Duration::from_secs(30)));
+        assert_eq!(clients.get(&key("b:1"), b"k", start + FRAME_CLIENT_IDLE), Some(2));
+        assert!(clients.entries.get(&key("a:1")).is_none(), "an idle connection goes on any lookup");
+        assert!(clients.reap(&key("a:1"), a, start + FRAME_CLIENT_IDLE), "nothing left to reap");
+        let b = clients.insert(key("b:1"), b"k", 3u8, start + FRAME_CLIENT_IDLE);
+        assert!(clients.reap(&key("b:1"), b - 1, start), "a replaced connection is not reaped");
+        assert!(clients.reap(&key("b:1"), b, start + FRAME_CLIENT_IDLE * 2));
+        assert!(clients.entries.is_empty());
+    }
+
+    #[test]
+    fn only_a_broken_connection_is_closed_after_a_failed_read() {
+        use quil_rpc::ArchiveClientError::Rpc;
+        for status in [tonic::Status::unavailable(""), tonic::Status::unknown(""), tonic::Status::cancelled(""),
+            tonic::Status::deadline_exceeded("")] {
+            assert!(read_breaks_connection(&Rpc(status)));
+        }
+        for status in [tonic::Status::resource_exhausted("busy"), tonic::Status::not_found(""),
+            tonic::Status::permission_denied("")] {
+            assert!(!read_breaks_connection(&Rpc(status)));
+        }
+        assert!(read_breaks_connection(&quil_rpc::ArchiveClientError::InvalidEndpoint("".into())));
     }
 }

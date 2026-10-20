@@ -208,11 +208,36 @@ impl ArchiveEndpointPool {
         None
     }
 
+    /// The next known endpoint round-robin, including one the poller has
+    /// passed over after a failed frame poll, but never this node's own.
+    /// `None` only while no other archive is known. A reader that must not
+    /// stall for the blacklist TTL takes this once [`Self::next`] has none.
+    pub async fn any_known(&self) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let len = inner.endpoints.len();
+        let start = inner.cursor;
+        for i in 0..len {
+            let idx = (start + i) % len;
+            if !inner.own.contains(&inner.endpoints[idx]) {
+                inner.cursor = (idx + 1) % len;
+                return Some(inner.endpoints[idx].clone());
+            }
+        }
+        None
+    }
+
     /// `endpoint` is this node: [`Self::next`] never hands it out again.
     pub async fn mark_own(&self, endpoint: &str) {
         if self.inner.lock().await.own.insert(endpoint.to_string()) {
             info!(%endpoint, "archive endpoint is this node; the poller skips it");
         }
+    }
+
+    /// Test hook: record a failed frame poll of `endpoint`, as the poller
+    /// does.
+    #[doc(hidden)]
+    pub async fn blacklist_for_tests(&self, endpoint: &str) {
+        self.blacklist(endpoint).await;
     }
 
     async fn blacklist(&self, endpoint: &str) {
@@ -1335,6 +1360,25 @@ mod pool_tests {
         assert_eq!(sorted, vec!["a:1", "b:1", "c:1"]);
         // Fourth wraps to "a:1" again.
         assert_eq!(picks[3].as_deref(), Some("a:1"));
+    }
+
+    /// With every endpoint passed over by the poller, a reader still gets
+    /// one in rotation, but never this node's own, and nothing when empty.
+    #[tokio::test]
+    async fn any_known_ignores_the_blacklist_but_not_own_endpoints() {
+        let pool = pool();
+        assert_eq!(pool.any_known().await, None);
+        for ep in ["a:1", "b:1", "c:1"] {
+            pool.add(ep.into()).await;
+            pool.blacklist(ep).await;
+        }
+        pool.mark_own("c:1").await;
+        assert_eq!(pool.next().await, None);
+        let picks = [pool.any_known().await, pool.any_known().await, pool.any_known().await];
+        assert_eq!(picks, [Some("a:1".into()), Some("b:1".into()), Some("a:1".into())]);
+        pool.mark_own("a:1").await;
+        pool.mark_own("b:1").await;
+        assert_eq!(pool.any_known().await, None);
     }
 
     #[tokio::test]
