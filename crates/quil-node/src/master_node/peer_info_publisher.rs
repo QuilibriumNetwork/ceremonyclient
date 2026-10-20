@@ -175,8 +175,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         additional_metadata: hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
             .expect("build script emits a SHA-256 fingerprint"),
     });
+    // Peers see only the patch release in `version`/`patch_number`; the
+    // subpatch tells its fixes apart (a build without one advertises none).
+    if let Ok(subpatch) = quil_config::SUBPATCH.parse::<u32>() {
+        pi_caps.push(quil_p2p::CanonicalCapability {
+            protocol_identifier: quil_p2p::RELEASE_SUBPATCH_CAPABILITY_ID,
+            additional_metadata: subpatch.to_be_bytes().to_vec(),
+        });
+    }
     info!(
-        version = quil_config::VERSION_STRING,
+        version = quil_config::display_version(),
         build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
         "publishing local source build identity"
     );

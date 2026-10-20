@@ -146,6 +146,7 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/hypergraph/vertex/:id", any(handlers::handle_vertex))
         .route("/hypergraph/hyperedge/:id", any(handlers::handle_hyperedge))
         .route("/peers", any(handlers::handle_peers))
+        .route("/peers/releases", any(handlers::handle_peer_releases))
         .route("/provers", any(handlers::handle_provers))
         .route("/provers/shards", any(handlers::handle_prover_shards))
         .route("/provers/shards/:filter", any(handlers::handle_prover_shard_detail))

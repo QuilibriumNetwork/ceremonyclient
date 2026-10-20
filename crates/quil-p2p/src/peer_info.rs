@@ -21,6 +21,12 @@ pub const ARCHIVE_SERVICE_CAPABILITY_ID: u32 = 0x00050001;
 /// signed peer metadata, not a protocol compatibility or trust decision.
 pub const BUILD_FINGERPRINT_CAPABILITY_ID: u32 = 0x51424901;
 
+/// QBI v1: the release subpatch (the repository `subpatch` counter, e.g. 92
+/// in 2.1.0.25.92), exactly 4 bytes big-endian. `version` and `patch_number`
+/// stop at the patch release, so without it peers on two fixes of one patch
+/// release look alike. Signed peer metadata, like the build fingerprint.
+pub const RELEASE_SUBPATCH_CAPABILITY_ID: u32 = 0x51424902;
+
 /// Outcome of attempting to decode a message from the GLOBAL_PEER_INFO_BITMASK.
 #[derive(Debug)]
 pub enum PeerInfoMessage {
@@ -72,6 +78,30 @@ impl CanonicalPeerInfo {
         let fingerprint = matches.next()?.additional_metadata.as_slice().try_into().ok()?;
         if matches.next().is_some() { return None; }
         Some(fingerprint)
+    }
+
+    /// The release subpatch this peer advertises; `None` when it advertises
+    /// none (a build older than the capability), more than one, or a
+    /// malformed one.
+    pub fn release_subpatch(&self) -> Option<u32> {
+        let mut matches = self.capabilities.iter()
+            .filter(|c| c.protocol_identifier == RELEASE_SUBPATCH_CAPABILITY_ID);
+        let subpatch = matches.next()?.additional_metadata.as_slice().try_into().ok().map(u32::from_be_bytes)?;
+        if matches.next().is_some() { return None; }
+        Some(subpatch)
+    }
+
+    /// The release this peer runs, e.g. `2.1.0.25.92`; only up to the patch
+    /// release (`2.1.0.25`) when it advertises no subpatch, and empty when
+    /// its version fields are malformed.
+    pub fn release(&self) -> String {
+        let (Ok([major, minor, patch]), [number]) = (<[u8; 3]>::try_from(self.version.as_slice()), self.patch_number.as_slice()) else {
+            return String::new();
+        };
+        match self.release_subpatch() {
+            Some(subpatch) => format!("{major}.{minor}.{patch}.{number}.{subpatch}"),
+            None => format!("{major}.{minor}.{patch}.{number}"),
+        }
     }
 
     /// True if this peer advertises the archive service capability flag.
@@ -767,6 +797,25 @@ mod tests {
         assert_eq!(info.build_fingerprint(), Some([0; 32]));
         info.capabilities.push(info.capabilities[0].clone());
         assert_eq!(info.build_fingerprint(), None);
+    }
+
+    #[test]
+    fn release_names_the_subpatch_when_advertised() {
+        let mut info = CanonicalPeerInfo { version: vec![2, 1, 0], patch_number: vec![25], ..Default::default() };
+        assert_eq!((info.release_subpatch(), info.release()), (None, "2.1.0.25".to_string()));
+        info.capabilities.push(CanonicalCapability {
+            protocol_identifier: RELEASE_SUBPATCH_CAPABILITY_ID,
+            additional_metadata: 92u32.to_be_bytes().to_vec(),
+        });
+        let decoded = decode_canonical_peer_info(&encode_canonical_peer_info(&info, &[], &[])).unwrap();
+        assert_eq!((decoded.release_subpatch(), decoded.release()), (Some(92), "2.1.0.25.92".to_string()));
+        info.capabilities.push(info.capabilities[0].clone());
+        assert_eq!((info.release_subpatch(), info.release()), (None, "2.1.0.25".to_string()));
+        info.capabilities.truncate(1);
+        info.capabilities[0].additional_metadata.pop();
+        assert_eq!(info.release_subpatch(), None);
+        info.version = vec![2, 1];
+        assert_eq!(info.release(), "");
     }
 
     #[test]

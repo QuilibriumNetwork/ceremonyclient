@@ -259,6 +259,11 @@ struct PeerInfoJson {
     last_seen: i64,
     last_received_frame: u64,
     last_global_head_frame: u64,
+    /// `2.1.0.25.92`, or `2.1.0.25` from a peer that advertises no subpatch.
+    /// `version` stays the raw version bytes for shape compatibility.
+    release: String,
+    subpatch: Option<u32>,
+    build_fingerprint: Option<String>,
     capabilities: Option<Vec<PeerCapabilityJson>>,
     reachability: Option<Vec<PeerReachabilityJson>>,
 }
@@ -318,6 +323,9 @@ pub async fn handle_peers(method: Method, State(state): State<ExplorerState>) ->
                     last_seen: info.timestamp,
                     last_received_frame: info.last_received_frame,
                     last_global_head_frame: info.last_global_head_frame,
+                    release: info.release(),
+                    subpatch: info.release_subpatch(),
+                    build_fingerprint: info.build_fingerprint().map(hex::encode),
                     capabilities,
                     reachability,
                 }
@@ -330,6 +338,115 @@ pub async fn handle_peers(method: Method, State(state): State<ExplorerState>) ->
             .cmp(&a.last_seen)
             .then_with(|| a.peer_id.cmp(&b.peer_id))
     });
+    json_ok(&response, Some(CACHE_60))
+}
+
+// ---------------------------------------------------------------------------
+// /peers/releases
+// ---------------------------------------------------------------------------
+
+/// A peer counts in the release census while its PeerInfo is at most this old:
+/// mainnet peers republish theirs every 30 minutes.
+const RELEASE_CENSUS_MAX_AGE_MS: i64 = 2 * 30 * 60 * 1000;
+/// A peer is behind GLOBAL when the head it reported trails ours by more than
+/// this: a republish interval is ~150 frames at ~12 s per frame.
+const RELEASE_CENSUS_BEHIND_FRAMES: u64 = 360;
+
+#[derive(Serialize)]
+struct BuildCountJson {
+    build_fingerprint: Option<String>,
+    peers: usize,
+}
+
+#[derive(Serialize)]
+struct ReleaseGroupJson {
+    /// `2.1.0.25.92`; `2.1.0.25` groups every peer older than the subpatch
+    /// capability; empty for malformed version fields.
+    release: String,
+    subpatch: Option<u32>,
+    peers: usize,
+    archives: usize,
+    /// Peers whose reported GLOBAL head trails `global_head` by more than
+    /// `behind_frames`.
+    behind_global: usize,
+    /// Lowest and highest GLOBAL head the group reported (0 when none did).
+    global_head_min: u64,
+    global_head_max: u64,
+    builds: Vec<BuildCountJson>,
+}
+
+#[derive(Serialize)]
+struct PeerReleasesJson {
+    /// This node's GLOBAL frame, the reference for `behind_global`.
+    global_head: u64,
+    behind_frames: u64,
+    /// Peers whose PeerInfo is recent enough to count, and those left out.
+    peers: usize,
+    stale_peers: usize,
+    /// Most peers first.
+    releases: Vec<ReleaseGroupJson>,
+}
+
+/// Which release the peers that published PeerInfo recently run, how many of
+/// each are archives or behind GLOBAL, and by which builds.
+fn peer_releases<'a>(
+    infos: impl IntoIterator<Item = &'a quil_p2p::CanonicalPeerInfo>,
+    now_ms: i64,
+    global_head: u64,
+) -> PeerReleasesJson {
+    let mut groups: BTreeMap<String, (ReleaseGroupJson, BTreeMap<Option<String>, usize>)> = BTreeMap::new();
+    let (mut peers, mut stale_peers) = (0, 0);
+    for info in infos {
+        if now_ms.saturating_sub(info.timestamp) > RELEASE_CENSUS_MAX_AGE_MS {
+            stale_peers += 1;
+            continue;
+        }
+        peers += 1;
+        let release = info.release();
+        let (group, builds) = groups.entry(release.clone()).or_insert_with(|| (ReleaseGroupJson {
+            release,
+            subpatch: info.release_subpatch(),
+            peers: 0,
+            archives: 0,
+            behind_global: 0,
+            global_head_min: 0,
+            global_head_max: 0,
+            builds: Vec::new(),
+        }, BTreeMap::new()));
+        group.peers += 1;
+        group.archives += usize::from(info.is_archive());
+        let head = info.last_global_head_frame;
+        if head > 0 {
+            group.global_head_min = if group.global_head_min == 0 { head } else { group.global_head_min.min(head) };
+            group.global_head_max = group.global_head_max.max(head);
+            group.behind_global += usize::from(head.saturating_add(RELEASE_CENSUS_BEHIND_FRAMES) < global_head);
+        }
+        *builds.entry(info.build_fingerprint().map(hex::encode)).or_default() += 1;
+    }
+    let mut releases: Vec<ReleaseGroupJson> = groups
+        .into_values()
+        .map(|(mut group, builds)| {
+            group.builds = builds.into_iter().map(|(build_fingerprint, peers)| BuildCountJson { build_fingerprint, peers }).collect();
+            group.builds.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| a.build_fingerprint.cmp(&b.build_fingerprint)));
+            group
+        })
+        .collect();
+    releases.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| b.release.cmp(&a.release)));
+    PeerReleasesJson { global_head, behind_frames: RELEASE_CENSUS_BEHIND_FRAMES, peers, stale_peers, releases }
+}
+
+pub async fn handle_peer_releases(method: Method, State(state): State<ExplorerState>) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let global_head = state.current_frame.load(Ordering::Relaxed);
+    let response = {
+        let map = state.peer_info_cache.read();
+        peer_releases(map.values(), now_ms, global_head)
+    };
     json_ok(&response, Some(CACHE_60))
 }
 
@@ -2028,6 +2145,56 @@ mod tests {
         String::from_utf8(serde_json::to_vec(v).unwrap()).unwrap()
     }
 
+    fn peer(subpatch: Option<u32>, fingerprint: u8, archive: bool, head: u64, timestamp: i64) -> quil_p2p::CanonicalPeerInfo {
+        let mut capabilities = vec![quil_p2p::CanonicalCapability {
+            protocol_identifier: quil_p2p::BUILD_FINGERPRINT_CAPABILITY_ID,
+            additional_metadata: vec![fingerprint; 32],
+        }];
+        capabilities.extend(subpatch.map(|subpatch| quil_p2p::CanonicalCapability {
+            protocol_identifier: quil_p2p::RELEASE_SUBPATCH_CAPABILITY_ID,
+            additional_metadata: subpatch.to_be_bytes().to_vec(),
+        }));
+        if archive {
+            capabilities.push(quil_p2p::CanonicalCapability {
+                protocol_identifier: quil_p2p::ARCHIVE_SERVICE_CAPABILITY_ID,
+                additional_metadata: Vec::new(),
+            });
+        }
+        quil_p2p::CanonicalPeerInfo {
+            version: vec![2, 1, 0],
+            patch_number: vec![25],
+            capabilities,
+            timestamp,
+            last_global_head_frame: head,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_releases_group_recent_peers_by_release_and_count_those_behind_global() {
+        let now = 10_000_000;
+        let peers = [
+            peer(Some(93), 1, false, 9_990, now - 1_000),
+            peer(Some(93), 1, true, 10_000, now - 1_000),
+            peer(Some(93), 2, false, 0, now - 1_000),
+            peer(None, 3, false, 9_000, now - 1_000),
+            peer(None, 4, false, 9_700, now - 1_000),
+            peer(Some(92), 5, false, 9_000, now - RELEASE_CENSUS_MAX_AGE_MS - 1),
+        ];
+        let census = peer_releases(&peers, now, 10_000);
+        assert_eq!((census.global_head, census.peers, census.stale_peers), (10_000, 5, 1));
+        let summary: Vec<_> = census.releases.iter()
+            .map(|g| (g.release.as_str(), g.subpatch, g.peers, g.archives, g.behind_global, g.global_head_min, g.global_head_max))
+            .collect();
+        assert_eq!(summary, [
+            ("2.1.0.25.93", Some(93), 3, 1, 0, 9_990, 10_000),
+            ("2.1.0.25", None, 2, 0, 1, 9_000, 9_700),
+        ]);
+        let builds: Vec<_> = census.releases[0].builds.iter().map(|b| (b.build_fingerprint.clone(), b.peers)).collect();
+        assert_eq!(builds, [(Some(hex::encode([1u8; 32])), 2), (Some(hex::encode([2u8; 32])), 1)]);
+        assert!(to_str(&census).contains("\"release\":\"2.1.0.25.93\""));
+    }
+
     #[test]
     fn quil_str_is_exact() {
         assert_eq!(quil_str(8_000_000_000), "1");
@@ -2269,6 +2436,9 @@ mod tests {
             last_seen: 5,
             last_received_frame: 0,
             last_global_head_frame: 0,
+            release: "2.1.0.25".into(),
+            subpatch: None,
+            build_fingerprint: None,
             capabilities: None,
             reachability: None,
         };
@@ -2279,6 +2449,7 @@ mod tests {
         assert!(s.contains(r#""cores":0"#));
         // 64-bit frame fields emitted as NUMBERS (custom-JSON path).
         assert!(s.contains(r#""last_received_frame":0"#));
+        assert!(s.contains(r#""release":"2.1.0.25","subpatch":null,"build_fingerprint":null"#), "{s}");
 
         let with_cap = PeerInfoJson {
             capabilities: Some(vec![PeerCapabilityJson {
