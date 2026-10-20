@@ -783,6 +783,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     info!(
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions one epoch after their request"
+    );
     let confirm_release_from =
         quil_execution::global_intrinsic::prover_release::init_confirm_release_frame(args.network);
     info!(
