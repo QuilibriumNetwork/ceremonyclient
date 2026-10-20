@@ -2980,6 +2980,7 @@ impl GlobalIntrinsic {
         if state.get_record(DUE_FRAME_KEY)?.as_deref() == Some(frame_number.to_be_bytes().as_slice()) {
             return Ok(());
         }
+        self.restore_missing_pending_changes_or_warn(frame_number, state);
         let flipped = self.apply_due_shard_changes_inner(frame_number, state)?;
         #[cfg(feature = "confidential-tokens")]
         self.reconcile_orphaned_blocks(frame_number, state, &flipped)?;
@@ -2990,6 +2991,260 @@ impl GlobalIntrinsic {
             key: DUE_FRAME_KEY.to_vec(), value: Some(frame_number.to_be_bytes().to_vec()),
         }]);
         Ok(())
+    }
+
+    /// [`Self::restore_missing_pending_changes`], which only repairs: on a
+    /// failure the frame goes on as it would without the repair, and the scan
+    /// is asked for again at the next frame.
+    fn restore_missing_pending_changes_or_warn(&self, frame_number: u64, state: &HypergraphState) {
+        let checkpoint = state.changeset_len();
+        if let Err(error) = self.restore_missing_pending_changes(frame_number, state) {
+            state.rollback_to(checkpoint);
+            rearm_pending_repair();
+            report_repair_failure(frame_number, None, &error);
+        }
+    }
+
+    /// Restore the pending split or merge records this node's local store
+    /// lacks. The grid and its pending changes are local records outside every
+    /// committed root, and only executing the proposing frame creates a
+    /// pending change, so a store rewritten, restored or edited outside
+    /// execution can keep a split's parent with no pending change. The grid
+    /// then never flips, and GLOBAL execution that reads it (join admission,
+    /// session reconciliation) diverges from the network's.
+    ///
+    /// A committee-governed change leaves its request in committed state: the
+    /// parent's (or merged children's) head session is closing or closed for
+    /// it. For each grid shard so headed with no pending change of that
+    /// request, the change is rebuilt and verified
+    /// ([`super::handoff::schedule::recover_topology_change`]) and restored in
+    /// this frame's batch, before the gate runs. It then flips at its gate:
+    /// with the network if the change is still pending there, at once (late)
+    /// if its successors are already authorized. A healthy store
+    /// never has such a shard unless a later change re-registered a source,
+    /// which the recovery recognizes (a request's pending change is consumed
+    /// only by the flip that takes its sources out of the grid), so there this
+    /// writes nothing. It never writes committed state. A change no session
+    /// governed left nothing committed and is not restored. A chain of lost
+    /// changes heals one level per scan, in practice one per epoch: a restored
+    /// flip registers children whose own lost changes the next scan finds.
+    /// Returns how many changes were restored.
+    ///
+    /// A record goes missing, or its request arrives, only outside execution,
+    /// so the scan runs only after such a change ([`pending_repair_due`]): at
+    /// the first frame this process executes, the first after a prover-shard
+    /// reconcile or state jump ([`request_pending_repair`]), and the first of
+    /// each epoch as a backstop. One shard's store error does not stop the
+    /// scan of the others; it is logged once per epoch and the scan runs again
+    /// next frame, with earlier verdicts kept.
+    fn restore_missing_pending_changes(&self, frame_number: u64, state: &HypergraphState) -> Result<usize> {
+        if PENDING_REPAIR_OFF.with(|off| off.get()) {
+            return Ok(0);
+        }
+        let Some(policy) = quil_types::consensus::committee_handoff_policy() else {
+            return Ok(0);
+        };
+        if frame_number < policy.activation_frame {
+            return Ok(0);
+        }
+        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled) else {
+            return Ok(0);
+        };
+        let cursor = || {
+            self.hypergraph.as_ref()
+                .and_then(|hg| hg.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key()).ok())
+                .unwrap_or(0)
+        };
+        if !pending_repair_due(frame_number, cursor) {
+            return Ok(0);
+        }
+        let batch = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
+        let mut filters: Vec<Vec<u8>> = batch
+            .range_app_shards()?
+            .into_iter()
+            .filter(|row| row.shard_key.len() >= 35)
+            .map(|row| quil_forest::shard_prefix_to_filter(&row.shard_key[3..35], &row.prefix))
+            .collect();
+        filters.sort();
+        filters.dedup();
+        let shard = |filter: &[u8]| quil_forest::decode_shard_filter_or_root(filter, 32);
+        let grid: std::collections::BTreeSet<(Vec<u8>, Vec<bool>)> =
+            filters.iter().filter_map(|filter| shard(filter)).collect();
+        let in_grid = |filter: &[u8]| shard(filter).is_some_and(|key| grid.contains(&key));
+        // Another grid shard covers part of `filter`'s range: one of its
+        // ancestors or descendants.
+        let overlapped = |filter: &[u8]| {
+            shard(filter).is_some_and(|(app, bits)| {
+                grid.iter().any(|(other_app, other)| {
+                    *other_app == app && *other != bits && (other.starts_with(&bits) || bits.starts_with(other))
+                })
+            })
+        };
+        let same = |a: &[u8], b: &[u8]| a == b || shard(a).is_some_and(|key| Some(key) == shard(b));
+        let pending = batch.all_pending_shard_changes()?;
+        // Every reset that dropped pending changes is a floor: nothing
+        // proposed or scheduled before it can be pending now.
+        let last_reset = [
+            super::materialize::unified_tree_cutover_frame(),
+            super::materialize::quil_grid_reset_v2_frame(),
+            super::materialize::quil_prover_reset_v3_frame(),
+            super::materialize::quil_prover_reset_v4_frame(),
+            super::materialize::quil_prover_reset_v5_frame(),
+        ]
+        .into_iter()
+        .filter(|reset| *reset <= frame_number)
+        .max()
+        .unwrap_or(0);
+        let floor = super::handoff::schedule::RecoveryFloor {
+            request_frame: policy.activation_frame.max(last_reset.saturating_add(1)),
+            proposed_frame: last_reset.saturating_add(1),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut unresolved = std::collections::BTreeMap::new();
+        let mut restored = Vec::new();
+        let mut failure: Option<(Vec<u8>, QuilError)> = None;
+        for filter in &filters {
+            let examined = (|| -> Result<Option<([u8; 32], PendingShardChange)>> {
+                let Some(request) = super::handoff::schedule::retiring_request(state, filter)? else {
+                    return Ok(None);
+                };
+                if !seen.insert(request) {
+                    return Ok(None);
+                }
+                for change in pending.iter().filter(|change| {
+                    same(&change.parent, filter) || change.children.iter().any(|child| same(child, filter))
+                }) {
+                    if super::handoff::schedule::topology_request(state, change)? == Some(request) {
+                        return Ok(None);
+                    }
+                }
+                if let Some(verdict) = settled(&request) {
+                    if let Some(reason) = verdict {
+                        unresolved.insert(request, (filter.clone(), reason));
+                    }
+                    return Ok(None);
+                }
+                use super::handoff::schedule::Recovery;
+                match super::handoff::schedule::recover_topology_change(state, &request, floor, &in_grid, &overlapped)? {
+                    Recovery::Restore(mut change) => {
+                        if change.kind == ShardChangeKind::Merge {
+                            match self.merge_children_order(&change) {
+                                Ok(children) => change.children = children,
+                                Err(reason) => {
+                                    report_unresolved(frame_number, filter, &request, reason);
+                                    unresolved.insert(request, (filter.clone(), reason));
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Ok(Some((request, change)))
+                    }
+                    Recovery::Applied(guard) => {
+                        report_superseded(frame_number, filter, &request, guard);
+                        Ok(None)
+                    }
+                    Recovery::Never => {
+                        settle(request, None);
+                        Ok(None)
+                    }
+                    Recovery::Unresolved(reason) => {
+                        report_unresolved(frame_number, filter, &request, reason);
+                        unresolved.insert(request, (filter.clone(), reason));
+                        Ok(None)
+                    }
+                }
+            })();
+            match examined {
+                Ok(Some((request, change))) => restored.push((filter.clone(), request, change)),
+                Ok(None) => {}
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some((filter.clone(), error));
+                    }
+                }
+            }
+        }
+        match &failure {
+            Some((filter, error)) => {
+                // Scan again next frame; verdicts stay settled, so a lasting
+                // store error repeats neither a key search nor a warning.
+                rearm_pending_repair();
+                report_repair_failure(frame_number, Some(filter), error);
+            }
+            // A complete scan ends the reports of shards no longer unresolved,
+            // and of a failing check.
+            None => {
+                report_resolved(frame_number, &unresolved);
+                report_repair_recovered(frame_number);
+            }
+        }
+        if restored.is_empty() {
+            return Ok(0);
+        }
+        let txn: &dyn quil_types::store::Transaction = &batch;
+        for (filter, request, change) in &restored {
+            batch.put_pending_shard_change(txn, change)?;
+            tracing::warn!(
+                frame = frame_number,
+                filter = hex::encode(filter),
+                kind = ?change.kind,
+                parent = hex::encode(&change.parent),
+                children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                effective_epoch = change.effective_epoch,
+                proposed_frame = change.proposed_frame,
+                request = hex::encode(request),
+                "shard grid repair: this node's local shard grid was missing a pending split or merge that a \
+                 committed handoff request names; restored it from that request. It flips at its gate: with \
+                 the network if it is still pending there, late if it already flipped. Check why this store \
+                 lacked it (a store restore or edit, a reconcile skip) and compare its shard grid with other \
+                 archives'"
+            );
+        }
+        state.stage_records(batch.into_records());
+        Ok(restored.len())
+    }
+
+    /// The order of a restored merge's children. A merge moves allocations
+    /// child by child, and a prover with allocations on two of the children
+    /// keeps the last one's (`rekey_allocation_with_key` writes one parent
+    /// slot), so the proposal's order matters; the request keeps its sources
+    /// sorted. The order comes from the proposing frame's ShardMerge of this
+    /// parent and these children in the local GLOBAL frame record: the one
+    /// whose bundle succeeded when the frame's outcomes are recorded, else the
+    /// one order every such op agrees on. Without it the merge is not
+    /// restored: telling whether any prover holds two of the children would
+    /// take a scan of every committed prover. A split's order does not
+    /// matter: its allocations move by filter.
+    fn merge_children_order(&self, change: &PendingShardChange) -> std::result::Result<Vec<Vec<u8>>, &'static str> {
+        const ABSENT: &str = "the merge's order of its children is in no local frame record";
+        let mut sorted = change.children.clone();
+        sorted.sort();
+        let Some(clock) = self.clock_store.as_ref() else { return Err(ABSENT) };
+        let Ok(frame) = clock.get_global_clock_frame(change.proposed_frame) else { return Err(ABSENT) };
+        let outcomes = clock.get_global_clock_frame_outcomes(change.proposed_frame).unwrap_or_default();
+        let known = outcomes.len() == frame.requests.len();
+        let mut orders: Vec<(bool, Vec<Vec<u8>>)> = Vec::new();
+        for (index, bundle) in frame.requests.iter().enumerate() {
+            for request in &bundle.requests {
+                let Some(quil_types::proto::global::message_request::Request::ShardMerge(op)) = &request.request else {
+                    continue;
+                };
+                let mut named = op.shard_addresses.clone();
+                named.sort();
+                if op.parent_address == change.parent && named == sorted {
+                    let succeeded = known && outcomes[index].status == quil_types::store::RequestStatus::Succeeded;
+                    orders.push((succeeded, op.shard_addresses.clone()));
+                }
+            }
+        }
+        if let Some((_, order)) = orders.iter().rev().find(|(succeeded, _)| *succeeded) {
+            return Ok(order.clone());
+        }
+        match orders.split_first() {
+            None => Err(ABSENT),
+            Some(((_, first), rest)) if rest.iter().all(|(_, order)| order == first) => Ok(first.clone()),
+            Some(_) => Err("the frame record holds the merge in more than one order, and which applied is unknown"),
+        }
     }
 
     /// Returns every `(application, removed shard path)` this frame's flips
@@ -4277,6 +4532,208 @@ impl HeaderTiming {
                 participants, total_ms = total.as_millis() as u64,
                 steps_us = ?self.steps, "slow GLOBAL shard header execution");
         }
+    }
+}
+
+thread_local! {
+    static PENDING_REPAIR_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turn the pending-change repair (`restore_missing_pending_changes`) off on
+/// this thread, so a test can compare runs with and without it.
+pub fn set_pending_repair_off_for_thread(off: bool) {
+    PENDING_REPAIR_OFF.with(|cell| cell.set(off));
+}
+
+/// When the pending-change repair scans next. `armed` is set at startup, by
+/// [`request_pending_repair`] or [`rearm_pending_repair`], and at the first
+/// frame of each new epoch (`epoch`). It is consumed only by a frame at or
+/// above `highest`, the highest frame executed so far, which starts at the
+/// store's materialized cursor: an execution of a lower frame (a fork, a
+/// branch, a replay) cannot use up a trigger the materializer's next frame
+/// needs. A consumed trigger covers every execution of frames up to
+/// `through`, so a frame retried after an abort, or executed on a tentative
+/// branch and then for real, scans again. Lower frames also scan while a
+/// trigger waits, and catch-up frames below a consumed `through` scan too:
+/// each such scan costs about three reads per grid row, until the
+/// materializer passes `through`. A reconcile racing an epoch's first frame
+/// can delay a heal by up to an epoch.
+struct RepairTrigger {
+    armed: bool,
+    epoch: u64,
+    highest: Option<u64>,
+    through: u64,
+}
+
+static PENDING_REPAIR_TRIGGER: std::sync::Mutex<RepairTrigger> =
+    std::sync::Mutex::new(RepairTrigger { armed: true, epoch: u64::MAX, highest: None, through: 0 });
+
+/// Scan for lost pending changes at the next executed frame. For GLOBAL state
+/// that changed outside execution: a prover-shard reconcile (with or without
+/// a cursor skip) or a state jump can bring in a split's or merge's request
+/// whose pending record this node never wrote. Forgets earlier verdicts, which
+/// a partially synced prover shard may have produced.
+pub fn request_pending_repair() {
+    rearm_pending_repair();
+    PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Scan again at the next executed frame, keeping earlier verdicts.
+fn rearm_pending_repair() {
+    PENDING_REPAIR_TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).armed = true;
+}
+
+/// Whether `frame`'s execution scans for lost pending changes (see
+/// [`RepairTrigger`]); `cursor` is the store's materialized cursor, read once.
+fn pending_repair_due(frame: u64, cursor: impl FnOnce() -> u64) -> bool {
+    let mut trigger = PENDING_REPAIR_TRIGGER.lock().unwrap_or_else(|e| e.into_inner());
+    let highest = *trigger.highest.get_or_insert_with(cursor);
+    if frame >= highest {
+        trigger.highest = Some(frame);
+        let epoch = quil_types::consensus::epoch_for_frame(frame);
+        if trigger.epoch != epoch {
+            trigger.epoch = epoch;
+            trigger.armed = true;
+            // Verdicts are re-examined, and unresolved or superseded ones
+            // reported, once per epoch while they last.
+            PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            PENDING_REPAIR_SUPERSEDED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        if trigger.armed {
+            trigger.armed = false;
+            trigger.through = trigger.through.max(frame);
+            return true;
+        }
+    }
+    // A lower frame scans while a trigger waits for the materializer's next
+    // frame; its writes reach only that execution's own batch.
+    trigger.armed || frame <= trigger.through
+}
+
+/// Requests the pending-change repair has found it will not restore, with
+/// the reason for an unresolved one (`None`: never, as a membership request
+/// or one before the floors). Cleared each epoch and by
+/// [`request_pending_repair`].
+static PENDING_REPAIR_SETTLED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Option<&'static str>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The unresolved requests the last complete scan reported, by grid filter.
+static PENDING_REPAIR_UNRESOLVED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Vec<u8>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn settled(request: &[u8; 32]) -> Option<Option<&'static str>> {
+    PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).get(request).copied()
+}
+
+/// Settle `request`; false if it was already settled.
+fn settle(request: [u8; 32], reason: Option<&'static str>) -> bool {
+    let mut settled = PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner());
+    if settled.len() >= 65_536 {
+        settled.clear();
+    }
+    settled.insert(request, reason).is_none()
+}
+
+/// Request record absent, from [`super::handoff::schedule::recover_topology_change`].
+const REQUEST_ABSENT: &str = "the request record is absent";
+
+fn report_unresolved(frame: u64, filter: &[u8], request: &[u8; 32], reason: &'static str) {
+    if !settle(*request, Some(reason)) {
+        return;
+    }
+    if reason == REQUEST_ABSENT {
+        tracing::warn!(
+            frame,
+            filter = hex::encode(filter),
+            request = hex::encode(request),
+            reason,
+            "shard grid repair: a grid shard's committee session is closing or closed for a request whose \
+             record is absent from committed state, so whether its split or merge is missing here cannot \
+             be checked (logged once per epoch while it lasts; report this line)"
+        );
+    } else {
+        tracing::warn!(
+            frame,
+            filter = hex::encode(filter),
+            request = hex::encode(request),
+            reason,
+            "shard grid repair: this node's local shard grid keeps a shard whose committee is closing or \
+             closed for a split or merge, with no pending change, and the change cannot be rebuilt from \
+             committed state; the grid stays diverged from the network's. Compare its shard grid with \
+             other archives' and report this line (logged once per epoch while it lasts)"
+        );
+    }
+}
+
+/// End the report of every request the previous complete scan found
+/// unresolved that this one did not.
+fn report_resolved(frame: u64, current: &std::collections::BTreeMap<[u8; 32], (Vec<u8>, &'static str)>) {
+    let mut reported = PENDING_REPAIR_UNRESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+    for (request, filter) in reported.iter() {
+        if !current.contains_key(request) {
+            tracing::info!(
+                frame,
+                filter = hex::encode(filter),
+                request = hex::encode(request),
+                "shard grid repair: the shard reported as not rebuildable is no longer: its grid row, \
+                 pending change or committed request changed"
+            );
+        }
+    }
+    *reported = current.iter().map(|(request, (filter, _))| (*request, filter.clone())).collect();
+}
+
+/// Requests the repair counted as applied here while a source is in the grid
+/// headed by their closing session, reported this epoch. Cleared each epoch.
+static PENDING_REPAIR_SUPERSEDED: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A grid shard is headed by a session closing for `request`, with no pending
+/// change of it, but the change counts as applied here (`guard`), so nothing
+/// is restored: logged so that a heal the guards skip is visible.
+fn report_superseded(frame: u64, filter: &[u8], request: &[u8; 32], guard: &'static str) {
+    if PENDING_REPAIR_SUPERSEDED.lock().unwrap_or_else(|e| e.into_inner()).insert(*request) {
+        tracing::info!(
+            frame,
+            filter = hex::encode(filter),
+            request = hex::encode(request),
+            guard,
+            "shard grid repair: a grid shard's committee is closing or closed for a split or merge whose \
+             pending change this node's store lacks, but the change counts as applied here, so nothing \
+             is restored (logged once per epoch)"
+        );
+    }
+}
+
+static PENDING_REPAIR_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PENDING_REPAIR_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many scans of the pending-change repair hit a store error in this
+/// process, for tests and diagnostics.
+pub fn pending_repair_failures() -> u64 {
+    PENDING_REPAIR_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// End the failure report once a scan completes again.
+fn report_repair_recovered(frame: u64) {
+    if PENDING_REPAIR_FAILING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(frame, "shard grid repair: the check for lost pending splits and merges completes again");
+    }
+}
+
+fn report_repair_failure(frame: u64, filter: Option<&[u8]>, error: &QuilError) {
+    static WARNED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    PENDING_REPAIR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PENDING_REPAIR_FAILING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let epoch = quil_types::consensus::epoch_for_frame(frame);
+    if WARNED_EPOCH.swap(epoch, std::sync::atomic::Ordering::Relaxed) != epoch {
+        tracing::warn!(
+            frame,
+            filter = %filter.map(hex::encode).unwrap_or_default(),
+            %error,
+            "shard grid repair: the check for lost pending splits and merges failed; it runs again at \
+             the next frame (logged once per epoch)"
+        );
     }
 }
 

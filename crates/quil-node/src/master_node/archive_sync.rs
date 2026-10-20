@@ -1436,6 +1436,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 .await;
                 if let Some(n) = jumped {
                     info!(target = n, "state-jump: fast-forwarded to peer head");
+                    quil_execution::global_intrinsic::intrinsic::request_pending_repair();
                 }
                 // Notify the registry task only after all jump verification,
                 // data installation, cursor storage and registry refresh finish.
@@ -1506,7 +1507,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 let pr = fb_pr.clone();
                 let crdt = fb_crdt.clone();
                 Box::pin(async move {
-                    run_state_jump(
+                    let jumped = run_state_jump(
                         pool, seed, cs, hg, ss, fv, pr, crdt,
                         /*sync_all_shards*/ false,
                         fb_mainnet,
@@ -1516,7 +1517,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         // than hanging this supervised task.
                         cancel,
                     )
-                    .await
+                    .await;
+                    if jumped.is_some() {
+                        quil_execution::global_intrinsic::intrinsic::request_pending_repair();
+                    }
+                    jumped
                 }) as std::pin::Pin<
                     Box<dyn std::future::Future<Output = Option<u64>> + Send>,
                 >
@@ -3508,6 +3513,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 // LIVE forest root, so the vote gate now sees the
                                                 // converged root and consensus can resume.
                                                 m.record_current_prover_root();
+                                                // The synced prover shard may hold
+                                                // split or merge requests whose
+                                                // pending records this node never
+                                                // wrote: scan at the next frame.
+                                                quil_execution::global_intrinsic::intrinsic::request_pending_repair();
                                                 // SHARD/CURSOR CONSISTENCY. The reconcile just
                                                 // pulled the global prover shard to the head's
                                                 // (QC'd) prover_tree_commitment. If the durable
