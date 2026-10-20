@@ -745,7 +745,8 @@ impl AppShardHarness {
     /// CW workers that run GLOBALLY AUTHORIZED committee sessions: every worker
     /// reads `global` (the authenticated GLOBAL hypergraph) and owns a
     /// RocksDB-backed shard CRDT with a persistent forest, which the session's
-    /// committed checkpoint reads require.
+    /// committed checkpoint reads require. The hosts hold `global` until
+    /// they join: call [`Self::shutdown`] before the test returns.
     pub fn build_cw_sessions(
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
@@ -841,8 +842,11 @@ impl AppShardHarness {
                 .expect("seed worker storage confirm");
                 (Some(sh.crdt.clone()), Some(kv))
             } else if session_global.is_some() {
-                let rocks: &'static quil_store::RocksDb =
-                    Box::leak(Box::new(quil_store::RocksDb::open_in_memory().unwrap()));
+                // Not leaked: the CRDT and clock store below own the database,
+                // which closes once `shutdown` has joined the hosts holding them.
+                // A store left open at exit keeps RocksDB's periodic stats
+                // dump running while the process destroys its statics.
+                let rocks = quil_store::RocksDb::open_in_memory().unwrap();
                 let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
                     Arc::new(quil_store::RocksHypergraphStore::new(rocks.inner()))
                         as Arc<dyn quil_types::store::HypergraphStore>,
@@ -1101,6 +1105,14 @@ impl AppShardHarness {
     }
 
     /// Stop engines cooperatively and wait for engines and event drains.
+    ///
+    /// Call it before a CW harness's test returns. Dropping the harness
+    /// with its runtime only flags each engine's consensus host thread to
+    /// stop; the thread stays detached and keeps its stores. The last one
+    /// to exit closes a RocksDB store; doing so while the process runs its
+    /// static destructors aborts the process ("pthread lock: Invalid
+    /// argument") after the test has passed. Shutting down also drops
+    /// the workers' own stores, which then close before the test returns.
     pub async fn shutdown(self) {
         for worker in &self.workers {
             worker.handle.stop();

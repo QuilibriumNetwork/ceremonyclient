@@ -299,6 +299,7 @@ async fn app_consensus_cw_single_prover_finalizes() {
 
     let harness = AppShardHarness::build_cw(1);
     assert_deterministic_app_chain(&harness, std::time::Duration::from_secs(60)).await;
+    harness.shutdown().await;
 }
 
 /// A 3-prover shard committee driven by commonware-simplex + Falcon
@@ -320,6 +321,7 @@ async fn app_consensus_cw_multi_prover_finalizes() {
 
     let harness = AppShardHarness::build_cw(3);
     assert_deterministic_app_chain(&harness, std::time::Duration::from_secs(90)).await;
+    harness.shutdown().await;
 }
 
 /// A legacy shard whose committee changed restarts from the head the old

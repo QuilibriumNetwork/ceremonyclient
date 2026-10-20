@@ -363,5 +363,8 @@ pub async fn migrate_in_place(tip_kind: Tip) {
         }
         assert_eq!(shard.capture_committed_shard(&filter).unwrap().roots, sealed.state_roots);
     }
+    // Join every consensus host before the stores drop: a detached host
+    // can close RocksDB while the process exits (`AppShardHarness::shutdown`).
+    harness.shutdown().await;
     quil_types::consensus::set_committee_handoff_policy(None);
 }
