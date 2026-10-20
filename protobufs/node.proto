@@ -199,6 +199,12 @@ message ShardRecovery {
   uint64 permit_wait_ms = 15;
   uint64 attempt_ms = 16;
   uint64 attempt_installed_leaves = 17;
+  // Failed attempts since the engine started, by class: "no_archive_known",
+  // "connect", "archive_request", "archive_state", "replay_mismatch" or
+  // "other".
+  map<string, uint32> failures_by_class = 18;
+  // The longest wait for a recovery permit since the engine started.
+  uint64 longest_permit_wait_ms = 19;
 }
 
 message WorkerInfoResponse {

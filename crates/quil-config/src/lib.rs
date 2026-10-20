@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod diagnostics;
 mod engine;
 mod explorer;
 mod keys;
@@ -11,6 +12,7 @@ mod version;
 
 pub use config::*;
 pub use db::*;
+pub use diagnostics::*;
 pub use engine::*;
 pub use explorer::*;
 pub use keys::*;

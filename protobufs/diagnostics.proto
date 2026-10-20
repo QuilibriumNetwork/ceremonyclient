@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package quilibrium.node.diagnostics.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+// Opt-in diagnostics a node serves on its authenticated peer listener to the
+// peers its operator allowlists (`diagnostics.healthReport`). The schema
+// carries no strings: free text from the engine (blockers, errors, archive
+// addresses) is mapped to the enums below or left out, so a report cannot
+// carry paths, addresses or log text.
+
+// A worker's lifecycle phase (`WorkerExecution.state`).
+enum Phase {
+  // The worker reported no observation.
+  PHASE_UNSPECIFIED = 0;
+  PHASE_STARTING = 1;
+  // Waiting for its allocation to activate.
+  PHASE_WAITING = 2;
+  PHASE_SYNCING = 3;
+  PHASE_SERVING = 4;
+  PHASE_CLOSING = 5;
+  PHASE_HANDOFF = 6;
+  PHASE_BLOCKED = 7;
+  PHASE_STOPPED = 8;
+  // An older worker that reports only that its consensus host started.
+  PHASE_RUNNING = 9;
+  // The engine could not read its session state.
+  PHASE_UNKNOWN = 10;
+  // A phase this build does not know.
+  PHASE_UNRECOGNIZED = 11;
+}
+
+// Why a worker's phase holds (`WorkerExecution.blocker`).
+enum Blocker {
+  BLOCKER_NONE = 0;
+  // A reason this build does not know.
+  BLOCKER_UNRECOGNIZED = 1;
+  BLOCKER_WAITING_FOR_TRANSPORT = 2;
+  BLOCKER_RESTARTING_CONSENSUS_HOST = 3;
+  BLOCKER_ENGINE_EXITED = 4;
+  BLOCKER_AWAITING_SUCCESSOR = 5;
+  BLOCKER_STAGING_SHARD_DATA = 6;
+  BLOCKER_AWAITING_CLOSING_CERTIFICATE = 7;
+  BLOCKER_AWAITING_ALLOCATION_ACTIVATION = 8;
+  BLOCKER_CHECKPOINT_MISMATCH = 9;
+  BLOCKER_STATE_UNAVAILABLE = 10;
+  BLOCKER_COMMITTEE_ADMISSION_UNAVAILABLE = 11;
+  BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE = 12;
+  BLOCKER_SESSION_IDENTITY_UNAVAILABLE = 13;
+  BLOCKER_SESSION_STATE_UNAVAILABLE = 14;
+}
+
+// The phase of a worker's archive recovery (`ShardRecovery.phase`).
+enum RecoveryPhase {
+  // No recovery attempt since the engine started.
+  RECOVERY_PHASE_NONE = 0;
+  RECOVERY_PHASE_IDLE = 1;
+  RECOVERY_PHASE_WAITING_FOR_PERMIT = 2;
+  RECOVERY_PHASE_REPLAYING_FRAMES = 3;
+  RECOVERY_PHASE_FETCHING_CHECKPOINT = 4;
+  RECOVERY_PHASE_INSTALLING_LEAVES = 5;
+  RECOVERY_PHASE_INSTALLING_CHECKPOINT = 6;
+  // An attempt started and has not named its phase yet.
+  RECOVERY_PHASE_STARTING = 7;
+  RECOVERY_PHASE_UNRECOGNIZED = 8;
+}
+
+// The class of a failed archive recovery attempt, by whose problem it is.
+enum RecoveryFailure {
+  RECOVERY_FAILURE_NONE = 0;
+  // This node's master knows no reachable archive.
+  RECOVERY_FAILURE_NO_ARCHIVE_KNOWN = 1;
+  RECOVERY_FAILURE_CONNECT = 2;
+  // The archive failed a read.
+  RECOVERY_FAILURE_ARCHIVE_REQUEST = 3;
+  // No archive supplied the shard state the worker needs.
+  RECOVERY_FAILURE_ARCHIVE_STATE = 4;
+  // The archive's frames do not replay onto the worker's local state.
+  RECOVERY_FAILURE_REPLAY_MISMATCH = 5;
+  RECOVERY_FAILURE_OTHER = 6;
+}
+
+message FailureCount {
+  RecoveryFailure class = 1;
+  uint32 count = 2;
+}
+
+// One data worker, as its master observes it. Times are the reporting
+// node's clock; compare them with `HealthReport.generated_unix_ms`.
+message WorkerHealth {
+  uint32 core_id = 1;
+  // The public shard filter the worker is bound to; empty when unallocated.
+  bytes filter = 2;
+  bool allocated = 3;
+  Phase phase = 4;
+  Blocker blocker = 5;
+  // When the worker last refreshed its observation; 0 without one.
+  uint64 observed_unix_ms = 6;
+  // The worker's highest materialized app frame.
+  optional uint64 materialized_frame = 7;
+  // When that frame last advanced; 0 when it has not since the engine
+  // started.
+  uint64 last_advance_unix_ms = 8;
+  // The shard's committee session and its head in committed GLOBAL state,
+  // in this node's view.
+  optional uint64 committee_head_frame = 9;
+  optional uint64 committed_generation = 10;
+  RecoveryPhase recovery_phase = 11;
+  uint64 recovery_phase_since_unix_ms = 12;
+  // Recovery attempts finished since the engine started, and how many of
+  // the latest failed in a row.
+  uint32 recovery_attempts = 13;
+  uint32 recovery_consecutive_failures = 14;
+  // Failed attempts since the engine started, by class.
+  repeated FailureCount recovery_failures = 15;
+  RecoveryFailure last_failure = 16;
+  uint64 last_failure_unix_ms = 17;
+  uint64 last_success_unix_ms = 18;
+  // The longest wait for a recovery turn since the engine started.
+  uint64 longest_permit_wait_ms = 19;
+  // The session's finalized terminal seal, while the worker hands off.
+  optional uint64 seal_generation = 20;
+  // When this node saw GLOBAL record the seal; 0 until then.
+  uint64 seal_recorded_unix_ms = 21;
+}
+
+message HealthReport {
+  uint32 schema = 1;
+  // The release, `version.patch.subpatch`: 3 version bytes.
+  bytes version = 2;
+  uint32 patch = 3;
+  // 0 when the build has no subpatch counter.
+  uint32 subpatch = 4;
+  // The SHA-256 build fingerprint this node also signs into its PeerInfo.
+  bytes build_fingerprint = 5;
+  // The newest GLOBAL frame this node advanced to the head of its time reel.
+  uint64 global_head_frame = 6;
+  uint64 generated_unix_ms = 7;
+  // Allocated workers first, at most 256 and 32 KiB in all.
+  repeated WorkerHealth workers = 8;
+  // Workers left out by those bounds.
+  uint32 omitted_workers = 9;
+}
+
+message GetHealthReportRequest {}
+
+service DiagnosticsService {
+  // Served only to this node itself and to allowlisted peers; others get
+  // PERMISSION_DENIED, and an allowlisted peer asking again within the
+  // configured interval RESOURCE_EXHAUSTED.
+  rpc GetHealthReport(GetHealthReportRequest) returns (HealthReport);
+}

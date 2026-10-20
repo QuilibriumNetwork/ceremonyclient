@@ -8,6 +8,7 @@ use clap::Subcommand;
 use crate::context::GlobalArgs;
 
 pub mod archive;
+pub mod diagnostics;
 pub mod lifecycle;
 pub mod log;
 pub mod nodeconfig;
@@ -30,6 +31,11 @@ pub enum NodeCommand {
     Archive {
         #[command(subcommand)]
         command: archive::ArchiveCommand,
+    },
+    /// Opt-in diagnostics from other nodes: their health reports.
+    Diagnostics {
+        #[command(subcommand)]
+        command: diagnostics::DiagnosticsCommand,
     },
     /// Node log management.
     Log {
@@ -81,6 +87,7 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
         NodeCommand::Config { command } => nodeconfig::run(global, command),
         NodeCommand::Log { command } => log::run(global, command),
         NodeCommand::Archive { command } => archive::run(global, command).await,
+        NodeCommand::Diagnostics { command } => diagnostics::run(global, command).await,
         NodeCommand::Info { config } => info(global, config.as_deref()),
         NodeCommand::Service { action } => service::run(action),
         NodeCommand::Clean { all, logs, node } => clean(&global, *all, *logs, *node),
