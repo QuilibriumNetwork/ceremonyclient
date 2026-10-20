@@ -114,13 +114,23 @@ pub fn multi_filter_signing_message(filters: &[Vec<u8>], frame_number: u64) -> V
 /// confirm's leaf-root set appended, so the registered roots are authenticated
 /// by the prover's signature. An empty leaf-root set appends nothing, so this is
 /// byte-identical to [`multi_filter_signing_message`] for legacy confirms.
+///
+/// From the confirm release frame a `release` appends `"release" || release`
+/// ([`super::prover_release::signed_release`]); before it, and without one,
+/// nothing, so a release a confirm carries early is neither signed nor
+/// verified.
 pub fn confirm_signing_message(
     filters: &[Vec<u8>],
     frame_number: u64,
     leaf_roots: &[super::leaf_root_registration::ConfirmLeafRoots],
+    release: Option<&super::prover_release::Release>,
 ) -> Vec<u8> {
     let mut msg = multi_filter_signing_message(filters, frame_number);
     super::leaf_root_registration::append_confirm_leaf_roots(&mut msg, leaf_roots);
+    if let Some(release) = super::prover_release::signed_release(frame_number, release) {
+        msg.extend_from_slice(b"release");
+        msg.extend_from_slice(&release.to_bytes());
+    }
     msg
 }
 

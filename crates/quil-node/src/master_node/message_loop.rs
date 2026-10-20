@@ -415,17 +415,27 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             if !committee_builds.due(filter, id, now) {
                                 continue;
                             }
-                            let builds: Vec<_> = {
+                            // Each member's build, release and reported GLOBAL head;
+                            // this node and members without PeerInfo report no head.
+                            let (mut builds, mut releases, mut heads) = (Vec::new(), Vec::new(), Vec::new());
+                            {
                                 let infos = pic_for_recv.read();
-                                session.members.iter()
-                                    .map(|key| if quil_engine::bitmasks::shard_cw_addressee_tag(key) == local_cw_tag {
-                                        super::committee_builds::Build::ThisNode
+                                for key in &session.members {
+                                    if quil_engine::bitmasks::shard_cw_addressee_tag(key) == local_cw_tag {
+                                        builds.push(super::committee_builds::Build::ThisNode);
+                                        releases.push(super::committee_builds::Release::ThisNode);
+                                        heads.push(None);
                                     } else {
-                                        super::committee_builds::Build::of(
-                                            infos.get(&quil_p2p::peer_id_from_falcon_pubkey(key)).map(|info| info.build_fingerprint()))
-                                    })
-                                    .collect()
-                            };
+                                        let info = infos.get(&quil_p2p::peer_id_from_falcon_pubkey(key));
+                                        builds.push(super::committee_builds::Build::of(info.map(|info| info.build_fingerprint())));
+                                        releases.push(super::committee_builds::Release::of(info.map(|info| info.release())));
+                                        heads.push(info.map(|info| info.last_global_head_frame));
+                                    }
+                                }
+                            }
+                            let global_head = lhf_for_recv.load(std::sync::atomic::Ordering::Relaxed);
+                            let behind = super::committee_builds::behind_global(&heads, global_head);
+                            let behind_list = if behind.is_empty() { "none".to_string() } else { behind.join(",") };
                             info!(
                                 scope = "peer",
                                 filter = %hex::encode(filter),
@@ -433,8 +443,34 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 session = %hex::encode(id),
                                 members = builds.len(),
                                 builds = %super::committee_builds::groups(&builds),
+                                releases = %super::committee_builds::release_groups(&releases),
+                                global_head,
+                                behind_global = %behind_list,
                                 "app committee member builds by member index"
                             );
+                            if !behind.is_empty() {
+                                warn!(
+                                    scope = "peer",
+                                    filter = %hex::encode(filter),
+                                    generation = session.generation,
+                                    members = builds.len(),
+                                    behind = behind.len(),
+                                    behind_global = %behind_list,
+                                    global_head,
+                                    action = "nothing to fix on this node: these members' nodes stopped following GLOBAL, most likely on an outdated release; it ends when their operators upgrade",
+                                    "app committee members behind GLOBAL"
+                                );
+                            }
+                            if committee_builds.caught_up(filter, !behind.is_empty()) {
+                                info!(
+                                    scope = "peer",
+                                    filter = %hex::encode(filter),
+                                    generation = session.generation,
+                                    members = builds.len(),
+                                    global_head,
+                                    "app committee members caught up with GLOBAL"
+                                );
+                            }
                         }
                     }
                 }

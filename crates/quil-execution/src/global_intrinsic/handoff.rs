@@ -1372,6 +1372,15 @@ pub(crate) fn activate_with(
 
 /// Authenticated source checkpoints for a successor's bootstrap. Returning
 /// records is not a local materialization/readiness verdict.
+/// The GLOBAL frame the request that authorized session `id` was scheduled
+/// at, where its committee was chosen; `None` for a session no request
+/// authorized (a first session) or without an origin record.
+pub fn scheduled_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
+    let Some(bytes) = read(state, b"origin", id)? else { return Ok(None) };
+    let Ok(request_id) = <[u8; 32]>::try_from(bytes.as_slice()) else { return Ok(None) };
+    Ok(request(state, &request_id)?.map(|request| request.frame))
+}
+
 pub fn origins(state: &impl Records, id: &[u8; 32]) -> Result<Vec<(Session, Checkpoint)>> {
     session(state, id)?.ok_or_else(|| invalid("bootstrap session absent"))?;
     let bytes = read(state, b"origin", id)?

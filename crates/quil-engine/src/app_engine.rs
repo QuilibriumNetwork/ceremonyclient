@@ -3086,6 +3086,8 @@ impl AppConsensusEngine {
     /// ([`PredecessorBlock::blocked`]), naming the predecessor and the shard
     /// sync's last anchor refusal.
     fn warn_predecessor_blocked(&mut self, now: std::time::Instant) {
+        // Its archive recoveries go first while it waits (thread_worker).
+        self.execution.set_successor_blocked(true);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
         let predecessor = self.global_hypergraph.as_ref()
             .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
@@ -3114,9 +3116,20 @@ impl AppConsensusEngine {
             "successor session blocked: predecessor state not recovered through its seal");
     }
 
+    /// Follow a consensus start attempt: whether it left this successor
+    /// waiting on its predecessor's state.
+    fn note_predecessor_block(&mut self, refused: Option<&QuilError>, now: std::time::Instant) {
+        match refused {
+            None => self.end_predecessor_block("consensus started", now),
+            Some(error) if predecessor_recovery_pending(error) => self.warn_predecessor_blocked(now),
+            Some(_) => self.end_predecessor_block("startup now waits on something else", now),
+        }
+    }
+
     /// Once this successor no longer waits on its predecessor's state, say
     /// so if it was warned about, with how long it waited.
     fn end_predecessor_block(&mut self, outcome: &'static str, now: std::time::Instant) {
+        self.execution.set_successor_blocked(false);
         if let Some(blocked) = self.predecessor_block.cleared(now) {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
                 blocked_secs = blocked.as_secs(),
@@ -3168,15 +3181,38 @@ impl AppConsensusEngine {
     }
 
     /// This prover's allocations for the shard at the latest GLOBAL frame,
-    /// for a worker whose key is not in the committee it would start.
-    fn local_seat(&self) -> NotSeated {
+    /// for a worker whose key is not in the committee it would start
+    /// (`session`, when one governs the shard).
+    fn local_seat(&self, session: Option<&quil_cw_consensus::handoff::Session>) -> NotSeated {
         let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
         let allocations = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
             .map(|p| p.allocations.iter().filter(|a| a.confirmation_filter == self.filter)
                 .map(|a| a.effective_status(global_frame)).collect())
             .unwrap_or_default();
-        NotSeated { allocations, global_frame }
+        let release = session.and_then(|session| self.release_shortfall(session, global_frame));
+        NotSeated { allocations, global_frame, release }
+    }
+
+    /// This prover's recorded release on the shard, when the minimum GLOBAL
+    /// applied to `session`'s committee is above it. The minimum is the one
+    /// GLOBAL used ([`prover_release::minimum_release_at`]) at the frame the
+    /// session's authorizing request was scheduled; a session no request
+    /// authorized (a first session) is judged at `global_frame` instead.
+    ///
+    /// [`prover_release::minimum_release_at`]: quil_execution::global_intrinsic::prover_release::minimum_release_at
+    fn release_shortfall(
+        &self,
+        session: &quil_cw_consensus::handoff::Session,
+        global_frame: u64,
+    ) -> Option<ReleaseShortfall> {
+        use quil_execution::global_intrinsic::{handoff, prover_release};
+        let view = handoff::CommittedView::capture(self.global_hypergraph.as_ref()?).ok()?;
+        let scheduled = handoff::scheduled_frame(&view, &session.id().ok()?).ok().flatten();
+        let frame = scheduled.unwrap_or(global_frame);
+        let minimum = prover_release::minimum_release_at(frame)?;
+        let recorded = prover_release::recorded_release(&view, &self.local_bls_pubkey, &self.filter).ok()?;
+        ReleaseShortfall::of(recorded, minimum, frame, scheduled.is_some())
     }
 
     /// A finalized header carries the quorum-certified fee total of its
@@ -3336,7 +3372,7 @@ impl AppConsensusEngine {
     ///
     /// The request made at committee build fires when the worker is spawned,
     /// which on a fresh boot is before peer discovery has put any archive in
-    /// the pool: the syncer then resolves an EMPTY endpoint ("invalid URI"),
+    /// the pool: the syncer then finds no archive ("no archive known yet"),
     /// gives up, and nothing retries it until the next committee rebuild. A
     /// node restarting into a SPLIT application has no stored frames for its
     /// child shard either, so it takes the bootstrap branch, fails it once, and
@@ -3744,7 +3780,11 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::CwTransportReady) => {
                             if !cw_transport_ready {
                                 cw_transport_ready = true;
-                                match self.start_consensus_cw((bls_signer_factory)()).await {
+                                let started = self.start_consensus_cw((bls_signer_factory)()).await;
+                                // A successor's first start may already wait on
+                                // its predecessor's state: its recoveries go first.
+                                self.note_predecessor_block(started.as_ref().err(), std::time::Instant::now());
+                                match started {
                                     Ok(handle) => {
                                         self.cw_handle = Some(handle);
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -3819,15 +3859,11 @@ impl AppConsensusEngine {
                                     filter = hex::encode(&self.filter),
                                     "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
                                 );
-                                self.end_predecessor_block("consensus started", std::time::Instant::now());
+                                self.note_predecessor_block(None, std::time::Instant::now());
                                 self.end_start_block(std::time::Instant::now());
                             }
                             Err(e) => {
-                                if predecessor_recovery_pending(&e) {
-                                    self.warn_predecessor_blocked(std::time::Instant::now());
-                                } else {
-                                    self.end_predecessor_block("startup now waits on something else", std::time::Instant::now());
-                                }
+                                self.note_predecessor_block(Some(&e), std::time::Instant::now());
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
                                 self.note_start_refused(&e, std::time::Instant::now());
@@ -4678,7 +4714,7 @@ impl AppConsensusEngine {
             self.start_context.members = Some(session.members.len());
             let my_pk = bls_signer.public_key();
             if !session.members.iter().any(|key| key.as_slice() == my_pk) {
-                self.start_context.not_seated = Some(self.local_seat());
+                self.start_context.not_seated = Some(self.local_seat(Some(session)));
             }
         }
         let mut session_genesis = None;
@@ -4793,7 +4829,7 @@ impl AppConsensusEngine {
         if !member_pubkeys.iter().any(|key| key == &my_pk) {
             let seat = match self.start_context.not_seated.take() {
                 Some(seat) => seat,
-                None => self.local_seat(),
+                None => self.local_seat(session.as_ref()),
             };
             let joining = seat.joining();
             self.start_context.not_seated = Some(seat);
@@ -8268,6 +8304,33 @@ impl StartScope {
 struct NotSeated {
     allocations: Vec<quil_types::consensus::EffectiveStatus>,
     global_frame: u64,
+    /// Set when sessions require a release this prover has not recorded.
+    release: Option<ReleaseShortfall>,
+}
+
+/// A recorded release below the minimum a session's committee required:
+/// none when this prover's confirms recorded none (sent before the release
+/// frame, by an older build or without a release).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReleaseShortfall {
+    recorded: Option<quil_execution::global_intrinsic::prover_release::Release>,
+    minimum: quil_execution::global_intrinsic::prover_release::Release,
+    /// The GLOBAL frame the minimum was evaluated at.
+    frame: u64,
+    /// Whether that is the frame the session was scheduled at, or, for a
+    /// session no request authorized, the latest GLOBAL frame.
+    scheduled: bool,
+}
+
+impl ReleaseShortfall {
+    fn of(
+        recorded: Option<quil_execution::global_intrinsic::prover_release::Release>,
+        minimum: quil_execution::global_intrinsic::prover_release::Release,
+        frame: u64,
+        scheduled: bool,
+    ) -> Option<Self> {
+        recorded.is_none_or(|release| release < minimum).then_some(Self { recorded, minimum, frame, scheduled })
+    }
 }
 
 impl NotSeated {
@@ -8339,6 +8402,28 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             "it starts when the allocation activates at its activation epoch", true);
     }
     if let Some(seat) = context.not_seated.as_ref() {
+        if let Some(shortfall) = seat.release {
+            let recorded = shortfall.recorded.map_or_else(|| "none".to_string(), |release| release.to_string());
+            let at = if shortfall.scheduled {
+                "the frame its session was scheduled"
+            } else {
+                "the latest GLOBAL frame; its session records no scheduling frame"
+            };
+            return refusal(
+                "not seated: release below minimum".into(),
+                format!("not seated: release below minimum: this worker's allocation records release {recorded}, \
+                    below the minimum {} the release eligibility schedule sets at GLOBAL frame {} ({at}; \
+                    this build: {}); start refused with: {text}",
+                    shortfall.minimum,
+                    shortfall.frame,
+                    quil_execution::global_intrinsic::prover_release::Release::current()),
+                ExpectedWait,
+                "this build records its release with the allocation's next epoch reconfirm, and a session formed \
+                    after that seats it; check this worker's prover confirmation (dispatch and publish in the \
+                    master log) if it persists past the next epoch",
+                true,
+            );
+        }
         let action = if seat.allocations.is_empty() {
             "the prover registry holds no allocation of this prover for the shard: check this worker's \
                 allocation (join and confirm); it starts only once a committee session seats it"
@@ -8587,7 +8672,7 @@ mod start_block_tests {
         let lapsed = StartContext {
             generation: Some(19),
             members: Some(4),
-            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234 }),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234, release: None }),
         };
         let seat = classify_start_refusal(&committee_build_failed(), &lapsed);
         assert_eq!(seat.scope, StartScope::ThisNode);
@@ -8599,7 +8684,7 @@ mod start_block_tests {
         assert_eq!(earlier.key, seat.key, "the gate that refused first does not change the refusal");
 
         let unseated_joining = StartContext {
-            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1 }),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1, release: None }),
             ..StartContext::default()
         };
         assert_eq!(classify_start_refusal(&committee_build_failed(), &unseated_joining).scope, StartScope::ExpectedWait);
@@ -8613,6 +8698,39 @@ mod start_block_tests {
         let retired = refusal(QuilError::Consensus("app committee session unavailable: head session is retired".into()));
         assert_eq!(retired.scope, StartScope::ExpectedWait);
         assert_eq!(joining().scope, StartScope::ExpectedWait);
+    }
+
+    /// A worker sessions do not seat for its recorded release says so, with
+    /// both releases, as an expected wait for its next reconfirm.
+    #[test]
+    fn a_seat_refused_for_its_release_names_both_releases() {
+        use quil_execution::global_intrinsic::prover_release::Release;
+        let minimum = Release { version: [2, 1, 0], patch: 25, subpatch: 90 };
+        assert_eq!(ReleaseShortfall::of(Some(minimum), minimum, 7, true), None, "the minimum is seated");
+        assert_eq!(ReleaseShortfall::of(Some(Release { subpatch: 91, ..minimum }), minimum, 7, true), None);
+        let older = Release { subpatch: 89, ..minimum };
+        for (recorded, scheduled) in [(None, true), (Some(older), false)] {
+            let shortfall = ReleaseShortfall::of(recorded, minimum, 777, scheduled).expect("below the minimum");
+            let context = StartContext {
+                not_seated: Some(NotSeated {
+                    allocations: vec![EffectiveStatus::Active], global_frame: 1234, release: Some(shortfall),
+                }),
+                ..StartContext::default()
+            };
+            let seat = classify_start_refusal(&committee_build_failed(), &context);
+            assert_eq!(seat.scope, StartScope::ExpectedWait);
+            assert!(seat.repeats);
+            assert!(seat.reason.starts_with("not seated: release below minimum"), "{}", seat.reason);
+            let recorded = recorded.map_or_else(|| "none".to_string(), |release| release.to_string());
+            assert!(seat.reason.contains(&format!("records release {recorded},")), "{}", seat.reason);
+            assert!(seat.reason.contains(&format!("minimum {minimum} the release eligibility schedule sets at GLOBAL frame 777")),
+                "{}", seat.reason);
+            assert_eq!(seat.reason.contains("the frame its session was scheduled"), scheduled, "{}", seat.reason);
+            assert!(seat.action.contains("reconfirm"), "{}", seat.action);
+            let earlier = classify_start_refusal(
+                &QuilError::ExecutionUnavailable("covered shard data is not staged".into()), &context);
+            assert_eq!(earlier.key, seat.key, "one refusal, whichever gate refused first");
+        }
     }
 }
 
@@ -8876,6 +8994,60 @@ mod session_view_lag_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A successor whose start waits on its predecessor's state takes the
+    /// next recovery turn, though its recovery queued before the refusal.
+    #[tokio::test]
+    async fn a_blocked_successor_start_moves_its_queued_recovery_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock, global_anchor_store: None, global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let held = turns.acquire(Arc::new(AtomicBool::new(false))).await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = |name: &'static str, blocked: Arc<AtomicBool>| {
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _turn = turns.acquire(blocked).await;
+                order.lock().unwrap().push(name);
+            })
+        };
+        let other = run("other", Arc::new(AtomicBool::new(false)));
+        tokio::task::yield_now().await;
+        let successor_flag = handle.execution_record().successor_blocked_flag();
+        let successor = run("successor", successor_flag.clone());
+        tokio::task::yield_now().await;
+        let pending = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
+        engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+        assert!(successor_flag.load(Ordering::Relaxed));
+        drop(held);
+        other.await.unwrap();
+        successor.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["successor", "other"]);
+        engine.note_predecessor_block(None, std::time::Instant::now());
+        assert!(!successor_flag.load(Ordering::Relaxed), "a started session no longer goes first");
+    }
+
     #[test]
     fn expected_admission_wait_is_distinct_from_preparation_failure() {
         assert!(expected_admission_wait(&QuilError::ExecutionUnavailable("awaiting allocation activation".into())));

@@ -37,7 +37,7 @@ pub use peer_info::{
     peek_key_registry_timestamp, peek_peer_info_timestamp,
     CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
     InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
-    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID,
+    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID, RELEASE_SUBPATCH_CAPABILITY_ID,
 };
 pub use signer_registry::{SignerEntry, SignerRegistry};
 

@@ -570,10 +570,14 @@ impl ProverPipeline {
         // appends the leaf-root set — byte-identical to the legacy
         // concat(filters)||frame message when the set is empty (pre-activation
         // / deps absent), so default Go-parity is preserved.
+        // From the confirm release frame the confirm reports and signs this
+        // build's release, which GLOBAL records on each confirmed allocation.
+        let release = quil_execution::global_intrinsic::prover_release::release_for_confirm(frame_number);
         let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
             &filters,
             frame_number,
             &leaf_roots,
+            release.as_ref(),
         );
 
         let signer = self.bls_signer()?;
@@ -589,11 +593,13 @@ impl ProverPipeline {
             }),
             filters: filters.clone(),
             leaf_roots,
+            release,
         };
         let bytes = confirm.to_canonical_bytes()?;
 
         info!(frame = frame_number, filter_count = filters.len(), leaf_roots = confirm.leaf_roots.len(),
             leaf_entries = confirm.leaf_roots.iter().map(|g| g.entries.len()).sum::<usize>(),
+            release = %confirm.release.map_or_else(|| "none".to_string(), |release| release.to_string()),
             "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
         self.publish_prover_message(bytes).await

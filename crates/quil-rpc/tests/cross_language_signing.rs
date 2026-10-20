@@ -75,6 +75,7 @@ fn build_confirm() -> pb::MessageBundle {
         public_key_signature_bls48581: Some(addr_sig()),
         filters: vec![fixture_filter_a()],
         leaf_roots: vec![],
+        release: None,
     };
     bundle_with(pb::message_request::Request::Confirm(confirm))
 }

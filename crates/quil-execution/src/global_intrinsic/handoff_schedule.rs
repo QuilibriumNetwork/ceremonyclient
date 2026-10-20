@@ -52,10 +52,44 @@ pub enum TopologyGate {
 /// Sorted, unique Falcon keys of the provers committee-eligible on `filter`.
 /// Keys that are not well-formed Falcon public keys cannot sign in a session
 /// and are left out deterministically.
+///
+/// While a step of the release eligibility schedule applies at `frame`, the
+/// frame the session is formed at, only allocations whose recorded release is
+/// at least that step's minimum are seated; one without a recorded release is
+/// not ([`super::super::prover_release::seat_eligible`]). The recorded
+/// release is signed by the prover's own key but self-attested: the schedule
+/// removes honest but outdated provers, and a false claim gains a prover
+/// nothing an eligible member does not have. Callers keep a shard's current
+/// session when no member remains. Committee eligibility, splits, merges and
+/// reassignment do not apply the gate.
 pub fn desired_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    use super::super::prover_release::{minimum_release_at, seat_eligible};
+    if minimum_release_at(frame).is_none() {
+        return members_where(scan, filter, frame, |_| true);
+    }
+    let releases = scan.releases_on_filter(filter);
+    members_where(scan, filter, frame, |address| seat_eligible(releases.get(address), frame))
+}
+
+/// [`desired_members`] without the release gate: the committee a merge's
+/// successor takes, which, like a split's, seats every eligible prover of its
+/// sources. A merge whose successor would have no member is dropped, unlike
+/// a membership change, which keeps the current session; the next membership
+/// boundary applies the gate to the merged shard.
+fn merge_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    members_where(scan, filter, frame, |_| true)
+}
+
+fn members_where(
+    scan: &CommittedProverScan,
+    filter: &[u8],
+    frame: u64,
+    seat: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
     let mut members: Vec<Vec<u8>> = scan
         .active_on_filter(filter, frame)
         .into_iter()
+        .filter(|(_, address)| seat(address))
         .map(|(public_key, _)| public_key)
         .filter(|key| FalconPublicKey::from_bytes(key).is_some())
         .collect();
@@ -344,7 +378,7 @@ pub fn gate_topology_change_sized<'s>(
         }
         ShardChangeKind::Merge => {
             let mut members: Vec<Vec<u8>> = sources.iter()
-                .flat_map(|source| desired_members(scan, source, frame)).collect();
+                .flat_map(|source| merge_members(scan, source, frame)).collect();
             members.sort();
             members.dedup();
             new.into_iter().map(|filter| DesiredCommittee { filter, members: members.clone() }).collect()

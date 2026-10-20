@@ -421,6 +421,7 @@ mod tests {
             }),
             filters: vec![vec![0x10u8; 8]],
             leaf_roots: vec![],
+            release: None,
         };
         let bundle_pb = pb::MessageBundle {
             requests: vec![pb::MessageRequest {
@@ -442,6 +443,7 @@ mod tests {
             }),
             filters: vec![vec![0x10u8; 8]],
             leaf_roots: Vec::new(),
+            release: None,
         };
         let confirm_inner = confirm_handcrafted.to_canonical_bytes().unwrap();
         let bundle_handcrafted = CanonicalMessageBundle {
