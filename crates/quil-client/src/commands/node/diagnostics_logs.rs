@@ -328,23 +328,46 @@ pub(crate) async fn target_addr(
     let Some(node) = node else {
         anyhow::bail!(
             "with --identity, pass --addr host:port of the target's peer listener (the stream address it \
-             publishes): qclient asks no local node for it"
+             publishes): qclient asks no local node for it; `qclient node diagnostics resolve {target}` \
+             prints it from your node's peer info"
         );
     };
     if target == own {
         return rpc::local_stream_addr(&node.config);
     }
-    let label = peer_tail(target);
-    let mut client = rpc::connect_node_service(&node.ctx.connect_opts(&node.config, false))
+    let peers = local_peer_info(node, &peer_tail(target)).await.map_err(|e| anyhow::anyhow!("{e:#} Or pass --addr host:port"))?;
+    super::diagnostics::published_stream_addr(&peers, target)
+}
+
+/// This node's peer info, from its local RPC. Refuses a qclient configured
+/// for a public or custom RPC: that would ask another node, which learns
+/// of the query and whose peer info is not this node's.
+pub(crate) async fn local_peer_info(
+    node: &NodeSide,
+    label: &str,
+) -> anyhow::Result<Vec<quil_types::proto::node::PeerInfo>> {
+    let opts = node.ctx.connect_opts(&node.config, false);
+    local_only(&opts, label)?;
+    let mut client = rpc::connect_node_service(&opts)
         .await
-        .map_err(|e| anyhow::anyhow!("ask this node for the address of {label}: {e}; is it running? Or pass --addr host:port"))?;
-    let peers = client
+        .map_err(|e| anyhow::anyhow!("ask this node for the address of {label}: {e}; is it running?"))?;
+    Ok(client
         .get_peer_info(quil_types::proto::node::GetPeerInfoRequest {})
         .await
-        .map_err(|e| anyhow::anyhow!("ask this node for its peer info: {}", e.message()))?
+        .map_err(|e| anyhow::anyhow!("ask this node for its peer info: {}.", e.message()))?
         .into_inner()
-        .peer_info;
-    super::diagnostics::published_stream_addr(&peers, target)
+        .peer_info)
+}
+
+/// Refuses connection options that reach a public or custom RPC instead
+/// of this node.
+fn local_only(opts: &rpc::ConnectOpts, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !opts.is_light_node(),
+        "qclient's config sets publicRpc or customRpc, so it would ask that RPC rather than this node for the \
+         address of {label}."
+    );
+    Ok(())
 }
 
 fn private_dir(dir: &Path) -> anyhow::Result<()> {
@@ -1005,6 +1028,19 @@ mod tests {
     use prost::Message as _;
 
     const NOW: u64 = 1_792_000_000_000;
+
+    #[test]
+    fn peer_info_is_asked_only_of_this_node() {
+        let local = rpc::ConnectOpts { listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/8337".into(), ..Default::default() };
+        assert!(local_only(&local, "…Ab12cd").is_ok());
+        assert!(local_only(&rpc::ConnectOpts::default(), "…Ab12cd").is_ok());
+        let public = rpc::ConnectOpts { public_rpc: true, ..local.clone() };
+        let custom = rpc::ConnectOpts { custom_rpc: "rpc.example.invalid:8337".into(), ..Default::default() };
+        for opts in [public, custom] {
+            let error = local_only(&opts, "…Ab12cd").unwrap_err().to_string();
+            assert!(error.contains("publicRpc or customRpc") && error.contains("…Ab12cd"), "{error}");
+        }
+    }
 
     fn pending_request(id: u8, status: LogRequestStatus, filters: Vec<Vec<u8>>) -> PendingLogRequest {
         let mut request = PendingLogRequest {
