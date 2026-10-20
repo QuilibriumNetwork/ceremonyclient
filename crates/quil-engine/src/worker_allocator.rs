@@ -1407,12 +1407,17 @@ impl WorkerAllocator {
         }
 
         // Serving allocations take precedence over joins that have not
-        // activated. A notice-period member must not lose its recovery slot
-        // to a pending join merely because the latter scores higher.
+        // activated, and a confirmed join over an unconfirmed one. A
+        // notice-period member must not lose its recovery slot to a pending
+        // join merely because the latter scores higher; nor may a confirmed
+        // join, a committee member from the next boundary whatever this node
+        // does, lose the worker to a join that may never be confirmed.
         bind_candidates.sort_by(|a, b| {
-            use quil_types::consensus::EffectiveStatus;
-            let pending = |a: &quil_types::consensus::ProverAllocationInfo| {
-                a.effective_status(frame_number) == EffectiveStatus::Joining
+            use quil_types::consensus::AllocationPhase;
+            let pending = |a: &quil_types::consensus::ProverAllocationInfo| match a.phase(frame_number) {
+                Some(AllocationPhase::Joining) => 2u8,
+                Some(AllocationPhase::Activating) => 1,
+                _ => 0,
             };
             pending(a).cmp(&pending(b)).then_with(|| {
                 if let Some(priority) = priority.as_ref() {
@@ -2191,6 +2196,43 @@ mod tests {
         let worker = wm.range_workers().unwrap().remove(0);
         assert_eq!(worker.filter, leaving.confirmation_filter);
         assert!(worker.allocated);
+    }
+
+    /// A confirmed join becomes a committee member at the next boundary
+    /// whatever this node does, so a scarce worker goes to it before a join
+    /// still awaiting confirmation, even one on a halt-risk shard and first
+    /// in registry order.
+    #[test]
+    fn a_confirmed_join_outranks_an_unconfirmed_one_for_a_scarce_worker() {
+        let e = epoch_length_frames();
+        let frame = 10 * e + 20;
+        let mut activating = make_alloc(vec![0x01; 32]);
+        activating.join_frame_number = 9 * e + 1;
+        activating.join_confirm_frame_number = 10 * e + 5;
+        activating.epoch = 11;
+        let mut pending = make_alloc(vec![0x02; 32]);
+        pending.status = ProverStatus::Joining;
+        pending.join_frame_number = 10 * e + 1;
+        pending.join_confirm_frame_number = 0;
+        assert_eq!(activating.phase(frame), Some(AllocationPhase::Activating));
+        assert_eq!(pending.phase(frame), Some(AllocationPhase::Joining));
+        for ranked in [false, true] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &[]).unwrap();
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                pending.clone(), activating.clone(),
+            ])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            if ranked {
+                allocator.publish_allocation_priority(frame, vec![
+                    (pending.confirmation_filter.clone(), true, BigInt::from(10)),
+                    (activating.confirmation_filter.clone(), false, BigInt::from(9_000)),
+                ]);
+            }
+            allocator.on_new_frame(frame).unwrap();
+            assert_eq!(bound_filters(&wm), vec![activating.confirmation_filter.clone()],
+                "ranked={ranked}");
+        }
     }
 
     /// The production worker manager, counting consensus starts.
