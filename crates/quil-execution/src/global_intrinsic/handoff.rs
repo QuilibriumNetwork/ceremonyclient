@@ -640,6 +640,58 @@ pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
     PRESENCE_REPORT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
+/// From this GLOBAL frame GLOBAL fences a closing session that has not
+/// sealed one epoch after its closing request, instead of
+/// [`schedule::FENCE_AFTER_EPOCHS`] epochs ([`schedule::fence_due_frame`]).
+/// The request's frame selects the rule, so a request's fence is due at the
+/// same frame whenever and wherever it is evaluated, and a request made
+/// before this frame keeps the longer timeout. At GLOBAL frame 907,920
+/// members on an older build refused every closing seal, and six app
+/// committees sat closing one to three votes short for the full four epochs
+/// before their fences. Not shorter than an epoch: stale seats stay eligible
+/// until the next epoch boundary, so a successor seated sooner would take
+/// them again and be fenced again. Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame. App
+/// provers date fences by the same rule when they rewind past one
+/// (`fence_rewind` in the engine), so they should too. Not scheduled on
+/// mainnet; `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
+pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = None;
+
+static EARLY_FENCE_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static EARLY_FENCE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn early_fence_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_EARLY_FENCE_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's early fence frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_early_fence_frame(network: u8) -> u64 {
+    *EARLY_FENCE_FRAME.get_or_init(|| {
+        early_fence_frame_for(network, std::env::var("QUIL_EARLY_FENCE_FRAME").ok().as_deref())
+    })
+}
+
+pub fn early_fence_frame() -> u64 {
+    if let Some(frame) = EARLY_FENCE_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *EARLY_FENCE_FRAME.get_or_init(|| {
+        std::env::var("QUIL_EARLY_FENCE_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the early fence frame for the calling thread only (tests).
+pub fn set_early_fence_frame_for_thread(frame: Option<u64>) {
+    EARLY_FENCE_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,

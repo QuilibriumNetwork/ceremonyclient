@@ -1793,6 +1793,59 @@ fn fenced_successor_eligibility_activates_only_at_a_scheduled_frame() {
     assert_eq!(fenced_successor_eligibility_frame_for(1, None), u64::MAX);
 }
 
+/// From the early fence frame GLOBAL fences a closing session that has not
+/// sealed one epoch after its request, and not before: stale seats stay
+/// eligible until the next epoch boundary (GLOBAL frame 907,920: six app
+/// committees whose older-build members refused every closing seal sat
+/// closing for the full four epochs). The request's frame selects the rule:
+/// a request made before the frame keeps four epochs, even past the frame.
+#[test]
+fn an_unsealed_close_is_fenced_one_epoch_after_its_request_from_the_early_fence_frame() {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let fenced_after = |activation: Option<u64>, requested: u64| -> u64 {
+        set_early_fence_frame_for_thread(activation);
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let (_, state) = make_state(&db);
+        let keys = keys();
+        let filter = vec![0x6e; 32];
+        let first = initial(filter.clone(), &keys);
+        initialize(&state, 1, &first).unwrap();
+        schedule(&state, requested, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+        let due = schedule::fence_due_frame(requested);
+        for early in [requested + epoch - 1, requested + epoch, due - 1] {
+            if early < due {
+                assert_eq!(schedule::fence_stalled_sources(&state, early, &[filter.clone()], None).unwrap(), 0,
+                    "not at {early}, before {due}");
+            }
+        }
+        assert!(!is_fenced(&state, &first.id().unwrap()).unwrap());
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        assert!(is_fenced(&state, &first.id().unwrap()).unwrap());
+        set_early_fence_frame_for_thread(None);
+        due - requested
+    };
+    // Without a setting, never (assumes QUIL_EARLY_FENCE_FRAME is unset).
+    assert_eq!(fenced_after(None, 2), 4 * epoch, "by default four epochs");
+    assert_eq!(fenced_after(Some(0), 2), epoch);
+    assert_eq!(fenced_after(Some(2), 2), epoch, "a request at the frame");
+    assert_eq!(fenced_after(Some(3), 2), 4 * epoch, "a request before the frame keeps four epochs");
+}
+
+/// Early fences are GLOBAL consensus and not scheduled on mainnet: by
+/// default every closing session keeps the four-epoch timeout.
+#[test]
+fn early_fences_are_not_scheduled_by_default() {
+    assert_eq!(MAINNET_EARLY_FENCE_FRAME, None);
+    assert_eq!(early_fence_frame_for(0, None), u64::MAX);
+    assert_eq!(early_fence_frame_for(0, Some("7")), u64::MAX);
+    assert_eq!(early_fence_frame_for(1, Some("7")), 7);
+    assert_eq!(early_fence_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(early_fence_frame_for(1, None), u64::MAX);
+    set_early_fence_frame_for_thread(None);
+    assert_eq!(schedule::fence_after_epochs(u64::MAX - 1), schedule::FENCE_AFTER_EPOCHS);
+    assert_eq!(schedule::fence_due_frame(2), 2 + fence_timeout());
+}
+
 /// A stalled session GLOBAL never executed a frame of is fenced at its base
 /// and succeeded. With a same-filter predecessor the fence carries that
 /// predecessor's certified roots; a first session (like a split or merge
