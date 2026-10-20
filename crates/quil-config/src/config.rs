@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DbConfig, EngineConfig, ExplorerConfig, KeyConfig, LogConfig, P2PConfig, ProofWorkerConfig};
+use crate::{
+    DbConfig, DiagnosticsConfig, EngineConfig, ExplorerConfig, KeyConfig, LogConfig, P2PConfig, ProofWorkerConfig,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +27,9 @@ pub struct Config {
     /// limits and executable path; the network policy itself is compiled in).
     #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub proof_worker: ProofWorkerConfig,
+    /// Opt-in diagnostics served to peers this node names; off by default.
+    #[serde(default, deserialize_with = "crate::deserialize_null_default")]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 /// The gRPC listener a node binds when `listenGrpcMultiaddr` is empty: local
@@ -55,6 +60,7 @@ impl Default for Config {
             listen_rest_multiaddr: String::new(),
             explorer: ExplorerConfig::default(),
             proof_worker: ProofWorkerConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 }
@@ -67,6 +73,7 @@ impl Config {
         self.db.apply_defaults();
         self.explorer.apply_defaults();
         self.proof_worker.apply_defaults();
+        self.diagnostics.apply_defaults();
     }
 }
 
@@ -93,5 +100,26 @@ mod tests {
         assert!(encoded.contains("proofWorker:"));
         let decoded: Config = serde_yaml::from_str(&encoded).unwrap();
         assert_eq!(decoded.proof_worker, explicit.proof_worker);
+    }
+
+    #[test]
+    fn diagnostics_are_off_unless_configured_and_their_interval_is_clamped() {
+        for yaml in ["p2p:\n  network: 1\n", "diagnostics: null\n", "diagnostics:\n  healthReport: null\n"] {
+            let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+            config.apply_defaults();
+            assert_eq!(config.diagnostics, DiagnosticsConfig::default(), "{yaml}");
+            assert!(!config.diagnostics.health_report.enabled);
+        }
+        assert!(!Config::default().diagnostics.health_report.enabled);
+        let mut config: Config = serde_yaml::from_str(
+            "diagnostics:\n  healthReport:\n    enabled: true\n    allowedPeers: [QmPeer]\n    minIntervalSecs: 1\n",
+        )
+        .unwrap();
+        config.apply_defaults();
+        let report = &config.diagnostics.health_report;
+        assert!(report.enabled);
+        assert_eq!((report.allowed_peers.as_slice(), report.min_interval_secs), (["QmPeer".to_string()].as_slice(), 10));
+        let decoded: Config = serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.diagnostics, config.diagnostics);
     }
 }

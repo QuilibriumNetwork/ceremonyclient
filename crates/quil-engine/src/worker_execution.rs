@@ -12,6 +12,43 @@ tokio::task_local! {
     static RECOVERING: SharedWorkerExecution;
 }
 
+/// Every phase a worker execution record names (`WorkerExecution.state`).
+/// Readers outside the engine map these literals, so add a new one here.
+pub const STATES: [&str; 9] =
+    ["starting", "waiting", "syncing", "serving", "closing", "handoff", "blocked", "stopped", "unknown"];
+
+/// Every reason a record gives for its phase (`WorkerExecution.blocker`),
+/// besides none.
+pub const BLOCKERS: [&str; 13] = [
+    "waiting for transport",
+    "restarting consensus host",
+    "engine exited",
+    "awaiting successor",
+    "staging shard data",
+    "awaiting closing certificate",
+    "awaiting allocation activation",
+    "checkpoint mismatch",
+    "state unavailable",
+    "committee admission unavailable",
+    "consensus startup unavailable",
+    "session identity unavailable",
+    "session state unavailable",
+];
+
+/// Every archive recovery phase (`ShardRecovery.phase`).
+pub const RECOVERY_PHASES: [&str; 6] = [
+    "idle",
+    "waiting_for_permit",
+    "replaying_frames",
+    "fetching_checkpoint",
+    "installing_leaves",
+    "installing_checkpoint",
+];
+
+/// Every class [`failure_class`] gives a failed recovery attempt.
+pub const FAILURE_CLASSES: [&str; 6] =
+    [NO_ARCHIVE, "connect", "archive_request", "archive_state", "replay_mismatch", "other"];
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis() as u64
@@ -158,6 +195,8 @@ impl SharedWorkerExecution {
                     r.last_error = failure.clone();
                     r.last_error_unix_ms = now;
                     r.consecutive_failures += 1;
+                    let count = r.failures_by_class.entry(failure_class(failure).into()).or_default();
+                    *count = count.saturating_add(1);
                 }
                 (None, progress) => {
                     r.last_outcome = progress.as_ref().map(ToString::to_string).unwrap_or_default();
@@ -330,8 +369,9 @@ fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: In
     }
 }
 
-/// The class of a failed recovery attempt, from its error or not-ready text.
-fn failure_class(error: &str) -> &'static str {
+/// The class of a failed recovery attempt, from its error or not-ready
+/// text: one of [`FAILURE_CLASSES`].
+pub fn failure_class(error: &str) -> &'static str {
     if error.contains("no archive known") || error.contains("discovered an archive") || error.contains("archive discovery") {
         NO_ARCHIVE
     } else if error.contains("archive connect") {
@@ -368,6 +408,7 @@ fn enter(r: &mut ShardRecovery, phase: &str, now: u64) {
     if r.phase != phase {
         if r.phase == "waiting_for_permit" {
             r.permit_wait_ms = now.saturating_sub(r.phase_since_unix_ms);
+            r.longest_permit_wait_ms = r.longest_permit_wait_ms.max(r.permit_wait_ms);
         }
         r.phase = phase.into();
         r.phase_since_unix_ms = now;
@@ -495,6 +536,112 @@ mod tests {
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.last_error.contains("archive discovery timed out"));
         assert_eq!(r.consecutive_failures, 2);
+        let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
+        assert_eq!(classes, BTreeMap::from([("archive_state".into(), 1), ("no_archive_known".into(), 1)]),
+            "failures are counted by class since the engine started");
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A failure streak warns once it reaches the threshold, then only
+    /// every repeat interval with its count and duration, and its end is
+    /// named once.
+    #[test]
+    fn a_failure_streak_warns_after_the_threshold_and_then_at_a_bounded_rate() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.succeeded(start), None, "no streak, no end");
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("connect", start, 3), None);
+        assert_eq!(streak.failed("no_archive_known", start + MINUTE, 3),
+            Some(StreakLog::Failing { failures: 3, duration: MINUTE }));
+        for minute in 2..11 {
+            assert_eq!(streak.failed("no_archive_known", start + MINUTE * minute, 3), None);
+        }
+        assert_eq!(streak.failed("connect", start + MINUTE * 11, 3),
+            Some(StreakLog::Failing { failures: 13, duration: MINUTE * 11 }));
+        assert_eq!(streak.classes(), "connect=3,no_archive_known=10");
+        assert_eq!(streak.succeeded(start + MINUTE * 20),
+            Some(StreakLog::Ended { failures: 13, duration: MINUTE * 20 }));
+        assert_eq!(streak.succeeded(start + MINUTE * 21), None);
+        assert_eq!(streak.classes(), "");
+    }
+
+    /// Failures between successes do not warn, and a flapping recovery
+    /// warns at most once per repeat interval; an unwarned streak's end is
+    /// not named.
+    #[test]
+    fn a_flapping_recovery_warns_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        let mut warnings = 0;
+        for minute in 0..20 {
+            let at = start + MINUTE * minute;
+            if minute % 4 == 3 {
+                streak.succeeded(at);
+                continue;
+            }
+            warnings += usize::from(streak.failed("connect", at, 3).is_some());
+        }
+        assert_eq!(warnings, 2, "minutes 2 and 14");
+        for minute in 20..30 {
+            let at = start + MINUTE * minute;
+            assert_eq!(streak.failed("connect", at, 3), None);
+            assert_eq!(streak.succeeded(at), None);
+        }
+    }
+
+    /// Recoveries finding no archive warn once for the node, with the
+    /// shards affected, and end when any recovery reaches an archive.
+    #[test]
+    fn a_node_without_archives_warns_once_for_all_its_workers() {
+        let start = Instant::now();
+        let mut node = NoArchive::new();
+        assert_eq!(node.resolved(start), None);
+        assert_eq!(node.failed(&[1; 32], start), Some((StreakLog::Failing { failures: 1, duration: Duration::ZERO }, 1)));
+        for worker in 2..100u8 {
+            assert_eq!(node.failed(&[worker; 32], start + MINUTE), None);
+        }
+        assert_eq!(node.failed(&[1; 32], start + MINUTE * 10),
+            Some((StreakLog::Failing { failures: 100, duration: MINUTE * 10 }, 99)));
+        assert_eq!(node.resolved(start + MINUTE * 11),
+            Some((StreakLog::Ended { failures: 100, duration: MINUTE * 11 }, 99)));
+    }
+
+    /// Each shard keeps its own streak: another shard's success does not
+    /// end it, and a node without archives leaves the worker's own warning
+    /// to the node's.
+    #[tokio::test]
+    async fn streaks_are_kept_per_shard() {
+        let worker = SharedWorkerExecution::default();
+        let fail = || async { Err(quil_types::error::QuilError::Internal("archive connect: refused".into())) };
+        for _ in 0..2 {
+            let _ = worker.recovering(&[1; 32], fail()).await;
+        }
+        let _ = worker.recovering(&[2; 32], async { Ok(ShardRecoveryProgress::Anchored { frame: 3 }) }).await;
+        let _ = worker.recovering(&[1; 32], fail()).await;
+        let streaks = worker.streaks.lock().unwrap();
+        assert_eq!(streaks[&vec![1; 32]].failures, 3, "the other shard's success must not reset it");
+        assert!(streaks[&vec![1; 32]].reported);
+        assert_eq!(streaks[&vec![2; 32]].failures, 0);
+    }
+
+    #[test]
+    fn failures_are_classed_by_whose_problem_they_are() {
+        for (error, class) in [
+            ("execution unavailable: no archive known yet", "no_archive_known"),
+            ("internal error: archive connect: invalid endpoint: invalid URI", "connect"),
+            ("internal error: get app-shard frame: status: Unavailable", "archive_request"),
+            ("invalid argument: wrong-shard archive replay tip", "replay_mismatch"),
+            ("execution unavailable: archive replay pre-state mismatch at phase 0", "replay_mismatch"),
+            ("the archive checkpoint failed validation", "archive_state"),
+            ("execution unavailable: archive replay is missing shard frame 9", "archive_state"),
+            ("actor rejected checkpoint", "other"),
+        ] {
+            assert_eq!(failure_class(error), class, "{error}");
+        }
+        assert_eq!(failure_guidance("no_archive_known").0, "this node");
+        assert_eq!(failure_guidance("connect").0, "archive");
     }
 
     const MINUTE: Duration = Duration::from_secs(60);
@@ -613,5 +760,61 @@ mod tests {
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.permit_wait_ms >= 60, "{}", r.permit_wait_ms);
         assert!(r.attempt_ms >= 30 && r.attempt_ms < r.permit_wait_ms + 30, "{} after {}", r.attempt_ms, r.permit_wait_ms);
+        let longest = r.longest_permit_wait_ms;
+        assert_eq!(longest, r.permit_wait_ms);
+        let _ = worker.recovering(&[7; 32], async {
+            recovery_phase("waiting_for_permit");
+            recovery_phase("fetching_checkpoint");
+            Ok(ShardRecoveryProgress::Anchored { frame: 2 })
+        }).await;
+        let r = worker.snapshot().recovery.unwrap();
+        assert!(r.permit_wait_ms < longest);
+        assert_eq!(r.longest_permit_wait_ms, longest, "the longest wait outlasts a shorter one");
     }
+
+    /// The text between `start` and the next `end` after it in `source`.
+    fn region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let from = source.find(start).unwrap_or_else(|| panic!("{start} not found"));
+        let rest = &source[from + start.len()..];
+        &rest[..rest.find(end).unwrap_or_else(|| panic!("{end} not found after {start}"))]
+    }
+
+    /// The string literals of each `open` … `close` in `source` that starts
+    /// with a literal, e.g. each `state("…", "…")` call.
+    fn literals<'a>(source: &'a str, open: &str, close: char) -> Vec<Vec<&'a str>> {
+        source.match_indices(open).filter_map(|(at, _)| {
+            let rest = &source[at + open.len()..];
+            rest.starts_with('"').then(|| rest[..rest.find(close).unwrap()].split('"').skip(1).step_by(2).collect())
+        }).collect()
+    }
+
+    /// Every phase and reason the engine writes is listed in [`STATES`] and
+    /// [`BLOCKERS`], every recovery phase in [`RECOVERY_PHASES`], and every
+    /// listed one is written: readers outside the engine map the lists.
+    #[test]
+    fn the_lists_hold_every_literal_the_engine_writes() {
+        let engine = include_str!("app_engine.rs");
+        let thread = include_str!("thread_worker.rs");
+        let syncer = include_str!("prover_tree_syncer.rs");
+        let own = include_str!("worker_execution.rs");
+        let own = &own[..own.find("#[cfg(test)]
+mod tests").unwrap()];
+        let phase = region(own, "pub fn consensus_phase", "self.state(state, reason)");
+        let chain = region(engine, "let blocker = ", ";");
+        let mut written: Vec<Vec<&str>> = [engine, thread].iter().flat_map(|s| literals(s, "state(", ')')).collect();
+        assert!(written.len() >= 10, "{written:?}");
+        written.extend(literals(phase, "(", ')'));
+        let chained = literals(chain, "{ ", '}');
+        assert_eq!(chained.len(), 4, "{chain}");
+        written.extend(chained.into_iter().map(|blocker| vec!["blocked", blocker[0]]));
+        let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();
+        let blockers: BTreeSet<&str> = written.iter().filter_map(|args| args.get(1).copied()).filter(|b| !b.is_empty()).collect();
+        assert_eq!(states, STATES.into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(blockers, BLOCKERS.into_iter().collect::<BTreeSet<_>>());
+        let phases: BTreeSet<&str> = [thread, syncer].iter().flat_map(|s| literals(s, "recovery_phase(", ')'))
+            .chain(literals(own, "enter(r, ", ','))
+            .map(|args| args[0]).collect();
+        assert_eq!(phases, RECOVERY_PHASES.into_iter().collect::<BTreeSet<_>>());
+    }
+
 }

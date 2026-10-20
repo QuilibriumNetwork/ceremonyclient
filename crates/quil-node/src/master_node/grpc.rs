@@ -1789,21 +1789,7 @@ pub(crate) fn spawn_all(
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let execution = wm.worker_execution();
-                let entries: Vec<quil_rpc::WorkerEntry> =
-                    quil_engine::worker::WorkerView::snapshot(wm.as_ref())
-                        .all
-                        .into_iter()
-                        .map(|w| quil_rpc::WorkerEntry {
-                            execution: execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
-                            core_id: w.core_id,
-                            filter: w.filter.clone(),
-                            available_storage: w.available_storage,
-                            total_storage: w.total_storage,
-                            manually_managed: w.manually_managed,
-                            allocated: !w.filter.is_empty(),
-                        })
-                        .collect();
+                let entries = worker_entries(wm.as_ref());
                 { *view.write().unwrap() = entries; }
             }
         });
@@ -2387,15 +2373,8 @@ pub(crate) fn spawn_all(
                     // dial; without it we fall back to log-and-drop.
                     let (exit_handler, exit_proxy): (quil_p2p::onion::OnData, _) = match onion_dialer_falcon.clone() {
                         Some(seed) => {
-                            let allowed: std::collections::HashSet<String> = [
-                                "/quilibrium.node.global.pb.DispatchService/PutInboxMessage",
-                                "/quilibrium.node.global.pb.DispatchService/GetInboxMessages",
-                                "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame",
-                                "/quilibrium.node.global.pb.GlobalService/GetAppShards",
-                            ]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
+                            let allowed: std::collections::HashSet<String> =
+                                ONION_EXIT_METHODS.iter().map(|s| s.to_string()).collect();
                             let proxy = quil_rpc::onion_exit::OnionExitProxy::new(
                                 seed,
                                 onion_peer_lookup.clone(),
@@ -2545,6 +2524,25 @@ pub(crate) fn spawn_all(
                 quil_rpc::peer_auth_middleware::peer_auth_interceptor,
             ))
         } else { None };
+
+        // The opt-in health report, on this authenticated listener only and
+        // never on the plaintext NodeService: its handler admits a caller by
+        // the peer ID the PQNoise handshake proved.
+        let diagnostics_service = {
+            let admission = Arc::new(quil_rpc::diagnostics_service::Admission::new(
+                &config.diagnostics.health_report,
+                peer_id,
+            ));
+            let (view, head, crdt) = (workers_view.clone(), last_global_head_frame.clone(), crdt.clone());
+            let source: quil_rpc::diagnostics_service::HealthSource =
+                Arc::new(move || health_inputs(&view, &head, &crdt));
+            let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
+                .expect("build script emits a SHA-256 fingerprint");
+            tonic::service::interceptor::InterceptedService::new(
+                quil_rpc::diagnostics_service::DiagnosticsServer::new(admission, source, fingerprint).into_service(),
+                quil_rpc::peer_auth_middleware::peer_auth_interceptor,
+            )
+        };
 
         let seed = mtls_seed.ok_or_else(|| anyhow::anyhow!(
             "peer gRPC requires an Ed448 identity — set `p2p.peerPrivKey` to a 57-byte hex seed (or 114-byte seed+pubkey). Without it no peer can authenticate against this node.",
@@ -2700,7 +2698,8 @@ pub(crate) fn spawn_all(
                 .add_service(connectivity_service)
                 .add_service(dispatch_service)
                 .add_service(mixnet_service)
-                .add_service(onion_service);
+                .add_service(onion_service)
+                .add_service(diagnostics_service);
             if let Some(pp) = pubsub_proxy_service {
                 info!("registering PubSubProxy on peer gRPC listener");
                 builder = builder.add_service(pp);
@@ -2729,6 +2728,58 @@ pub(crate) fn spawn_all(
     Ok(())
 }
 
+/// The only methods anonymous onion circuits reach through this node's exit.
+/// The exit dials with this node's identity, which other operators may
+/// allowlist for diagnostics, so the diagnostics service is never one.
+pub(crate) const ONION_EXIT_METHODS: [&str; 4] = [
+    "/quilibrium.node.global.pb.DispatchService/PutInboxMessage",
+    "/quilibrium.node.global.pb.DispatchService/GetInboxMessages",
+    "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame",
+    "/quilibrium.node.global.pb.GlobalService/GetAppShards",
+];
+
+/// The worker view: each worker with its engine's execution report.
+fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::WorkerEntry> {
+    let execution = wm.worker_execution();
+    quil_engine::worker::WorkerView::snapshot(wm)
+        .all
+        .into_iter()
+        .map(|w| quil_rpc::WorkerEntry {
+            execution: execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
+            core_id: w.core_id,
+            filter: w.filter.clone(),
+            available_storage: w.available_storage,
+            total_storage: w.total_storage,
+            manually_managed: w.manually_managed,
+            allocated: !w.filter.is_empty(),
+        })
+        .collect()
+}
+
+/// What a health report reads: the worker view, the GLOBAL head and the
+/// committed session head of each allocated worker's shard.
+fn health_inputs(
+    view: &std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>,
+    head: &std::sync::atomic::AtomicU64,
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+) -> quil_rpc::diagnostics_service::HealthInputs {
+    let workers = view.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let filters: Vec<Vec<u8>> =
+        workers.iter().filter(|w| !w.filter.is_empty()).map(|w| w.filter.clone()).collect();
+    let committee_heads = match committed_global_app_heads(crdt, &filters) {
+        Ok(heads) => filters.into_iter().zip(heads).filter_map(|(filter, head)| Some((filter, head?))).collect(),
+        Err(error) => {
+            debug!(%error, "health report without committee heads: committed GLOBAL state unavailable");
+            Default::default()
+        }
+    };
+    quil_rpc::diagnostics_service::HealthInputs {
+        workers,
+        committee_heads,
+        global_head_frame: head.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
 /// volatile clock or an archive provider's reported materialization cursor.
 fn committed_global_app_heads(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, filters: &[Vec<u8>])
@@ -2744,6 +2795,105 @@ fn committed_global_app_heads(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, filte
             generation: session.generation,
         }))
     }).collect()
+}
+
+#[cfg(test)]
+mod onion_exit_tests {
+    /// Anonymous circuits leave through the exit under this node's
+    /// identity: they reach the four listed reads, never diagnostics.
+    #[test]
+    fn the_onion_exit_never_reaches_diagnostics() {
+        use quil_types::proto::diagnostics::diagnostics_service_server::SERVICE_NAME;
+        assert_eq!(SERVICE_NAME, "quilibrium.node.diagnostics.pb.DiagnosticsService");
+        for method in super::ONION_EXIT_METHODS {
+            assert!(!method.starts_with(&format!("/{SERVICE_NAME}/")) && !method.contains(".diagnostics."), "{method}");
+        }
+        assert_eq!(super::ONION_EXIT_METHODS, [
+            "/quilibrium.node.global.pb.DispatchService/PutInboxMessage",
+            "/quilibrium.node.global.pb.DispatchService/GetInboxMessages",
+            "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame",
+            "/quilibrium.node.global.pb.GlobalService/GetAppShards",
+        ], "a method added to the exit needs its own review");
+    }
+
+    /// The service is added once, to the authenticated peer listener, and
+    /// never to the plaintext NodeService.
+    #[test]
+    fn diagnostics_are_served_on_the_peer_listener_only() {
+        let source = include_str!("grpc.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod onion_exit_tests").unwrap()];
+        let at = |text: &str| source.find(text).unwrap_or_else(|| panic!("{text} not found"));
+        assert_eq!(source.matches(".add_service(diagnostics_service)").count(), 1);
+        assert_eq!(source.matches("DiagnosticsServer::new").count(), 1);
+        let peer = at("let mut builder = tonic::transport::Server::builder()");
+        let added = at(".add_service(diagnostics_service)");
+        let served = peer + source[peer..].find(".serve_with_incoming_shutdown(incoming").unwrap();
+        assert!(peer < added && added < served, "outside the peer listener's builder");
+        let built = at("DiagnosticsServer::new");
+        assert!(source[built..added].contains("peer_auth_interceptor"), "without the handshake identity");
+        let plaintext = &source[at("NodeServiceServer::new")..];
+        let plaintext = &plaintext[..plaintext.find(".serve_with_shutdown(addr").unwrap()];
+        assert!(!plaintext.contains("diagnostics"), "{plaintext}");
+    }
+}
+
+#[cfg(test)]
+mod health_input_tests {
+    use super::*;
+    use quil_execution::{hypergraph_state::HypergraphState, global_intrinsic::handoff};
+    use quil_rpc::diagnostics_service::build_report;
+    use quil_types::crypto::Signer as _;
+    use quil_types::proto::diagnostics::Phase;
+
+    /// The report reads the master's worker view as the refresh loop builds
+    /// it, and each allocated shard's committed session head.
+    #[test]
+    fn the_report_reads_the_worker_view_and_committed_session_heads() {
+        let workers = quil_engine::test_support::TestWorkerManager::new();
+        let (filter, other) = (vec![1; 32], vec![2; 32]);
+        workers.add_with_filter(1, filter.clone());
+        workers.add_with_filter(2, other.clone());
+        workers.add_with_filter(3, Vec::new());
+        let serving = quil_types::proto::node::WorkerExecution {
+            state: "serving".into(), materialized_frame: Some(5), observed_unix_ms: 1, ..Default::default() };
+        workers.set_execution(1, &filter, serving);
+        workers.set_execution(2, &[9; 32], quil_types::proto::node::WorkerExecution { state: "blocked".into(), ..Default::default() });
+        let view = std::sync::RwLock::new(worker_entries(&workers));
+        let head = std::sync::atomic::AtomicU64::new(100);
+
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let unread = health_inputs(&view, &head, &crdt);
+        assert!(unread.committee_heads.is_empty(), "no committed GLOBAL state yet");
+        assert_eq!(unread.workers.len(), 3, "the workers are reported without it");
+
+        let state = HypergraphState::new(crdt.clone());
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [0x11; 32], filter: filter.clone(), generation: 1,
+            genesis: [0x33; 32], base_frame: 0, authorization: [0x22; 32],
+            members: vec![signer.public_key().to_vec()],
+        };
+        handoff::initialize(&state, 100, &session).unwrap();
+        state.commit().unwrap(); state.abort();
+        crdt.commit_with_global_cursor(100, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+
+        let inputs = health_inputs(&view, &head, &crdt);
+        assert_eq!(inputs.global_head_frame, 100);
+        assert_eq!(inputs.committee_heads.keys().collect::<Vec<_>>(), [&filter], "only shards with a session");
+        let report = build_report(&inputs, &[], 0);
+        let rows: Vec<_> = report.workers.iter().map(|w| (w.core_id, w.allocated, w.phase(), w.materialized_frame,
+            w.committee_head_frame, w.committed_generation)).collect();
+        assert_eq!(rows, [
+            (1, true, Phase::Serving, Some(5), Some(0), Some(1)),
+            (2, true, Phase::Unspecified, None, None, None),
+            (3, false, Phase::Unspecified, None, None, None),
+        ], "a report for another filter is not the worker's");
+    }
 }
 
 #[cfg(test)]

@@ -1020,7 +1020,7 @@ impl Service<Uri> for QuilPqNoiseConnector {
                 crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref()).await?;
             if expected_peer.is_some_and(|expected| peer != expected) {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                    "PQNoise server identity does not match the configured master").into());
+                    "PQNoise server identity does not match the expected peer").into());
             }
             if refused_peer == Some(peer) {
                 return Err(Box::new(OwnEndpoint) as Box<dyn std::error::Error + Send + Sync>);

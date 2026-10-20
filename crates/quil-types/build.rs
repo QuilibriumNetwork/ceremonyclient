@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto_dir.join("proxy.proto"),
         proto_dir.join("ferret_proxy.proto"),
         proto_dir.join("global.proto"),
+        proto_dir.join("diagnostics.proto"),
     ];
 
     // build_transport(false) suppresses the inherent `Client::connect(uri)`

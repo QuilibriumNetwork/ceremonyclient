@@ -1,5 +1,6 @@
 pub mod archive_client;
 pub mod archive_shard_list;
+pub mod diagnostics_service;
 pub mod dispatch_service;
 pub mod forest_read_cache;
 pub mod forest_sync_reader;
