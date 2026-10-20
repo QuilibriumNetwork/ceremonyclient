@@ -2987,6 +2987,7 @@ impl GlobalIntrinsic {
         #[cfg(not(feature = "confidential-tokens"))]
         let _ = flipped;
         self.reconcile_committee_sessions(frame_number, state)?;
+        self.log_local_shard_grid_once_per_epoch(frame_number, state);
         state.stage_records([quil_types::store::RecordMutation {
             key: DUE_FRAME_KEY.to_vec(), value: Some(frame_number.to_be_bytes().to_vec()),
         }]);
@@ -3245,6 +3246,21 @@ impl GlobalIntrinsic {
             Some(((_, first), rest)) if rest.iter().all(|(_, order)| order == first) => Ok(first.clone()),
             Some(_) => Err("the frame record holds the merge in more than one order, and which applied is unknown"),
         }
+    }
+
+    /// The `local shard grid` line at the first frame this process executes
+    /// in each epoch (see [`log_local_shard_grid`]).
+    fn log_local_shard_grid_once_per_epoch(&self, frame_number: u64, state: &HypergraphState) {
+        static LOGGED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled) else {
+            return;
+        };
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        if LOGGED_EPOCH.swap(epoch, std::sync::atomic::Ordering::Relaxed) == epoch {
+            return;
+        }
+        let batch = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
+        log_local_shard_grid(&batch, Some(frame_number));
     }
 
     /// Returns every `(application, removed shard path)` this frame's flips
@@ -4734,6 +4750,109 @@ fn report_repair_failure(frame: u64, filter: Option<&[u8]>, error: &QuilError) {
             "shard grid repair: the check for lost pending splits and merges failed; it runs again at \
              the next frame (logged once per epoch)"
         );
+    }
+}
+
+/// A node's local shard grid in brief: its rows, its pending splits and
+/// merges, and short digests of each. Neither is part of any committed root,
+/// so these are what lets archive operators compare their grids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalShardGrid {
+    pub rows: usize,
+    pub pending: usize,
+    /// [`filter_list_digest`] over every application's live filters.
+    pub digest: String,
+    /// The same over the sorted pending changes (kind, effective epoch,
+    /// proposal frame, parent, sorted children).
+    pub pending_digest: String,
+    /// Rows of the QUIL token application's grid.
+    pub quil_rows: usize,
+    /// [`filter_list_digest`] over the QUIL grid alone, computed as the
+    /// archive-list digest proposed in #816.
+    pub quil_digest: String,
+}
+
+/// The live filters of grid `rows`, spelled as `GetAppShards` readers build
+/// them.
+fn grid_filters<'a>(rows: impl Iterator<Item = &'a ShardInfo>) -> std::collections::BTreeSet<Vec<u8>> {
+    rows.filter(|row| row.shard_key.len() >= 35)
+        .map(|row| quil_forest::shard_prefix_to_filter(&row.shard_key[3..35], &row.prefix))
+        .filter(|filter| !filter.is_empty())
+        .collect()
+}
+
+/// First 8 hex digits of SHA-256 over `filters`, each length-prefixed (u32,
+/// big-endian), in sorted order: the algorithm of the archive-list digest
+/// proposed in #816, so the two compare directly.
+fn filter_list_digest(filters: &std::collections::BTreeSet<Vec<u8>>) -> String {
+    let mut hasher = Sha256::new();
+    for filter in filters {
+        hasher.update((filter.len() as u32).to_be_bytes());
+        hasher.update(filter);
+    }
+    hex::encode(&hasher.finalize()[..4])
+}
+
+pub fn local_shard_grid(store: &dyn ShardsStore) -> Result<LocalShardGrid> {
+    let rows = store.range_app_shards()?;
+    let digest = filter_list_digest(&grid_filters(rows.iter()));
+    let quil = crate::domains::QUIL_TOKEN;
+    let mut quil_key = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
+    quil_key.extend_from_slice(&quil);
+    let quil_rows = rows.iter().filter(|row| row.shard_key == quil_key).count();
+    let quil_digest = filter_list_digest(&grid_filters(rows.iter().filter(|row| row.shard_key == quil_key)));
+    let mut pending = store.all_pending_shard_changes()?;
+    for change in &mut pending {
+        change.children.sort();
+    }
+    pending.sort_by(|a, b| {
+        (a.effective_epoch, &a.parent, a.proposed_frame).cmp(&(b.effective_epoch, &b.parent, b.proposed_frame))
+    });
+    let mut hasher = Sha256::new();
+    for change in &pending {
+        hasher.update([match change.kind {
+            ShardChangeKind::Split => 1u8,
+            ShardChangeKind::Merge => 2u8,
+        }]);
+        hasher.update(change.effective_epoch.to_be_bytes());
+        hasher.update(change.proposed_frame.to_be_bytes());
+        for filter in std::iter::once(&change.parent).chain(&change.children) {
+            hasher.update((filter.len() as u32).to_be_bytes());
+            hasher.update(filter);
+        }
+    }
+    let pending_digest = hex::encode(&hasher.finalize()[..4]);
+    Ok(LocalShardGrid { rows: rows.len(), pending: pending.len(), digest, pending_digest, quil_rows, quil_digest })
+}
+
+/// Log the node's local shard grid (rows, pending changes, digests), at
+/// startup (`frame` `None`) or after a frame's execution.
+pub fn log_local_shard_grid(store: &dyn ShardsStore, frame: Option<u64>) {
+    match (local_shard_grid(store), frame) {
+        (Ok(grid), Some(frame)) => tracing::info!(
+            frame,
+            epoch = quil_types::consensus::epoch_for_frame(frame),
+            rows = grid.rows,
+            pending = grid.pending,
+            digest = %grid.digest,
+            pending_digest = %grid.pending_digest,
+            quil_rows = grid.quil_rows,
+            quil_digest = %grid.quil_digest,
+            "local shard grid: rows, pending splits and merges, and digests at the first frame executed \
+             in this epoch; archives with equal digests at the same frame hold the same grid. quil_digest \
+             is computed as the archive-list digest of #816 over the QUIL grid"
+        ),
+        (Ok(grid), None) => tracing::info!(
+            rows = grid.rows,
+            pending = grid.pending,
+            digest = %grid.digest,
+            pending_digest = %grid.pending_digest,
+            quil_rows = grid.quil_rows,
+            quil_digest = %grid.quil_digest,
+            "local shard grid: rows, pending splits and merges, and digests at startup. quil_digest is \
+             computed as the archive-list digest of #816 over the QUIL grid"
+        ),
+        (Err(error), _) => tracing::warn!(?frame, %error, "local shard grid: the local grid could not be read"),
     }
 }
 

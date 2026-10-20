@@ -3544,13 +3544,30 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     {
                                                         Ok(()) => {
                                                             m.seed_cursor(vf);
-                                                            info!(
+                                                            // The skipped frames' local
+                                                            // records (shard grid, pending
+                                                            // splits and merges) are never
+                                                            // written here.
+                                                            warn!(
                                                                 from = cursor,
                                                                 to = vf,
+                                                                skipped_from = cursor + 1,
+                                                                skipped_to = vf,
+                                                                skipped_frames = vf - cursor,
                                                                 "reconcile: advanced materialized \
                                                                  cursor to the synced prover head \
                                                                  (breaks the shard-ahead-of-cursor \
-                                                                 epoch-skew replay loop)",
+                                                                 epoch-skew replay loop); frames \
+                                                                 skipped_from..=skipped_to are not \
+                                                                 executed here, so splits and merges \
+                                                                 proposed in them are never recorded \
+                                                                 in this node's local shard grid, and \
+                                                                 flips due in them apply here late or \
+                                                                 not at all. The grid repair scans at \
+                                                                 the next frame and may restore some \
+                                                                 committee-governed ones; compare \
+                                                                 digest and quil_digest in the `local \
+                                                                 shard grid` line with other archives",
                                                             );
                                                         }
                                                         Err(e) => warn!(
