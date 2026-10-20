@@ -2084,7 +2084,24 @@ impl ProverLifecycle {
             // count(workers where !allocated). Mirrors Go's gate so a
             // node with more pending confirms than free workers doesn't
             // commit to allocations it can't service.
-            let available_workers = workers.iter().filter(|w| !w.allocated).count();
+            //
+            // Less the workers owed to allocations we already hold that no
+            // worker serves (a lost worker, a binding not yet made): an Active
+            // or Paused seat, a notice period, a recovering renewal and a
+            // confirmed join stay or become committee members whatever a
+            // pending join does, so a pending join must not take the worker
+            // one of them needs. Pending joins are what this cap decides.
+            let owed_workers = prover_info.as_ref().map_or(0, |p| p.allocations.iter()
+                .filter(|a| !a.confirmation_filter.is_empty()
+                    && !worker_bound_filters.contains(&a.confirmation_filter))
+                .filter(|a| match a.phase(frame_number) {
+                    Some(quil_types::consensus::AllocationPhase::Joining) => false,
+                    Some(_) => true,
+                    None => self.allocator.renewal_recovering(a, frame_number),
+                })
+                .count());
+            let available_workers = workers.iter().filter(|w| !w.allocated).count()
+                .saturating_sub(owed_workers);
 
             // Manual bucket: confirm up to capacity, reject excess
             // (capacity-only, deterministic lexicographic order so
@@ -6687,6 +6704,54 @@ mod proposal_loop_tests {
         let actions = evaluate();
         assert!(count_confirms(&actions).contains(&root), "{actions:?}");
         assert!(!count_reject_filters(&actions).contains(&root), "{actions:?}");
+    }
+
+    /// A worker owed to an allocation this prover already holds is no
+    /// capacity for a pending join: a confirmed join no worker serves (its
+    /// worker lost) is a committee member from the boundary whatever happens,
+    /// so the pending join holding the only free worker is rejected, even on
+    /// a halt-risk shard, instead of confirmed into a seat nothing serves.
+    #[test]
+    fn a_pending_join_does_not_take_the_worker_a_held_seat_is_owed() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let waiting = filter_bytes(0xB0);
+        let held = filter_bytes(0xB1);
+        let large = filter_bytes(0xA2);
+        let decide = |held_bound: bool| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            let reg = Arc::new(ConfigurableRegistry::new());
+            wm.add(WorkerInfo {
+                core_id: 1, filter: waiting.clone(), available_storage: 0, total_storage: 0,
+                manually_managed: false, pending_filter_frame: 0, allocated: false,
+            });
+            if held_bound {
+                wm.add(allocated_worker(2, held.clone()));
+            }
+            // Confirmed in epoch 1: a member from the epoch-2 boundary.
+            let mut activating = alloc(held.clone(), ProverStatus::Active, 10);
+            activating.join_confirm_frame_number = 760;
+            assert_eq!(activating.phase(800), Some(quil_types::consensus::AllocationPhase::Activating));
+            reg.set_prover(prover(address.clone(),
+                vec![alloc(waiting.clone(), ProverStatus::Joining, 50), activating]));
+            let mut counts = HashMap::new();
+            counts.insert(ProverStatus::Active, 2);
+            reg.set_summaries(vec![
+                ProverShardSummary { filter: waiting.clone(), status_counts: counts, total_size: 1_000 },
+                shard_summary(held.clone(), 5),
+                ProverShardSummary { filter: large.clone(), status_counts: HashMap::new(), total_size: 100_000_000 },
+            ]);
+            let lifecycle = make_lifecycle(
+                address.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            lifecycle.set_prover_root_verified_frame(800);
+            let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            (count_confirms(&actions).contains(&waiting), count_reject_filters(&actions).contains(&waiting))
+        };
+        assert_eq!(decide(true), (true, false), "the held seat has its worker: the halt-risk join confirms");
+        assert_eq!(decide(false), (false, true), "the free worker is owed to the confirmed join");
     }
 
     // Every joiner of a halt-risk shard confirms regardless of score, though
