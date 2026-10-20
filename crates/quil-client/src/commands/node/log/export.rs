@@ -36,7 +36,7 @@ const SAMPLE_LINES: usize = 20;
 const ROTATION_TZ_SLACK_SECS: i64 = 14 * 3600;
 
 /// Name of the redacted log inside the bundle.
-const BUNDLE_LOG: &str = "node.log.gz";
+pub(crate) const BUNDLE_LOG: &str = "node.log.gz";
 
 /// What redaction hides and what it cannot hide; shown in the help, the
 /// preview and the manifest.
@@ -494,7 +494,7 @@ pub(crate) fn parse_when(s: &str, now: i64) -> anyhow::Result<i64> {
 }
 
 /// `YYYYMMDDTHHMMSSZ` of UTC Unix seconds, for file names.
-fn compact_ts(secs: i64) -> String {
+pub(crate) fn compact_ts(secs: i64) -> String {
     redact::format_rfc3339_utc(secs).replace(['-', ':'], "")
 }
 
@@ -577,11 +577,18 @@ pub(crate) fn manifest(
     })
 }
 
-/// The preview printed before writing.
-fn preview(manifest: &serde_json::Value, stats: &ExportStats, out: &Path, map_path: &Path) -> String {
+/// The preview printed before writing; `destination` says where the bundle
+/// goes.
+pub(crate) fn preview(manifest: &serde_json::Value, stats: &ExportStats, destination: &str, map_path: &Path) -> String {
     let mut s = String::new();
     let w = &manifest["window"];
     s.push_str(&format!("Window: {} .. {} (UTC)\n", w["since"].as_str().unwrap_or(""), w["until"].as_str().unwrap_or("")));
+    if let Some(filters) = manifest["selection"]["filters"].as_array().filter(|f| !f.is_empty()) {
+        s.push_str("Shard filters (their lines, plus every warn and error line):\n");
+        for filter in filters {
+            s.push_str(&format!("  {}\n", filter.as_str().unwrap_or("")));
+        }
+    }
     let src = &manifest["source"];
     match src["kind"].as_str() {
         Some("files") => {
@@ -618,13 +625,14 @@ fn preview(manifest: &serde_json::Value, stats: &ExportStats, out: &Path, map_pa
     }
     s.push_str(REDACTION_NOTE);
     s.push('\n');
-    s.push_str(&format!("Bundle: {}\n", out.display()));
+    s.push_str(destination);
+    s.push('\n');
     s.push_str(&format!("Token map (original values; keep private, never share it): {}\n", map_path.display()));
     s
 }
 
 /// Removes a staging directory unless disarmed.
-struct StagingGuard(Option<PathBuf>);
+pub(crate) struct StagingGuard(pub Option<PathBuf>);
 
 impl Drop for StagingGuard {
     fn drop(&mut self) {
@@ -635,7 +643,7 @@ impl Drop for StagingGuard {
 }
 
 /// `path` with `suffix` appended to its last component.
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
@@ -670,8 +678,8 @@ fn local_literals() -> Vec<(&'static str, String)> {
     out
 }
 
-/// Write the token map, readable by the owner only.
-fn write_token_map(path: &Path, bundle: &Path, map: &BTreeMap<String, String>) -> anyhow::Result<()> {
+/// Write the token map of the export `about`, readable by the owner only.
+pub(crate) fn write_token_map(path: &Path, about: &str, map: &BTreeMap<String, String>) -> anyhow::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -680,19 +688,15 @@ fn write_token_map(path: &Path, bundle: &Path, map: &BTreeMap<String, String>) -
         opts.mode(0o600);
     }
     let mut f = opts.open(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
-    writeln!(f, "# Token map of {}: original values. PRIVATE: do not share this file.", bundle.display())?;
+    writeln!(f, "# Token map of {about}: original values. PRIVATE: do not share this file.")?;
     for (token, value) in map {
         writeln!(f, "{token}\t{value}")?;
     }
     Ok(())
 }
 
-/// `qclient node log export`.
-pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("clock: {e}"))?
-        .as_secs() as i64;
+/// The records `args` selects at `now`.
+pub(crate) fn selection(args: &ExportArgs, now: i64) -> anyhow::Result<Selection> {
     let until = match &args.until {
         Some(u) => parse_when(u, now)?,
         None => now,
@@ -712,50 +716,25 @@ pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
         }
         filters.push(f);
     }
-    let selection = Selection {
+    Ok(Selection {
         since,
         until,
         min_level: args.level.map_or(0, MinLevel::rank),
         filters,
         matches: args.matches.clone(),
-    };
+    })
+}
 
-    let log_dir = match args.source {
-        LogSource::Journal => None,
-        LogSource::Auto => configured_log_dir_if_present(global),
-        LogSource::Files => match super::configured_log_dir(global)? {
-            Some(dir) if dir.is_dir() => Some(dir),
-            Some(dir) => anyhow::bail!("log directory not found: {}", dir.display()),
-            None => anyhow::bail!("the node writes no log files (logger.path is none); use --source journal"),
-        },
-    };
-    let mut child: Option<Child> = None;
-    let (readers, source) = match &log_dir {
-        Some(dir) => {
-            let (readers, names) = file_readers(dir, since, until)?;
-            if names.is_empty() {
-                anyhow::bail!("no node log files in {}", dir.display());
-            }
-            (readers, SourceInfo::Files(names))
-        }
-        None => {
-            if system::os_type() != "linux" {
-                anyhow::bail!("the journal source needs Linux (systemd); use --source files");
-            }
-            let mut cmd = Command::new("journalctl");
-            cmd.args(["--utc", "-o", "cat", "--no-pager", "-u", system::NODE_SERVICE_NAME])
-                .arg("--since")
-                .arg(format!("@{since}"))
-                .arg("--until")
-                .arg(format!("@{until}"))
-                .stdout(Stdio::piped());
-            let mut spawned = cmd.spawn().map_err(|e| anyhow::anyhow!("run journalctl: {e}"))?;
-            let stdout = spawned.stdout.take().ok_or_else(|| anyhow::anyhow!("journalctl: no stdout"))?;
-            child = Some(spawned);
-            let reader: Box<dyn BufRead> = Box::new(BufReader::new(stdout));
-            (vec![RecordReader::new(vec![("journal".to_string(), reader)])], SourceInfo::Journal(system::NODE_SERVICE_NAME.to_string()))
-        }
-    };
+/// `qclient node log export`.
+pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("clock: {e}"))?
+        .as_secs() as i64;
+    let selection = selection(args, now)?;
+    let (since, until) = (selection.since, selection.until);
+
+    let (readers, source, child) = open_source(global, args.source, since, until)?;
 
     let out: PathBuf = args
         .out
@@ -773,54 +752,156 @@ pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&staging).map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
     let mut guard = StagingGuard(Some(staging.clone()));
 
-    let mut salt = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut salt);
-    let mut opts = RedactOptions::with_bootstrap_endpoints(args.keep_self);
+    let log_path = staging.join(BUNDLE_LOG);
+    let file = File::create(&log_path).map_err(|e| anyhow::anyhow!("create {}: {e}", log_path.display()))?;
+    let export = produce(readers, child, &source, &selection, args.keep_self, io::BufWriter::new(file))?;
+    drop(export.out);
+
+    print!("{}", preview(&export.manifest, &export.stats, &format!("Bundle: {}", out.display()), &map_path));
+    if !confirm(global, "Type yes to write the bundle: ")? {
+        println!("Nothing written.");
+        return Ok(());
+    }
+
+    let (manifest_text, sums) = bundle_texts(&export.manifest, &export.log)?;
+    std::fs::write(staging.join("manifest.json"), &manifest_text)?;
+    std::fs::write(staging.join("SHA256SUMS"), sums)?;
+    write_token_map(&map_path, &out.display().to_string(), &export.token_map)?;
+    std::fs::rename(&staging, &out).map_err(|e| anyhow::anyhow!("rename to {}: {e}", out.display()))?;
+    guard.0 = None;
+    println!("Wrote {} ({} lines).", out.display(), export.stats.lines_kept);
+    println!("The token map {} holds the original values: keep it private and never share it.", map_path.display());
+    Ok(())
+}
+
+/// The record readers of `source` over `[since, until]`, what they read,
+/// and the `journalctl` child to wait for when they read the journal.
+pub(crate) fn open_source(
+    global: &GlobalArgs,
+    source: LogSource,
+    since: i64,
+    until: i64,
+) -> anyhow::Result<(Vec<RecordReader>, SourceInfo, Option<Child>)> {
+    let log_dir = match source {
+        LogSource::Journal => None,
+        LogSource::Auto => configured_log_dir_if_present(global),
+        LogSource::Files => match super::configured_log_dir(global)? {
+            Some(dir) if dir.is_dir() => Some(dir),
+            Some(dir) => anyhow::bail!("log directory not found: {}", dir.display()),
+            None => anyhow::bail!("the node writes no log files (logger.path is none); use --source journal"),
+        },
+    };
+    match &log_dir {
+        Some(dir) => {
+            let (readers, names) = file_readers(dir, since, until)?;
+            if names.is_empty() {
+                anyhow::bail!("no node log files in {}", dir.display());
+            }
+            Ok((readers, SourceInfo::Files(names), None))
+        }
+        None => {
+            if system::os_type() != "linux" {
+                anyhow::bail!("the journal source needs Linux (systemd); use --source files");
+            }
+            let mut cmd = Command::new("journalctl");
+            cmd.args(["--utc", "-o", "cat", "--no-pager", "-u", system::NODE_SERVICE_NAME])
+                .arg("--since")
+                .arg(format!("@{since}"))
+                .arg("--until")
+                .arg(format!("@{until}"))
+                .stdout(Stdio::piped());
+            let mut spawned = cmd.spawn().map_err(|e| anyhow::anyhow!("run journalctl: {e}"))?;
+            let stdout = spawned.stdout.take().ok_or_else(|| anyhow::anyhow!("journalctl: no stdout"))?;
+            let reader: Box<dyn BufRead> = Box::new(BufReader::new(stdout));
+            Ok((
+                vec![RecordReader::new(vec![("journal".to_string(), reader)])],
+                SourceInfo::Journal(system::NODE_SERVICE_NAME.to_string()),
+                Some(spawned),
+            ))
+        }
+    }
+}
+
+/// One redacted export: the gzipped log in `out`, its manifest and the
+/// token map of the values it hides.
+pub(crate) struct Export<W> {
+    pub out: W,
+    pub manifest: serde_json::Value,
+    pub stats: ExportStats,
+    pub log: LogDigest,
+    pub token_map: BTreeMap<String, String>,
+}
+
+/// Select, redact and gzip the records of `readers` into `out`, with a
+/// fresh token salt, and describe the result in a manifest.
+pub(crate) fn produce<W: Write>(
+    readers: Vec<RecordReader>,
+    child: Option<Child>,
+    source: &SourceInfo,
+    selection: &Selection,
+    keep_self: bool,
+    out: W,
+) -> anyhow::Result<Export<W>> {
+    produce_salted(readers, child, source, selection, keep_self, out, None)
+}
+
+/// [`produce`] with the token salt `salt`, or a fresh one; a fixed salt
+/// lets tests compare two exports.
+pub(crate) fn produce_salted<W: Write>(
+    readers: Vec<RecordReader>,
+    child: Option<Child>,
+    source: &SourceInfo,
+    selection: &Selection,
+    keep_self: bool,
+    out: W,
+    salt: Option<[u8; 32]>,
+) -> anyhow::Result<Export<W>> {
+    let salt = salt.unwrap_or_else(|| {
+        let mut salt = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut salt);
+        salt
+    });
+    let mut opts = RedactOptions::with_bootstrap_endpoints(keep_self);
     opts.literals = local_literals();
     let mut redactor = Redactor::new(salt, opts);
 
-    let log_path = staging.join(BUNDLE_LOG);
-    let file = File::create(&log_path).map_err(|e| anyhow::anyhow!("create {}: {e}", log_path.display()))?;
-    let hashing = HashingWriter { inner: io::BufWriter::new(file), hasher: Sha256::new(), bytes: 0 };
+    let hashing = HashingWriter { inner: out, hasher: Sha256::new(), bytes: 0 };
     let mut gz = GzEncoder::new(hashing, Compression::default());
     let mut merger = Merger::new(readers);
-    let mut stats = export_records(merger.by_ref(), &selection, &mut redactor, &mut gz)?;
+    let mut stats = export_records(merger.by_ref(), selection, &mut redactor, &mut gz)?;
     stats.lines_read = merger.lines_read();
     stats.read_errors = merger.errors();
     let mut hashing = gz.finish()?;
     hashing.flush()?;
     let log = LogDigest { sha256: hex::encode(hashing.hasher.finalize()), bytes: hashing.bytes };
-    drop(hashing.inner);
     if let Some(mut c) = child {
         let status = c.wait()?;
         if !status.success() {
             anyhow::bail!("journalctl exited with {status}");
         }
     }
+    let manifest = manifest(selection, source, &stats, &redactor, keep_self, &log);
+    Ok(Export { out: hashing.inner, manifest, stats, log, token_map: redactor.token_map().clone() })
+}
 
-    let manifest = manifest(&selection, &source, &stats, &redactor, args.keep_self, &log);
-    print!("{}", preview(&manifest, &stats, &out, &map_path));
-    if !global.yes {
-        print!("Type yes to write the bundle: ");
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if answer.trim() != "yes" {
-            println!("Nothing written.");
-            return Ok(());
-        }
-    }
-
-    let manifest_text = serde_json::to_string_pretty(&manifest)? + "\n";
-    std::fs::write(staging.join("manifest.json"), &manifest_text)?;
+/// The bundle's `manifest.json` and `SHA256SUMS`.
+pub(crate) fn bundle_texts(manifest: &serde_json::Value, log: &LogDigest) -> anyhow::Result<(String, String)> {
+    let manifest_text = serde_json::to_string_pretty(manifest)? + "\n";
     let manifest_sha = hex::encode(Sha256::digest(manifest_text.as_bytes()));
-    std::fs::write(staging.join("SHA256SUMS"), format!("{}  {BUNDLE_LOG}\n{manifest_sha}  manifest.json\n", log.sha256))?;
-    write_token_map(&map_path, &out, redactor.token_map())?;
-    std::fs::rename(&staging, &out).map_err(|e| anyhow::anyhow!("rename to {}: {e}", out.display()))?;
-    guard.0 = None;
-    println!("Wrote {} ({} lines).", out.display(), stats.lines_kept);
-    println!("The token map {} holds the original values: keep it private and never share it.", map_path.display());
-    Ok(())
+    let sums = format!("{}  {BUNDLE_LOG}\n{manifest_sha}  manifest.json\n", log.sha256);
+    Ok((manifest_text, sums))
+}
+
+/// Ask the operator to type yes, unless the global --yes is set.
+pub(crate) fn confirm(global: &GlobalArgs, question: &str) -> io::Result<bool> {
+    if global.yes {
+        return Ok(true);
+    }
+    print!("{question}");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim() == "yes")
 }
 
 /// The configured log directory when it exists (for `--source auto`).

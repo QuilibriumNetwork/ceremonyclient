@@ -5864,6 +5864,7 @@ dependencies = [
 name = "quil-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "bls48581",
  "channel",
  "criterion 0.5.1",

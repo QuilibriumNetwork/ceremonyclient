@@ -30,6 +30,8 @@ fn-dsa = "0.3"
 # transport key-exchange uses).
 pqcrypto-ntruprime = "0.1"
 pqcrypto-traits = "0.3"
+# AES-256-GCM for payloads sealed to an sntrup761 key (`seal`).
+aes-gcm = "0.10"
 poseidon-rs = "0.0.10"
 ff_ce = "0.11"
 num-bigint = "0.4"

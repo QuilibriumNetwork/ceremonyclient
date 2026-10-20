@@ -79,6 +79,8 @@ fn owned_filters(
 
 pub(crate) struct GrpcArgs {
     pub frame_observations_path: std::path::PathBuf,
+    /// Where approved diagnostics log bundles wait for their requester.
+    pub diagnostics_spool: std::path::PathBuf,
     /// Rebuilds legacy committees; served to the node's standalone workers.
     pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
     /// Holds standalone workers' reward proofs back during a coverage halt, as
@@ -730,6 +732,7 @@ pub(crate) fn spawn_all(
 ) -> anyhow::Result<()> {
     let GrpcArgs {
         frame_observations_path,
+        diagnostics_spool,
         historical_committees,
         halt_state,
         committed_shard_sizes,
@@ -2544,6 +2547,40 @@ pub(crate) fn spawn_all(
             )
         };
 
+        // Peers' requests for this node's redacted logs, on the same
+        // listener: the requester service for allowlisted peers, the
+        // operator service for this node's own identity only.
+        let (log_request_service, log_operator_service) = {
+            let requests = Arc::new(quil_rpc::diagnostics_logs::LogRequests::new(
+                &config.diagnostics.log_requests,
+                peer_id,
+                diagnostics_spool,
+            ));
+            if requests.enabled() {
+                let requests = requests.clone();
+                sup.spawn("diagnostics-log-requests", move |token| async move {
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                        }
+                        requests.tick(quil_engine::worker_execution::now_ms());
+                    }
+                });
+            }
+            let server = quil_rpc::diagnostics_logs::LogRequestServer::new(requests);
+            (
+                tonic::service::interceptor::InterceptedService::new(
+                    server.peer_service(),
+                    quil_rpc::peer_auth_middleware::peer_auth_interceptor,
+                ),
+                tonic::service::interceptor::InterceptedService::new(
+                    server.operator_service(),
+                    quil_rpc::peer_auth_middleware::peer_auth_interceptor,
+                ),
+            )
+        };
+
         let seed = mtls_seed.ok_or_else(|| anyhow::anyhow!(
             "peer gRPC requires an Ed448 identity — set `p2p.peerPrivKey` to a 57-byte hex seed (or 114-byte seed+pubkey). Without it no peer can authenticate against this node.",
         ))?;
@@ -2699,7 +2736,9 @@ pub(crate) fn spawn_all(
                 .add_service(dispatch_service)
                 .add_service(mixnet_service)
                 .add_service(onion_service)
-                .add_service(diagnostics_service);
+                .add_service(diagnostics_service)
+                .add_service(log_request_service)
+                .add_service(log_operator_service);
             if let Some(pp) = pubsub_proxy_service {
                 info!("registering PubSubProxy on peer gRPC listener");
                 builder = builder.add_service(pp);
@@ -2831,6 +2870,14 @@ mod onion_exit_tests {
         assert!(peer < added && added < served, "outside the peer listener's builder");
         let built = at("DiagnosticsServer::new");
         assert!(source[built..added].contains("peer_auth_interceptor"), "without the handshake identity");
+        for service in [".add_service(log_request_service)", ".add_service(log_operator_service)"] {
+            assert_eq!(source.matches(service).count(), 1, "{service}");
+            let added = at(service);
+            assert!(peer < added && added < served, "{service} outside the peer listener's builder");
+        }
+        let logs = at("LogRequestServer::new");
+        assert_eq!(source[logs..logs + source[logs..].find("let seed = mtls_seed").unwrap()].matches("peer_auth_interceptor").count(), 2,
+            "both log request services carry the handshake identity");
         let plaintext = &source[at("NodeServiceServer::new")..];
         let plaintext = &plaintext[..plaintext.find(".serve_with_shutdown(addr").unwrap()];
         assert!(!plaintext.contains("diagnostics"), "{plaintext}");
