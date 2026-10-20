@@ -57,6 +57,13 @@ impl SimplexFalconScheme {
             Subject::Nullify { round: vote.round }, &vote.attestation)
     }
 
+    /// Verify one member's NOTARIZE vote for `proposal`, outside the engine:
+    /// GLOBAL checks the votes a presence report carries. An attestation whose
+    /// signer index lies outside the committee fails.
+    pub fn verify_notarize<D: Digest>(&self, proposal: &Proposal<D>, attestation: &Attestation<Self>) -> bool {
+        self.generic.verify_attestation::<Self, D>(Subject::Notarize { proposal }, attestation)
+    }
+
     /// Verify a FINALIZATION certificate over `proposal` against this committee.
     /// No rng needed — Falcon verify is deterministic (non‑batchable). Used for
     /// off‑engine cert verification (reward attribution at the global level),

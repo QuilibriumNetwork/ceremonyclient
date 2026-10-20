@@ -8,11 +8,21 @@
 //! authorizes the successor only after every source session in its transition
 //! has supplied such a seal.
 
-use commonware_cryptography::{sha256::Sha256, Hasher as _};
+use commonware_consensus::{
+    simplex::types::Proposal,
+    types::{Epoch, Round, View},
+};
+use commonware_cryptography::{
+    certificate::Attestation,
+    sha256::{Digest as Sha256Digest, Sha256},
+    Hasher as _,
+};
+use commonware_utils::{ordered::Set, Participant};
 use quil_types::error::{QuilError, Result};
 
 use crate::app_cert::{verify_finalization_details, VerifiedFinalization};
-use crate::falcon_base::FalconPublicKey;
+use crate::falcon_base::{FalconPublicKey, FalconSignature};
+use crate::falcon_simplex::SimplexFalconScheme;
 
 pub mod automaton;
 
@@ -274,6 +284,62 @@ pub fn verify_seal_with(
         return None;
     }
     Some(verified)
+}
+
+/// Checks single votes of one session's members, as GLOBAL checks a presence
+/// report. A certificate proves that a quorum voted; a vote proves only that
+/// its signer did.
+pub struct SessionVotes {
+    scheme: SimplexFalconScheme,
+}
+
+impl SessionVotes {
+    pub fn new(session: &Session) -> Result<Self> {
+        let keys: Vec<FalconPublicKey> = session
+            .members
+            .iter()
+            .map(|key| FalconPublicKey::from_bytes(key))
+            .collect::<Option<_>>()
+            .ok_or_else(|| invalid("members must be Falcon keys"))?;
+        let participants: Set<FalconPublicKey> = keys
+            .try_into()
+            .map_err(|_| invalid("members must be unique"))?;
+        Ok(Self {
+            scheme: SimplexFalconScheme::verifier(&session.namespace()?, participants),
+        })
+    }
+
+    /// Whether `signature` is member `signer`'s NOTARIZE of the proposal at
+    /// round (`epoch`, `view`) with `parent` and `payload`. `signer` indexes
+    /// the session's sorted members: an index outside them fails, as does a
+    /// signature of another length or another vote of the same round.
+    pub fn verify_notarize(
+        &self,
+        epoch: u64,
+        view: u64,
+        parent: u64,
+        payload: [u8; 32],
+        signer: u32,
+        signature: &[u8],
+    ) -> bool {
+        let mut bytes = signature;
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &()) else {
+            return false;
+        };
+        if !bytes.is_empty() {
+            return false;
+        }
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(epoch), View::new(view)),
+            View::new(parent),
+            Sha256Digest(payload),
+        );
+        let attestation: Attestation<SimplexFalconScheme> = Attestation {
+            signer: Participant::new(signer),
+            signature: signature.into(),
+        };
+        self.scheme.verify_notarize(&proposal, &attestation)
+    }
 }
 
 /// Small bounded codec shared with the global authorization record. Counts are
@@ -582,5 +648,51 @@ mod tests {
         seal.checkpoint.digest = session.genesis;
         seal.checkpoint.frame += 1;
         assert!(seal.validate(&session, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn session_votes_accept_only_a_members_notarize_of_the_proposal() {
+        let keys = keys();
+        let session = session(&keys);
+        let members: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let scheme =
+            SimplexFalconScheme::signer(&session.namespace().unwrap(), members, keys[1].clone())
+                .unwrap();
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(7), View::new(12)),
+            View::new(11),
+            Digest([9; 32]),
+        );
+        let notarize = scheme.sign(Subject::Notarize { proposal: &proposal }).unwrap();
+        let signer = notarize.signer.get();
+        let signature = notarize.signature.get().unwrap().to_vec();
+        let votes = SessionVotes::new(&session).unwrap();
+        assert!(votes.verify_notarize(7, 12, 11, [9; 32], signer, &signature));
+        // Another member's index, an index outside the committee, another
+        // round, parent or payload, or a truncated signature.
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], (signer + 1) % 4, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], 4, &signature));
+        assert!(!votes.verify_notarize(8, 12, 11, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 13, 11, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 10, [9; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [8; 32], signer, &signature));
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &signature[1..]));
+        // A finalize or a nullify of the same round is not a notarize.
+        let finalize = scheme.sign(Subject::Finalize { proposal: &proposal }).unwrap();
+        let finalize = finalize.signature.get().unwrap().to_vec();
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &finalize));
+        let nullify = scheme.sign::<Digest>(Subject::Nullify { round: proposal.round }).unwrap();
+        let nullify = nullify.signature.get().unwrap().to_vec();
+        assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &nullify));
+        // The same members in another session sign under another namespace.
+        let mut other = session.clone();
+        other.generation += 1;
+        let other = SessionVotes::new(&other).unwrap();
+        assert!(!other.verify_notarize(7, 12, 11, [9; 32], signer, &signature));
     }
 }

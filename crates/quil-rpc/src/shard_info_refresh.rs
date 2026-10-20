@@ -60,6 +60,10 @@ pub enum ShardInfoRefreshError {
 /// chain refuses a join that includes one).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArchiveShardInfo {
+    /// The archive endpoint that reported it.
+    pub endpoint: String,
+    /// Shard keys whose `GetAppShards` call failed: their shards are missing.
+    pub failed_shard_keys: usize,
     pub sizes: HashMap<Vec<u8>, u64>,
     pub data_shards: HashMap<Vec<u8>, u64>,
     pub frozen: HashSet<Vec<u8>>,
@@ -171,6 +175,16 @@ pub async fn fetch_shard_sizes_from_archive(
     ))
 }
 
+/// Ask the single archive `endpoint` for every shard under `shard_keys`, as
+/// one refresh does; `qclient node archive shards` compares archives with it.
+pub async fn fetch_shard_info_from_endpoint(
+    endpoint: &str,
+    falcon_signing_key: &[u8],
+    shard_keys: &[Vec<u8>],
+) -> Result<ArchiveShardInfo, ArchiveClientError> {
+    try_one_endpoint(endpoint, falcon_signing_key, shard_keys).await
+}
+
 /// Enumerate `shard_keys` against a single endpoint. Returns
 /// whatever sizes were successfully fetched; per-shard errors are
 /// logged and skipped (partial OK).
@@ -180,7 +194,7 @@ async fn try_one_endpoint(
     shard_keys: &[Vec<u8>],
 ) -> Result<ArchiveShardInfo, ArchiveClientError> {
     let mut client = ArchiveClient::connect_mtls(endpoint, falcon_signing_key).await?;
-    let mut out = ArchiveShardInfo::default();
+    let mut out = ArchiveShardInfo { endpoint: endpoint.to_string(), ..Default::default() };
     let mut any_success = false;
     let mut last_err: Option<ArchiveClientError> = None;
     for shard_key in shard_keys {
@@ -196,6 +210,7 @@ async fn try_one_endpoint(
                     error = %e,
                     "shard_info refresh: per-shard call failed, skipping"
                 );
+                out.failed_shard_keys += 1;
                 last_err = Some(e);
                 continue;
             }

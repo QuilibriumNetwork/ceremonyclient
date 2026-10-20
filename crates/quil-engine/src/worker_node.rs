@@ -370,15 +370,31 @@ fn worker_global_submissions(
     halted: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
     let handoff_prefix = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
+    let presence_prefix = quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes();
     Arc::new(move |canonical: Vec<u8>| {
         if halted.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!(core_id, "holding back GLOBAL submission — coverage halt active");
+            crate::presence_reports::publication_failed(&canonical);
             return;
         }
         let (relay, publish) = (relay.clone(), publish.clone());
         tokio::spawn(async move {
             let handoff = canonical.starts_with(&handoff_prefix);
             let outcome = relay.submit(core_id, canonical.clone()).await;
+            // A presence report goes only through the master, which answers
+            // once it is published; one not taken gives its budget back.
+            if canonical.starts_with(&presence_prefix) {
+                if outcome != MasterSubmission::Queued {
+                    crate::presence_reports::publication_failed(&canonical);
+                    let filter = quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(&canonical)
+                        .map(|report| hex::encode(report.filter))
+                        .unwrap_or_default();
+                    warn!(core_id, kind = "presence_report", filter = %filter, outcome = ?outcome,
+                        "presence report not published: the master held, refused or did not take it; \
+                         the next look may build it again");
+                }
+                return;
+            }
             if outcome != MasterSubmission::Unavailable {
                 if outcome == MasterSubmission::Refused {
                     warn!(core_id, handoff, "master refused this worker's GLOBAL submission");

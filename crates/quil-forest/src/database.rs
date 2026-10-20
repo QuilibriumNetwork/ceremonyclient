@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use quil_types::store::{BackingStoreIdentity, ScanPoint};
 use rocksdb::{
@@ -187,6 +187,17 @@ impl DisjointBatch {
 #[derive(Clone)]
 pub struct CoordinatedDb(Arc<DatabaseInner>);
 
+/// A handle that does not keep the database open (see [`CoordinatedDb::downgrade`]).
+#[derive(Clone)]
+pub struct WeakCoordinatedDb(Weak<DatabaseInner>);
+
+impl WeakCoordinatedDb {
+    /// The database, unless every [`CoordinatedDb`] clone has been dropped.
+    pub fn upgrade(&self) -> Option<CoordinatedDb> {
+        self.0.upgrade().map(CoordinatedDb)
+    }
+}
+
 impl CoordinatedDb {
     pub fn new(db: DB) -> Self {
         Self::open(db, None)
@@ -230,6 +241,12 @@ impl CoordinatedDb {
 
     pub fn same_database(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// For background work that should stop, rather than keep the database
+    /// open, once its other owners drop it.
+    pub fn downgrade(&self) -> WeakCoordinatedDb {
+        WeakCoordinatedDb(Arc::downgrade(&self.0))
     }
 
     /// Lock order: the caller's frame/forest/commit/engine/cache locks first,
@@ -646,6 +663,18 @@ mod watched_write_tests {
         let plain = CoordinatedDb::new(DB::open_default(plain_dir.path()).unwrap());
         assert_eq!(plain.lock_writes().unwrap().watched_write_sequence(), None);
         assert_ne!(plain.instance(), db.instance());
+    }
+
+    #[test]
+    fn a_weak_handle_does_not_keep_the_database_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CoordinatedDb::new(DB::open_default(dir.path()).unwrap());
+        let weak = db.downgrade();
+        assert!(weak.upgrade().unwrap().same_database(&db));
+        drop(db);
+        assert!(weak.upgrade().is_none());
+        // The RocksDB lock is released: the path opens again.
+        let _reopened = DB::open_default(dir.path()).unwrap();
     }
 }
 

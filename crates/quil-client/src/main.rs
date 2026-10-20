@@ -19,7 +19,7 @@ struct GlobalFlags {
 
     /// Verify the binary's release signatures before running
     /// (default true, or the value of QUILIBRIUM_SIGNATURE_CHECK).
-    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true)]
+    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true, action = clap::ArgAction::Set)]
     signature_check: bool,
 
     /// Auto-approve prompts and bypass the signature check.

@@ -187,6 +187,9 @@ message MessageRequest {
     // Canonical old-session closing certificate. The authorized request and
     // successor membership are read from committed global state.
     bytes committee_handoff = 31;
+    // Canonical notarize votes of an app-shard session, the evidence of
+    // which members vote. GLOBAL validates them against committed state.
+    bytes presence_report = 32;
   }
   int64 timestamp = 99;
 }

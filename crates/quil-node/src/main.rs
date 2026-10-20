@@ -763,11 +763,21 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         seal_checkpoint_drain_frame = %if seal_checkpoint_drain_from == u64::MAX { "never".to_string() } else { seal_checkpoint_drain_from.to_string() },
         "committee handoff drains of checkpoint frames certified only by their seal"
     );
+    let session_leader_no_drain_from = quil_engine::shard_drain::init_session_leader_no_drain_frame(args.network);
+    info!(
+        session_leader_no_drain_frame = %if session_leader_no_drain_from == u64::MAX { "never".to_string() } else { session_leader_no_drain_from.to_string() },
+        "committee session leaders proposing content on shards a frozen grid names retired"
+    );
     let fenced_successor_eligibility_from =
         quil_execution::global_intrinsic::handoff::init_fenced_successor_eligibility_frame(args.network);
     info!(
         fenced_successor_eligibility_frame = %if fenced_successor_eligibility_from == u64::MAX { "never".to_string() } else { fenced_successor_eligibility_from.to_string() },
         "committee handoff fenced membership successors from current eligibility"
+    );
+    let presence_report_from = quil_execution::global_intrinsic::handoff::init_presence_report_frame(args.network);
+    info!(
+        presence_report_frame = %if presence_report_from == u64::MAX { "never".to_string() } else { presence_report_from.to_string() },
+        "committee presence reports validated"
     );
     let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
     info!(

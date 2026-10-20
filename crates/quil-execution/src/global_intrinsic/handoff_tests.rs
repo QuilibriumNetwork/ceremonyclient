@@ -1270,6 +1270,100 @@ fn a_seal_waits_until_global_executed_the_source_through_its_checkpoint() {
     assert!(super::apply_submission(&state, 3, &seal).unwrap());
 }
 
+/// GLOBAL records the frame of a tip advance only from the presence report
+/// frame on: before it, and by default, the same steps stage the same writes
+/// as a build without the record.
+#[test]
+fn tip_advance_frames_are_staged_only_from_the_presence_report_frame() {
+    let keys = keys();
+    let filter = vec![0x5d; 32];
+    let first = initial(filter.clone(), &keys);
+    let id = first.id().unwrap();
+    let run = |activation: Option<u64>| {
+        set_presence_report_frame_for_thread(activation);
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let (_, state) = make_state(&db);
+        initialize(&state, 1, &first).unwrap();
+        schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+        for frame in [5, 6, 6, 4] {
+            record_session_tip(&state, 3, &id, &tip(frame, frame + 3, [frame as u8; 32])).unwrap();
+        }
+        let staged = state.pending_vertex_adds(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS).unwrap();
+        set_presence_report_frame_for_thread(None);
+        staged
+    };
+    let default = run(None);
+    assert_eq!(run(Some(4)), default, "below the activation frame nothing new is staged");
+    let active = run(Some(1));
+    let record = address(b"tip-frame", &id);
+    assert_eq!(active.iter().filter(|(at, _)| at[..] == record[..]).count(), 3,
+        "the creation and the two advances");
+    let rest: Vec<_> = active.into_iter().filter(|(at, _)| at[..] != record[..]).collect();
+    assert_eq!(rest, default, "the record is the only addition");
+}
+
+/// From the presence report frame on, a session records the GLOBAL frame that
+/// created it, then each GLOBAL frame that advanced its tip; a tip at or below
+/// the executed one is no advance. The successor a seal authorizes is anchored
+/// at the activating frame.
+#[test]
+fn a_tip_advance_records_the_global_frame_that_executed_it() {
+    set_presence_report_frame_for_thread(Some(0));
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5e; 32];
+    let first = initial(filter.clone(), &keys);
+    let id = first.id().unwrap();
+    initialize(&state, 1, &first).unwrap();
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(1), "anchored at its creation");
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let seal = submission(&request, 0, &keys, 6);
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(1), "scheduling advances nothing");
+    record_session_tip(&state, 3, &id, &tip(5, 4, [0x55; 32])).unwrap();
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(3));
+    record_session_tip(&state, 4, &id, &tip(5, 4, [0x55; 32])).unwrap();
+    record_session_tip(&state, 5, &id, &tip(4, 3, [0x44; 32])).unwrap();
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(3), "an equal or lower tip is no advance");
+    assert_eq!(frames_since_tip_advance(&state, &id, 9).unwrap(), Some(6));
+    commit(&state, 5);
+    record_session_tip(&state, 6, &id, &seal.seal.checkpoint).unwrap();
+    commit(&state, 6);
+    let view = CommittedView::capture(state.crdt()).unwrap();
+    assert_eq!(session_tip_frame(&view, &id).unwrap(), Some(6), "committed with the tip");
+
+    assert!(super::apply_submission(&state, 7, &seal).unwrap());
+    let successor = head(&state, &filter).unwrap().unwrap().id().unwrap();
+    assert_eq!(session_tip_frame(&state, &successor).unwrap(), Some(7));
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(6), "the seal advances no tip");
+    set_presence_report_frame_for_thread(None);
+}
+
+/// A session created before the presence report frame has no record until
+/// its tip advances. Until then the frames since the activation frame bound
+/// how long it has not advanced; before that frame nothing is known.
+#[test]
+fn a_session_created_before_the_presence_report_frame_is_bounded_from_it() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let first = initial(vec![0x5f; 32], &keys());
+    let id = first.id().unwrap();
+    initialize(&state, 1, &first).unwrap();
+    record_session_tip(&state, 3, &id, &tip(5, 8, [0x55; 32])).unwrap();
+    commit(&state, 3);
+    assert_eq!(frames_since_tip_advance(&state, &id, 9).unwrap(), None, "disabled by default");
+    set_presence_report_frame_for_thread(Some(10));
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), None);
+    assert_eq!(frames_since_tip_advance(&state, &id, 9).unwrap(), None, "before the activation frame");
+    assert_eq!(frames_since_tip_advance(&state, &id, 10).unwrap(), Some(0));
+    assert_eq!(frames_since_tip_advance(&state, &id, 14).unwrap(), Some(4), "a lower bound");
+    record_session_tip(&state, 15, &id, &tip(6, 9, [0x66; 32])).unwrap();
+    assert_eq!(session_tip_frame(&state, &id).unwrap(), Some(15));
+    assert_eq!(frames_since_tip_advance(&state, &id, 20).unwrap(), Some(5));
+    assert_eq!(frames_since_tip_advance(&state, &id, 12).unwrap(), Some(0), "not after the advance");
+    set_presence_report_frame_for_thread(None);
+}
+
 /// A seal's drain headers trail the certificate submission: without them the
 /// bytes are a [`CertificateSubmission`]'s, so older builds and GLOBAL's
 /// records read them unchanged. Counts outside 1..=8 and trailing bytes are
@@ -1721,3 +1815,100 @@ fn a_merge_activates_from_one_sealed_and_one_fenced_source() {
 
 #[path = "handoff_legacy_tests.rs"]
 mod legacy_tests;
+
+#[path = "handoff_presence_tests.rs"]
+mod presence_tests;
+
+/// The pending-change repair rebuilds a split whose parent's committee
+/// SEALED (not fenced) from its request, both while the parent seals and once
+/// it closed; it leaves the request alone once a shard the split registers,
+/// or one overlapping the parent, is in the grid; and it reports, rather than
+/// rebuilds, a request it cannot rebuild unambiguously.
+#[test]
+fn the_repair_rebuilds_a_sealed_split_and_reports_what_it_cannot_rebuild() {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+    use schedule::{recover_topology_change, Recovery, RecoveryFloor};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    let length = quil_types::consensus::epoch_length_frames();
+    let start = (super::super::materialize::unified_tree_cutover_frame() / length + 10) * length;
+    commit(&state, start - 1);
+    let floor = RecoveryFloor { request_frame: 0, proposed_frame: 0 };
+    let none = |_: &[u8]| false;
+    let split = |app: u8, proposed: u64| {
+        let app = [app; 32];
+        PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: quil_forest::encode_shard_bit_path(&app, &[true]),
+            children: [false, true].map(|bit| quil_forest::encode_shard_bit_path(&app, &[true, true, bit])).to_vec(),
+            effective_epoch: proposed / length + 2,
+            proposed_frame: proposed,
+        }
+    };
+    let provers = keys();
+    // Three splits: staffed (four provers), one with a single prover (a child
+    // without members), and one scheduled long after it came due.
+    let staffed = split(0x21, start + 5);
+    let single = split(0x22, start + 6);
+    let late = split(0x23, start + 7);
+    for (change, members) in [(&staffed, &provers[..]), (&single, &provers[..1]), (&late, &provers[..])] {
+        let scan = scan_of(&[(&change.parent, members)]);
+        schedule::reconcile_membership(&state, start, &policy(), &[change.parent.clone()], &scan).unwrap();
+    }
+    commit(&state, start);
+    let due = staffed.effective_epoch * length;
+    let schedule_at = |change: &PendingShardChange, members: &[FalconPrivateKey], frame: u64| {
+        let scan = scan_of(&[(&change.parent, members)]);
+        assert_eq!(schedule::gate_topology_change(&state, frame, &policy(), change, Some(&scan), true).unwrap(),
+            schedule::TopologyGate::Wait);
+        commit(&state, frame);
+        let source = head(&state, &change.parent).unwrap().unwrap();
+        let Status::Sealing(id) = status(&state, &source.id().unwrap()).unwrap() else {
+            panic!("the parent must be closing");
+        };
+        (source, id)
+    };
+    let mut scheduled = vec![schedule_at(&staffed, &provers, due), schedule_at(&single, &provers[..1], due + 1)];
+    let in_grid = |change: &PendingShardChange| {
+        let parent = change.parent.clone();
+        move |filter: &[u8]| filter == parent.as_slice()
+    };
+
+    let (source, id) = &scheduled[0];
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Restore(staffed.clone()), "rebuilt while the parent seals");
+    let request = request(&state, id).unwrap().unwrap();
+    assert!(apply_submission(&state, due + 2, &submission(&request, 0, &provers, 4)).unwrap());
+    commit(&state, due + 2);
+    assert_eq!(status(&state, &source.id().unwrap()).unwrap(), Status::Closed(*id));
+    assert!(!is_fenced(&state, &source.id().unwrap()).unwrap(), "sealed, not fenced");
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Restore(staffed.clone()), "rebuilt once the seal closed the parent");
+    // A child in the grid beside the parent, or anything overlapping it: the
+    // split applied here and something registered the parent again.
+    let child = staffed.children[0].clone();
+    let parent = staffed.parent.clone();
+    assert_eq!(recover_topology_change(&state, id, floor, &|f: &[u8]| f == parent.as_slice() || f == child.as_slice(), &none).unwrap(),
+        Recovery::Applied("a shard the change registers is in the grid"));
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &|f: &[u8]| f == parent.as_slice()).unwrap(),
+        Recovery::Applied("a shard overlapping a source is in the grid"));
+    // Floors: a request before them is never rebuilt.
+    let later = RecoveryFloor { request_frame: due + 1, proposed_frame: 0 };
+    assert_eq!(recover_topology_change(&state, id, later, &in_grid(&staffed), &none).unwrap(), Recovery::Never);
+
+    scheduled.push(schedule_at(&late, &provers, due + 20 * length));
+    assert_eq!(recover_topology_change(&state, &scheduled[1].1, floor, &in_grid(&single), &none).unwrap(),
+        Recovery::Unresolved("a split child may have received no members"));
+    // The applied-here guards come first: a healthy store whose grid holds
+    // the staffed child reports nothing.
+    let staffed_child = single.children[0].clone();
+    let single_parent = single.parent.clone();
+    assert_eq!(recover_topology_change(&state, &scheduled[1].1, floor,
+        &|f: &[u8]| f == single_parent.as_slice() || f == staffed_child.as_slice(), &none).unwrap(),
+        Recovery::Applied("a shard the change registers is in the grid"));
+    assert_eq!(recover_topology_change(&state, &scheduled[2].1, floor, &in_grid(&late), &none).unwrap(),
+        Recovery::Unresolved("no topology record of the searched proposal frames names the request"));
+    assert_eq!(recover_topology_change(&state, &[0x5a; 32], floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Unresolved("the request record is absent"));
+}

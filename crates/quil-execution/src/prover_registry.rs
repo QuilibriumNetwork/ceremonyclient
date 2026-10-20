@@ -2048,11 +2048,16 @@ impl ProverRegistryTrait for SharedProverRegistry {
                 reward_rings.insert(filter.clone(), estimate);
             }
             // Clone addresses, not complete peer records and cryptographic keys.
-            let active = guard.get_provers_by_status(&filter, ProverStatus::Active)
-                .into_iter().map(|p| p.address.clone()).collect();
-            let leaving = guard.get_provers_by_status(&filter, ProverStatus::Leaving)
-                .into_iter().map(|p| p.address.clone()).collect();
-            members.insert(filter, LifecycleMembers { active, leaving });
+            let mut shard = LifecycleMembers::default();
+            for status in [ProverStatus::Active, ProverStatus::Leaving] {
+                for p in guard.get_provers_by_status(&filter, status) {
+                    if let Some(alloc) = p.allocations.iter().find(|a| a.confirmation_filter == filter && a.status == status) {
+                        shard.add(p.address.clone(), alloc, frame);
+                    }
+                }
+            }
+            shard.sort();
+            members.insert(filter, shard);
         }
         Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
     }
@@ -4525,6 +4530,37 @@ mod tests {
         assert!(!signed_frame_census_governs(activation + threshold - 1, threshold, activation));
         assert!(signed_frame_census_governs(activation + threshold, threshold, activation));
         assert!(!signed_frame_census_governs(u64::MAX - 1, threshold, u64::MAX));
+    }
+
+    #[test]
+    fn scan_eviction_candidates_counts_what_the_floor_and_stall_exemption_spare() {
+        // Three shards with members past the threshold: a progressing one
+        // whose two stale members are selected, a stalled one whose six are
+        // spared, and one at the floor whose stale member is spared.
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let (frame, threshold) = (start + 2000, 500);
+        let (progressing, stalled, floor) = (vec![0x51u8; 64], vec![0x52u8; 64], vec![0x53u8; 64]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let mut members: Vec<(u8, u64, u64)> = vec![(0x10, start + 100, 0), (0x11, start + 100, 0)];
+        members.extend((0x12u8..0x16).map(|p| (p, frame - 10, 0)));
+        seed_signers(&store, &shard, &progressing, &members, frame);
+        let members: Vec<(u8, u64, u64)> = (0x20u8..0x26).map(|p| (p, start + 100, 0)).collect();
+        seed_signers(&store, &shard, &stalled, &members, frame);
+        let mut members: Vec<(u8, u64, u64)> = vec![(0x30, start + 100, 0)];
+        members.extend((0x31u8..0x34).map(|p| (p, frame - 10, 0)));
+        seed_signers(&store, &shard, &floor, &members, frame);
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let scan = reg.scan_eviction_candidates(frame, threshold, &HashMap::new());
+        assert_eq!(
+            selected_pairs(&scan.candidates),
+            vec![(vec![0x10u8; 32], progressing.clone()), (vec![0x11u8; 32], progressing)]
+        );
+        assert_eq!(scan.candidates, reg.find_eviction_candidates(frame, threshold, &HashMap::new()));
+        assert_eq!((scan.shards, scan.active, scan.stale), (3, 16, 2));
+        assert_eq!((scan.spared_floor, scan.spared_stalled), (1, 6));
+        assert_eq!(scan.stalled, vec![(stalled, 6, 0)]);
     }
 
     #[test]

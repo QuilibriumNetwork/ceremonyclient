@@ -229,7 +229,12 @@ mod tests {
                     // journal. Simulate detached I/O still draining afterward.
                     std::thread::sleep(Duration::from_millis(40));
                     if generation == 1 {
-                        panic!("injected host failure");
+                        // Unwind without the panic hook: with RUST_BACKTRACE
+                        // set, the hook symbolizes a backtrace before the
+                        // thread unwinds, delaying `is_finished` and the
+                        // Worker drop by seconds on a loaded runner. Join
+                        // still reports the panic to the supervisor.
+                        std::panic::resume_unwind(Box::new("injected host failure"));
                     }
                     return;
                 }

@@ -24,6 +24,7 @@ pub(crate) mod worker_manager;
 pub(crate) mod direct_delivery;
 pub(crate) mod reward_proofs;
 pub(crate) mod historical_committees;
+pub(crate) mod global_execution;
 
 /// How long shutdown waits for the worker threads to stop before the
 /// process arms its forced-exit watchdog.
@@ -67,6 +68,14 @@ pub(crate) async fn start(
     let key_store = storage.key_store.clone();
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
+    // The grid is local and in no committed root: log it, so an operator can
+    // compare it with other archives' and see a store rewritten while down.
+    // Archives only: a regular node executes no GLOBAL frames after genesis,
+    // so its stored grid stays the genesis grid and would invite a false
+    // comparison.
+    if archive_mode {
+        quil_execution::global_intrinsic::intrinsic::log_local_shard_grid(shards_store.as_ref(), None);
+    }
 
     // NOTE: the boot-time `normalize_quil_token_grid` (force QUIL to 64-way) was
     // REMOVED. It was a one-time pebble->rocksdb migration escape (legacy 4096
@@ -1649,7 +1658,15 @@ pub(crate) async fn start(
                 .expect("recent_messages ring present when explorer enabled"),
             last_global_head_frame.clone(),
         );
-        let router = quil_explorer::router(state);
+        // Outside archive mode the shards store keeps the genesis grid: the
+        // production KPIs take the current one from the archive cache.
+        let state = if archive_mode {
+            state
+        } else {
+            let lifecycle = prover_lifecycle.clone();
+            state.with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
+        };
+        let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {
             Ok(listener) => {
                 info!(addr = %listen_addr, "explorer REST API listening");
@@ -1659,6 +1676,10 @@ pub(crate) async fn start(
                     })
                     .await
                     .map_err(anyhow::Error::from)
+                });
+                // App-shard production index for `/shards/production`.
+                sup.run_until_cancelled("explorer-production", move |_token| {
+                    quil_explorer::production::run_indexer(state)
                 });
             }
             Err(e) => warn!(

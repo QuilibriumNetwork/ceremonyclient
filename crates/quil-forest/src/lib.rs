@@ -57,7 +57,9 @@ pub use membership_proof::{
     verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
 };
 pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
-pub use database::{CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet};
+pub use database::{
+    CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet, WeakCoordinatedDb,
+};
 pub use overlay::{
     ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits, OverlayMutation, OverlayReadView,
     OverlayStats, PreparedOverlayCommit, DEFAULT_EXECUTION_VIEW_MAX_AGE,

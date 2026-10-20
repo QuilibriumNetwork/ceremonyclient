@@ -742,10 +742,47 @@ pub struct ProverLifecycleView {
     pub reward_rings: HashMap<Vec<u8>, crate::reward_ring::RewardRingEstimate>,
 }
 
+/// A shard's provers as the lifecycle counts them at one frame: who is a
+/// member after the next epoch boundary, and whose leave is still undecided.
+/// By effective status, not the raw status byte: a confirmed join's byte is
+/// already Active but it becomes a member only at the boundary, a confirmed
+/// leave keeps its Leaving byte while it departs regardless, and a departed or
+/// stale-epoch allocation keeps its byte for good.
 #[derive(Debug, Clone, Default)]
 pub struct LifecycleMembers {
+    /// Effective Active members.
     pub active: Vec<Vec<u8>>,
+    /// Confirmed joins that become members at the next boundary.
+    pub activating: Vec<Vec<u8>>,
+    /// Members whose leave is proposed but not yet confirmed.
     pub leaving: Vec<Vec<u8>>,
+}
+
+impl LifecycleMembers {
+    /// Count `address`, whose allocation on this shard is `alloc`, by its
+    /// effective status at `frame`; confirmed leaves, paused, expired and
+    /// terminal allocations are not counted.
+    pub fn add(&mut self, address: Vec<u8>, alloc: &ProverAllocationInfo, frame: u64) {
+        match alloc.effective_status(frame) {
+            EffectiveStatus::Active => self.active.push(address),
+            EffectiveStatus::Joining if alloc.join_confirm_frame_number > 0 => self.activating.push(address),
+            EffectiveStatus::Leaving if alloc.leave_confirm_frame_number == 0 => self.leaving.push(address),
+            _ => {}
+        }
+    }
+
+    /// How many provers remain members after the boundary if no undecided
+    /// leave departs.
+    pub fn staying(&self) -> usize {
+        self.active.len() + self.activating.len()
+    }
+
+    /// Sort each list, so every node orders members the same way.
+    pub fn sort(&mut self) {
+        self.active.sort();
+        self.activating.sort();
+        self.leaving.sort();
+    }
 }
 
 /// Manages the prover trie: state transitions, lookups, eviction.
@@ -772,11 +809,16 @@ pub trait ProverRegistry: Send + Sync {
             if let Some(estimate) = self.get_reward_ring_estimate(address, &filter, frame)? {
                 reward_rings.insert(filter.clone(), estimate);
             }
-            let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
-                .into_iter().map(|p| p.address).collect();
-            let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
-                .into_iter().map(|p| p.address).collect();
-            members.insert(filter, LifecycleMembers { active, leaving });
+            let mut shard = LifecycleMembers::default();
+            for status in [ProverStatus::Active, ProverStatus::Leaving] {
+                for p in self.get_provers_by_status(&filter, status)? {
+                    if let Some(alloc) = p.allocations.iter().find(|a| a.confirmation_filter == filter && a.status == status) {
+                        shard.add(p.address.clone(), alloc, frame);
+                    }
+                }
+            }
+            shard.sort();
+            members.insert(filter, shard);
         }
         Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
     }
@@ -1369,6 +1411,39 @@ pub(crate) mod epoch_tests {
         set_epoch_length_frames(0);
         assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
         assert_eq!(epoch_for_frame(720), 1);
+    }
+
+    /// Members are counted by effective status: a confirmed join is
+    /// activating, a confirmed leave and every expired, stale-epoch or paused
+    /// allocation is not counted, and only an undecided leave is leaving.
+    #[test]
+    fn lifecycle_members_count_by_effective_status() {
+        let _guard = epoch_length_guard();
+        let e = EPOCH_LENGTH_FRAMES;
+        let frame = 10 * e + 5;
+        let with = |status, f: &dyn Fn(&mut ProverAllocationInfo)| {
+            let mut a = active_alloc(vec![7], 10);
+            a.status = status;
+            f(&mut a);
+            a
+        };
+        let cases = [
+            (1u8, with(ProverStatus::Active, &|_| {})),
+            (2, with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1)),
+            (3, with(ProverStatus::Active, &|a| a.epoch = 8)),
+            (4, with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; })),
+            (5, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 2 * e)),
+            (6, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 9 * e + 3)),
+            (7, with(ProverStatus::Paused, &|_| {})),
+        ];
+        let mut members = LifecycleMembers::default();
+        for (id, a) in &cases {
+            members.add(vec![*id], a, frame);
+        }
+        assert_eq!(members.active, vec![vec![1]]);
+        assert_eq!(members.activating, vec![vec![2]]);
+        assert_eq!(members.leaving, vec![vec![6]]);
+        assert_eq!(members.staying(), 2);
     }
 }
 

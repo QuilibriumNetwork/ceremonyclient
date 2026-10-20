@@ -212,6 +212,10 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             crate::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
             Ok(bytes.clone())
         }
+        Inner::PresenceReport(bytes) => {
+            crate::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
+            Ok(bytes.clone())
+        }
         Inner::Join(p) => {
             crate::global_intrinsic::conversions::prover_join_from_proto(p)
                 .to_canonical_bytes()

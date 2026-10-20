@@ -79,7 +79,8 @@ pub fn global_engine_cost(_message: &[u8]) -> BigInt {
 // MessageKindGlobal — per-op type prefixes
 // =====================================================================
 //
-// The legacy prover/shard operations plus authenticated committee handoff.
+// The legacy prover/shard operations plus authenticated committee handoff
+// and presence reports.
 
 // Re-export type-prefix constants from the canonical-bytes modules
 // where they are defined alongside their structs.
@@ -90,7 +91,7 @@ pub use crate::global_intrinsic::{
     TYPE_SHARD_SPLIT, TYPE_SHARD_MERGE, TYPE_FRAME_HEADER,
 };
 
-pub use crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF;
+pub use crate::global_intrinsic::handoff::{TYPE_COMMITTEE_HANDOFF, TYPE_PRESENCE_REPORT};
 
 /// The set of global operations the engine dispatches on. Each
 /// variant maps one-to-one with a `MessageRequest` oneof case.
@@ -109,6 +110,7 @@ pub enum MessageKindGlobal {
     ShardSplit,
     ShardMerge,
     CommitteeHandoff,
+    PresenceReport,
 }
 
 impl MessageKindGlobal {
@@ -127,6 +129,7 @@ impl MessageKindGlobal {
             Self::ShardSplit => TYPE_SHARD_SPLIT,
             Self::ShardMerge => TYPE_SHARD_MERGE,
             Self::CommitteeHandoff => TYPE_COMMITTEE_HANDOFF,
+            Self::PresenceReport => TYPE_PRESENCE_REPORT,
         }
     }
 
@@ -145,10 +148,11 @@ impl MessageKindGlobal {
             Self::ShardSplit => "shard_split",
             Self::ShardMerge => "shard_merge",
             Self::CommitteeHandoff => "committee_handoff",
+            Self::PresenceReport => "presence_report",
         }
     }
 
-    pub const fn all() -> [MessageKindGlobal; 13] {
+    pub const fn all() -> [MessageKindGlobal; 14] {
         [
             Self::ProverJoin,
             Self::ProverLeave,
@@ -163,6 +167,7 @@ impl MessageKindGlobal {
             Self::ShardSplit,
             Self::ShardMerge,
             Self::CommitteeHandoff,
+            Self::PresenceReport,
         ]
     }
 }
@@ -192,6 +197,7 @@ pub fn peek_global_message_kind(input: &[u8]) -> Result<MessageKindGlobal> {
         TYPE_SHARD_SPLIT => Ok(MessageKindGlobal::ShardSplit),
         TYPE_SHARD_MERGE => Ok(MessageKindGlobal::ShardMerge),
         TYPE_COMMITTEE_HANDOFF => Ok(MessageKindGlobal::CommitteeHandoff),
+        TYPE_PRESENCE_REPORT => Ok(MessageKindGlobal::PresenceReport),
         other => Err(QuilError::InvalidArgument(format!(
             "global dispatch: unknown type prefix 0x{:08x}",
             other
@@ -204,7 +210,8 @@ pub fn peek_global_message_kind(input: &[u8]) -> Result<MessageKindGlobal> {
 // =====================================================================
 
 /// Does this `MessageRequest` carry a global-engine operation?
-/// Returns true for a supported prover, shard or committee-handoff prefix.
+/// Returns true for a supported prover, shard, committee-handoff or
+/// presence-report request.
 pub fn request_is_global_op(request: &MessageRequest) -> bool {
     matches!(
         request.request,
@@ -221,6 +228,7 @@ pub fn request_is_global_op(request: &MessageRequest) -> bool {
             | Some(MessageRequestInner::ShardSplit(_))
             | Some(MessageRequestInner::ShardMerge(_))
             | Some(MessageRequestInner::CommitteeHandoff(_))
+            | Some(MessageRequestInner::PresenceReport(_))
     )
 }
 
@@ -242,6 +250,7 @@ pub fn global_kind_for_request(request: &MessageRequest) -> Option<MessageKindGl
         MessageRequestInner::ShardSplit(_) => Some(MessageKindGlobal::ShardSplit),
         MessageRequestInner::ShardMerge(_) => Some(MessageKindGlobal::ShardMerge),
         MessageRequestInner::CommitteeHandoff(_) => Some(MessageKindGlobal::CommitteeHandoff),
+        MessageRequestInner::PresenceReport(_) => Some(MessageKindGlobal::PresenceReport),
         _ => None,
     }
 }
@@ -263,6 +272,7 @@ pub fn is_global_type_prefix(tp: u32) -> bool {
             | TYPE_SHARD_SPLIT
             | TYPE_SHARD_MERGE
             | TYPE_COMMITTEE_HANDOFF
+            | TYPE_PRESENCE_REPORT
     )
 }
 
@@ -373,7 +383,7 @@ mod tests {
             .iter()
             .map(|k| k.type_prefix())
             .collect();
-        assert_eq!(ids.len(), 13);
+        assert_eq!(ids.len(), 14);
     }
 
     #[test]
@@ -381,7 +391,7 @@ mod tests {
         use std::collections::HashSet;
         let labels: HashSet<&str> =
             MessageKindGlobal::all().iter().map(|k| k.label()).collect();
-        assert_eq!(labels.len(), 13);
+        assert_eq!(labels.len(), 14);
     }
 
     #[test]
@@ -402,6 +412,7 @@ mod tests {
         assert_eq!(MessageKindGlobal::ShardSplit.label(), "shard_split");
         assert_eq!(MessageKindGlobal::ShardMerge.label(), "shard_merge");
         assert_eq!(MessageKindGlobal::CommitteeHandoff.label(), "committee_handoff");
+        assert_eq!(MessageKindGlobal::PresenceReport.label(), "presence_report");
     }
 
     // -----------------------------------------------------------------

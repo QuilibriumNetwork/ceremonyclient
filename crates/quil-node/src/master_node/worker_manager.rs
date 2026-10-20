@@ -323,7 +323,7 @@ pub(crate) fn build_thread_worker_hypergraph(
     }
     let label = db.inner().path().display().to_string();
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, &label);
-    crate::clock_retention::spawn_staged_cleanup(Arc::new(quil_store::RocksClockStore::new(db.inner())), label);
+    crate::clock_retention::spawn_staged_cleanup(&db.inner(), label);
     crdt
 }
 
@@ -532,6 +532,7 @@ pub(crate) fn init(
             let coverage_spawner = spawner.clone();
             let coverage_transport_cell = prover_message_transport.clone();
             let coverage_halt = halt_state.clone();
+            let coverage_clock = clock_store.clone();
             let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> =
                 Arc::new(move |header_canonical_bytes: Vec<u8>| {
                     // Belt-and-suspenders halt gate: the engine's
@@ -543,16 +544,39 @@ pub(crate) fn init(
                     // publish here too so no reward proof escapes
                     // for shard work that shouldn't have produced
                     // anything during the halt window.
+                    use super::reward_proofs::{
+                        describe_request, track_worker_request, unpublished, worker_submission, WorkerSubmission,
+                    };
+                    let kind = worker_submission(&header_canonical_bytes);
                     if coverage_halt.any_halted() {
                         debug!("suppressing coverage publish — coverage halt active");
+                        unpublished(&header_canonical_bytes, false);
                         return;
                     }
+                    if kind.is_some_and(|kind| !kind.active()) {
+                        debug!("presence reports are not active on this node; not publishing one");
+                        return;
+                    }
+                    // A presence report is followed to its GLOBAL frame, as a
+                    // standalone worker's is on relay; registered before it is
+                    // published, so an early inclusion is not missed.
+                    let tracked = kind.is_some_and(WorkerSubmission::tracked) && {
+                        let frame = coverage_clock.get_latest_global_clock_frame().ok()
+                            .and_then(|frame| frame.header.map(|header| header.frame_number));
+                        track_worker_request(&header_canonical_bytes, frame)
+                    };
+                    let request = header_canonical_bytes.clone();
+                    let failed = move |reason: &str, error: &dyn std::fmt::Display| {
+                        unpublished(&request, tracked);
+                        let (kind, filter) = describe_request(&request);
+                        warn!(kind, filter = %filter, error = %error, "coverage publish: {reason}");
+                    };
                     let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
                         header_canonical_bytes,
                     ) {
                         Ok(r) => r,
                         Err(e) => {
-                            warn!(error = %e, "coverage publish: bad FrameHeader bytes");
+                            failed("bad request bytes", &e);
                             return;
                         }
                     };
@@ -570,24 +594,16 @@ pub(crate) fn init(
                             coverage_spawner.detach("coverage-publish", async move {
                                 match cell.get() {
                                     Some(transport) => {
-                                        if let Err(e) = transport
-                                            .publish_prover_bundle(bytes)
-                                            .await
-                                        {
-                                            warn!(error = %e,
-                                                "coverage publish: transport submission failed");
+                                        if let Err(e) = transport.publish_prover_bundle(bytes).await {
+                                            failed("transport submission failed", &e);
                                         }
                                     }
-                                    None => {
-                                        warn!(
-                                            "coverage publish: transport not yet wired — dropping"
-                                        );
-                                    }
+                                    None => failed("transport not yet wired — dropping", &"no transport"),
                                 }
                                 Ok(())
                             });
                         }
-                        Err(e) => warn!(error = %e, "coverage publish: bundle encode failed"),
+                        Err(e) => failed("bundle encode failed", &e),
                     }
                 });
             // Per-worker state builder: each thread-mode worker opens
