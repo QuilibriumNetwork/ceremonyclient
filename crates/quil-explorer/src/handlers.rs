@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -15,6 +16,7 @@ use axum::{
 };
 use base64::Engine as _;
 use num_bigint::{BigInt, Sign};
+use parking_lot::Mutex;
 use serde::Serialize;
 
 use quil_execution::prover_registry::{
@@ -32,6 +34,9 @@ const CACHE_LONG: &str = "public, max-age=31536000, immutable";
 const CACHE_180: &str = "public, max-age=180";
 const CACHE_60: &str = "public, max-age=60";
 const PROVER_CACHE_TTL: Duration = Duration::from_secs(180);
+/// Longest a prover snapshot serves requests at its frame (one GLOBAL
+/// frame is about 9 s).
+const PROVER_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Response helpers
@@ -843,12 +848,47 @@ pub async fn handle_key_prover(
 /// in one registry call that clones each prover once. Asking per filter
 /// cloned a prover once per shard it holds, each clone carrying its key
 /// and all its allocations.
-fn all_provers(state: &ExplorerState, frame: u64) -> Vec<ProverInfo> {
-    let mut filters: Vec<Vec<u8>> = vec![Vec::new()];
-    if let Ok(summaries) = state.prover_registry.get_prover_shard_summaries(frame) {
+///
+/// Requests within one frame and `PROVER_SNAPSHOT_MAX_AGE` share one
+/// snapshot, so one build serves every dashboard request in that window
+/// (each refresh asks for eviction risk, seniority, kicked provers and
+/// stats). The age bound refreshes the snapshot when the frame stands
+/// still. At most one snapshot is held: a newer one replaces it.
+fn all_provers(state: &ExplorerState, frame: u64) -> Arc<Vec<ProverInfo>> {
+    snapshot_for(&state.provers_snapshot, frame, Instant::now(), || {
+        let summaries = state.prover_registry.get_prover_shard_summaries(frame).ok()?;
+        let mut filters: Vec<Vec<u8>> = vec![Vec::new()];
         filters.extend(summaries.into_iter().map(|s| s.filter));
+        state.prover_registry.get_provers_on_filters(&filters).ok()
+    })
+}
+
+/// The slot's value when it was built at `frame` less than
+/// `PROVER_SNAPSHOT_MAX_AGE` before `now`; otherwise `build`'s value, which
+/// replaces it. The lock is held while building, so concurrent requests
+/// needing a new snapshot build one copy, not several. A failed build
+/// (`None`) is not kept: the previous snapshot, if any, serves on and the
+/// next request builds again.
+fn snapshot_for<T: Default>(
+    slot: &Mutex<Option<(u64, Instant, Arc<T>)>>,
+    frame: u64,
+    now: Instant,
+    build: impl FnOnce() -> Option<T>,
+) -> Arc<T> {
+    let mut slot = slot.lock();
+    if let Some((built_frame, built_at, value)) = &*slot {
+        if *built_frame == frame
+            && now.saturating_duration_since(*built_at) < PROVER_SNAPSHOT_MAX_AGE
+        {
+            return Arc::clone(value);
+        }
     }
-    state.prover_registry.get_provers_on_filters(&filters).unwrap_or_default()
+    let Some(value) = build() else {
+        return slot.as_ref().map_or_else(|| Arc::new(T::default()), |(_, _, v)| Arc::clone(v));
+    };
+    let value = Arc::new(value);
+    *slot = Some((frame, now, Arc::clone(&value)));
+    value
 }
 
 /// Per-allocation inactivity assessment, mirroring
@@ -1059,7 +1099,7 @@ pub async fn handle_eviction_risk(
     // shard floor and regardless of `min_ratio`, so `eviction_pending`
     // matches the evictor's selection.
     let mut stale: Vec<EvictionCandidate> = Vec::new();
-    for prover in &provers {
+    for prover in provers.iter() {
         if prover.status != ProverStatus::Active {
             continue;
         }
@@ -1140,7 +1180,8 @@ pub async fn handle_seniority(
     let limit: Option<usize> = params.get("limit").and_then(|s| s.parse().ok());
 
     let frame = state.current_frame.load(Ordering::Relaxed);
-    let mut provers = all_provers(&state, frame);
+    let snapshot = all_provers(&state, frame);
+    let mut provers: Vec<&ProverInfo> = snapshot.iter().collect();
     // Seniority descending; ties broken by address ascending for stability.
     provers.sort_by(|a, b| b.seniority.cmp(&a.seniority).then_with(|| a.address.cmp(&b.address)));
     let mut entries: Vec<SeniorityEntry> = provers
@@ -1180,7 +1221,7 @@ pub async fn handle_kicked(method: Method, State(state): State<ExplorerState>) -
     }
     let frame = state.current_frame.load(Ordering::Relaxed);
     let mut entries: Vec<KickedEntry> = all_provers(&state, frame)
-        .into_iter()
+        .iter()
         .filter(|p| p.status == ProverStatus::Kicked)
         .map(|p| KickedEntry {
             address: hex::encode(&p.address),
@@ -1229,7 +1270,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     let mut total_seniority: u64 = 0;
     let mut eviction_pending: u64 = 0;
     let mut at_risk: u64 = 0;
-    for prover in &provers {
+    for prover in provers.iter() {
         *by_status
             .entry(prover_status_to_string(prover.status))
             .or_insert(0) += 1;
@@ -2479,5 +2520,44 @@ mod tests {
         assert!(matches!(parse_prover_status("2"), Some(StatusParam::Known(ProverStatus::Active))));
         assert!(matches!(parse_prover_status("200"), Some(StatusParam::NumericEmpty)));
         assert!(parse_prover_status("nonsense").is_none());
+    }
+
+    #[test]
+    fn snapshot_for_builds_once_per_frame() {
+        let slot = Mutex::new(None);
+        let builds = std::cell::Cell::new(0u32);
+        let build = |value: u32| {
+            builds.set(builds.get() + 1);
+            Some(value)
+        };
+        let half = PROVER_SNAPSHOT_MAX_AGE / 2;
+        let t0 = Instant::now();
+        let first = snapshot_for(&slot, 10, t0, || build(1));
+        let again = snapshot_for(&slot, 10, t0 + half, || build(2));
+        assert_eq!(builds.get(), 1);
+        assert!(Arc::ptr_eq(&first, &again));
+        // A new frame rebuilds.
+        let t1 = t0 + half;
+        let next = snapshot_for(&slot, 11, t1, || build(3));
+        assert_eq!((builds.get(), *next), (2, 3));
+        // The same frame shares within the max age and rebuilds past it.
+        assert_eq!(*snapshot_for(&slot, 11, t1 + half, || build(4)), 3);
+        assert_eq!(builds.get(), 2);
+        assert_eq!(*snapshot_for(&slot, 11, t1 + PROVER_SNAPSHOT_MAX_AGE, || build(5)), 5);
+        assert_eq!(builds.get(), 3);
+    }
+
+    #[test]
+    fn snapshot_for_keeps_the_last_snapshot_when_a_build_fails() {
+        let slot = Mutex::new(None);
+        let t0 = Instant::now();
+        // Nothing built yet: an empty answer, not kept.
+        assert_eq!(*snapshot_for(&slot, 10, t0, || None::<u32>), 0);
+        assert!(slot.lock().is_none());
+        assert_eq!(*snapshot_for(&slot, 10, t0, || Some(7)), 7);
+        // A failed build at a new frame serves the previous snapshot and
+        // leaves it in place, so the next request builds again.
+        assert_eq!(*snapshot_for(&slot, 11, t0, || None), 7);
+        assert_eq!(*snapshot_for(&slot, 11, t0, || Some(8)), 8);
     }
 }
