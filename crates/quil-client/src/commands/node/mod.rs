@@ -9,6 +9,7 @@ use crate::context::GlobalArgs;
 
 pub mod archive;
 pub mod diagnostics;
+pub mod diagnostics_logs;
 pub mod lifecycle;
 pub mod log;
 pub mod nodeconfig;
@@ -32,7 +33,8 @@ pub enum NodeCommand {
         #[command(subcommand)]
         command: archive::ArchiveCommand,
     },
-    /// Opt-in diagnostics from other nodes: their health reports.
+    /// Opt-in diagnostics from other nodes: their health reports and,
+    /// approved by their operators, their redacted logs.
     Diagnostics {
         #[command(subcommand)]
         command: diagnostics::DiagnosticsCommand,

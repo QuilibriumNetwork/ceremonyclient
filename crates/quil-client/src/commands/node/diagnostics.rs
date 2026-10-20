@@ -4,6 +4,9 @@
 //! its phase, frames, committee session and archive recovery counts. A node
 //! serves it to itself and to the peers its operator lists in
 //! `diagnostics.healthReport`; the report holds no logs, addresses or keys.
+//!
+//! The log request commands (`request`, `status`, `fetch`, `pending`,
+//! `approve`, `deny`) are in [`super::diagnostics_logs`].
 
 use std::fmt::Write as _;
 use std::str::FromStr;
@@ -15,10 +18,10 @@ use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
     Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase, WorkerHealth,
 };
-use quil_types::proto::node::{GetPeerInfoRequest, PeerInfo};
+use quil_types::proto::node::PeerInfo;
 
 use crate::commands::node::prover::local_execution::execution_label;
-use crate::context::{Context, GlobalArgs};
+use crate::context::GlobalArgs;
 use crate::rpc;
 
 #[derive(Debug, Subcommand)]
@@ -34,6 +37,11 @@ pub enum DiagnosticsCommand {
     /// `minIntervalSecs` (60 by default) for each peer. `--self` asks this
     /// node, which always serves itself.
     ///
+    /// The target sees the IP address you connect from; use a network you
+    /// are willing to reveal. With --identity <file> (from `qclient
+    /// diagnostics keygen`) qclient asks as that identity instead of this
+    /// node and contacts no local node; then pass --addr.
+    ///
     /// Columns: PHASE is the worker's lifecycle phase (stale when its last
     /// observation is over 30s old), REASON why that phase holds, LOCAL the
     /// worker's materialized app frame, COMMITTEE and GEN the head frame and
@@ -45,6 +53,48 @@ pub enum DiagnosticsCommand {
     /// and the longest wait for a recovery turn. Ages are <60s or >60s
     /// before the report, on the target's clock.
     Health(HealthArgs),
+    /// Ask a peer for its redacted logs of a window of at most 24 h.
+    ///
+    /// Signs the request with this node's network key and adds a fresh
+    /// encryption key of this request alone, whose secret stays in
+    /// .diagnostics/requests until the fetch. The target queues the request
+    /// only when its operator set `diagnostics.logRequests.enabled: true` and
+    /// listed this node's peer ID in `diagnostics.logRequests.allowedPeers`;
+    /// that operator then reviews a redacted preview and approves or denies
+    /// it. With --filter only lines mentioning those shard filters are
+    /// exported, plus every warn and error line.
+    ///
+    /// The target sees the IP address you connect from; use a network you
+    /// are willing to reveal. With --identity <file> (from `qclient
+    /// diagnostics keygen`) the request is signed by and sent as that
+    /// identity instead of this node, and qclient contacts no local node;
+    /// then pass --addr, and keep the identity file for `status` and
+    /// `fetch`, which need --identity too.
+    Request(super::diagnostics_logs::RequestArgs),
+    /// Show the state of a log request at the peer it was made to.
+    Status(super::diagnostics_logs::PeerRequestArgs),
+    /// Download an approved log request and decrypt it into a
+    /// node-log-export folder (node.log.gz, manifest.json, SHA256SUMS).
+    Fetch(super::diagnostics_logs::FetchArgs),
+    /// List peers' log requests to this node (its operator only).
+    ///
+    /// Like approve and deny, it dials this node's peer listener with this
+    /// node's network key, the only key these operator commands admit:
+    /// whoever holds it acts as this node's operator.
+    Pending,
+    /// Approve a peer's log request.
+    ///
+    /// Exports the request's window and filters from this node's logs with
+    /// the redaction of `node log export` and shows its preview; after you
+    /// type yes (or with the global --yes) it seals the bundle to the
+    /// requester's key and hands it to this node, which serves it to that
+    /// peer alone until the request expires. The token map goes to
+    /// .diagnostics/token-maps, owner-readable only: keep it private;
+    /// approve deletes maps older than 7 days there.
+    Approve(super::diagnostics_logs::DecideArgs),
+    /// Deny a peer's pending log request, or withdraw an approved bundle,
+    /// fetched or not: this node deletes it and the peer sees it denied.
+    Deny(super::diagnostics_logs::DecideArgs),
 }
 
 #[derive(Debug, Args)]
@@ -59,27 +109,27 @@ pub struct HealthArgs {
     /// publishes (or, with --self, this node's stream listener).
     #[arg(long)]
     pub addr: Option<String>,
+    /// Ask as the diagnostics identity in this file (`qclient diagnostics
+    /// keygen`) instead of this node, contacting no local node; needs --addr.
+    #[arg(long, value_name = "FILE", conflicts_with = "own")]
+    pub identity: Option<std::path::PathBuf>,
 }
 
 pub async fn run(global: GlobalArgs, cmd: &DiagnosticsCommand) -> anyhow::Result<()> {
     match cmd {
         DiagnosticsCommand::Health(args) => health(global, args).await,
+        DiagnosticsCommand::Request(args) => super::diagnostics_logs::request(global, args).await,
+        DiagnosticsCommand::Status(args) => super::diagnostics_logs::status(global, args).await,
+        DiagnosticsCommand::Fetch(args) => super::diagnostics_logs::fetch(global, args).await,
+        DiagnosticsCommand::Pending => super::diagnostics_logs::pending(global).await,
+        DiagnosticsCommand::Approve(args) => super::diagnostics_logs::approve(global, args).await,
+        DiagnosticsCommand::Deny(args) => super::diagnostics_logs::deny(global, args).await,
     }
 }
 
 async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
-    let ctx = Context::load(global)?;
-    let (node_config, dir) = ctx.load_node_config("default")?;
-    let key = ctx
-        .key_manager(&node_config, &dir)?
-        .get_signer_by_id("q-prover-key")
-        .map_err(|e| anyhow::anyhow!("get q-prover-key for transport auth: {e}"))?
-        .private_key()
-        .to_vec();
-    let own = quil_p2p::Keypair::falcon_from_bytes(&key)
-        .map_err(|e| anyhow::anyhow!("this node's network identity: {e}"))?
-        .public()
-        .to_peer_id();
+    let (requester, node) = super::diagnostics_logs::requester(global, args.identity.as_deref())?;
+    let own = requester.peer;
     let (target, label) = match &args.peer {
         Some(peer) => {
             let target = PeerId::from_str(peer.trim()).map_err(|e| anyhow::anyhow!("{peer} is not a peer ID: {e}"))?;
@@ -87,23 +137,8 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
         }
         None => (own, "this node".to_string()),
     };
-    let addr = match &args.addr {
-        Some(addr) => addr.clone(),
-        None if target == own => rpc::local_stream_addr(&node_config)?,
-        None => {
-            let mut client = rpc::connect_node_service(&ctx.connect_opts(&node_config, false))
-                .await
-                .map_err(|e| anyhow::anyhow!("ask this node for the address of {label}: {e}; is it running? Or pass --addr host:port"))?;
-            let peers = client
-                .get_peer_info(GetPeerInfoRequest {})
-                .await
-                .map_err(|e| anyhow::anyhow!("ask this node for its peer info: {}", e.message()))?
-                .into_inner()
-                .peer_info;
-            published_stream_addr(&peers, &target)?
-        }
-    };
-    let mut client = diag::connect_peer(&addr, &key, target)
+    let addr = super::diagnostics_logs::target_addr(node.as_ref(), &target, &own, args.addr.as_deref()).await?;
+    let mut client = diag::connect_peer(&addr, &requester.key, target)
         .await
         .map_err(|e| anyhow::anyhow!("connect to {label} at {addr}: {}", error_chain(&*e)))?;
     match client.get_health_report(GetHealthReportRequest {}).await {
@@ -112,13 +147,13 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
             Ok(())
         }
         Err(status) => {
-            eprint!("{}", render_refusal(&label, &status, &own.to_base58()));
+            eprint!("{}", render_refusal(&label, &status, &own.to_base58(), requester.whose));
             anyhow::bail!("no health report from {label}")
         }
     }
 }
 
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
@@ -295,7 +330,7 @@ const MAX_MESSAGE_CHARS: usize = 200;
 
 /// A target's status message without control characters (it is remote
 /// text printed to a terminal), at most [`MAX_MESSAGE_CHARS`] long.
-fn printable(message: &str) -> String {
+pub(crate) fn printable(message: &str) -> String {
     let mut text: String = message.chars().filter(|c| !c.is_control()).take(MAX_MESSAGE_CHARS + 1).collect();
     if text.chars().count() > MAX_MESSAGE_CHARS {
         text = text.chars().take(MAX_MESSAGE_CHARS).collect::<String>() + "…";
@@ -304,14 +339,14 @@ fn printable(message: &str) -> String {
 }
 
 /// Why `target` did not send a report, and what would change that.
-pub(crate) fn render_refusal(target: &str, status: &tonic::Status, own: &str) -> String {
+pub(crate) fn render_refusal(target: &str, status: &tonic::Status, own: &str, whose: &str) -> String {
     let message = printable(status.message());
     match status.code() {
         tonic::Code::PermissionDenied => format!(
             "{target} refused the health report ({message}).\n\
              Its operator serves it only to peers listed in that node's config:\n  \
              diagnostics:\n    healthReport:\n      enabled: true\n      allowedPeers:\n        - {own}\n\
-             and a restart of that node. {own} is this node's peer ID.\n"
+             and a restart of that node. {own} is {whose} peer ID.\n"
         ),
         tonic::Code::ResourceExhausted => format!(
             "{target} refused the health report: {message}.\n\
@@ -424,7 +459,7 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
     #[test]
     fn a_refusal_names_what_the_target_operator_must_configure() {
         let denied = tonic::Status::permission_denied(diag::DENIED);
-        assert_eq!(render_refusal("…Ab12cd", &denied, "QmOwnPeerId"), "\
+        assert_eq!(render_refusal("…Ab12cd", &denied, "QmOwnPeerId", "this node's"), "\
 …Ab12cd refused the health report (diagnostics unavailable).
 Its operator serves it only to peers listed in that node's config:
   diagnostics:
@@ -435,9 +470,9 @@ Its operator serves it only to peers listed in that node's config:
 and a restart of that node. QmOwnPeerId is this node's peer ID.
 ");
         let limited = tonic::Status::resource_exhausted("a health report was served to this peer less than 60s ago");
-        assert!(render_refusal("…Ab12cd", &limited, "QmOwnPeerId").contains("minIntervalSecs"));
+        assert!(render_refusal("…Ab12cd", &limited, "QmOwnPeerId", "this node's").contains("minIntervalSecs"));
         let old = tonic::Status::unimplemented("");
-        assert!(render_refusal("…Ab12cd", &old, "QmOwnPeerId").contains("predates"));
+        assert!(render_refusal("…Ab12cd", &old, "QmOwnPeerId", "this node's").contains("predates"));
     }
 
     /// A target's message reaches the terminal without escape sequences
@@ -445,7 +480,7 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
     #[test]
     fn a_refusal_message_is_printable_and_bounded() {
         let hostile = tonic::Status::unavailable(format!("\x1b]0;owned\x07\x1b[2Jbusy\r\nretry{}", "x".repeat(500)));
-        let text = render_refusal("…Ab12cd", &hostile, "QmOwnPeerId");
+        let text = render_refusal("…Ab12cd", &hostile, "QmOwnPeerId", "this node's");
         assert!(text.starts_with("…Ab12cd did not answer the health report request: Unavailable: ]0;owned[2Jbusyretryxxx"), "{text}");
         assert!(!text.trim_end_matches('\n').chars().any(char::is_control), "{text:?}");
         assert_eq!(printable(hostile.message()).chars().count(), MAX_MESSAGE_CHARS + 1);
