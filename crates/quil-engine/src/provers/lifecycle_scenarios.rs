@@ -279,6 +279,9 @@ fn scenario_allocation_state_and_worker_matrix() {
                         let mut scenario = Scenario::new(vec![allocation], vec![worker]);
                         // This matrix characterizes allocator state alone;
                         // targeted histories above exercise policy actions.
+                        // Renewals were decided since start: a lapsed seat
+                        // bound at startup is the seeded histories' case.
+                        scenario.lifecycle.allocator.note_renewals_offered();
                         scenario.lifecycle.allocator.on_new_frame(frame).unwrap();
                         scenario.assert_unique_workers();
                         // Manual selection controls placement, not whether
@@ -398,12 +401,16 @@ fn scenario_seeded_recovery_histories() {
                 scenario.observe();
                 renewed = true;
             }
-            if next() % 4 == 0 {
+            let bound_before = scenario.is_bound(&held);
+            let restarted = next() % 4 == 0;
+            if restarted {
                 scenario.restart();
             }
             scenario.tick(frame);
             // The model never calls effective_status or the recovery helper.
-            let expected = (renewed && frame / 720 <= 3) || frame < 1440;
+            // A restart keeps a seat its worker still served until the first
+            // evaluation decides its renewal, which no pipeline runs here.
+            let expected = (renewed && frame / 720 <= 3) || frame < 1440 || (restarted && bound_before);
             assert_eq!(
                 scenario.is_bound(&held),
                 expected,
