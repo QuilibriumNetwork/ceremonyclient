@@ -2150,6 +2150,9 @@ impl ProverLifecycle {
                     decide_candidates.push(d.clone());
                 }
             }
+            for d in &mut decide_candidates {
+                d.activating_count = membership.get(&d.filter).map_or(0, |m| m.activating.len() as u64);
+            }
             let (auto_reject, auto_confirm) = proposer::decide_joins(
                 &decide_candidates,
                 &auto_ready,
@@ -2430,7 +2433,7 @@ impl ProverLifecycle {
             // release this node; see `proposer::releasable_member`.
             let releasable = |filter: &[u8]| {
                 let members = membership.get(filter).cloned().unwrap_or_default();
-                let addresses: Vec<_> = members.active.into_iter().chain(members.leaving).collect();
+                let addresses: Vec<_> = members.active.into_iter().chain(members.activating).chain(members.leaving).collect();
                 proposer::releasable_member(&self.prover_address, filter, &addresses)
             };
             // The pending-confirm bucket excludes confirmed leaves serving
@@ -2725,7 +2728,7 @@ impl ProverLifecycle {
                 }
                 let members = membership.get(filter).cloned().unwrap_or_default();
                 if !proposer::chosen_to_depart(&self.prover_address, filter,
-                    members.active.len(), &members.leaving) {
+                    members.staying(), &members.leaving) {
                     return true;
                 }
                 swap_confirm.push(filter.clone());
@@ -3070,6 +3073,7 @@ fn build_proposal_descriptors(
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
             active_count: active as u64,
+            activating_count: 0,
         });
         seen.insert(s.filter.clone());
     }
@@ -3111,6 +3115,7 @@ fn build_proposal_descriptors(
             // bucket-by-halt-risk pass picks these first.
             total_active_joining: 0,
             active_count: 0,
+            activating_count: 0,
         });
     }
     out
@@ -3151,6 +3156,7 @@ fn build_decide_descriptors(
             active_on_ring: ri.active_on_current_ring,
             total_active_joining: total as u64,
             active_count: active as u64,
+            activating_count: 0,
         })
     }).collect()
 }
@@ -3205,6 +3211,44 @@ mod buckets_tests {
             ring: 0,
             vertex_address: Vec::new(),
         }
+    }
+
+    /// A swap keeps the halt-risk floor whatever the shard's other leaves
+    /// did: a confirmed leaver departs anyway and a departed or stale-epoch
+    /// allocation is no member, so neither frees a spare, while a confirmed
+    /// join is a member the shard will have. Of two undecided leavers on a
+    /// shard with two Active members and one confirmed join, one may depart.
+    #[test]
+    fn swap_departures_spare_only_members_the_shard_keeps() {
+        use quil_types::consensus::LifecycleMembers;
+        let _epoch = epoch_length_guard();
+        let e = quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let frame = 10 * e + 5;
+        let current = |mut a: ProverAllocationInfo| { a.epoch = 10; a };
+        let activating = { let mut a = current(alloc(7, ProverStatus::Active, 9 * e, 0)); a.join_confirm_frame_number = 10 * e + 1; a };
+        let stale_epoch = { let mut a = alloc(7, ProverStatus::Active, 0, 0); a.epoch = 8; a };
+        let departing = { let mut a = alloc(7, ProverStatus::Leaving, 0, 9 * e); a.leave_confirm_frame_number = 10 * e + 2; a };
+        let entries = [
+            (1u8, current(alloc(7, ProverStatus::Active, 0, 0))),
+            (2, current(alloc(7, ProverStatus::Active, 0, 0))),
+            (3, activating),
+            (4, stale_epoch),
+            (5, departing),
+            (6, alloc(7, ProverStatus::Leaving, 0, 2 * e)),
+            (7, alloc(7, ProverStatus::Leaving, 0, 9 * e + 3)),
+            (8, alloc(7, ProverStatus::Leaving, 0, 9 * e + 4)),
+        ];
+        let mut members = LifecycleMembers::default();
+        for (id, a) in &entries {
+            members.add(vec![*id; 32], a, frame);
+        }
+        members.sort();
+        assert_eq!(members.staying(), 3);
+        assert_eq!(members.leaving, vec![vec![7u8; 32], vec![8u8; 32]]);
+        let chosen = members.leaving.iter()
+            .filter(|me| proposer::chosen_to_depart(me, &[7], members.staying(), &members.leaving))
+            .count();
+        assert_eq!(chosen, 1, "the shard keeps four members");
     }
 
     /// Serializes every test whose expectations depend on the process-global
@@ -3963,7 +4007,7 @@ mod proposal_loop_tests {
             status_counts: HashMap::from([(ProverStatus::Active, 3),
                 (ProverStatus::Joining, 20), (ProverStatus::Leaving, 7)]) };
         let descriptor = ShardDescriptor { filter, size: 1000, ring: 0, shards: 2,
-            active_on_ring: 3, total_active_joining: 23, active_count: 3 };
+            active_on_ring: 3, total_active_joining: 23, active_count: 3, activating_count: 0 };
         let evidence = priority_evidence(&descriptor, Some(&summary), Some(&allocation),
             frame, 10, &30.into(), None);
         assert_eq!(evidence.active, 3);
@@ -4842,7 +4886,8 @@ mod proposal_loop_tests {
             summaries.push(summary);
         }
         let mut members = vec![prover(address.clone(), allocations.clone())];
-        for byte in 0..63 { members.push(prover(vec![byte; 32], Vec::new())); }
+        // The other provers hold the same shards, as the summaries count.
+        for byte in 0..63 { members.push(prover(vec![byte; 32], allocations.clone())); }
         reg.set_provers(members);
         reg.set_summaries(summaries);
         let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
