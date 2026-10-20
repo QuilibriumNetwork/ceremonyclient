@@ -182,5 +182,8 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     assert_eq!(next.frame_number, sealed_at + 1);
     assert_eq!(next.parent_selector, second.genesis, "the successor extends its authorized genesis");
     assert!(finalized(&harness).iter().all(|f| f.header.as_ref().unwrap().frame_number != 0));
+    // Join every consensus host before the stores drop: a detached host
+    // can close RocksDB while the process exits (`AppShardHarness::shutdown`).
+    harness.shutdown().await;
     quil_types::consensus::set_committee_handoff_policy(None);
 }

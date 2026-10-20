@@ -136,6 +136,17 @@ pub async fn connect_dispatch_mtls(
         .max_encoding_message_size(MAX_MSG))
 }
 
+/// The node's stream endpoint (`:8340`) as a `host:port` to dial: its stream
+/// listen address, on localhost for a `0.0.0.0` listener.
+pub fn local_stream_addr(node_config: &quil_config::Config) -> anyhow::Result<String> {
+    let stream = if node_config.p2p.stream_listen_multiaddr.is_empty() {
+        "/ip4/0.0.0.0/tcp/8340"
+    } else {
+        node_config.p2p.stream_listen_multiaddr.as_str()
+    };
+    Ok(grpc_multiaddr_to_host_port(stream)?.replace("0.0.0.0", "127.0.0.1"))
+}
+
 /// Convert a gRPC listen multiaddr to a `host:port` string.
 ///
 /// Port of `go-multiaddr/net.DialArgs` for the multiaddr shapes the node

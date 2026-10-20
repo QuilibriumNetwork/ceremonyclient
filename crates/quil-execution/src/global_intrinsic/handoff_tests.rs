@@ -1818,3 +1818,97 @@ mod legacy_tests;
 
 #[path = "handoff_presence_tests.rs"]
 mod presence_tests;
+
+/// The pending-change repair rebuilds a split whose parent's committee
+/// SEALED (not fenced) from its request, both while the parent seals and once
+/// it closed; it leaves the request alone once a shard the split registers,
+/// or one overlapping the parent, is in the grid; and it reports, rather than
+/// rebuilds, a request it cannot rebuild unambiguously.
+#[test]
+fn the_repair_rebuilds_a_sealed_split_and_reports_what_it_cannot_rebuild() {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+    use schedule::{recover_topology_change, Recovery, RecoveryFloor};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    let length = quil_types::consensus::epoch_length_frames();
+    let start = (super::super::materialize::unified_tree_cutover_frame() / length + 10) * length;
+    commit(&state, start - 1);
+    let floor = RecoveryFloor { request_frame: 0, proposed_frame: 0 };
+    let none = |_: &[u8]| false;
+    let split = |app: u8, proposed: u64| {
+        let app = [app; 32];
+        PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: quil_forest::encode_shard_bit_path(&app, &[true]),
+            children: [false, true].map(|bit| quil_forest::encode_shard_bit_path(&app, &[true, true, bit])).to_vec(),
+            effective_epoch: proposed / length + 2,
+            proposed_frame: proposed,
+        }
+    };
+    let provers = keys();
+    // Three splits: staffed (four provers), one with a single prover (a child
+    // without members), and one scheduled long after it came due.
+    let staffed = split(0x21, start + 5);
+    let single = split(0x22, start + 6);
+    let late = split(0x23, start + 7);
+    for (change, members) in [(&staffed, &provers[..]), (&single, &provers[..1]), (&late, &provers[..])] {
+        let scan = scan_of(&[(&change.parent, members)]);
+        schedule::reconcile_membership(&state, start, &policy(), &[change.parent.clone()], &scan).unwrap();
+    }
+    commit(&state, start);
+    let due = staffed.effective_epoch * length;
+    let schedule_at = |change: &PendingShardChange, members: &[FalconPrivateKey], frame: u64| {
+        let scan = scan_of(&[(&change.parent, members)]);
+        assert_eq!(schedule::gate_topology_change(&state, frame, &policy(), change, Some(&scan), true).unwrap(),
+            schedule::TopologyGate::Wait);
+        commit(&state, frame);
+        let source = head(&state, &change.parent).unwrap().unwrap();
+        let Status::Sealing(id) = status(&state, &source.id().unwrap()).unwrap() else {
+            panic!("the parent must be closing");
+        };
+        (source, id)
+    };
+    let mut scheduled = vec![schedule_at(&staffed, &provers, due), schedule_at(&single, &provers[..1], due + 1)];
+    let in_grid = |change: &PendingShardChange| {
+        let parent = change.parent.clone();
+        move |filter: &[u8]| filter == parent.as_slice()
+    };
+
+    let (source, id) = &scheduled[0];
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Restore(staffed.clone()), "rebuilt while the parent seals");
+    let request = request(&state, id).unwrap().unwrap();
+    assert!(apply_submission(&state, due + 2, &submission(&request, 0, &provers, 4)).unwrap());
+    commit(&state, due + 2);
+    assert_eq!(status(&state, &source.id().unwrap()).unwrap(), Status::Closed(*id));
+    assert!(!is_fenced(&state, &source.id().unwrap()).unwrap(), "sealed, not fenced");
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Restore(staffed.clone()), "rebuilt once the seal closed the parent");
+    // A child in the grid beside the parent, or anything overlapping it: the
+    // split applied here and something registered the parent again.
+    let child = staffed.children[0].clone();
+    let parent = staffed.parent.clone();
+    assert_eq!(recover_topology_change(&state, id, floor, &|f: &[u8]| f == parent.as_slice() || f == child.as_slice(), &none).unwrap(),
+        Recovery::Applied("a shard the change registers is in the grid"));
+    assert_eq!(recover_topology_change(&state, id, floor, &in_grid(&staffed), &|f: &[u8]| f == parent.as_slice()).unwrap(),
+        Recovery::Applied("a shard overlapping a source is in the grid"));
+    // Floors: a request before them is never rebuilt.
+    let later = RecoveryFloor { request_frame: due + 1, proposed_frame: 0 };
+    assert_eq!(recover_topology_change(&state, id, later, &in_grid(&staffed), &none).unwrap(), Recovery::Never);
+
+    scheduled.push(schedule_at(&late, &provers, due + 20 * length));
+    assert_eq!(recover_topology_change(&state, &scheduled[1].1, floor, &in_grid(&single), &none).unwrap(),
+        Recovery::Unresolved("a split child may have received no members"));
+    // The applied-here guards come first: a healthy store whose grid holds
+    // the staffed child reports nothing.
+    let staffed_child = single.children[0].clone();
+    let single_parent = single.parent.clone();
+    assert_eq!(recover_topology_change(&state, &scheduled[1].1, floor,
+        &|f: &[u8]| f == single_parent.as_slice() || f == staffed_child.as_slice(), &none).unwrap(),
+        Recovery::Applied("a shard the change registers is in the grid"));
+    assert_eq!(recover_topology_change(&state, &scheduled[2].1, floor, &in_grid(&late), &none).unwrap(),
+        Recovery::Unresolved("no topology record of the searched proposal frames names the request"));
+    assert_eq!(recover_topology_change(&state, &[0x5a; 32], floor, &in_grid(&staffed), &none).unwrap(),
+        Recovery::Unresolved("the request record is absent"));
+}

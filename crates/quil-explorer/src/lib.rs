@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 
 pub mod handlers;
 pub mod message_ring;
+pub mod production;
 
 pub use message_ring::{RecentMessage, RecentMessageRing};
 
@@ -75,6 +76,14 @@ pub struct ExplorerState {
     /// per-request `proverCache`/`proverShardCache` maps. Keyed by an
     /// endpoint-specific string; stores the already-serialized body.
     pub(crate) cache: Arc<RwLock<HashMap<String, (Instant, Vec<u8>)>>>,
+    /// `/shards/production` and `/stats` `app_shards` as
+    /// [`production::run_indexer`] last built them; `None` until its first
+    /// build. Handlers only read it.
+    pub(crate) production_snapshot: Arc<RwLock<Option<Arc<production::Snapshot>>>>,
+    /// Outside archive mode, the node's archive shard-info cache: the
+    /// production snapshot's grid then comes from it, not from the shards
+    /// store (see [`production::GridSource`]). `None` on archives.
+    pub archive_grid: Option<production::ArchiveGridProvider>,
 }
 
 impl ExplorerState {
@@ -104,7 +113,17 @@ impl ExplorerState {
             messages,
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            production_snapshot: Arc::new(RwLock::new(None)),
+            archive_grid: None,
         }
+    }
+
+    /// Take the production snapshot's grid from the node's archive
+    /// shard-info cache: for a node outside archive mode, whose shards
+    /// store keeps the genesis grid.
+    pub fn with_archive_grid(mut self, provider: production::ArchiveGridProvider) -> Self {
+        self.archive_grid = Some(provider);
+        self
     }
 }
 
@@ -127,6 +146,7 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/provers/seniority", any(handlers::handle_seniority))
         .route("/provers/kicked", any(handlers::handle_kicked))
         .route("/stats", any(handlers::handle_stats))
+        .route("/shards/production", any(handlers::handle_shard_production))
         .route("/token/supply", any(handlers::handle_token_supply))
         .route("/token/coin/:address", any(handlers::handle_token_coin))
         .route("/token/coins/:owner", any(handlers::handle_token_coins))
