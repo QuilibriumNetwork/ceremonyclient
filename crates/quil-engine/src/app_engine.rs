@@ -24,6 +24,7 @@ use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
 
 use crate::app_types::AppShardState;
+use crate::bounded_warn::{self, Report};
 use crate::outage::OutageEvent;
 
 #[path = "app_parent.rs"]
@@ -4745,16 +4746,32 @@ impl AppConsensusEngine {
                         &source, manager.clone(), self.clock_store.clone(), self.frame_validator(),
                         self.delivery_frame_source.as_ref(), checkpoint.frame,
                     ).await {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            let key = ("history-headers", session.filter.clone(), session.generation, source.generation);
+                            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&key, 0) {
+                                info!(
+                                    filter = hex::encode(&session.filter), session_generation = session.generation,
+                                    predecessor_generation = source.generation, through = checkpoint.frame,
+                                    attempts, duration_secs = duration.as_secs(),
+                                    "predecessor outgoing history recovered from certified headers after earlier failures",
+                                );
+                            }
+                        }
                         Ok(false) => {
                             return Err(QuilError::ExecutionUnavailable(
                                 "predecessor outgoing history recovery is still in progress".into()));
                         }
-                        Err(error) => warn!(
-                            filter = hex::encode(&session.filter), session_generation = session.generation,
-                            predecessor_generation = source.generation, through = checkpoint.frame, %error,
-                            "predecessor outgoing history could not be recovered from certified headers",
-                        ),
+                        Err(error) => {
+                            let key = ("history-headers", session.filter.clone(), session.generation, source.generation);
+                            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&key, 0) {
+                                warn!(
+                                    filter = hex::encode(&session.filter), session_generation = session.generation,
+                                    predecessor_generation = source.generation, through = checkpoint.frame,
+                                    attempts, ongoing_secs = duration.as_secs(), %error,
+                                    "predecessor outgoing history could not be recovered from certified headers",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -4762,9 +4779,22 @@ impl AppConsensusEngine {
             // no carry, a header this member cannot fetch), an archive's
             // records can, accepted only against the sealed history root.
             if let Some(fetch) = self.outgoing_history_source.as_ref() {
-                if let Err(error) = crate::app_handoff::recover_sealed_history(global, &shard, session, fetch).await {
-                    warn!(filter = hex::encode(&session.filter), session_generation = session.generation, %error,
-                        "predecessor outgoing history could not be recovered from an archive");
+                let key = ("history-archive", session.filter.clone(), session.generation, 0);
+                match crate::app_handoff::recover_sealed_history(global, &shard, session, fetch).await {
+                    Ok(_) => {
+                        if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&key, 0) {
+                            info!(filter = hex::encode(&session.filter), session_generation = session.generation,
+                                attempts, duration_secs = duration.as_secs(),
+                                "predecessor outgoing history recovered from an archive after earlier failures");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&key, 0) {
+                            warn!(filter = hex::encode(&session.filter), session_generation = session.generation,
+                                attempts, ongoing_secs = duration.as_secs(), %error,
+                                "predecessor outgoing history could not be recovered from an archive");
+                        }
+                    }
                 }
             }
             if let Err(error) = crate::app_handoff::successor_state_matches(global, &shard, self.clock_store.as_ref(), session) {
@@ -8107,15 +8137,37 @@ async fn storage_history_unavailable(
     // Every certified frame taken from an archive or the local store passes
     // here before it is validated: a legacy certificate today's registry no
     // longer reproduces gets its historical committees first.
-    if let Err(error) = validator.prepare_historical_committee(frame).await {
-        warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
-            "historical committee of a certified legacy frame unavailable");
-    }
-    match validator.prepare_storage_history(frame).await {
-        Ok(()) => None,
+    // One condition per shard, whichever of its frames is being checked.
+    let (filter, number) = frame.header.as_ref().map_or((Vec::new(), 0), |h| (h.address.clone(), h.frame_number));
+    let committee_key = ("history-committee", filter.clone(), 0, 0);
+    match validator.prepare_historical_committee(frame).await {
+        Ok(()) => {
+            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&committee_key, number) {
+                info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
+                    "historical committee of a certified legacy frame available after earlier failures");
+            }
+        }
         Err(error) => {
-            warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
-                "storage history of a certified frame unavailable; validating its certificate without possession");
+            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&committee_key, number) {
+                warn!(filter = hex::encode(&filter), frame = number, attempts, ongoing_secs = duration.as_secs(), %error,
+                    "historical committee of a certified legacy frame unavailable");
+            }
+        }
+    }
+    let history_key = ("history-storage", filter.clone(), 0, 0);
+    match validator.prepare_storage_history(frame).await {
+        Ok(()) => {
+            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&history_key, number) {
+                info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
+                    "storage history of a certified frame available after earlier failures");
+            }
+            None
+        }
+        Err(error) => {
+            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&history_key, number) {
+                warn!(filter = hex::encode(&filter), frame = number, attempts, ongoing_secs = duration.as_secs(), %error,
+                    "storage history of a certified frame unavailable; validating its certificate without possession");
+            }
             Some(error)
         }
     }
