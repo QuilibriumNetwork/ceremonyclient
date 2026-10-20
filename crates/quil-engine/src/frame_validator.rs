@@ -111,6 +111,69 @@ pub fn global_frame_body_matches_requests_root(
     recomputed == header.requests_root
 }
 
+/// How often, at most, the newer-committee upgrade warning repeats.
+const NEWER_COMMITTEE_WARN_SECS: u64 = 600;
+
+/// The consensus epoch `cert` claims, when it is later than `expected_epoch`,
+/// the epoch this build expects for the certificate's GLOBAL frame: the
+/// network moved to a successor committee this build does not know. Read
+/// before any verification, so it is a hint, never an acceptance.
+fn newer_certificate_epoch(expected_epoch: u64, cert: &[u8]) -> Option<u64> {
+    quil_cw_consensus::app_cert::unverified_finalization_epoch(cert).filter(|epoch| *epoch > expected_epoch)
+}
+
+/// GLOBAL frames refused while their certificate claims a newer committee,
+/// process-wide: when the warning last fired (unix seconds, 0 for never)
+/// and how many such frames were refused since.
+struct NewerCommitteeFrames {
+    last_warn_secs: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+}
+
+impl NewerCommitteeFrames {
+    const fn new() -> Self {
+        Self { last_warn_secs: std::sync::atomic::AtomicU64::new(0), frames: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Count one refused frame; when the warning is due at `now_secs` (first
+    /// time, or [`NEWER_COMMITTEE_WARN_SECS`] after the previous one), the
+    /// frames refused since the previous warning, this one included.
+    fn note(&self, now_secs: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.frames.fetch_add(1, Relaxed);
+        let last = self.last_warn_secs.load(Relaxed);
+        if last != 0 && now_secs < last.saturating_add(NEWER_COMMITTEE_WARN_SECS) {
+            return None;
+        }
+        self.last_warn_secs.compare_exchange(last, now_secs.max(1), Relaxed, Relaxed).ok()?;
+        Some(self.frames.swap(0, Relaxed))
+    }
+}
+
+static NEWER_COMMITTEE_FRAMES: NewerCommitteeFrames = NewerCommitteeFrames::new();
+
+/// Warn, at a bounded rate, when GLOBAL frame `frame` was refused and its
+/// certificate claims a later epoch than `expected_epoch`: this build cannot
+/// follow GLOBAL until it is upgraded to a release that knows the successor
+/// committee. The refusal itself is unchanged.
+fn warn_if_newer_committee(frame: u64, expected_epoch: u64, cert: &[u8]) {
+    let Some(certificate_epoch) = newer_certificate_epoch(expected_epoch, cert) else { return };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    if let Some(frames) = NEWER_COMMITTEE_FRAMES.note(now_secs) {
+        warn!(
+            frame,
+            expected_epoch,
+            certificate_epoch,
+            frames,
+            scope = "local",
+            action = "upgrade the node to the current release; until then it cannot follow GLOBAL",
+            "GLOBAL frames are certified by a newer committee than this build knows: upgrade required"
+        );
+    }
+}
+
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
         Self { frame_prover, bls_constructor: None, global_committee: Vec::new(), successor_committee: Vec::new() }
@@ -160,10 +223,20 @@ impl GlobalFrameVerifier {
             .as_ref()
             .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))?;
         let (epoch, committee) = self.committee_for_frame(header.frame_number);
+        Self::finalization_by(cert, epoch, committee, &header.output)
+    }
+
+    /// `cert` over `output`, verified against `committee` in `epoch`.
+    fn finalization_by(
+        cert: &[u8],
+        epoch: u64,
+        committee: &[Vec<u8>],
+        output: &[u8],
+    ) -> Option<quil_cw_consensus::app_cert::VerifiedFinalization> {
         if committee.is_empty() {
             return None;
         }
-        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()?;
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(output).ok()?;
         quil_cw_consensus::app_cert::verify_finalization_details(cert, committee, b"global", digest)
             .filter(|verified| verified.finalization.proposal.round.epoch().get() == epoch)
     }
@@ -265,14 +338,17 @@ impl GlobalFrameVerifier {
         // that someone solved the (publicly computable) VDF. No committee ⇒ skip
         // (legacy behavior); a present-but-invalid cert is rejected.
         if !self.global_committee.is_empty() {
-            if header
+            if let Some(cert) = header
                 .public_key_signature_bls48581
                 .as_ref()
                 .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
-                .is_some()
             {
                 // Against the committee of this frame, in its epoch.
                 if self.verified_finalization(header).is_none() {
+                    // Named here, on the authenticated archive path with the
+                    // VDF already checked, not on gossip: anyone can gossip a
+                    // certificate that claims a later epoch.
+                    warn_if_newer_committee(header.frame_number, self.committee_for_frame(header.frame_number).0, cert);
                     warn!(
                         frame = header.frame_number,
                         "global CW finalization cert verification failed",
@@ -1803,6 +1879,59 @@ mod tests {
             !v.verify_global_finalization_cert(&garbage_sig),
             "a frame with a bogus/unverifiable cert must be rejected"
         );
+    }
+
+    #[test]
+    fn a_certificate_of_a_later_epoch_is_named_and_still_refused() {
+        use quil_cw_consensus::{
+            _codec::Encode as _,
+            _consensus::{simplex::types::Proposal, types::{Epoch, Round, View}},
+            _crypto::sha256::Digest,
+            app_cert::wrap_cert_for_header,
+        };
+        use quil_types::proto::{global::GlobalFrameHeader, keys::Bls48581AggregateSignature};
+        // The epoch lookup reads the proposal prefix, which is all a
+        // certificate of an unknown committee can be checked for.
+        let cert = |epoch| {
+            Proposal::new(Round::new(Epoch::new(epoch), View::new(43)), View::new(42), Digest([9; 32]))
+                .encode()
+                .to_vec()
+        };
+        assert_eq!(newer_certificate_epoch(0, &cert(1)), Some(1), "the succession, on a build without it");
+        assert_eq!(newer_certificate_epoch(1, &cert(2)), Some(2));
+        assert_eq!(newer_certificate_epoch(0, &cert(0)), None, "an invalid certificate of the expected epoch");
+        assert_eq!(newer_certificate_epoch(1, &cert(0)), None, "an older epoch is not an upgrade");
+        assert_eq!(newer_certificate_epoch(0, &[0xAA; 128]), None, "garbage");
+
+        // The frame is refused as before.
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        )
+        .with_global_committee(vec![vec![0x09u8; 897]]);
+        let header = GlobalFrameHeader {
+            frame_number: 5,
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                signature: wrap_cert_for_header(&cert(1)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(v.committee_for_frame(5).0, 0);
+        assert!(!v.verify_global_finalization_cert(&header));
+    }
+
+    #[test]
+    fn the_newer_committee_warning_repeats_at_most_every_ten_minutes_with_a_count() {
+        let frames = NewerCommitteeFrames::new();
+        assert_eq!(frames.note(1_000), Some(1), "the first refusal warns");
+        assert_eq!(frames.note(1_001), None);
+        assert_eq!(frames.note(1_599), None);
+        assert_eq!(frames.note(1_600), Some(3), "ten minutes later, with the refusals since");
+        assert_eq!(frames.note(1_601), None);
+        assert_eq!(frames.note(2_200), Some(2));
     }
 
     #[test]
