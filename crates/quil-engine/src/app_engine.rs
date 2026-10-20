@@ -1062,7 +1062,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // archive can recompute it byte-for-byte from `frame.requests`.
         // A shard a recorded split or merge is retiring finalizes only empty
         // frames near its flip: GLOBAL may refuse them (crate::shard_drain).
-        let draining = self.shard_drain.as_ref().is_some_and(|drain| drain.drains_at(anchor_gfn));
+        let draining = self.shard_drain.as_ref().is_some_and(|drain| drain.drains_at(anchor_gfn, crate::shard_drain::DrainRole::Leader));
         if draining {
             info!(frame = frame_number, anchor = anchor_gfn, "retiring shard drains: proposing an empty frame");
         }
@@ -6721,7 +6721,7 @@ pub(crate) fn build_requests_root_check(
             // A retiring shard finalizes only empty frames near its flip
             // (crate::shard_drain).
             if !frame.requests.is_empty()
-                && drain.as_ref().is_some_and(|drain| drain.drains_at(header.global_frame_number))
+                && drain.as_ref().is_some_and(|drain| drain.drains_at(header.global_frame_number, crate::shard_drain::DrainRole::Voter))
             {
                 tracing::warn!(frame = header.frame_number, anchor = header.global_frame_number,
                     "cw app verify: a retiring shard's proposal carries requests inside its drain");
