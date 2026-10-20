@@ -1231,11 +1231,12 @@ pub async fn handle_eviction_risk(
     response
 }
 
+/// One prover's seniority rank. The prover's public key is left out:
+/// `/provers?address=<hex>` serves it.
 #[derive(Serialize)]
 struct SeniorityEntry {
     rank: u64,
     address: String,
-    public_key: String,
     seniority: u64,
     status: String,
     active_shards: u64,
@@ -1262,7 +1263,6 @@ pub async fn handle_seniority(
         .map(|(i, p)| SeniorityEntry {
             rank: (i as u64) + 1,
             address: hex::encode(&p.address),
-            public_key: hex::encode(&p.public_key),
             seniority: p.seniority,
             status: prover_status_to_string(p.status),
             active_shards: p
@@ -2243,6 +2243,20 @@ mod tests {
         let filtered = convert_prover_info(&info, Some(&filter));
         assert_eq!(filtered.allocations.len(), 1);
         assert_eq!(filtered.allocations[0].confirmation_filter, "cafe");
+    }
+
+    #[test]
+    fn seniority_entry_omits_public_key() {
+        let entry = SeniorityEntry {
+            rank: 1,
+            address: "ab".into(),
+            seniority: 5,
+            status: "active".into(),
+            active_shards: 3,
+        };
+        let s = to_str(&entry);
+        assert!(s.contains(r#""active_shards":3"#), "{s}");
+        assert!(!s.contains("public_key"), "{s}");
     }
 
     #[test]
