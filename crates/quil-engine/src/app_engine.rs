@@ -649,6 +649,14 @@ const GLOBAL_ANCHOR_SAFETY_MARGIN: u64 = quil_execution::token_intrinsic::consta
 ///
 /// Free function so BOTH the `AppLeaderProvider` (propose/leader) and the
 /// `AppConsensusEngine` (CW committee activation) compute the identical anchor.
+/// A new session host's liveness. Its notarize votes keep their signatures
+/// only while the presence report frame is set, for presence reports.
+fn new_session_liveness() -> Arc<quil_cw_consensus::adapters::Liveness> {
+    let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+    liveness.keep_votes(quil_execution::global_intrinsic::handoff::presence_report_frame() != u64::MAX);
+    liveness
+}
+
 pub(crate) fn resolve_global_anchor(store: &dyn ClockStore) -> (u64, Vec<u8>) {
     let gf_to_anchor = |f: quil_types::proto::global::GlobalFrame| -> (u64, Vec<u8>) {
         let n = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
@@ -2217,6 +2225,9 @@ pub struct AppConsensusEngine {
     /// logged ([`Self::log_session_liveness`]).
     session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
     session_liveness_logged: Option<std::time::Instant>,
+    /// This node's presence reports of the running session
+    /// ([`Self::report_presence`]).
+    presence: crate::presence_reports::PresenceReporter,
     /// Consensus messages received for the running session, per channel, and
     /// those dropped because the master could not name their author's key
     /// (no PeerInfo for it): a member whose votes never arrive, or arrive
@@ -2387,6 +2398,7 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
+            presence: Default::default(),
             cw_inbound: [0; 4],
             cw_unresolved: 0,
             cw_nonmember: 0,
@@ -3679,6 +3691,7 @@ impl AppConsensusEngine {
                     // messages that the barrier is meant to prevent.
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
+                    self.report_presence();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
                         self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -3970,6 +3983,108 @@ impl AppConsensusEngine {
         self.log_silent_members(seen.voters, quorum);
     }
 
+    /// While the running session's committed tip stands still, carry the
+    /// notarize votes this node received to GLOBAL as evidence of which
+    /// members are present ([`crate::presence_reports`]). Nothing is read
+    /// while the presence report frame is unset; once it is set, the session
+    /// is looked at every few committed GLOBAL frames, and only the member first in the
+    /// epoch's order of verified voters submits. A report is checked first
+    /// as GLOBAL checks it, against the committed view, so one GLOBAL would
+    /// refuse is not sent. Its inclusion is logged by the own-operation
+    /// tracker of the master that publishes it.
+    fn report_presence(&mut self) {
+        use crate::presence_reports::{Hold, Look, Outcome, Pace};
+        use quil_execution::global_intrinsic::handoff;
+        // Unset (mainnet, and by default): nothing is read.
+        if handoff::presence_report_frame() == u64::MAX || self.halted.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let (Some(global), Some(liveness), Some(session), Some(publish)) = (
+            self.global_hypergraph.as_ref(),
+            self.session_liveness.as_ref(),
+            self.cw_session.as_ref(),
+            self.coverage_publish.as_ref(),
+        ) else {
+            return;
+        };
+        let Ok(view) = handoff::CommittedView::capture(global) else { return };
+        let latest = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number));
+        let (anchors, clock) = (&self.global_anchor_store, &self.clock_store);
+        let look = Look {
+            view: &view, frame: view.frame(), latest, session, key: &self.local_bls_pubkey, pace: Pace::current(),
+        };
+        let Some(attempt) = self.presence.attempt(look, liveness.as_ref(), |anchor| {
+            anchors
+                .get_global_clock_frame_header(anchor)
+                .or_else(|_| clock.get_global_clock_frame_header(anchor))
+                .map(|header| header.output)
+        }) else {
+            return;
+        };
+        let (core_id, filter, id) = (self.core_id, hex::encode(&self.filter), hex::encode(attempt.session));
+        let (generation, epoch, frame, stalled) = (session.generation, attempt.epoch, attempt.inclusion, attempt.stalled);
+        let members = session.members.len();
+        // A submission is always published; other outcomes are logged when
+        // the reporter says so (once per cause and epoch, refusals bounded).
+        if let Outcome::Submit { built, bytes, added, voters } = attempt.outcome {
+            info!(core_id, filter = %filter, session = %id, generation, epoch, frame, stalled_frames = stalled,
+                reported = built.members.len(), new_members = added, voters, members, views = ?built.views(),
+                bytes = bytes.len(),
+                "submitting presence report: the session's GLOBAL tip stands still; carrying its members' \
+                 notarize votes to GLOBAL");
+            publish(bytes);
+            return;
+        }
+        if !attempt.log {
+            return;
+        }
+        match attempt.outcome {
+            Outcome::Submit { .. } => {}
+            Outcome::Refused { built, error, refusals, since } => warn!(core_id, filter = %filter, session = %id,
+                generation, epoch, frame, reported = built.members.len(), views = ?built.views(), %error,
+                refusals_this_epoch = refusals, first_refused_frame = since, scope = "local", action = "report",
+                "presence report not submitted: it fails the check GLOBAL applies although its session and anchors \
+                 are in place; this node's votes, headers or anchor outputs disagree with GLOBAL's rules, a defect to \
+                 report with this line (repeated at every {}th refusal of an epoch)",
+                crate::presence_reports::REFUSALS_LOGGED_EVERY),
+            Outcome::Wait(wait) => info!(core_id, filter = %filter, session = %id, generation, epoch, frame,
+                stalled_frames = stalled, cause = wait.cause(), ends = wait.ends(),
+                anchor = match wait { crate::presence_reports::Wait::Anchor { anchor } => anchor, _ => 0 },
+                "presence report waits: an expected condition on this node; nothing to fix, it is retried until \
+                 the named event ends it"),
+            Outcome::Held(hold) => {
+                let (reason, latest_global_frame) = match hold {
+                    Hold::EpochEnd { landing } => ("it would land in the last frames of the epoch, where its \
+                        anchors could expire; resumes next epoch", landing.saturating_sub(1)),
+                    Hold::ViewBehind { latest } => ("this node's committed GLOBAL view trails its latest GLOBAL \
+                        frame into another epoch; resumes when the view catches up", latest),
+                };
+                info!(core_id, filter = %filter, session = %id, generation, epoch, frame, stalled_frames = stalled,
+                    committed_frame = view.frame(), latest_global_frame, reason,
+                    "presence report held: the session's GLOBAL tip stands still, but a report now could reach \
+                     GLOBAL in another epoch than its anchors")
+            }
+            Outcome::NotDesignated { designated: Some(designated), voters } => info!(core_id, filter = %filter,
+                session = %id, generation, epoch, frame, stalled_frames = stalled, designated_member = designated,
+                voters, members,
+                "presence report: the session's GLOBAL tip stands still; another member submits this epoch \
+                 (the first in this epoch's order of members whose votes this node verified)"),
+            Outcome::NotDesignated { designated: None, .. } => info!(core_id, filter = %filter, session = %id,
+                generation, epoch, frame, stalled_frames = stalled, members,
+                "presence report: the session's GLOBAL tip stands still, but no notarize vote of its recent views \
+                 verified on this node, its own included, so it cannot tell which member submits; an expected wait \
+                 that ends when a member's notarize vote reaches this node"),
+            Outcome::NothingEligible(why) => info!(core_id, filter = %filter, session = %id, generation, epoch, frame,
+                stalled_frames = stalled, committed_frame = view.frame(), sealed_proposals = why.sealed,
+                anchored_ahead = why.anchored_ahead, anchored_before = why.anchored_before,
+                without_verified_votes = why.unverified,
+                "presence report: this member submits this epoch, but no recent proposal can be reported yet; \
+                 anchored_ahead means this node's committed GLOBAL view trails its committee's anchors, \
+                 anchored_before that the proposals predate this epoch"),
+        }
+    }
+
     /// While the running session lacks a voting quorum, the members never
     /// heard on the vote channel ([`SilentMembers`]), each with its prover
     /// registry allocation on this shard: an Active prover that never takes
@@ -4094,6 +4209,7 @@ impl AppConsensusEngine {
                     }
                 }
                 self.cw_session = None;
+                self.session_liveness = None;
                 self.execution.state("handoff", "awaiting successor");
             }
             // Logged above, at its transitions.
@@ -4949,7 +5065,7 @@ impl AppConsensusEngine {
                             })
                     }) as quil_cw_consensus::handoff::automaton::ParentReader
                 });
-                let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+                let liveness = new_session_liveness();
                 self.session_liveness = Some(liveness.clone());
                 self.cw_inbound = [0; 4];
                 self.cw_unresolved = 0;
@@ -9337,6 +9453,82 @@ mod tests {
             assert!(db.get(&quil_store::encoding::clock_shard_staged_key(staged, 2)).unwrap().is_none(),
                 "no staged copy outlives the seal");
         }
+    }
+
+    /// Without a presence report frame (mainnet), the tick's presence step
+    /// returns before reading anything; once one is set, it looks.
+    #[tokio::test]
+    async fn presence_reports_read_nothing_until_their_frame_is_set() {
+        use quil_execution::global_intrinsic::handoff;
+        use quil_types::crypto::Signer as _;
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let mut members: Vec<Vec<u8>> =
+            (0..3).map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec()).collect();
+        members.sort();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32], filter: vec![0x61; 32], generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(), base_frame: 0,
+            authorization: [0; 32], members: members.clone(),
+        };
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        handoff::initialize(&state, 1, &session).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock.clone(), global_anchor_store: None, global_hypergraph: Some(global),
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: members[0].clone(),
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: Some(Arc::new(|_: Vec<u8>| {})), hypergraph: None, storage_source_hypergraph: None,
+            topology: None, execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, _handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        engine.cw_session = Some(session);
+        engine.session_liveness = Some(Arc::new(quil_cw_consensus::adapters::Liveness::default()));
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        engine.report_presence();
+        assert_eq!(engine.presence.attempts(), 0, "unset: nothing is read");
+        handoff::set_presence_report_frame_for_thread(Some(0));
+        engine.report_presence();
+        assert_eq!(engine.presence.attempts(), 1, "set: the session is looked at");
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        // A running session GLOBAL no longer has as its filter's head is
+        // retired, and its liveness (votes and the host's bodies) with it.
+        let mut stale = engine.cw_session.clone().unwrap();
+        stale.members.remove(0);
+        engine.cw_session = Some(stale);
+        engine.maintain_committee_session().await;
+        assert!(engine.cw_session.is_none(), "retired");
+        assert!(engine.session_liveness.is_none(), "its liveness is released");
+    }
+
+    /// A session host's liveness keeps vote signatures only while the
+    /// presence report frame is set.
+    #[test]
+    fn a_session_keeps_vote_signatures_only_while_presence_reports_are_set() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        assert!(!new_session_liveness().keeps_votes());
+        handoff::set_presence_report_frame_for_thread(Some(10_000));
+        assert!(new_session_liveness().keeps_votes(), "set, even ahead");
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
     }
 
     #[tokio::test]

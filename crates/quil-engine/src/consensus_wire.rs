@@ -866,6 +866,9 @@ pub fn decode_message_bundle(
                     // A malformed one must not become a default/empty request.
                     quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(&req.inner_bytes)?;
                 }
+                if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
+                    quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(&req.inner_bytes)?;
+                }
                 requests.push(canonical_request_to_proto(req));
             }
         }
@@ -943,6 +946,9 @@ fn canonical_request_to_proto(
         quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF =>
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(inner)
                 .ok().map(|_| Request::CommitteeHandoff(inner.to_vec())),
+        quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT =>
+            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(inner)
+                .ok().map(|_| Request::PresenceReport(inner.to_vec())),
         prover_ops::TYPE_SHARD_SPLIT => prover_ops::ShardSplit::from_canonical_bytes(inner)
             .ok()
             .map(|s| Request::ShardSplit(conversions::shard_split_to_proto(&s))),
@@ -1064,6 +1070,9 @@ pub fn proto_message_bundle_to_canonical_bytes(
         if let Some(quil_types::proto::global::message_request::Request::CommitteeHandoff(bytes)) = &req.request {
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
         }
+        if let Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) = &req.request {
+            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
+        }
         match proto_message_request_to_canonical(req) {
             Some(canon_req) => requests.push(Some(canon_req)),
             None => requests.push(None),
@@ -1123,6 +1132,10 @@ fn proto_message_request_to_canonical(
             .ok()?,
         Request::CommitteeHandoff(bytes) => {
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes).ok()?;
+            bytes.clone()
+        }
+        Request::PresenceReport(bytes) => {
+            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes).ok()?;
             bytes.clone()
         }
         Request::ShardSplit(p) => conversions::shard_split_from_proto(p)
@@ -1535,6 +1548,47 @@ mod tests {
         assert!(decode_message_bundle(&bad).is_err());
         let mut bad_proto = protobuf;
         bad_proto.requests[0].request = Some(Request::CommitteeHandoff(malformed));
+        assert!(proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+        assert!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+    }
+
+    #[test]
+    fn presence_report_roundtrips_global_bundle_and_rejects_malformed_payloads() {
+        use quil_execution::{
+            global_intrinsic::{handoff::presence::{NotarizeVote, PresenceProposal, PresenceReport}, FrameHeader},
+            message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest},
+        };
+        use quil_types::proto::global::message_request::Request;
+        use prost::Message as _;
+        let filter = vec![0x21; 32];
+        let header = FrameHeader {
+            address: filter.clone(), frame_number: 9, rank: 6, difficulty: 100, output: vec![3; 516],
+            parent_selector: vec![4; 32], global_frame_number: 1_441, ..Default::default()
+        };
+        let vote = |signer| NotarizeVote { signer, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] };
+        let report = PresenceReport { session: [2; 32], filter, proposals: vec![PresenceProposal {
+            header, epoch: 3, view: 6, parent: 5, payload: [5; 32], votes: vec![vote(0), vote(2)] }] };
+        // Wire conversion preserves the bytes; authenticated global execution
+        // separately verifies the votes against the session and its anchors.
+        let inner = report.to_canonical_bytes().unwrap();
+        assert_eq!(PresenceReport::from_canonical_bytes(&inner).unwrap(), report);
+        let bundle = CanonicalMessageBundle { timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())] };
+        let canonical = bundle.to_canonical_bytes().unwrap();
+        let decoded = decode_message_bundle(&canonical).unwrap();
+        assert!(matches!(decoded.requests[0].request.as_ref(), Some(Request::PresenceReport(bytes)) if *bytes == inner));
+        assert!(quil_execution::global_engine::request_is_global_op(&decoded.requests[0]));
+        assert_eq!(quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
+            Some(quil_execution::global_engine::MessageKindGlobal::PresenceReport));
+        let protobuf = quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
+        assert_eq!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
+        let mut malformed = inner; malformed.push(0);
+        let bad = CanonicalMessageBundle { timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(malformed.clone()).unwrap())] }.to_canonical_bytes().unwrap();
+        assert!(decode_message_bundle(&bad).is_err());
+        let mut bad_proto = protobuf;
+        bad_proto.requests[0].request = Some(Request::PresenceReport(malformed));
         assert!(proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
         assert!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
     }
