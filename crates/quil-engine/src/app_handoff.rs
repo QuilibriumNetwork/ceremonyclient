@@ -830,7 +830,10 @@ pub fn successor_state_matches(
 /// them, for good. Looking through gives the state the origin was authorized
 /// from: the same roots when its members held them, the certified roots below
 /// otherwise. Generation zero is not looked through: its base is a certified
-/// legacy frame.
+/// legacy frame. Each looked-through origin is its successor's predecessor,
+/// one generation below it, so the walk ends without a step limit: a limit
+/// refused every session of a shard whose committees had sealed at their
+/// base more often, and each refused session sealed at its base in turn.
 pub struct EffectiveOrigins {
     pub origins: Vec<(Session, quil_cw_consensus::handoff::Checkpoint)>,
     /// A looked-through origin had no origins of its own (a first session):
@@ -839,18 +842,13 @@ pub struct EffectiveOrigins {
 }
 
 pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<EffectiveOrigins> {
-    const MAX_LOOK_THROUGH: usize = 16;
+    let start = session.id()?;
     let mut origins = Vec::new();
     let mut uncertified = false;
-    let mut pending = vec![session.id()?];
-    let mut steps = 0;
-    while let Some(id) = pending.pop() {
-        steps += 1;
-        if steps > MAX_LOOK_THROUGH {
-            return Err(unavailable("too many sessions sealed at their base to look through"));
-        }
+    let mut pending = vec![(start, session.generation)];
+    while let Some((id, generation)) = pending.pop() {
         let direct = handoff::origins(view, &id)?;
-        if direct.is_empty() && id != session.id()? {
+        if direct.is_empty() && id != start {
             uncertified = true;
         }
         for (source, checkpoint) in direct {
@@ -859,7 +857,10 @@ pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<Effe
                 && checkpoint.frame == source.base_frame
                 && checkpoint.digest == source.genesis;
             if at_base {
-                pending.push(source.id()?);
+                if source.generation >= generation {
+                    return Err(QuilError::Store("a same-filter origin does not precede its successor".into()));
+                }
+                pending.push((source.id()?, source.generation));
             } else {
                 origins.push((source, checkpoint));
             }
@@ -1336,6 +1337,64 @@ mod successor_tests {
         other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&ran, 3)).unwrap();
         let error = successor_state_matches(&global, &other, &clock, &third).unwrap_err();
         assert!(error.to_string().contains("sealed checkpoint"), "other state is still refused: {error}");
+    }
+
+    /// Committees that cannot produce keep sealing at their base, one session
+    /// after another. However long that run grows, a successor still looks
+    /// through it to the last certified checkpoint, rather than refusing to
+    /// start and so sealing at its base too.
+    #[test]
+    fn a_long_run_of_sessions_sealed_at_their_base_is_looked_through() {
+        let (global, state) = global_state();
+        let clock = quil_store::RocksClockStore::new(quil_store::RocksDb::open_in_memory().unwrap().inner());
+        let filter = vec![0x09; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        let member = crdt();
+        member.add_vertex(&quil_hypergraph::Location { app_address: [0x09; 32], data_address: [7; 32] }, &[7; 64]).unwrap();
+        let mut history = handoff::history::start(&source).unwrap();
+        for frame in 1..=3 {
+            member.commit_with_frame_cursor_and_records(frame, &cursor_key, &outflow_records(&filter, frame)).unwrap();
+            history = handoff::history::link(history, &outgoing(&filter, frame)).unwrap();
+        }
+        let certified = member.capture_committed_shard(&filter).unwrap().roots;
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: [0x33; 32], state_roots: certified, history_root: history },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 5, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 5, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 5);
+
+        let mut head = handoff::head(&state, &filter).unwrap().unwrap();
+        let mut frame = 6;
+        for _ in 0..20 {
+            let close = handoff::schedule(&state, frame, vec![filter.clone()], vec![DesiredCommittee {
+                filter: filter.clone(), members: head.members.clone(),
+            }]).unwrap();
+            commit(&global, &state, frame);
+            let seal = Seal {
+                request: close.id().unwrap(), session: head.id().unwrap(), view: 9,
+                checkpoint: Checkpoint {
+                    frame: head.base_frame, view: 0, digest: head.genesis,
+                    state_roots: [[0xb0; 32]; 4], history_root: [0xb1; 32],
+                },
+            };
+            let certificate = crate::test_support::certify_seal(&head, &signers, &seal);
+            assert!(handoff::apply_submission(&state, frame + 1, &CertificateSubmission { seal, certificate }).unwrap());
+            commit(&global, &state, frame + 1);
+            head = handoff::head(&state, &filter).unwrap().unwrap();
+            frame += 2;
+        }
+        assert_eq!((head.generation, head.base_frame), (22, 3));
+        let view = CommittedView::capture(&global).unwrap();
+        let effective = effective_origins(&view, &head).unwrap();
+        assert!(!effective.uncertified);
+        assert_eq!(effective.origins.len(), 1);
+        assert_eq!((effective.origins[0].0.generation, effective.origins[0].1.frame), (1, 3));
+        assert_eq!(origin_anchors(&global, &filter).unwrap(), vec![(filter.clone(), certified)]);
+        successor_state_matches(&global, &member, &clock, &head).expect("holds the certified state");
     }
 
     /// GLOBAL authenticates a frame by the digest it committed for it: the
