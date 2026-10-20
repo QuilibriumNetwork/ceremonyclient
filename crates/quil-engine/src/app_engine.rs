@@ -2169,6 +2169,10 @@ pub struct AppConsensusEngine {
     /// How long this successor has been unable to start on its predecessor's
     /// state, and why the shard sync last failed to recover it.
     predecessor_block: PredecessorBlock,
+    /// How long consensus has been refused a start, for bounded logging.
+    start_block: StartBlock,
+    /// What the last start attempt learned before it was refused.
+    start_context: StartContext,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -2373,6 +2377,8 @@ impl AppConsensusEngine {
             global_anchor_source: None,
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
+            start_block: StartBlock::default(),
+            start_context: StartContext::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3060,6 +3066,61 @@ impl AppConsensusEngine {
         }
     }
 
+    /// Name a refused consensus start ([`StartBlock`]): its reason, scope and
+    /// what ends it when first refused, and how long it lasts while it does.
+    /// Without a committee-handoff policy only an allocation's activation
+    /// wait is named; the legacy passive retry stays at debug.
+    fn note_start_refused(&mut self, error: &QuilError, now: std::time::Instant) {
+        debug!(core_id = self.core_id, %error, "cw retry: app consensus not startable yet");
+        if quil_types::consensus::committee_handoff_policy().is_none() && !expected_admission_wait(error) {
+            return;
+        }
+        let refusal = classify_start_refusal(error, &self.start_context);
+        let Some(log) = self.start_block.observe(now, &refusal) else { return };
+        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let filter = hex::encode(&self.filter);
+        let generation = or_none(self.start_context.generation);
+        let members = or_none(self.start_context.members.map(|n| n as u64));
+        let scope = refusal.scope.label();
+        match log {
+            StartLog::Refused => info!(core_id = self.core_id, filter = %filter, session_generation = %generation,
+                members = %members, scope = scope, reason = %refusal.reason, action = refusal.action,
+                "app consensus cannot start"),
+            StartLog::Continues { blocked, warn: true } => warn!(core_id = self.core_id, filter = %filter,
+                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
+                action = refusal.action, blocked_secs = blocked.as_secs(),
+                "app consensus still cannot start"),
+            StartLog::Continues { blocked, warn: false } => info!(core_id = self.core_id, filter = %filter,
+                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
+                action = refusal.action, blocked_secs = blocked.as_secs(),
+                "app consensus still waiting to start"),
+        }
+    }
+
+    /// Once consensus starts, say how long it was refused, if it was.
+    fn end_start_block(&mut self, now: std::time::Instant) {
+        if let Some(blocked) = self.start_block.started(now) {
+            let generation = self.cw_session.as_ref().map(|session| session.generation)
+                .or(self.start_context.generation)
+                .map_or_else(|| "none".to_string(), |n| n.to_string());
+            let secs = blocked.as_secs();
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), session_generation = %generation,
+                blocked_secs = secs, "app consensus started after {secs}s blocked");
+        }
+    }
+
+    /// This prover's allocations for the shard at the latest GLOBAL frame,
+    /// for a worker whose key is not in the committee it would start.
+    fn local_seat(&self) -> NotSeated {
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        let allocations = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
+            .map(|p| p.allocations.iter().filter(|a| a.confirmation_filter == self.filter)
+                .map(|a| a.effective_status(global_frame)).collect())
+            .unwrap_or_default();
+        NotSeated { allocations, global_frame }
+    }
+
     /// A finalized header carries the quorum-certified fee total of its
     /// previous frame and the settlement and spend windows it relays. A member
     /// that reached those frames by sync rather than by materializing them has
@@ -3631,8 +3692,9 @@ impl AppConsensusEngine {
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                                             "shard commonware-simplex consensus running after transport readiness");
                                     }
-                                    Err(e) if expected_admission_wait(&e) => info!(core_id = self.core_id,
-                                        "app worker preparing; awaiting allocation activation"),
+                                    Err(e) if expected_admission_wait(&e)
+                                        || quil_types::consensus::committee_handoff_policy().is_some() =>
+                                        self.note_start_refused(&e, std::time::Instant::now()),
                                     Err(e) => warn!(core_id = self.core_id, error = %e,
                                         "failed to start shard simplex after transport readiness — will retry"),
                                 }
@@ -3699,6 +3761,7 @@ impl AppConsensusEngine {
                                     "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
                                 );
                                 self.end_predecessor_block("consensus started", std::time::Instant::now());
+                                self.end_start_block(std::time::Instant::now());
                             }
                             Err(e) => {
                                 if predecessor_recovery_pending(&e) {
@@ -3708,17 +3771,7 @@ impl AppConsensusEngine {
                                 }
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
-                                if expected_admission_wait(&e) {
-                                    debug!(core_id = self.core_id, "app worker awaiting allocation activation");
-                                } else if quil_types::consensus::committee_handoff_policy().is_some() {
-                                    info!(core_id = self.core_id, error = %e, "cw retry: app consensus not startable yet");
-                                } else {
-                                    debug!(
-                                        core_id = self.core_id,
-                                        error = %e,
-                                        "cw retry: committee not yet buildable"
-                                    );
-                                }
+                                self.note_start_refused(&e, std::time::Instant::now());
                             }
                         }
                     } else if cw_transport_ready && self.cw_session.is_none() {
@@ -4400,6 +4453,7 @@ impl AppConsensusEngine {
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
         let filter = self.filter.clone();
         let app_address = self.app_address.clone();
+        self.start_context = StartContext::default();
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
@@ -4455,6 +4509,16 @@ impl AppConsensusEngine {
             }
             None => None,
         };
+        // Whether this worker is seated is known now; the gates below may
+        // refuse first, and a worker that is not seated never passes them all.
+        self.start_context.generation = session.as_ref().map(|session| session.generation);
+        if let Some(session) = session.as_ref() {
+            self.start_context.members = Some(session.members.len());
+            let my_pk = bls_signer.public_key();
+            if !session.members.iter().any(|key| key.as_slice() == my_pk) {
+                self.start_context.not_seated = Some(self.local_seat());
+            }
+        }
         let mut session_genesis = None;
         if let Some(session) = session.as_ref() {
             let session_id = session.id()?;
@@ -4563,12 +4627,15 @@ impl AppConsensusEngine {
         self.cw_committee_fp = Some(Self::committee_fp(&member_pubkeys));
         let my_sk = bls_signer.private_key().to_vec();
         let my_pk = bls_signer.public_key().to_vec();
+        self.start_context.members = Some(member_pubkeys.len());
         if !member_pubkeys.iter().any(|key| key == &my_pk) {
-            let frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
-                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-            if self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
-                .is_some_and(|p| p.allocations.iter().any(|a| a.confirmation_filter == filter
-                    && a.effective_status(frame) == quil_types::consensus::EffectiveStatus::Joining)) {
+            let seat = match self.start_context.not_seated.take() {
+                Some(seat) => seat,
+                None => self.local_seat(),
+            };
+            let joining = seat.joining();
+            self.start_context.not_seated = Some(seat);
+            if joining {
                 return Err(QuilError::ExecutionUnavailable("awaiting allocation activation".into()));
             }
         }
@@ -7977,6 +8044,399 @@ mod predecessor_block_tests {
             "anchored GLOBAL frame not found on this node's master or its archives");
         assert_eq!(anchor_refusal_cause(Some(pruned), false), "archive sync frame failed validation");
         assert_eq!(anchor_refusal_cause(None, true), "anchored GLOBAL frame not held by this node");
+    }
+}
+
+/// How long a start refused for this node or committed GLOBAL state lasts
+/// before it warns. As for a successor's predecessor wait
+/// ([`PREDECESSOR_BLOCKED_AFTER`]), a start that can succeed does so within
+/// a few 10 s retries and the shard syncs they request; ten minutes is about
+/// sixty refused attempts.
+const START_BLOCKED_AFTER: Duration = PREDECESSOR_BLOCKED_AFTER;
+
+/// How often a start still refused past [`START_BLOCKED_AFTER`] warns again.
+const START_BLOCKED_REPEAT: Duration = Duration::from_secs(5 * 60);
+
+/// How often an expected wait is repeated, at info. Such a wait lasts until
+/// an activation epoch or a handoff, so a repeat only shows it continues.
+const START_WAIT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// Refusals a block remembers as named, so two that alternate are not
+/// named again on every retry.
+const START_REFUSALS_NAMED: usize = 8;
+
+/// Whose problem a refused start is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartScope {
+    /// This worker's state, allocation or setup.
+    ThisNode,
+    /// The shard's committed GLOBAL state, for every worker of the shard.
+    CommittedGlobal,
+    /// A lifecycle wait that a named event ends.
+    ExpectedWait,
+}
+
+impl StartScope {
+    fn label(self) -> &'static str {
+        match self {
+            StartScope::ThisNode => "this node",
+            StartScope::CommittedGlobal => "committed GLOBAL state",
+            StartScope::ExpectedWait => "expected wait",
+        }
+    }
+}
+
+/// A worker whose key is not in the committee it would start, and this
+/// prover's allocations for the shard as the registry has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotSeated {
+    allocations: Vec<quil_types::consensus::EffectiveStatus>,
+    global_frame: u64,
+}
+
+impl NotSeated {
+    fn joining(&self) -> bool {
+        self.allocations.contains(&quil_types::consensus::EffectiveStatus::Joining)
+    }
+
+    fn describe(&self) -> String {
+        if self.allocations.is_empty() {
+            return "none".into();
+        }
+        self.allocations.iter().map(|status| format!("{status:?}")).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// What a start attempt learned before it was refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StartContext {
+    /// The committee session it resolved from committed GLOBAL state.
+    generation: Option<u64>,
+    members: Option<usize>,
+    not_seated: Option<NotSeated>,
+}
+
+/// A refused start, as an operator reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartRefusal {
+    /// What makes two refusals the same: digit runs folded, so a frame or
+    /// count advancing in an error is not a new refusal.
+    key: String,
+    reason: String,
+    scope: StartScope,
+    action: &'static str,
+    /// Whether it repeats while it lasts; a predecessor wait has its own
+    /// warning ([`PredecessorBlock`]).
+    repeats: bool,
+}
+
+fn refusal_key(reason: &str) -> String {
+    let mut key = String::with_capacity(reason.len());
+    let mut digits = false;
+    for c in reason.chars() {
+        if c.is_ascii_digit() {
+            if !digits {
+                key.push('#');
+            }
+            digits = true;
+        } else {
+            key.push(c);
+            digits = false;
+        }
+    }
+    key
+}
+
+/// Why a start was refused, whose problem it is and what ends it. A worker
+/// whose key is not in the committee is named as such whichever gate
+/// refused it first: it cannot start before a session seats it.
+fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRefusal {
+    use quil_types::consensus::EffectiveStatus;
+    use StartScope::{CommittedGlobal, ExpectedWait, ThisNode};
+    let text = error.to_string();
+    let refusal = |key: String, reason: String, scope: StartScope, action: &'static str, repeats: bool| {
+        StartRefusal { key: refusal_key(&key), reason, scope, action, repeats }
+    };
+    if expected_admission_wait(error) || context.not_seated.as_ref().is_some_and(NotSeated::joining) {
+        let reason = "this worker's allocation is joining".to_string();
+        return refusal(reason.clone(), reason, ExpectedWait,
+            "it starts when the allocation activates at its activation epoch", true);
+    }
+    if let Some(seat) = context.not_seated.as_ref() {
+        let action = if seat.allocations.is_empty() {
+            "the prover registry holds no allocation of this prover for the shard: check this worker's \
+                allocation (join and confirm); it starts only once a committee session seats it"
+        } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
+            "this worker's allocation missed its epoch reconfirm: check this worker's prover confirmation \
+                (dispatch and publish in the master log); it starts only once a later session seats it"
+        } else {
+            "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
+                of this worker's allocation; it starts only once a later session seats it"
+        };
+        return refusal(
+            format!("not seated: {}", seat.describe()),
+            format!("this worker's prover is not seated in the committee (allocation status {} at GLOBAL frame {}); \
+                start refused with: {text}", seat.describe(), seat.global_frame),
+            ThisNode, action, true,
+        );
+    }
+    let (scope, action, repeats) = if text.contains("awaiting its successor") || text.contains("head session is retired") {
+        (ExpectedWait, "this shard's session is sealed or retired; it starts when GLOBAL authorizes its successor session", true)
+    } else if text.contains("first session not authorized yet") || text.contains("shard has no session") {
+        (ExpectedWait, "it starts when GLOBAL authorizes a committee session for this shard", true)
+    } else if text.contains("to look through") {
+        (CommittedGlobal, "the shard's session chain in committed GLOBAL state is not resolvable by this build, \
+            for every worker of the shard; report it to the maintainer with this line", true)
+    } else if predecessor_recovery_pending(error) {
+        (ThisNode, "the shard sync recovers the predecessor's sealed state from an archive; \
+            the 'successor session blocked' warning tracks it", false)
+    } else if text.contains("authenticated GLOBAL state") {
+        (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
+            check the master if it persists", true)
+    } else if matches!(error, QuilError::ExecutionUnavailable(_)) {
+        (ThisNode, "this worker's shard state is not ready (sync or recovery in progress); it retries every 10 s; \
+            report it with this line if it persists", true)
+    } else {
+        (ThisNode, "this worker refuses the start on its local state; it retries every 10 s; \
+            report it with this line if it persists", true)
+    };
+    refusal(text.clone(), text, scope, action, repeats)
+}
+
+/// What to log for a refused start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartLog {
+    /// The first refusal of a block, or one not yet named in it: info.
+    Refused,
+    /// The block continues: a warning unless it is an expected wait.
+    Continues { blocked: Duration, warn: bool },
+}
+
+/// Consensus refused a start, from the first refusal to the next start.
+#[derive(Default)]
+struct StartBlock {
+    since: Option<std::time::Instant>,
+    /// The first refusal that is not an expected wait.
+    owned_since: Option<std::time::Instant>,
+    logged: Option<std::time::Instant>,
+    current: Option<String>,
+    named: VecDeque<String>,
+}
+
+impl StartBlock {
+    /// A start refused at `now`: name a refusal not yet named in this block;
+    /// repeat one that is not an expected wait once refusals of that kind
+    /// have lasted [`START_BLOCKED_AFTER`], every [`START_BLOCKED_REPEAT`];
+    /// repeat an expected wait every [`START_WAIT_REPEAT`].
+    fn observe(&mut self, now: std::time::Instant, refusal: &StartRefusal) -> Option<StartLog> {
+        let since = *self.since.get_or_insert(now);
+        let expected = refusal.scope == StartScope::ExpectedWait;
+        if !expected {
+            self.owned_since.get_or_insert(now);
+        }
+        let changed = self.current.as_deref() != Some(refusal.key.as_str());
+        if changed {
+            self.current = Some(refusal.key.clone());
+            if !self.named.contains(&refusal.key) {
+                if self.named.len() == START_REFUSALS_NAMED {
+                    self.named.pop_front();
+                }
+                self.named.push_back(refusal.key.clone());
+                self.logged = Some(now);
+                return Some(StartLog::Refused);
+            }
+        }
+        if !refusal.repeats {
+            return None;
+        }
+        let (from, after, every) = if expected {
+            (since, START_WAIT_REPEAT, START_WAIT_REPEAT)
+        } else {
+            (self.owned_since.unwrap_or(since), START_BLOCKED_AFTER, START_BLOCKED_REPEAT)
+        };
+        if now.saturating_duration_since(from) < after
+            || self.logged.is_some_and(|at| now.saturating_duration_since(at) < every)
+        {
+            return None;
+        }
+        self.logged = Some(now);
+        Some(StartLog::Continues { blocked: now.saturating_duration_since(since), warn: !expected })
+    }
+
+    /// Consensus started at `now`: how long it was refused, if it was.
+    fn started(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since?;
+        *self = StartBlock::default();
+        Some(now.saturating_duration_since(since))
+    }
+}
+
+#[cfg(test)]
+mod start_block_tests {
+    use super::*;
+    use quil_types::consensus::EffectiveStatus;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn refusal(error: QuilError) -> StartRefusal {
+        classify_start_refusal(&error, &StartContext::default())
+    }
+
+    fn unready(what: &str) -> StartRefusal {
+        refusal(QuilError::ExecutionUnavailable(what.into()))
+    }
+
+    fn joining() -> StartRefusal {
+        unready("awaiting allocation activation")
+    }
+
+    fn committee_build_failed() -> QuilError {
+        QuilError::Consensus("app CW committee build failed (this node's key not in the active set?)".into())
+    }
+
+    /// The first refusal is named at once; the same one again, on every
+    /// 10 s retry, is not, until it has lasted the threshold.
+    #[test]
+    fn the_first_refusal_is_named_and_the_same_one_stays_quiet() {
+        let start = std::time::Instant::now();
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        assert_eq!(block.observe(start, &gap), Some(StartLog::Refused));
+        for tick in 1..60u64 {
+            assert_eq!(block.observe(start + Duration::from_secs(10 * tick), &gap), None, "tick {tick}");
+        }
+    }
+
+    /// A lasting refusal warns at the threshold with its duration, then once
+    /// per repeat interval.
+    #[test]
+    fn a_lasting_refusal_warns_after_the_threshold_and_then_every_interval() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        block.observe(at(0), &gap);
+        assert_eq!(block.observe(at(9), &gap), None);
+        assert_eq!(block.observe(at(10), &gap), Some(StartLog::Continues { blocked: MINUTE * 10, warn: true }));
+        assert_eq!(block.observe(at(11), &gap), None);
+        assert_eq!(block.observe(at(14), &gap), None);
+        assert_eq!(block.observe(at(15), &gap), Some(StartLog::Continues { blocked: MINUTE * 15, warn: true }));
+    }
+
+    /// A different refusal is named again; an advancing number is not a
+    /// different refusal, and one already named that comes back is not
+    /// named again.
+    #[test]
+    fn a_changed_refusal_is_named_again_but_an_alternating_one_is_not() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let behind = unready("generation zero starts at the legacy tip 10; materialized through 4");
+        let further = unready("generation zero starts at the legacy tip 10; materialized through 7");
+        let diverged = refusal(QuilError::Consensus(
+            "local outgoing history differs from the predecessor's sealed history".into()));
+        assert_eq!(block.observe(at(0), &behind), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(1), &further), None, "the same refusal, further along");
+        assert_eq!(block.observe(at(2), &diverged), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(3), &behind), None, "already named in this block");
+        assert_eq!(block.observe(at(4), &diverged), None);
+        assert_eq!(block.observe(at(12), &diverged), Some(StartLog::Continues { blocked: MINUTE * 12, warn: true }));
+    }
+
+    /// An expected wait never warns; it repeats at info on its own interval.
+    #[test]
+    fn an_expected_wait_repeats_at_info_only() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let wait = joining();
+        assert_eq!(wait.scope, StartScope::ExpectedWait);
+        assert_eq!(block.observe(at(0), &wait), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(10), &wait), None);
+        assert_eq!(block.observe(at(29), &wait), None);
+        assert_eq!(block.observe(at(30), &wait), Some(StartLog::Continues { blocked: MINUTE * 30, warn: false }));
+        assert_eq!(block.observe(at(45), &wait), None);
+        assert_eq!(block.observe(at(60), &wait), Some(StartLog::Continues { blocked: MINUTE * 60, warn: false }));
+    }
+
+    /// After an expected wait, the warning threshold runs from the first
+    /// refusal that is not one; the duration logged is the whole block.
+    #[test]
+    fn the_warning_threshold_counts_from_the_first_refusal_this_node_owns() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        block.observe(at(0), &joining());
+        assert_eq!(block.observe(at(120), &gap), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(125), &gap), None);
+        assert_eq!(block.observe(at(129), &gap), None);
+        assert_eq!(block.observe(at(130), &gap), Some(StartLog::Continues { blocked: MINUTE * 130, warn: true }));
+    }
+
+    /// A predecessor wait is named once; its repeats are the successor
+    /// warning's.
+    #[test]
+    fn a_predecessor_wait_leaves_its_repeats_to_the_successor_warning() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let wait = unready("predecessor outgoing history recovery is still in progress");
+        assert!(!wait.repeats);
+        assert_eq!(block.observe(at(0), &wait), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(10), &wait), None);
+        assert_eq!(block.observe(at(60), &wait), None);
+    }
+
+    /// A start ends a block with its duration, once; a start never refused
+    /// says nothing; a later block is named afresh.
+    #[test]
+    fn a_start_names_how_long_it_was_blocked_only_after_a_block() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        assert_eq!(block.started(at(0)), None, "never refused");
+        block.observe(at(1), &gap);
+        assert_eq!(block.started(at(7)), Some(MINUTE * 6));
+        assert_eq!(block.started(at(8)), None, "named once");
+        assert_eq!(block.observe(at(9), &gap), Some(StartLog::Refused), "a later block is named afresh");
+    }
+
+    /// A refusal says whose problem it is: a worker the committee does not
+    /// seat, whichever gate refused it; a joining one waits; a session chain
+    /// no build resolves is committed GLOBAL state.
+    #[test]
+    fn a_refusal_names_whose_problem_it_is() {
+        let lapsed = StartContext {
+            generation: Some(19),
+            members: Some(4),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234 }),
+        };
+        let seat = classify_start_refusal(&committee_build_failed(), &lapsed);
+        assert_eq!(seat.scope, StartScope::ThisNode);
+        assert!(seat.reason.contains("not seated") && seat.reason.contains("ExpiredEpoch"), "{}", seat.reason);
+        assert!(seat.action.contains("reconfirm"), "{}", seat.action);
+        let earlier = classify_start_refusal(
+            &QuilError::ExecutionUnavailable("covered shard data is not staged".into()), &lapsed);
+        assert!(earlier.reason.contains("not seated"), "{}", earlier.reason);
+        assert_eq!(earlier.key, seat.key, "the gate that refused first does not change the refusal");
+
+        let unseated_joining = StartContext {
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1 }),
+            ..StartContext::default()
+        };
+        assert_eq!(classify_start_refusal(&committee_build_failed(), &unseated_joining).scope, StartScope::ExpectedWait);
+        assert!(!refusal(committee_build_failed()).reason.contains("not seated"), "no committee read, no seat claim");
+
+        let look_through = unready("app committee session: too many sessions sealed at their base to look through");
+        assert_eq!(look_through.scope, StartScope::CommittedGlobal);
+        assert!(look_through.action.contains("maintainer"), "{}", look_through.action);
+        let sealed = refusal(QuilError::Consensus("app committee session is sealed; awaiting its successor".into()));
+        assert_eq!(sealed.scope, StartScope::ExpectedWait);
+        let retired = refusal(QuilError::Consensus("app committee session unavailable: head session is retired".into()));
+        assert_eq!(retired.scope, StartScope::ExpectedWait);
+        assert_eq!(joining().scope, StartScope::ExpectedWait);
     }
 }
 
