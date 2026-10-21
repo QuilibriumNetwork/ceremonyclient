@@ -2684,17 +2684,23 @@ impl AppConsensusEngine {
         }
         let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-        let crate::app_handoff::SessionChoice::Session(session) =
-            crate::app_handoff::resolve(&global, &self.filter, global_frame)?
+        let choice = crate::app_handoff::resolve(&global, &self.filter, global_frame)?;
+        // A refusal below names the session it was checked against.
+        if let crate::app_handoff::SessionChoice::Session(session) = &choice {
+            self.start_context.generation = Some(session.generation);
+        }
+        let crate::app_handoff::SessionChoice::Session(session) = choice
         else {
             return Ok(false);
         };
-        let outcome = crate::app_handoff::fence_rewind(&global, &shard, self.clock_store.as_ref(), &session)?;
+        let outcome = crate::app_handoff::fence_rewind_held(
+            &global, &shard, self.clock_store.as_ref(), &session, &mut self.start_context.own_chain,
+        )?;
         let reanchor = outcome.reanchor().map(|marker| marker.with_head(self.clock_store.as_ref(), &self.filter));
         let fence = match outcome {
             crate::app_handoff::FenceRewind::Rewound(fence) => fence,
             crate::app_handoff::FenceRewind::Untouched => {
-                self.end_unrewindable_fence("nothing past the fence to rewind", std::time::Instant::now());
+                self.end_unrewindable_fence("nothing to rewind past the fence: none there, or the session's own", std::time::Instant::now());
                 return Ok(false);
             }
             crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
@@ -5378,7 +5384,7 @@ impl AppConsensusEngine {
                     }
                 }
             }
-            if let Err(error) = crate::app_handoff::successor_state_matches(global, &shard, self.clock_store.as_ref(), session) {
+            if let Err(error) = crate::app_handoff::successor_state_matches_held(global, &shard, self.clock_store.as_ref(), session, &mut self.start_context.own_chain) {
                 // A member that did not run (or did not finish) the predecessor
                 // recovers its sealed state through the shard sync: a replay of
                 // the missing frames from an archive when it has a lineage, the
@@ -9069,6 +9075,9 @@ struct StartContext {
     generation: Option<u64>,
     members: Option<usize>,
     not_seated: Option<NotSeated>,
+    /// The session's own frames past its fence, as the fence check found
+    /// them, for the state check after it.
+    own_chain: crate::app_handoff::HeldOwnChain,
 }
 
 /// A refused start, as an operator reads it.
@@ -9394,6 +9403,7 @@ mod start_block_tests {
             generation: Some(19),
             members: Some(4),
             not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234, release: None }),
+            ..StartContext::default()
         };
         let seat = classify_start_refusal(&committee_build_failed(), &lapsed);
         assert_eq!(seat.scope, StartScope::ThisNode);
