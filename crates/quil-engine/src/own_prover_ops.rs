@@ -15,7 +15,7 @@ use quil_execution::global_intrinsic::handoff::{presence::PresenceReport, TYPE_P
 use quil_execution::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROVER_LEAVE};
 use quil_execution::global_intrinsic::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
 use quil_execution::global_intrinsic::prover_ops::{
-    ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT,
+    ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_SENIORITY_MERGE,
 };
 use quil_execution::message_envelope::CanonicalMessageBundle;
 use tracing::info;
@@ -65,6 +65,7 @@ fn describe(inner: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
         TYPE_PROVER_LEAVE => ("leave", ProverLeave::from_canonical_bytes(inner).map(|op| op.filters).unwrap_or_default()),
         TYPE_PRESENCE_REPORT => (PRESENCE_REPORT,
             PresenceReport::from_canonical_bytes(inner).map(|report| vec![report.filter]).unwrap_or_default()),
+        TYPE_PROVER_SENIORITY_MERGE => ("seniority_merge", Vec::new()),
         _ => ("other", Vec::new()),
     }
 }
@@ -236,5 +237,11 @@ mod tests {
             ops.submitted(&i.to_be_bytes(), i);
         }
         assert_eq!(ops.tracked(), MAX_TRACKED);
+    }
+
+    #[test]
+    fn a_seniority_merge_is_named() {
+        let merge = quil_execution::global_intrinsic::prover_ops::ProverSeniorityMerge { frame_number: 9, ..Default::default() };
+        assert_eq!(describe(&merge.to_canonical_bytes().unwrap()), ("seniority_merge", Vec::new()));
     }
 }

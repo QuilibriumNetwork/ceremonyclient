@@ -477,6 +477,9 @@ pub struct WorkerAllocator {
     /// Go's `estimateSeniorityFromConfig` return value. `u64::MAX`
     /// sentinel means "not yet computed"; lifecycle treats that as 0.
     config_seniority_estimate: std::sync::atomic::AtomicU64,
+    /// First epoch in which a seniority merge may be proposed again, set
+    /// when none of this node's merge targets was creditable.
+    seniority_merge_resume_epoch: std::sync::atomic::AtomicU64,
     /// Latest lifecycle-published allocation ranking, consulted when
     /// this node holds more allocations than it has worker slots.
     /// `None` until the first `publish_allocation_priority`.
@@ -606,6 +609,7 @@ impl WorkerAllocator {
                 std::sync::atomic::AtomicU64::new(0),
             ],
             config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
+            seniority_merge_resume_epoch: std::sync::atomic::AtomicU64::new(0),
             allocation_priority: RwLock::new(None),
             session_authority: RwLock::new(None),
             last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
@@ -741,6 +745,17 @@ impl WorkerAllocator {
     }
     pub fn set_last_seniority_merge_attempt(&self, frame_number: u64) {
         self.record_attempt(Cooldown::SeniorityMerge, frame_number);
+    }
+    /// Hold seniority merges for the rest of `frame_number`'s epoch: GLOBAL
+    /// already consumed every merge target. The next epoch checks again.
+    pub fn hold_seniority_merge(&self, frame_number: u64) {
+        let resume = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+        self.seniority_merge_resume_epoch
+            .fetch_max(resume, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn seniority_merge_held(&self, frame_number: u64) -> bool {
+        quil_types::consensus::epoch_for_frame(frame_number)
+            < self.seniority_merge_resume_epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn last_reject_attempt(&self) -> u64 {
         self.last_attempt(Cooldown::Reject)
