@@ -1260,6 +1260,11 @@ pub fn committed_frame_digest(global: &Arc<HypergraphCrdt>, filter: &[u8], numbe
         if checkpoint.frame == number && checkpoint.frame != source.base_frame {
             return Ok(Some(checkpoint.digest));
         }
+        // Frames an origin executed past its checkpoint are not this
+        // shard's history: its successor continues from the checkpoint.
+        if number > checkpoint.frame {
+            continue;
+        }
         if let Some(digest) = tip_of(&source)? {
             return Ok(Some(digest));
         }
@@ -2383,6 +2388,10 @@ mod successor_tests {
         assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), Some([0x33; 32]), "the sealed checkpoint");
         assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), None, "below the predecessor's tip");
         assert_eq!(committed_frame_digest(&global, &[0x08; 32], 3).unwrap(), None, "another shard");
+        handoff::record_session_tip(&state, 6, &source.id().unwrap(),
+            &Checkpoint { frame: 4, view: 6, digest: [0x55; 32], state_roots: [[1; 32]; 4], history_root: [0; 32] }).unwrap();
+        commit(&global, &state, 6);
+        assert_eq!(committed_frame_digest(&global, &filter, 4).unwrap(), None, "a predecessor's tip past its seal");
     }
 
     #[test]

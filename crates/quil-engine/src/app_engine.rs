@@ -5331,7 +5331,7 @@ impl AppConsensusEngine {
                 )? {
                     match crate::app_history_recovery::recover(
                         &source, manager.clone(), self.clock_store.clone(), self.frame_validator(),
-                        self.delivery_frame_source.as_ref(), checkpoint.frame,
+                        Some(global), self.delivery_frame_source.as_ref(), checkpoint.frame,
                     ).await {
                         Ok(true) => {
                             let key = ("history-headers", session.filter.clone(), session.generation, source.generation);
@@ -5469,7 +5469,7 @@ impl AppConsensusEngine {
             let validator = self.frame_validator();
             let recovered = crate::app_history_recovery::recover(
                 session, manager.clone(), self.clock_store.clone(), validator.clone(),
-                self.delivery_frame_source.as_ref(), self.last_materialized_frame,
+                self.global_hypergraph.as_ref(), self.delivery_frame_source.as_ref(), self.last_materialized_frame,
             ).await;
             // The next header's accumulator field reads the carry window below
             // the tip, which a member that joined at the tip never executed.
@@ -5477,7 +5477,7 @@ impl AppConsensusEngine {
                 let cursor = self.last_materialized_frame;
                 match crate::app_history_recovery::recover_carry_window(
                     &filter, manager, self.clock_store.clone(), validator,
-                    self.delivery_frame_source.as_ref(), cursor,
+                    self.global_hypergraph.as_ref(), self.delivery_frame_source.as_ref(), cursor,
                 ).await {
                     Ok((0, None)) => {}
                     Ok((frames, None)) => info!(core_id = self.core_id, filter = hex::encode(&filter), cursor, frames,
