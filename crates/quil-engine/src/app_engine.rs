@@ -2185,6 +2185,8 @@ pub struct AppConsensusEngine {
     predecessor_block: PredecessorBlock,
     /// How long consensus has been refused a start, for bounded logging.
     start_block: StartBlock,
+    /// cw-finalized frames deferred ahead of the cursor, for bounded logging.
+    ahead_deferral: AheadDeferral,
     /// What the last start attempt learned before it was refused.
     start_context: StartContext,
 
@@ -2398,6 +2400,7 @@ impl AppConsensusEngine {
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
             start_block: StartBlock::default(),
+            ahead_deferral: AheadDeferral::default(),
             start_context: StartContext::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
@@ -2684,6 +2687,13 @@ impl AppConsensusEngine {
         let prev = self.last_materialized_frame;
         self.execution.materialized(n);
         self.last_materialized_frame = n;
+        if let Some(Report::Recovered { attempts, duration }) =
+            self.ahead_deferral.materialized(n, std::time::Instant::now())
+        {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), cursor = n,
+                deferred = attempts, deferred_secs = duration.as_secs(),
+                "cw-finalized frames deferred ahead of this worker's cursor are materialized; caught up");
+        }
         if let Some(parents) = self.private_parents.as_ref() {
             parents.retire_through(n);
         }
@@ -5664,11 +5674,18 @@ impl AppConsensusEngine {
             // prior frame failed fatally). Materializing here would apply N+k on
             // state missing N..N+k-1's mutations and permanently skip them. Refuse;
             // the follower/shard-sync path fills the gap strictly (== last+1).
-            warn!(
-                core_id = self.core_id, frame = frame_number,
-                cursor = self.last_materialized_frame,
-                "cw-finalized frame ahead of cursor; deferring to catch-up (not skipping)",
-            );
+            if let Some((Report::Failing { attempts, duration }, highest)) =
+                self.ahead_deferral.deferred(frame_number, std::time::Instant::now())
+            {
+                let cursor = self.last_materialized_frame;
+                warn!(
+                    core_id = self.core_id, filter = hex::encode(&self.filter), frame = frame_number,
+                    highest_deferred = highest, cursor, gap = highest.saturating_sub(cursor),
+                    deferred = attempts, ongoing_secs = duration.as_secs(),
+                    "cw-finalized frames ahead of this worker's cursor are deferred to catch-up (not skipped); \
+                     they materialize in order once the frames above the cursor arrive",
+                );
+            }
             // Kept for the ordered follower path, which applies it from its
             // committed clock header once the missing frames are filled in.
             self.finalized_requests_roots.entry(frame_number).or_insert_with(|| header.requests_root.clone());
@@ -8964,6 +8981,41 @@ mod silent_member_tests {
 /// state is replaced, so a repeat only shows it continues.
 const UNREWINDABLE_FENCE_REPEAT: Duration = Duration::from_secs(30 * 60);
 
+/// cw-finalized frames this worker refused to materialize because they are
+/// more than one above its cursor: one condition from the first such frame
+/// until the cursor reaches the highest of them. A worker held below its
+/// committee defers every frame the committee finalizes; without it each
+/// one warned.
+struct AheadDeferral {
+    limiter: bounded_warn::WarnLimiter<()>,
+    /// The highest frame deferred while the condition lasts.
+    highest: u64,
+}
+
+impl Default for AheadDeferral {
+    fn default() -> Self {
+        Self { limiter: bounded_warn::WarnLimiter::new(), highest: 0 }
+    }
+}
+
+impl AheadDeferral {
+    /// `frame` was deferred at `now`: what to warn, with the highest frame
+    /// deferred so far, when the condition starts and then at most every
+    /// [`bounded_warn::WARN_REPEAT`].
+    fn deferred(&mut self, frame: u64, now: std::time::Instant) -> Option<(Report, u64)> {
+        self.highest = self.highest.max(frame);
+        Some((self.limiter.failed_at(&(), frame, now)?, self.highest))
+    }
+
+    /// The cursor reached `cursor` at `now`: the end of the condition once it
+    /// reaches the highest deferred frame.
+    fn materialized(&mut self, cursor: u64, now: std::time::Instant) -> Option<Report> {
+        let caught_up = self.limiter.succeeded_at(&(), cursor, now)?;
+        self.highest = 0;
+        Some(caught_up)
+    }
+}
+
 /// A shard head past its session fence that cannot be rewound locally, from
 /// the first rewind check that found it to the first that did not.
 #[derive(Default)]
@@ -9025,6 +9077,56 @@ mod unrewindable_fence_block_tests {
         assert_eq!(block.cleared(at(40)), Some(MINUTE * 40));
         assert_eq!(block.cleared(at(41)), None, "named once");
         assert_eq!(block.observe(at(50), &FILTER, pruned), Some(Duration::ZERO), "a new block");
+    }
+}
+
+#[cfg(test)]
+mod ahead_deferral_tests {
+    use super::*;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// A worker held at frame 6009 while its committee finalized 386 frames
+    /// over 2h16m (2026-10-20) warns at onset and then once per repeat
+    /// interval, each line with the deferrals since the previous one.
+    #[test]
+    fn deferrals_behind_a_held_cursor_warn_at_onset_then_at_the_interval() {
+        let start = std::time::Instant::now();
+        let mut deferral = AheadDeferral::default();
+        let mut lines = Vec::new();
+        for i in 0..386u64 {
+            let at = start + SECOND * u32::try_from(i * 21).unwrap();
+            if let Some(line) = deferral.deferred(6011 + i, at) {
+                lines.push(line);
+            }
+        }
+        assert_eq!(lines[0], (Report::Failing { attempts: 1, duration: Duration::ZERO }, 6011));
+        assert_eq!(lines.len(), 14, "onset plus one per 10 min of 8085 s: {lines:?}");
+        let counted: u64 = lines.iter().map(|(report, _)| match report {
+            Report::Failing { attempts, .. } => *attempts,
+            Report::Recovered { .. } => panic!("a deferral never ends the condition"),
+        }).sum();
+        assert_eq!(counted, 1 + 13 * 29, "each repeat counts the 29 deferrals since the previous line");
+        assert!(lines.windows(2).all(|pair| pair[1].1 > pair[0].1), "the highest deferred frame grows");
+    }
+
+    /// The cursor catching up ends the condition once, only when it reaches
+    /// the highest deferred frame, with every deferral and the duration.
+    #[test]
+    fn the_cursor_reaching_the_highest_deferred_frame_ends_it_once() {
+        let start = std::time::Instant::now();
+        let mut deferral = AheadDeferral::default();
+        assert_eq!(deferral.materialized(6009, start), None, "nothing deferred");
+        deferral.deferred(6011, start);
+        deferral.deferred(6012, start + SECOND);
+        deferral.deferred(6011, start + SECOND * 2);
+        assert_eq!(deferral.materialized(6010, start + SECOND * 3), None);
+        assert_eq!(deferral.materialized(6011, start + SECOND * 4), None, "6012 is still ahead");
+        assert_eq!(deferral.materialized(6012, start + SECOND * 5),
+            Some(Report::Recovered { attempts: 3, duration: SECOND * 5 }));
+        assert_eq!(deferral.materialized(6013, start + SECOND * 6), None, "named once");
+        assert_eq!(deferral.deferred(6020, start + SECOND * 7),
+            Some((Report::Failing { attempts: 1, duration: Duration::ZERO }, 6020)), "a new condition");
     }
 }
 
