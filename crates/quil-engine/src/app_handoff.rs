@@ -969,6 +969,19 @@ pub enum FenceRewind {
     Unrewindable { fence: UnrewindableFence, error: Option<QuilError> },
 }
 
+impl FenceRewind {
+    /// The re-anchor at the fence a head this node cannot rewind owes
+    /// ([`rebase_for_reanchor`]); `None` for anything else.
+    pub fn reanchor(&self) -> Option<ReanchorMarker> {
+        match self {
+            FenceRewind::Unrewindable { fence, .. } => Some(ReanchorMarker {
+                generation: fence.generation, fence: fence.fence, from_cursor: fence.local_head, head: None,
+            }),
+            FenceRewind::Untouched | FenceRewind::Rewound(_) => None,
+        }
+    }
+}
+
 /// [`fence_rewind`] as the fence frame when it rewound. A head it cannot
 /// rewind is not rewound, or fails with the rewind's refusal.
 pub fn rewind_past_fence(
@@ -1118,6 +1131,377 @@ pub fn fence_rewind(
         return Ok(FenceRewind::Rewound(checkpoint.frame));
     }
     Ok(FenceRewind::Untouched)
+}
+
+/// A shard re-anchor at its session fence whose rebase has not committed
+/// ([`rebase_for_reanchor`]). Kept durably from before the shard sync may
+/// write the shard's trees until the rebase moves the materialized cursor
+/// ([`reanchor_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReanchorMarker {
+    pub generation: u64,
+    /// The fence the head lay past.
+    pub fence: u64,
+    /// The materialized cursor the re-anchor began at.
+    pub from_cursor: u64,
+    /// The digest (`poseidon(output)`) of the local frame at `from_cursor`
+    /// when the re-anchor began, if there was one.
+    pub head: Option<[u8; 32]>,
+}
+
+impl ReanchorMarker {
+    /// This marker, naming the digest of `filter`'s local frame at its cursor.
+    pub fn with_head(mut self, clock: &dyn ClockStore, filter: &[u8]) -> Self {
+        self.head = local_frame_digest(clock, filter, self.from_cursor);
+        self
+    }
+}
+
+/// The digest (`poseidon(output)`) of `filter`'s local frame `number`, if
+/// this node holds it.
+pub fn local_frame_digest(clock: &dyn ClockStore, filter: &[u8], number: u64) -> Option<[u8; 32]> {
+    let frame = clock.get_shard_clock_frame(filter, number, false).ok()?;
+    quil_crypto::poseidon::hash_bytes_to_32(&frame.header?.output).ok()
+}
+
+/// What a recorded re-anchor marker means for the shard as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReanchorGate {
+    /// No marker.
+    Absent,
+    /// Its rebase has not committed: the trees may hold a partial sync over
+    /// the discarded head, and nothing may start on them.
+    Owed(ReanchorMarker),
+    /// Its rebase committed (the cursor moved), or another frame stands at
+    /// the head it was recorded for: it is cleared.
+    Stale(ReanchorMarker),
+}
+
+/// [`ReanchorGate`] of `marker` at materialized cursor `cursor`, whose
+/// local frame has digest `head` (`None`: no frame there). A rebase deletes
+/// the head frame before it moves the cursor, so a missing frame at an
+/// unmoved cursor is a rebase in progress: still owed.
+pub fn reanchor_gate(marker: Option<ReanchorMarker>, cursor: u64, head: Option<[u8; 32]>) -> ReanchorGate {
+    let Some(marker) = marker else { return ReanchorGate::Absent };
+    if cursor != marker.from_cursor {
+        return ReanchorGate::Stale(marker);
+    }
+    match (marker.head, head) {
+        (Some(recorded), Some(found)) if recorded != found => ReanchorGate::Stale(marker),
+        _ => ReanchorGate::Owed(marker),
+    }
+}
+
+/// [`reanchor_gate`] of `marker` for `filter` as its stores stand.
+pub fn reanchor_gate_at(
+    shard: &Arc<HypergraphCrdt>,
+    clock: &dyn ClockStore,
+    filter: &[u8],
+    marker: Option<ReanchorMarker>,
+) -> Result<ReanchorGate> {
+    if marker.is_none() {
+        return Ok(ReanchorGate::Absent);
+    }
+    let cursor = shard.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))?;
+    Ok(reanchor_gate(marker, cursor, local_frame_digest(clock, filter, cursor)))
+}
+
+#[cfg(test)]
+pub fn read_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<Option<ReanchorMarker>> {
+    let txn = clock.new_transaction(false)?;
+    let value = txn.get(&quil_store::encoding::app_reanchor_key(filter));
+    let _ = txn.abort();
+    let Some(bytes) = value? else { return Ok(None) };
+    decode_reanchor_marker(&bytes)
+        .map(Some)
+        .ok_or_else(|| QuilError::Store("malformed shard re-anchor marker".into()))
+}
+
+/// A marker's bytes: generation, fence and cursor (8-byte BE each), then
+/// the head digest (zero for none), which a marker written without it
+/// lacks.
+fn decode_reanchor_marker(bytes: &[u8]) -> Option<ReanchorMarker> {
+    let field = |i: usize| bytes.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+    let head = match bytes.len() {
+        24 => None,
+        56 => Some(<[u8; 32]>::try_from(&bytes[24..56]).ok()?).filter(|head| *head != [0; 32]),
+        _ => return None,
+    };
+    Some(ReanchorMarker { generation: field(0)?, fence: field(1)?, from_cursor: field(2)?, head })
+}
+
+/// [`read_reanchor_marker`] for a check that must not stay blocked: a
+/// malformed marker is cleared and reported by its length (`Some(len)`).
+/// If the head still lies past the fence, the next rewind check records a
+/// fresh marker for it before anything starts.
+pub fn load_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<(Option<ReanchorMarker>, Option<usize>)> {
+    let txn = clock.new_transaction(false)?;
+    let value = txn.get(&quil_store::encoding::app_reanchor_key(filter));
+    let _ = txn.abort();
+    let Some(bytes) = value? else { return Ok((None, None)) };
+    match decode_reanchor_marker(&bytes) {
+        Some(marker) => Ok((Some(marker), None)),
+        None => {
+            clear_reanchor_marker(clock, filter)?;
+            Ok((None, Some(bytes.len())))
+        }
+    }
+}
+
+pub fn write_reanchor_marker(clock: &dyn ClockStore, filter: &[u8], marker: &ReanchorMarker) -> Result<()> {
+    let mut value = Vec::with_capacity(56);
+    for field in [marker.generation, marker.fence, marker.from_cursor] {
+        value.extend_from_slice(&field.to_be_bytes());
+    }
+    value.extend_from_slice(&marker.head.unwrap_or([0; 32]));
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = txn.set(&quil_store::encoding::app_reanchor_key(filter), &value) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+pub fn clear_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = txn.delete(&quil_store::encoding::app_reanchor_key(filter)) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+/// Whether `anchor` is the frame GLOBAL committed for `filter` at its
+/// number: the executed tip of the shard's current session, or a
+/// same-filter origin's checkpoint or tip, the origins taken as
+/// [`effective_origins`] gives them, as the re-anchor's fence was found
+/// ([`fence_rewind`]). A session sealed or fenced at its base, never having
+/// run, is looked through to the checkpoint below it: otherwise a fence
+/// under such a session could never be re-anchored at until its successor
+/// ran, which may need this member. A re-anchor installs nothing else: its
+/// validation alone would accept any certified frame of the session.
+pub fn anchor_is_committed(
+    global: &Arc<HypergraphCrdt>,
+    filter: &[u8],
+    anchor: &quil_types::proto::global::AppShardFrame,
+) -> Result<bool> {
+    let Some(header) = anchor.header.as_ref().filter(|header| header.address == filter) else {
+        return Ok(false);
+    };
+    let (number, digest) = (header.frame_number, quil_crypto::poseidon::hash_bytes_to_32(&header.output)?);
+    let view = CommittedView::capture(global)?;
+    let Some(head) = handoff::head(&view, filter)? else { return Ok(false) };
+    let at_tip = |session: &Session| -> Result<bool> {
+        Ok(handoff::session_tip(&view, &session.id()?)?
+            .is_some_and(|tip| tip.frame == number && tip.digest == digest))
+    };
+    if at_tip(&head)? {
+        return Ok(true);
+    }
+    let effective = match effective_origins(&view, &head) {
+        Ok(effective) => effective,
+        Err(QuilError::ExecutionUnavailable(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for (source, checkpoint) in effective.origins {
+        if source.filter != filter {
+            continue;
+        }
+        if (checkpoint.frame == number && checkpoint.digest == digest) || at_tip(&source)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The anchor a re-anchor attempt found to be the frame GLOBAL committed
+/// ([`anchor_is_committed`]). Validated before the tree sync and again at
+/// installation, it is accepted the second time though GLOBAL has since
+/// executed the successor past it: the head session's tip moves with every
+/// frame GLOBAL executes, and an executed frame stays committed.
+/// The memo holds only under the head session it was found under: a new
+/// session is checked afresh.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedAnchor(Option<([u8; 32], u64, [u8; 32])>);
+
+impl CommittedAnchor {
+    /// Whether `anchor` is the frame GLOBAL committed: the one already found
+    /// so under the same head session, or one [`anchor_is_committed`]
+    /// accepts now, then remembered with that head.
+    pub fn accept(
+        &mut self,
+        global: &Arc<HypergraphCrdt>,
+        filter: &[u8],
+        anchor: &quil_types::proto::global::AppShardFrame,
+    ) -> Result<bool> {
+        let Some(header) = anchor.header.as_ref().filter(|header| header.address == filter) else {
+            return Ok(false);
+        };
+        let (frame, digest) = (header.frame_number, quil_crypto::poseidon::hash_bytes_to_32(&header.output)?);
+        let view = CommittedView::capture(global)?;
+        let Some(head) = handoff::head(&view, filter)?.map(|head| head.id()).transpose()? else {
+            return Ok(false);
+        };
+        if self.remembers(head, frame, digest) {
+            return Ok(true);
+        }
+        let committed = anchor_is_committed(global, filter, anchor)?;
+        if committed {
+            self.0 = Some((head, frame, digest));
+        }
+        Ok(committed)
+    }
+
+    /// Whether `(frame, digest)` was found committed under head session `head`.
+    fn remembers(&self, head: [u8; 32], frame: u64, digest: [u8; 32]) -> bool {
+        self.0 == Some((head, frame, digest))
+    }
+}
+
+/// Whether a re-anchor can still find its anchor under `filter`'s current
+/// head session: the head executed frames of its own, or one of its
+/// effective origins ([`effective_origins`]) is of this filter, whose
+/// checkpoint or tip the anchor is. A later session whose origins are all
+/// other shards', or that has none, gives the shard its state another way
+/// (its origins' pinned state), and the marker no longer applies. Unknown
+/// keeps it: no head (a view behind, or a retired shard, is no proof the
+/// fence is gone) or an unresolvable origin.
+pub fn reanchor_applies(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<bool> {
+    let view = CommittedView::capture(global)?;
+    let Some(head) = handoff::head(&view, filter)? else { return Ok(true) };
+    if handoff::session_tip(&view, &head.id()?)?.is_some() {
+        return Ok(true);
+    }
+    match effective_origins(&view, &head) {
+        Ok(effective) => Ok(continues_filter(&effective.origins, filter)),
+        Err(QuilError::ExecutionUnavailable(_)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// `filter`'s current head session, as (generation, effective origins), for
+/// naming it; `None` without one, or when its origins do not resolve.
+pub fn head_summary(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Option<(u64, usize)> {
+    let view = CommittedView::capture(global).ok()?;
+    let head = handoff::head(&view, filter).ok()??;
+    let origins = effective_origins(&view, &head).ok()?.origins.len();
+    Some((head.generation, origins))
+}
+
+/// Whether any of `origins` is of `filter`.
+fn continues_filter(origins: &[(Session, Checkpoint)], filter: &[u8]) -> bool {
+    origins.iter().any(|(source, _)| source.filter == filter)
+}
+
+/// Persist certified `frame` as `filter`'s shard frame `frame_number`. The
+/// clock head moves to it only when it is above the head.
+pub(crate) fn commit_clock_head(
+    clock: &dyn ClockStore,
+    filter: &[u8],
+    frame: &quil_types::proto::global::AppShardFrame,
+    frame_number: u64,
+) -> Result<()> {
+    let header = frame.header.as_ref().ok_or_else(|| QuilError::InvalidArgument(
+        "shard clock frame has no header".into()))?;
+    if header.frame_number != frame_number || header.address != filter {
+        return Err(QuilError::InvalidArgument("shard clock frame context mismatch".into()));
+    }
+    let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();
+    // The clock store resolves staged bytes from committed storage, so
+    // staging must finish before the canonical/head transaction is built.
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = clock.stage_shard_clock_frame(&selector, frame, txn.as_ref()) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()?;
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = clock.commit_shard_clock_frame(filter, frame_number, &selector, txn.as_ref(), false) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+/// The local frames a rebase dropped, `from..=to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebased {
+    pub from: u64,
+    pub to: u64,
+}
+
+/// Rebase a shard whose owed re-anchor ([`ReanchorMarker`]) synced its
+/// trees to archive anchor `anchor`'s pre-state (the state after frame
+/// `anchor - 1`, which the anchor's header names), before the anchor is
+/// replayed. The anchor is at or above the fence. Every local frame from
+/// the first past the fence, or from the anchor when that is the fence,
+/// up to the old head goes, with its relay records (fee total,
+/// settlements, spends, accumulator digest) and shard commits: past the
+/// fence they are the fenced predecessor's discarded frames, and frames
+/// below a later anchor are never materialized here again, so their
+/// records would stay for the relay windows and the session's outgoing
+/// history to read. `discard_above` then drops what the caller keeps of
+/// frames above `min(anchor - 1, fence)` (finalized records, fee window).
+/// The anchor's certified predecessor becomes the clock head and, last,
+/// the materialized cursor moves to it, which commits the rebase; the
+/// marker is cleared after it. Interrupted before the cursor moves, the
+/// re-anchor stays owed and repeats every step.
+pub fn rebase_for_reanchor(
+    shard: &Arc<HypergraphCrdt>,
+    clock: &dyn ClockStore,
+    filter: &[u8],
+    marker: &ReanchorMarker,
+    anchor: u64,
+    predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+    discard_above: impl FnOnce(u64) -> Result<()>,
+) -> Result<Rebased> {
+    use quil_store::encoding;
+    let app = filter.get(..32).ok_or_else(|| QuilError::InvalidArgument("a re-anchor needs a shard filter".into()))?;
+    if anchor < marker.fence {
+        return Err(QuilError::InvalidArgument("a re-anchor never anchors below its fence".into()));
+    }
+    let synced_to = anchor.checked_sub(1)
+        .ok_or_else(|| QuilError::InvalidArgument("a re-anchor needs an anchor above genesis".into()))?;
+    let cursor_key = encoding::consensus_materialized_cursor_key(filter);
+    let cursor = shard.read_frame_cursor(&cursor_key)?;
+    let stored = clock.get_latest_shard_clock_frame(filter).ok()
+        .and_then(|frame| frame.header.map(|header| header.frame_number))
+        .unwrap_or(0);
+    let top = cursor.max(stored).max(marker.from_cursor);
+    let from = anchor.min(marker.fence.saturating_add(1));
+    if from <= top {
+        let records = clock.new_transaction(false)?;
+        for frame in from..=top {
+            for key in [
+                encoding::clock_shard_frame_fee_total_key(filter, frame),
+                encoding::clock_shard_frame_settlements_key(filter, frame),
+                encoding::clock_shard_frame_spends_key(filter, frame),
+                encoding::clock_shard_frame_accumulator_key(filter, frame),
+            ] {
+                if let Err(error) = records.delete(&key) {
+                    let _ = records.abort();
+                    return Err(error);
+                }
+            }
+        }
+        records.commit()?;
+        for frame in from..=top {
+            shard.invalidate_domain_shard_commit(frame, app)?;
+        }
+        clock.delete_shard_clock_frame_range(filter, from, top + 1)?;
+    }
+    // Before the cursor moves: a crash after it would leave records above
+    // the cursor that a later start replays into the successor.
+    discard_above(synced_to.min(marker.fence))?;
+    clock.set_latest_shard_clock_frame_number(filter, synced_to)?;
+    if synced_to > 0 {
+        let predecessor = predecessor
+            .ok_or_else(|| QuilError::InvalidArgument("a re-anchor needs its anchor's predecessor".into()))?;
+        commit_clock_head(clock, filter, predecessor, synced_to)?;
+    }
+    shard.checkpoint_frame_cursor(synced_to, &cursor_key)?;
+    clear_reanchor_marker(clock, filter)?;
+    Ok(Rebased { from, to: top })
 }
 
 #[cfg(test)]
@@ -1699,6 +2083,22 @@ mod successor_tests {
         due: u64,
     }
 
+    impl PastFence {
+        /// GLOBAL fences the successor at its base, never having run, and
+        /// authorizes the next session from it: also based at the fence.
+        fn fence_successor_at_its_base(&self) -> Session {
+            let request = handoff::schedule(&self.state, self.due + 1, vec![self.filter.clone()],
+                vec![DesiredCommittee { filter: self.filter.clone(), members: self.successor.members.clone() }]).unwrap();
+            commit(&self.global, &self.state, self.due + 1);
+            let due = schedule::fence_due_frame(request.frame);
+            assert_eq!(schedule::fence_stalled_sources(&self.state, due, &[self.filter.clone()], None).unwrap(), 1);
+            commit(&self.global, &self.state, due);
+            let next = handoff::head(&self.state, &self.filter).unwrap().unwrap();
+            assert_eq!((next.generation, next.base_frame), (self.successor.generation + 1, 3));
+            next
+        }
+    }
+
     fn store_header(clock: &quil_store::RocksClockStore, header: quil_types::proto::global::FrameHeader) {
         use quil_types::store::ClockStore as _;
         let (filter, number) = (header.address.clone(), header.frame_number);
@@ -1887,6 +2287,359 @@ mod successor_tests {
         });
         assert!(matches!(fence_rewind(&past.global, &joiner, &joiner_clock, &past.successor).unwrap(),
             FenceRewind::Untouched));
+    }
+
+    /// Discarded frames `numbers` of the predecessor past the fence at 3,
+    /// anchored before GLOBAL fenced it, materialized through the last.
+    fn discarded_head(past: &PastFence, numbers: &[u64]) {
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        for &number in numbers {
+            store_header(&past.clock, quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(), frame_number: number, rank: number + 3,
+                output: vec![0x40 | number as u8; 32], ..Default::default()
+            });
+        }
+        let changed = quil_hypergraph::Location { app_address: [0x02; 32], data_address: [9; 32] };
+        past.shard.add_vertex(&changed, b"a discarded frame's").unwrap();
+        let last = *numbers.last().unwrap();
+        past.shard.commit_with_frame_cursor_and_records(last, &cursor_key, &outflow_records(&past.filter, last)).unwrap();
+    }
+
+    fn header_frame(filter: &[u8], number: u64, output: u8) -> quil_types::proto::global::AppShardFrame {
+        quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.to_vec(), frame_number: number, output: vec![output; 32], ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Frame `frame`'s relay records, as a member that materialized it keeps them.
+    fn store_relay_records(clock: &quil_store::RocksClockStore, filter: &[u8], frame: u64) {
+        use quil_types::store::ClockStore as _;
+        clock.put_shard_frame_fee_total(filter, frame, 7).unwrap();
+        clock.put_shard_frame_settlements(filter, frame, &[frame as u8]).unwrap();
+        clock.put_shard_frame_spends(filter, frame, &[frame as u8]).unwrap();
+        clock.put_shard_frame_accumulator(filter, frame, &[frame as u8; 32], b"report").unwrap();
+    }
+
+    fn relay_records_of(clock: &quil_store::RocksClockStore, filter: &[u8], frame: u64) -> [bool; 4] {
+        use quil_types::store::ClockStore as _;
+        [
+            clock.get_shard_frame_fee_total(filter, frame).unwrap().is_some(),
+            clock.get_shard_frame_settlements(filter, frame).unwrap().is_some(),
+            clock.get_shard_frame_spends(filter, frame).unwrap().is_some(),
+            clock.get_shard_frame_accumulator(filter, frame).unwrap().is_some(),
+        ]
+    }
+
+    fn gate_of(past: &PastFence) -> ReanchorGate {
+        let marker = read_reanchor_marker(&past.clock, &past.filter).unwrap();
+        reanchor_gate_at(&past.shard, &past.clock, &past.filter, marker).unwrap()
+    }
+
+    // An operator's worker installed an archive checkpoint past the fence
+    // (2026-10-13): it held the predecessor's discarded frames 5 and 6 and
+    // nothing at the fence, so it could neither rewind nor start, for six
+    // days. It owes a re-anchor at the frame GLOBAL committed, which while
+    // the successor has executed nothing is the fence, its base. Once the
+    // shard sync has installed that frame's pre-state, the rebase drops the
+    // discarded frames and moves head and cursor below the anchor; the
+    // anchor's replay then leaves a member the successor accepts.
+    #[test]
+    fn a_head_past_a_fence_without_its_frames_is_reanchored_at_the_fence() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 5).unwrap();
+        discarded_head(&past, &[5, 6]);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(&outcome, FenceRewind::Unrewindable { fence, error: None }
+            if fence.reason == "no local frame at the fence"), "{outcome:?}");
+        let marker = outcome.reanchor().expect("a head past the fence that cannot rewind owes a re-anchor");
+        assert_eq!(marker, ReanchorMarker { generation: past.successor.generation, fence: 3, from_cursor: 6, head: None });
+        let marker = marker.with_head(&past.clock, &past.filter);
+        assert_eq!(marker.head, Some(quil_crypto::poseidon::hash_bytes_to_32(&[0x46; 32]).unwrap()));
+        assert_eq!(past.successor.base_frame, 3, "a fenced predecessor's successor is based at the fence");
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(3), "the anchor is the fence");
+        write_reanchor_marker(&past.clock, &past.filter, &marker).unwrap();
+        assert_eq!(gate_of(&past), ReanchorGate::Owed(marker));
+
+        // The shard sync installed frame 3's pre-state; the actor rebases.
+        let rebased = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 3,
+            Some(&header_frame(&past.filter, 2, 0x22)), |kept| { assert_eq!(kept, 2); Ok(()) }).unwrap();
+        assert_eq!(rebased, Rebased { from: 3, to: 6 });
+        assert_eq!(past.cursor(), 2);
+        assert_eq!(past.clock.get_latest_shard_clock_frame(&past.filter).unwrap().header.unwrap().frame_number, 2);
+        for number in [5, 6] {
+            assert!(past.clock.get_shard_clock_frame(&past.filter, number, false).is_err(), "frame {number} is dropped");
+        }
+        assert_eq!(read_reanchor_marker(&past.clock, &past.filter).unwrap(), None, "the rebase committed");
+        assert_eq!(gate_of(&past), ReanchorGate::Absent);
+
+        // The anchor's replay: the fenced frame and the state after it.
+        past.shard.rewind_app_shard(&past.filter, &past.fenced_roots).unwrap();
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 3, rank: 5, output: vec![0x33; 32], ..Default::default()
+        });
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        past.shard.checkpoint_frame_cursor(3, &cursor_key).unwrap();
+        assert!(matches!(fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // Once GLOBAL has executed the successor past the fence, the anchor is
+    // its executed tip, and the frame there that is not GLOBAL's still says
+    // the head is the predecessor's. The rebase drops every discarded frame
+    // past the fence, not only those from the anchor up, and their relay
+    // records: frames below the anchor are never materialized here again.
+    // It never anchors below the fence.
+    #[test]
+    fn a_reanchor_past_the_successors_tip_drops_every_discarded_frame() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 5).unwrap();
+        discarded_head(&past, &[5, 6, 8]);
+        for frame in [3, 5, 6, 8] {
+            store_relay_records(&past.clock, &past.filter, frame);
+        }
+        handoff::record_session_tip(&past.state, past.due + 1, &past.successor.id().unwrap(), &Checkpoint {
+            frame: 8, view: 12, digest: quil_crypto::poseidon::hash_bytes_to_32(&[0x88; 32]).unwrap(),
+            state_roots: [[3; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(&past.global, &past.state, past.due + 1);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        let marker = outcome.reanchor().expect("the frame at the executed tip differs from GLOBAL's");
+        assert_eq!(marker.from_cursor, 8);
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(8), "the anchor is the executed tip");
+
+        let below = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 2,
+            Some(&header_frame(&past.filter, 1, 0x11)), |_| Ok(()));
+        assert!(below.is_err(), "an anchor below the fence");
+        assert_eq!(past.cursor(), 8);
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 5, false).is_ok(), "nothing dropped");
+
+        let rebased = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 8,
+            Some(&header_frame(&past.filter, 7, 0x77)), |kept| { assert_eq!(kept, 3); Ok(()) }).unwrap();
+        assert_eq!(rebased, Rebased { from: 4, to: 8 });
+        assert_eq!(past.cursor(), 7);
+        assert_eq!(past.clock.get_latest_shard_clock_frame(&past.filter).unwrap().header.unwrap().output, vec![0x77; 32]);
+        for number in [5, 6, 8] {
+            assert!(past.clock.get_shard_clock_frame(&past.filter, number, false).is_err(), "frame {number} is dropped");
+            assert_eq!(relay_records_of(&past.clock, &past.filter, number), [false; 4], "frame {number}'s relay records");
+        }
+        assert_eq!(relay_records_of(&past.clock, &past.filter, 3), [true; 4], "the fence's records stay");
+    }
+
+    // A member past the fence on this session's own chain owes nothing:
+    // its frame at the executed tip is the one GLOBAL executed.
+    #[test]
+    fn a_member_on_the_sessions_own_chain_owes_no_reanchor() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.execute_successor(0x44);
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 4).unwrap();
+        let roots = past.shard.capture_committed_shard(&past.filter).unwrap().roots;
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(outcome.reanchor(), None);
+        assert_eq!(past.shard.capture_committed_shard(&past.filter).unwrap().roots, roots);
+        assert_eq!(past.cursor(), 4);
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_ok());
+    }
+
+    // The marker outlives a restart, per shard, with or without the head it
+    // names, also in the layout without a head. A malformed marker is an
+    // error to a plain read; a check that must not block clears it.
+    #[test]
+    fn a_reanchor_marker_survives_a_restart_and_a_malformed_one_is_cleared() {
+        use quil_types::store::ClockStore as _;
+        let clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(clock_db.inner());
+        let filter = vec![0x02; 32];
+        assert_eq!(read_reanchor_marker(&clock, &filter).unwrap(), None);
+        for head in [Some([0x46; 32]), None] {
+            let marker = ReanchorMarker { generation: 2, fence: 1015, from_cursor: 1018, head };
+            write_reanchor_marker(&clock, &filter, &marker).unwrap();
+            let restarted = quil_store::RocksClockStore::new(clock_db.inner());
+            assert_eq!(read_reanchor_marker(&restarted, &filter).unwrap(), Some(marker));
+            assert_eq!(read_reanchor_marker(&restarted, &[0x03; 32]).unwrap(), None, "per shard");
+        }
+        clear_reanchor_marker(&clock, &filter).unwrap();
+        assert_eq!(read_reanchor_marker(&clock, &filter).unwrap(), None);
+        let txn = clock.new_transaction(false).unwrap();
+        let mut short = Vec::new();
+        for field in [2u64, 1015, 1018] {
+            short.extend_from_slice(&field.to_be_bytes());
+        }
+        txn.set(&quil_store::encoding::app_reanchor_key(&filter), &short).unwrap();
+        txn.commit().unwrap();
+        let headless = ReanchorMarker { generation: 2, fence: 1015, from_cursor: 1018, head: None };
+        assert_eq!(read_reanchor_marker(&clock, &filter).unwrap(), Some(headless), "the layout without a head");
+        assert_eq!(load_reanchor_marker(&clock, &filter).unwrap(), (Some(headless), None));
+
+        // The 56-byte layout with a head, written raw.
+        let mut full = short.clone();
+        full.extend_from_slice(&[0x46; 32]);
+        let txn = clock.new_transaction(false).unwrap();
+        txn.set(&quil_store::encoding::app_reanchor_key(&filter), &full).unwrap();
+        txn.commit().unwrap();
+        let headed = ReanchorMarker { head: Some([0x46; 32]), ..headless };
+        assert_eq!(load_reanchor_marker(&clock, &filter).unwrap(), (Some(headed), None), "the 56-byte layout");
+
+        let mut longer = full.clone();
+        longer.push(1);
+        for malformed in [vec![1; 17], longer] {
+            let txn = clock.new_transaction(false).unwrap();
+            txn.set(&quil_store::encoding::app_reanchor_key(&filter), &malformed).unwrap();
+            txn.commit().unwrap();
+            assert!(read_reanchor_marker(&clock, &filter).is_err(), "{} bytes", malformed.len());
+            assert_eq!(load_reanchor_marker(&clock, &filter).unwrap(), (None, Some(malformed.len())),
+                "cleared, not blocking");
+            assert_eq!(read_reanchor_marker(&clock, &filter).unwrap(), None);
+        }
+    }
+
+    // Owed while the cursor stands where the re-anchor began and the head
+    // there is the one recorded, or already deleted by the rebase; stale
+    // once the cursor moved (the rebase committed) or another frame stands
+    // at that cursor (the shard reached that height another way).
+    #[test]
+    fn a_reanchor_is_owed_until_its_rebase_moves_the_cursor_or_its_head_is_replaced() {
+        let head = Some([0x46; 32]);
+        let marker = ReanchorMarker { generation: 2, fence: 3, from_cursor: 6, head };
+        assert_eq!(reanchor_gate(None, 6, head), ReanchorGate::Absent);
+        assert_eq!(reanchor_gate(Some(marker), 6, head), ReanchorGate::Owed(marker), "a partial sync may be in the trees");
+        assert_eq!(reanchor_gate(Some(marker), 6, None), ReanchorGate::Owed(marker), "the rebase deleted the head");
+        assert_eq!(reanchor_gate(Some(marker), 2, None), ReanchorGate::Stale(marker), "the rebase committed");
+        assert_eq!(reanchor_gate(Some(marker), 2, head), ReanchorGate::Stale(marker));
+        assert_eq!(reanchor_gate(Some(marker), 6, Some([0x66; 32])), ReanchorGate::Stale(marker), "another frame there");
+        let unheaded = ReanchorMarker { head: None, ..marker };
+        assert_eq!(reanchor_gate(Some(unheaded), 6, Some([0x66; 32])), ReanchorGate::Owed(unheaded));
+    }
+
+    // A rebase interrupted after its deletions, before the cursor moves (a
+    // crash there), leaves the re-anchor owed; run again it converges: the
+    // marker is cleared, and the records kept above the cursor are dropped
+    // before the cursor moves.
+    #[test]
+    fn a_rebase_interrupted_before_its_cursor_moves_stays_owed_and_converges_when_rerun() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 5).unwrap();
+        discarded_head(&past, &[5, 6]);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        let marker = outcome.reanchor().unwrap().with_head(&past.clock, &past.filter);
+        write_reanchor_marker(&past.clock, &past.filter, &marker).unwrap();
+        let predecessor = header_frame(&past.filter, 2, 0x22);
+
+        let crashed = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 3, Some(&predecessor),
+            |_| Err(QuilError::Internal("stopped after the deletions".into())));
+        assert!(crashed.is_err());
+        assert_eq!(past.cursor(), 6, "the cursor has not moved");
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 6, false).is_err(), "the head is already deleted");
+        assert_eq!(gate_of(&past), ReanchorGate::Owed(marker), "still owed after a restart");
+
+        let finalized = std::cell::RefCell::new(vec![2u64, 3, 5, 6]);
+        let rebased = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 3, Some(&predecessor),
+            |kept| {
+                assert_eq!(past.cursor(), 6, "kept records are dropped before the cursor moves");
+                finalized.borrow_mut().retain(|&number| number <= kept);
+                Ok(())
+            }).unwrap();
+        assert_eq!(rebased, Rebased { from: 3, to: 6 });
+        assert_eq!(past.cursor(), 2);
+        assert!(finalized.borrow().iter().all(|&number| number <= past.cursor()), "{:?}", finalized.borrow());
+        assert_eq!(gate_of(&past), ReanchorGate::Absent, "the marker is cleared");
+        assert_eq!(past.clock.get_latest_shard_clock_frame(&past.filter).unwrap().header.unwrap().frame_number, 2);
+    }
+
+    // A successor fenced at its base, never having run, does not hide the
+    // fence below it: the head is still owed a re-anchor there, and the
+    // fenced frame is the committed anchor, as before the successor closed.
+    #[test]
+    fn a_fence_under_a_session_closed_at_its_base_is_still_the_committed_anchor() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        past.clock.delete_shard_clock_frame_range(&past.filter, 3, 5).unwrap();
+        discarded_head(&past, &[5, 6]);
+        let next = past.fence_successor_at_its_base();
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(3), "the anchor is the fence");
+        assert_eq!(committed_frame_digest(&past.global, &past.filter, 3).unwrap(), None,
+            "direct origins name only the successor's base");
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &next).unwrap();
+        assert_eq!(outcome.reanchor().map(|marker| (marker.fence, marker.from_cursor)), Some((3, 6)));
+        let committed = |frame| anchor_is_committed(&past.global, &past.filter, &frame).unwrap();
+        assert!(committed(header_frame(&past.filter, 3, 0x33)), "the fenced frame, looked through to");
+        assert!(!committed(header_frame(&past.filter, 3, 0x34)));
+    }
+
+    // The anchor an attempt validated as GLOBAL's executed tip is accepted
+    // at installation though GLOBAL executed the successor past it since:
+    // the head's tip moves with each frame GLOBAL executes.
+    #[test]
+    fn a_committed_anchor_stays_accepted_after_the_successor_produces_past_it() {
+        let past = past_fence();
+        past.execute_successor(0x55);
+        let anchor = header_frame(&past.filter, 4, 0x55);
+        let mut attempt = CommittedAnchor::default();
+        assert!(attempt.accept(&past.global, &past.filter, &anchor).unwrap(), "validated before the tree sync");
+        handoff::record_session_tip(&past.state, past.due + 2, &past.successor.id().unwrap(), &Checkpoint {
+            frame: 5, view: 10, digest: quil_crypto::poseidon::hash_bytes_to_32(&[0x66; 32]).unwrap(),
+            state_roots: [[3; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(&past.global, &past.state, past.due + 2);
+        assert!(!anchor_is_committed(&past.global, &past.filter, &anchor).unwrap(), "no longer the executed tip");
+        assert!(attempt.accept(&past.global, &past.filter, &anchor).unwrap(), "accepted again at installation");
+        assert!(!attempt.accept(&past.global, &past.filter, &header_frame(&past.filter, 4, 0x56)).unwrap());
+        assert!(!CommittedAnchor::default().accept(&past.global, &past.filter, &anchor).unwrap(), "a new attempt");
+    }
+
+    // A re-anchor applies while the shard's current session continues this
+    // filter's chain (its own tip, or a same-filter origin, looked through
+    // sessions closed at their base); not under a session whose origins are
+    // all other shards', or that has none.
+    #[test]
+    fn a_reanchor_applies_while_the_current_session_continues_this_shards_chain() {
+        let past = past_fence();
+        assert!(reanchor_applies(&past.global, &past.filter).unwrap(), "the successor of the fenced session");
+        past.fence_successor_at_its_base();
+        assert!(reanchor_applies(&past.global, &past.filter).unwrap(), "looked through a session closed at its base");
+        let origin = |filter: u8| (Session {
+            chain_id: [7; 32], filter: vec![filter; 32], generation: 1, genesis: [0; 32],
+            base_frame: 0, authorization: [0; 32], members: Vec::new(),
+        }, Checkpoint { frame: 3, view: 5, digest: [0; 32], state_roots: [[0; 32]; 4], history_root: [0; 32] });
+        assert!(continues_filter(&[origin(0x01), origin(0x02)], &[0x02; 32]));
+        assert!(!continues_filter(&[origin(0x01), origin(0x03)], &[0x02; 32]), "origins on other shards");
+        assert!(!continues_filter(&[], &[0x02; 32]), "no origins");
+        assert!(reanchor_applies(&past.global, &[0x07; 32]).unwrap(), "no head: kept");
+        assert_eq!(head_summary(&past.global, &past.filter), Some((past.successor.generation + 1, 1)));
+    }
+
+    // The memo of a committed anchor holds only under the head session it
+    // was found under.
+    #[test]
+    fn a_committed_anchor_is_remembered_only_under_its_head_session() {
+        let memo = CommittedAnchor(Some(([1; 32], 4, [0x55; 32])));
+        assert!(memo.remembers([1; 32], 4, [0x55; 32]));
+        assert!(!memo.remembers([2; 32], 4, [0x55; 32]), "another head session");
+        assert!(!memo.remembers([1; 32], 4, [0x56; 32]));
+        assert!(!CommittedAnchor::default().remembers([1; 32], 4, [0x55; 32]));
+    }
+
+    // A re-anchor installs only the frame GLOBAL committed: the fenced frame
+    // while the successor has executed nothing, its executed tip after.
+    #[test]
+    fn a_reanchor_anchor_must_be_the_frame_global_committed() {
+        let past = past_fence();
+        let committed = |frame| anchor_is_committed(&past.global, &past.filter, &frame).unwrap();
+        assert!(committed(header_frame(&past.filter, 3, 0x33)), "the fenced frame");
+        assert!(!committed(header_frame(&past.filter, 3, 0x34)), "another frame at the fence");
+        assert!(!committed(header_frame(&past.filter, 4, 0x44)), "a discarded frame");
+        assert!(!committed(header_frame(&[0x03; 32], 3, 0x33)), "another shard's frame");
+        past.execute_successor(0x55);
+        assert!(committed(header_frame(&past.filter, 4, 0x55)), "the successor's executed tip");
+        assert!(!committed(header_frame(&past.filter, 4, 0x44)));
     }
 
     // The same rewind on a sub-shard of a split application: only the shard's

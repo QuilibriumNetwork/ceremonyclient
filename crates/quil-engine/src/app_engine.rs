@@ -95,6 +95,13 @@ pub enum AppEngineMessage {
     CommittedTip {
         reply: tokio::sync::oneshot::Sender<Option<u64>>,
     },
+    /// The fence of the re-anchor this shard owes, if any
+    /// (`app_handoff::ReanchorMarker`).
+    ReanchorFence {
+        reply: tokio::sync::oneshot::Sender<crate::prover_tree_syncer::ReanchorAttempt>,
+    },
+    /// An attempt of the owed re-anchor installed nothing, and why.
+    ReanchorFailed { reason: String },
     /// A bounded archive fetch supplies one missing finalized frame. Validate
     /// and replay it on the engine actor so derived history advances with data.
     ReplayArchiveFrame {
@@ -362,6 +369,17 @@ impl AppEngineHandle {
             self.msg_tx.send(AppEngineMessage::CommittedTip { reply }).await.ok()?;
             receive.await.ok().flatten()
         }).await.ok().flatten()
+    }
+
+    /// `NotOwed` also when the engine does not answer within 30 s: the sync
+    /// then runs as it did before re-anchors.
+    pub(crate) async fn reanchor_fence(&self) -> crate::prover_tree_syncer::ReanchorAttempt {
+        use crate::prover_tree_syncer::ReanchorAttempt;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::ReanchorFence { reply }).await.ok()?;
+            receive.await.ok()
+        }).await.ok().flatten().unwrap_or(ReanchorAttempt::NotOwed)
     }
 
     pub(crate) async fn complete_archive_sync(
@@ -2177,6 +2195,8 @@ pub struct AppConsensusEngine {
     /// How long the shard head has lain past its session fence without a
     /// local rewind, for bounded logging.
     unrewindable_fence: UnrewindableFenceBlock,
+    /// The re-anchor at the session fence this shard owes, and its pacing.
+    fence_reanchor: FenceReanchor,
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
@@ -2395,6 +2415,7 @@ impl AppConsensusEngine {
             outgoing_history_source: None,
             global_anchor_source: None,
             unrewindable_fence: UnrewindableFenceBlock::default(),
+            fence_reanchor: FenceReanchor::default(),
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
             start_block: StartBlock::default(),
@@ -2612,12 +2633,43 @@ impl AppConsensusEngine {
     /// view back with it: materialized frame, head, fee window and the
     /// finalized records of the discarded frames. True when it rewound. A
     /// head past the fence that cannot be rewound here is warned about
-    /// ([`Self::note_unrewindable_fence`]) and, as before, not rewound, or
-    /// fails with the rewind's refusal.
+    /// ([`Self::note_unrewindable_fence`]) and owes a re-anchor at the
+    /// fence from an archive ([`crate::app_handoff::ReanchorMarker`]),
+    /// recorded before the shard sync is asked for it. While one is owed
+    /// the start is refused ([`REANCHOR_IN_PROGRESS`]) and the request
+    /// repeats every [`FENCE_REANCHOR_RETRY`]; a marker whose rebase
+    /// committed is cleared first.
     fn rewind_past_fence(&mut self) -> Result<bool> {
-        let (Some(global), Some(shard)) = (
-            self.global_hypergraph.clone(), self.execution_engine.as_ref().map(|m| m.crdt()),
-        ) else {
+        let Some(shard) = self.execution_engine.as_ref().map(|m| m.crdt()) else {
+            return Ok(false);
+        };
+        // A recorded re-anchor is honored or cleared before anything else.
+        let gate = self.reanchor_gate(&shard)?;
+        let applies = match gate {
+            crate::app_handoff::ReanchorGate::Owed(marker) => match self.reanchor_applies() {
+                Ok(applies) => applies,
+                Err(error) => {
+                    if self.fence_reanchor.applies_error_due(std::time::Instant::now()) {
+                        warn!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                            generation = marker.generation, fence = marker.fence, %error, scope = "this node",
+                            action = "the re-anchor is kept and retried; check this worker's GLOBAL state if it persists",
+                            "could not tell whether the shard re-anchor still applies");
+                    }
+                    true
+                }
+            },
+            crate::app_handoff::ReanchorGate::Stale(_) | crate::app_handoff::ReanchorGate::Absent => true,
+        };
+        match gate {
+            crate::app_handoff::ReanchorGate::Owed(marker) if !applies => self.expire_reanchor(&marker)?,
+            crate::app_handoff::ReanchorGate::Owed(_) => {
+                self.request_fence_reanchor(std::time::Instant::now());
+                return Err(QuilError::ExecutionUnavailable(REANCHOR_IN_PROGRESS.into()));
+            }
+            crate::app_handoff::ReanchorGate::Stale(marker) => self.clear_stale_reanchor(&marker)?,
+            crate::app_handoff::ReanchorGate::Absent => {}
+        }
+        let Some(global) = self.global_hypergraph.clone() else {
             return Ok(false);
         };
         if quil_types::consensus::committee_handoff_policy().is_none() {
@@ -2630,18 +2682,27 @@ impl AppConsensusEngine {
         else {
             return Ok(false);
         };
-        let fence = match crate::app_handoff::fence_rewind(&global, &shard, self.clock_store.as_ref(), &session)? {
+        let outcome = crate::app_handoff::fence_rewind(&global, &shard, self.clock_store.as_ref(), &session)?;
+        let reanchor = outcome.reanchor().map(|marker| marker.with_head(self.clock_store.as_ref(), &self.filter));
+        let fence = match outcome {
             crate::app_handoff::FenceRewind::Rewound(fence) => fence,
             crate::app_handoff::FenceRewind::Untouched => {
                 self.end_unrewindable_fence("nothing past the fence to rewind", std::time::Instant::now());
                 return Ok(false);
             }
             crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
-                self.note_unrewindable_fence(&fence, std::time::Instant::now());
-                return match error {
-                    Some(error) => Err(error),
-                    None => Ok(false),
-                };
+                let now = std::time::Instant::now();
+                self.note_unrewindable_fence(&fence, now);
+                if let Some(error) = error {
+                    debug!(core_id = self.core_id, %error, "local fence rewind refused; the shard is re-anchored instead");
+                }
+                if let Some(marker) = reanchor {
+                    // Durable before the shard sync may write the trees.
+                    crate::app_handoff::write_reanchor_marker(self.clock_store.as_ref(), &self.filter, &marker)?;
+                    self.fence_reanchor.marker = Some(Some(marker));
+                    self.request_fence_reanchor(now);
+                }
+                return Err(QuilError::ExecutionUnavailable(REANCHOR_IN_PROGRESS.into()));
             }
         };
         self.end_unrewindable_fence("rewound to the fence", std::time::Instant::now());
@@ -2657,6 +2718,175 @@ impl AppConsensusEngine {
         Ok(true)
     }
 
+    /// The re-anchor marker this shard recorded, read from the store on
+    /// first use. A read failure is not remembered: the next check reads
+    /// again. A malformed marker is cleared, and warned about once.
+    fn recorded_reanchor(&mut self) -> Result<Option<crate::app_handoff::ReanchorMarker>> {
+        if let Some(marker) = self.fence_reanchor.marker {
+            return Ok(marker);
+        }
+        let (marker, malformed) = crate::app_handoff::load_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        if let Some(bytes) = malformed {
+            warn!(core_id = self.core_id, filter = hex::encode(&self.filter), bytes, scope = "this node",
+                action = "the marker was cleared; if the shard head still lies past its session fence the next \
+                    check records a fresh one before anything starts; report it with this line",
+                "shard re-anchor marker malformed; cleared");
+        }
+        self.fence_reanchor.marker = Some(marker);
+        Ok(marker)
+    }
+
+    fn reanchor_gate(&mut self, shard: &Arc<quil_hypergraph::HypergraphCrdt>) -> Result<crate::app_handoff::ReanchorGate> {
+        let marker = self.recorded_reanchor()?;
+        crate::app_handoff::reanchor_gate_at(shard, self.clock_store.as_ref(), &self.filter, marker)
+    }
+
+    /// The re-anchor this shard owes now ([`crate::app_handoff::ReanchorGate::Owed`]).
+    fn owed_reanchor_now(&mut self) -> Result<Option<crate::app_handoff::ReanchorMarker>> {
+        let Some(shard) = self.execution_engine.as_ref().map(|m| m.crdt()) else { return Ok(None) };
+        Ok(match self.reanchor_gate(&shard)? {
+            crate::app_handoff::ReanchorGate::Owed(marker) => Some(marker),
+            crate::app_handoff::ReanchorGate::Absent | crate::app_handoff::ReanchorGate::Stale(_) => None,
+        })
+    }
+
+    /// Whether the owed re-anchor can still find its anchor under the
+    /// shard's current session ([`crate::app_handoff::reanchor_applies`]).
+    /// Without GLOBAL state it is kept.
+    fn reanchor_applies(&self) -> Result<bool> {
+        match self.global_hypergraph.as_ref() {
+            Some(global) if quil_types::consensus::committee_handoff_policy().is_some() => {
+                crate::app_handoff::reanchor_applies(global, &self.filter)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    /// Clear a re-anchor the shard's current session no longer leaves an
+    /// anchor for, say so, and hand the shard to the ordinary sync: an
+    /// origin-pinned installation without a local lineage, a replay with
+    /// one.
+    fn expire_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
+        crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        let owed = self.fence_reanchor.finished(std::time::Instant::now())
+            .map_or_else(|| "unknown".to_string(), |owed| owed.as_secs().to_string());
+        let head = self.global_hypergraph.as_ref()
+            .and_then(|global| crate::app_handoff::head_summary(global, &self.filter));
+        let (head_generation, head_origins) = head.map_or_else(
+            || ("unknown".to_string(), "unknown".to_string()),
+            |(generation, origins)| (generation.to_string(), origins.to_string()),
+        );
+        // Not handled yet: a member with a local lineage has no path to
+        // install the origin-pinned state of a session whose origins are
+        // other shards'. The ordinary sync replays its lineage, which cannot
+        // chain onto that session; the line says so, for a report.
+        let lineage = self.clock_store.get_latest_shard_clock_frame(&self.filter).is_ok();
+        let action = if lineage {
+            "this worker holds a local lineage, so the ordinary shard sync replays it; if the replay cannot chain \
+                onto the current session (the archive recovery lines name it) the shard does not start, a defect to \
+                report with this line and those"
+        } else {
+            "the ordinary shard sync installs the current session's state pinned to its origins' roots; report it \
+                with this line if the shard does not start"
+        };
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+            fence = marker.fence, local_head = marker.from_cursor, lineage, head_generation = %head_generation,
+            head_origins = %head_origins, owed_secs = %owed, scope = "this node", action = action,
+            "shard re-anchor no longer applies: the shard's current session does not continue its fenced chain");
+        let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested { filter: self.filter.clone() });
+        Ok(())
+    }
+
+    /// Clear a marker whose rebase committed before a restart or a failed
+    /// anchor replay, or whose head another frame replaced, and say so: the
+    /// trees are the archive's (or the shard's own), and catch-up goes on.
+    fn clear_stale_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
+        crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        let owed = self.fence_reanchor.finished(std::time::Instant::now())
+            .map_or_else(|| "unknown".to_string(), |owed| owed.as_secs().to_string());
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+            fence = marker.fence, from_cursor = marker.from_cursor, owed_secs = %owed,
+            "shard re-anchor no longer owed: its rebase committed, or another frame stands at its head");
+        Ok(())
+    }
+
+    /// Ask the shard sync for an attempt of the owed re-anchor: at once,
+    /// then every [`FENCE_REANCHOR_RETRY`]. The first shard sync to start
+    /// after a request asks back which one is owed
+    /// (`AppEngineMessage::ReanchorFence`) and makes the attempt, through
+    /// the same archive recovery turns as any shard sync. A request no sync
+    /// took, or an attempt running past [`FENCE_REANCHOR_HUNG`], is warned
+    /// about.
+    fn request_fence_reanchor(&mut self, now: std::time::Instant) {
+        let Some(silent) = self.fence_reanchor.due(now) else { return };
+        if let Some(reason) = silent {
+            self.note_reanchor_wait(reason, now);
+        }
+        debug!(core_id = self.core_id, filter = hex::encode(&self.filter), "shard re-anchor at the session fence requested");
+        let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested { filter: self.filter.clone() });
+    }
+
+    /// Warn that the owed re-anchor waits, named by its cause
+    /// ([`reanchor_wait`]): at its first failure, then every
+    /// [`FENCE_REANCHOR_WAIT_REPEAT`] while it lasts.
+    fn note_reanchor_wait(&mut self, reason: &str, now: std::time::Instant) {
+        let Some(marker) = self.fence_reanchor.owed() else { return };
+        let Some(waited) = self.fence_reanchor.failed(now) else { return };
+        let anchor = self.global_hypergraph.as_ref()
+            .and_then(|global| crate::app_handoff::committed_tip(global, &self.filter).ok().flatten())
+            .map_or_else(|| "unknown".to_string(), |frame| frame.to_string());
+        let refusal = self.fence_reanchor.recent_refusal(now);
+        let (wait, scope, action) = reanchor_wait(reason, refusal.as_ref().map(|(error, _)| error.as_str()));
+        let refusal_age = refusal.as_ref().map_or_else(|| "none".to_string(), |(_, age)| age.as_secs().to_string());
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+            fence = marker.fence, local_head = marker.from_cursor, anchor_frame = %anchor, reason = %reason,
+            last_refusal = %refusal.as_ref().map_or("none", |(error, _)| error.as_str()),
+            last_refusal_age_secs = %refusal_age, waited_secs = waited.as_secs(),
+            scope = scope, action = action, "{wait}");
+    }
+
+    /// The archive sync of an owed re-anchor installed anchor `anchor`'s
+    /// pre-state: rebase the shard below it
+    /// ([`crate::app_handoff::rebase_for_reanchor`]), dropping the
+    /// finalized records and fee window above the fence before its cursor
+    /// moves, and bring the engine's own view with it, as a rewind does.
+    fn rebase_for_reanchor(
+        &mut self,
+        marker: &crate::app_handoff::ReanchorMarker,
+        anchor: u64,
+        predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+    ) -> Result<Option<Duration>> {
+        let shard = self.execution_engine.as_ref().map(|manager| manager.crdt())
+            .ok_or_else(|| QuilError::ExecutionUnavailable("a re-anchor needs shard state".into()))?;
+        let (base, fees, filter) = (self.cw_storage_base.clone(), self.fee_manager.clone(), self.filter.clone());
+        let discard_above = move |kept: u64| -> Result<()> {
+            let _ = fees.rewind_to_frame(&filter, kept);
+            if let Some(base) = base {
+                let directory = base.join("cw-app-consensus").join(format!("finalized-{}", hex::encode(&filter)));
+                crate::cw_app_seams::FinalizedRecords::open(directory)
+                    .map_err(|e| QuilError::Internal(format!("open finalized app frames: {e}")))?
+                    .discard_above(kept);
+            }
+            Ok(())
+        };
+        let rebased = crate::app_handoff::rebase_for_reanchor(
+            &shard, self.clock_store.as_ref(), &self.filter, marker, anchor, predecessor, discard_above,
+        )?;
+        let owed = self.fence_reanchor.finished(std::time::Instant::now());
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+            fence = marker.fence, from = rebased.from, to = rebased.to, anchor_frame = anchor,
+            "shard re-anchor rebase committed: the discarded frames are dropped and the anchor replays next");
+        let synced_to = anchor - 1;
+        self.set_materialized_frame(synced_to);
+        self.shard_frame_number = synced_to;
+        self.received_full_frames.clear();
+        self.finalized_requests_roots.clear();
+        self.pending_follower_clock = None;
+        self.materialize_failures.clear();
+        self.frame_outflows.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        Ok(owed)
+    }
+
     /// Name a shard head past its session fence that this node cannot rewind
     /// ([`crate::app_handoff::UnrewindableFence`]) when first found or its
     /// reason changes, then every [`UNREWINDABLE_FENCE_REPEAT`] with how long
@@ -2666,7 +2896,8 @@ impl AppConsensusEngine {
         let session_tip = fence.session_tip.map_or_else(|| "none".to_string(), |n| n.to_string());
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = fence.generation,
             local_head = fence.local_head, fence = fence.fence, session_tip = %session_tip, reason = fence.reason,
-            action = "needs a re-anchor at the fence from an archive; report it if it persists",
+            action = "this node re-anchors the shard at the fence from an archive; a warning follows \
+                if no archive can serve it",
             elapsed_secs = elapsed.as_secs(),
             "local shard head lies past the session fence and cannot be rewound locally");
     }
@@ -2721,28 +2952,7 @@ impl AppConsensusEngine {
         frame: &quil_types::proto::global::AppShardFrame,
         frame_number: u64,
     ) -> Result<()> {
-        let header = frame.header.as_ref().ok_or_else(|| QuilError::InvalidArgument(
-            "shard clock frame has no header".into()))?;
-        if header.frame_number != frame_number || header.address != self.filter {
-            return Err(QuilError::InvalidArgument("shard clock frame context mismatch".into()));
-        }
-        let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();
-        // The clock store resolves staged bytes from committed storage, so
-        // staging must finish before the canonical/head transaction is built.
-        let txn = self.clock_store.new_transaction(false)?;
-        if let Err(error) = self.clock_store.stage_shard_clock_frame(&selector, frame, txn.as_ref()) {
-            let _ = txn.abort();
-            return Err(error);
-        }
-        txn.commit()?;
-        let txn = self.clock_store.new_transaction(false)?;
-        if let Err(error) = self.clock_store.commit_shard_clock_frame(
-            &self.filter, frame_number, &selector, txn.as_ref(), false,
-        ) {
-            let _ = txn.abort();
-            return Err(error);
-        }
-        txn.commit()
+        crate::app_handoff::commit_clock_head(self.clock_store.as_ref(), &self.filter, frame, frame_number)
     }
 
     async fn reconcile_with_sync(&mut self, synced_to_frame: u64) -> Result<()> {
@@ -2990,7 +3200,18 @@ impl AppConsensusEngine {
         &mut self,
         anchor: &quil_types::proto::global::AppShardFrame,
         predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+        reanchor: Option<crate::app_handoff::ReanchorMarker>,
     ) -> Result<u64> {
+        if reanchor.is_some() {
+            let committed = match self.global_hypergraph.as_ref() {
+                Some(global) => self.fence_reanchor.committed.accept(global, &self.filter, anchor)?,
+                None => false,
+            };
+            if !committed {
+                return Err(QuilError::InvalidSignature(REANCHOR_NOT_COMMITTED.into()));
+            }
+        }
+        let floor = sync_anchor_floor(self.last_materialized_frame, reanchor.map(|marker| marker.fence));
         let validator = self.frame_validator();
         let anchor_history = storage_history_unavailable(&validator, anchor).await;
         let predecessor_history = match predecessor {
@@ -3033,7 +3254,7 @@ impl AppConsensusEngine {
         };
         let mut first = true;
         validate_archive_sync_anchor_in(
-            &self.filter, self.last_materialized_frame, anchor, predecessor, genesis.as_ref(),
+            &self.filter, floor, anchor, predecessor, genesis.as_ref(),
             |frame| {
                 let is_anchor = std::mem::take(&mut first);
                 let role = if is_anchor { "anchor" } else { "predecessor" };
@@ -3275,10 +3496,24 @@ impl AppConsensusEngine {
         anchor: quil_types::proto::global::AppShardFrame,
         predecessor: Option<quil_types::proto::global::AppShardFrame>,
     ) -> bool {
-        let synced_to = match self.validate_archive_sync_anchor(&anchor, predecessor.as_ref()).await {
+        let reanchor = match self.owed_reanchor_now() {
+            Ok(reanchor) => reanchor,
+            Err(error) => {
+                warn!(core_id = self.core_id, filter = hex::encode(&self.filter), error = %error, scope = "this node",
+                    action = "nothing was installed; the next start check reads the marker again; report it with \
+                        this line if it persists",
+                    "archive sync completion rejected: the shard re-anchor marker is unreadable");
+                return false;
+            }
+        };
+        let synced_to = match self.validate_archive_sync_anchor(&anchor, predecessor.as_ref(), reanchor).await {
             Ok(height) => height,
             Err(error) => {
-                warn!(core_id = self.core_id, error = %error, "archive sync completion rejected");
+                if reanchor.is_some() {
+                    self.fence_reanchor.refused(std::time::Instant::now(), error.to_string());
+                }
+                warn!(core_id = self.core_id, filter = hex::encode(&self.filter), error = %error,
+                    "archive sync completion rejected");
                 return false;
             }
         };
@@ -3288,6 +3523,20 @@ impl AppConsensusEngine {
             manager.rebuild_block_summary_before_report(&self.filter);
         }
         let anchor_n = anchor.header.as_ref().expect("validated above").frame_number;
+        let mut owed_for = None;
+        if let Some(marker) = reanchor.as_ref() {
+            match self.rebase_for_reanchor(marker, anchor_n, predecessor.as_ref()) {
+                Ok(owed) => owed_for = owed,
+                Err(error) => {
+                    warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+                        fence = marker.fence, anchor_frame = anchor_n, %error, scope = "this node",
+                        action = "the trees hold the archive's state for the anchor and the re-anchor stays owed; \
+                            the next attempt repeats the rebase; report it with this line if it persists",
+                        "shard re-anchor rebase failed; the next attempt repeats it");
+                    return false;
+                }
+            }
+        }
         if synced_to > 0 {
             let predecessor = predecessor.expect("validated above");
             if let Err(error) = self.commit_shard_clock_head(&predecessor, synced_to) {
@@ -3311,6 +3560,18 @@ impl AppConsensusEngine {
         }
         info!(core_id = self.core_id, anchor_frame = anchor_n, synced_to,
             "app-shard bootstrap installed predecessor and replayed certified anchor");
+        if let Some(marker) = reanchor {
+            let now = std::time::Instant::now();
+            let elapsed = owed_for.unwrap_or_default();
+            let archive = self.execution.snapshot().recovery.map(|recovery| recovery.source)
+                .filter(|source| !source.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
+                fence = marker.fence, old_head = marker.from_cursor, anchor_frame = anchor_n,
+                elapsed_secs = elapsed.as_secs(), archive = %archive,
+                "re-anchored shard at the session fence from an archive");
+            self.end_unrewindable_fence("re-anchored at the fence from an archive", now);
+        }
         true
     }
 
@@ -3381,7 +3642,8 @@ impl AppConsensusEngine {
     /// with no proposer at all. `data_ready` is sticky and the worker keeps one
     /// sync in flight, so this is a no-op once the data lands.
     fn request_data_bootstrap_if_unstaged(&self) {
-        if self.data_ready.load(std::sync::atomic::Ordering::Relaxed) {
+        // An owed re-anchor requests its own attempts.
+        if self.data_ready.load(std::sync::atomic::Ordering::Relaxed) || self.fence_reanchor.owed().is_some() {
             return;
         }
         if self.covered_data_staged() {
@@ -3664,14 +3926,43 @@ impl AppConsensusEngine {
                                     .ok().flatten());
                             let _ = reply.send(tip);
                         }
+                        Some(AppEngineMessage::ReanchorFence { reply }) => {
+                            use crate::prover_tree_syncer::ReanchorAttempt;
+                            let attempt = match self.owed_reanchor_now() {
+                                Ok(Some(marker)) if self.fence_reanchor.take_attempt(std::time::Instant::now()) => {
+                                    ReanchorAttempt::Take(marker.fence)
+                                }
+                                Ok(Some(_)) | Err(_) => ReanchorAttempt::Elsewhere,
+                                Ok(None) => ReanchorAttempt::NotOwed,
+                            };
+                            if reply.send(attempt).is_err() && matches!(attempt, ReanchorAttempt::Take(_)) {
+                                // The sync stopped waiting for the answer: the
+                                // attempt goes to the next one.
+                                self.fence_reanchor.rearm();
+                            }
+                        }
+                        Some(AppEngineMessage::ReanchorFailed { reason }) => {
+                            self.fence_reanchor.outcome();
+                            self.note_reanchor_wait(&reason, std::time::Instant::now());
+                        }
                         Some(AppEngineMessage::ValidateShardSyncAnchor { anchor, predecessor, reply }) => {
-                            let valid = match self.validate_archive_sync_anchor(&anchor, predecessor.as_ref()).await {
+                            let reanchor = self.owed_reanchor_now();
+                            let reanchoring = matches!(reanchor, Ok(Some(_)));
+                            let checked = match reanchor {
+                                Ok(reanchor) => self.validate_archive_sync_anchor(&anchor, predecessor.as_ref(), reanchor).await,
+                                Err(error) => Err(error),
+                            };
+                            let valid = match checked {
                                 Ok(_) => {
                                     self.predecessor_block.refusal = None;
                                     true
                                 }
                                 Err(error) => {
-                                    warn!(core_id = self.core_id, error = %error, "archive sync anchor rejected before tree writes");
+                                    warn!(core_id = self.core_id, filter = hex::encode(&self.filter), error = %error,
+                                        "archive sync anchor rejected before tree writes");
+                                    if reanchoring {
+                                        self.fence_reanchor.refused(std::time::Instant::now(), error.to_string());
+                                    }
                                     self.record_anchor_refusal(&anchor, predecessor.as_ref(), &error);
                                     false
                                 }
@@ -6524,6 +6815,23 @@ fn bootstrap_frame_route(
     }
 }
 
+/// A consensus start refused while the shard owes a re-anchor at its
+/// session fence ([`crate::app_handoff::ReanchorMarker`]).
+const REANCHOR_IN_PROGRESS: &str = "shard re-anchor at the session fence is in progress";
+
+/// A re-anchor's anchor refused because GLOBAL, as this node holds it, did
+/// not commit it.
+const REANCHOR_NOT_COMMITTED: &str = "a re-anchor's anchor is not the frame GLOBAL committed for the session";
+
+/// The lowest predecessor height an archive sync anchor may install: the
+/// materialized frame, so an anchor behind materialized state is refused.
+/// A re-anchor at the session fence `reanchor` replaces a head the fence
+/// discarded, so its certified anchor may lie below that head, though
+/// never below the fence.
+fn sync_anchor_floor(materialized: u64, reanchor: Option<u64>) -> u64 {
+    reanchor.map_or(materialized, |fence| fence.saturating_sub(1))
+}
+
 /// Verify the structural relation between an archive anchor N and its required
 /// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
 /// keeping this portion pure makes the fail-closed bootstrap boundary testable.
@@ -8503,6 +8811,10 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
     } else if predecessor_recovery_pending(error) {
         (ThisNode, "the shard sync recovers the predecessor's sealed state from an archive; \
             the 'successor session blocked' warning tracks it", false)
+    } else if text.contains(REANCHOR_IN_PROGRESS) {
+        (ExpectedWait, "the shard sync re-anchors this shard at its session fence from an archive, requested every \
+            5 minutes; it starts once the re-anchor installs; the re-anchor warnings name an attempt that fails \
+            or has no outcome", true)
     } else if text.contains("authenticated GLOBAL state") {
         (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
             check the master if it persists", true)
@@ -8994,6 +9306,401 @@ impl UnrewindableFenceBlock {
         let since = self.since?;
         *self = UnrewindableFenceBlock::default();
         Some(now.saturating_duration_since(since))
+    }
+}
+
+/// How often an owed re-anchor at the session fence is attempted: one
+/// archive frame pair and one pinned tree sync per attempt.
+const FENCE_REANCHOR_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// How often an owed re-anchor that keeps waiting is warned about again.
+const FENCE_REANCHOR_WAIT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// How long an attempt may run before it is warned about: a pinned tree
+/// sync of a large shard can take minutes.
+const FENCE_REANCHOR_HUNG: Duration = Duration::from_secs(30 * 60);
+
+/// Why an owed re-anchor waits when no shard sync took its last request.
+const REANCHOR_UNTAKEN: &str = "no shard sync took the requested attempt";
+
+/// Why an owed re-anchor waits when its attempt runs past [`FENCE_REANCHOR_HUNG`].
+const REANCHOR_HUNG: &str = "the attempt has run for over 30 minutes";
+
+/// The re-anchor at its session fence a shard owes: the durable marker
+/// ([`crate::app_handoff::ReanchorMarker`]), and the pacing of attempts and
+/// of the warning while it waits.
+#[derive(Default)]
+struct FenceReanchor {
+    /// `None` until read from the store; then the recorded marker, if any.
+    marker: Option<Option<crate::app_handoff::ReanchorMarker>>,
+    /// When this engine first found it owed.
+    since: Option<std::time::Instant>,
+    /// When an attempt was last requested.
+    requested: Option<std::time::Instant>,
+    /// A requested attempt no shard sync has taken yet.
+    armed: bool,
+    /// When a shard sync took the attempt it is running, until its outcome.
+    taken: Option<std::time::Instant>,
+    /// When a waiting re-anchor was last warned about.
+    warned: Option<std::time::Instant>,
+    /// The anchor this re-anchor's validation found committed.
+    committed: crate::app_handoff::CommittedAnchor,
+    /// The last refusal of this re-anchor's own anchor validation, and when.
+    refusal: Option<(std::time::Instant, String)>,
+    /// When a failure to tell whether it still applies was last warned about.
+    applies_warned: Option<std::time::Instant>,
+}
+
+impl FenceReanchor {
+    fn owed(&self) -> Option<crate::app_handoff::ReanchorMarker> {
+        self.marker.flatten()
+    }
+
+    /// Whether to request an attempt at `now` (at once, then every
+    /// [`FENCE_REANCHOR_RETRY`]), and if so why the last one is silent: the
+    /// attempt taken runs past [`FENCE_REANCHOR_HUNG`], or no shard sync
+    /// took the request. An attempt still running within that is not, and
+    /// no other is offered meanwhile; past it, one is offered again, in
+    /// case its outcome was lost.
+    fn due(&mut self, now: std::time::Instant) -> Option<Option<&'static str>> {
+        self.since.get_or_insert(now);
+        if self.requested.is_some_and(|at| now.saturating_duration_since(at) < FENCE_REANCHOR_RETRY) {
+            return None;
+        }
+        let hung = self.taken.is_some_and(|at| now.saturating_duration_since(at) >= FENCE_REANCHOR_HUNG);
+        let silent = if hung {
+            Some(REANCHOR_HUNG)
+        } else if self.requested.is_some() && self.armed {
+            Some(REANCHOR_UNTAKEN)
+        } else {
+            None
+        };
+        self.requested = Some(now);
+        if self.taken.is_none() || hung {
+            self.armed = true;
+        }
+        Some(silent)
+    }
+
+    /// Whether a shard sync starting at `now` makes the requested attempt:
+    /// one per request, whichever sync asks first, so other sync triggers
+    /// add no archive traffic.
+    fn take_attempt(&mut self, now: std::time::Instant) -> bool {
+        if !std::mem::take(&mut self.armed) {
+            return false;
+        }
+        self.taken = Some(now);
+        self.refusal = None;
+        true
+    }
+
+    /// Whether a failure to tell if the re-anchor still applies is warned
+    /// about at `now`: at once, then every [`FENCE_REANCHOR_WAIT_REPEAT`].
+    fn applies_error_due(&mut self, now: std::time::Instant) -> bool {
+        if self.applies_warned.is_some_and(|at| now.saturating_duration_since(at) < FENCE_REANCHOR_WAIT_REPEAT) {
+            return false;
+        }
+        self.applies_warned = Some(now);
+        true
+    }
+
+    /// A sync took the attempt but could not receive it: the next one does.
+    fn rearm(&mut self) {
+        self.armed = true;
+        self.taken = None;
+    }
+
+    /// The running attempt ended without installing (its failure arrived).
+    fn outcome(&mut self) {
+        self.taken = None;
+    }
+
+    /// The re-anchor waits at `now`: how long it has been owed, at the first
+    /// wait and every [`FENCE_REANCHOR_WAIT_REPEAT`] after the last warning;
+    /// otherwise `None`.
+    fn failed(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = *self.since.get_or_insert(now);
+        if self.warned.is_some_and(|at| now.saturating_duration_since(at) < FENCE_REANCHOR_WAIT_REPEAT) {
+            return None;
+        }
+        self.warned = Some(now);
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// This re-anchor's anchor validation refused `error` at `now`.
+    fn refused(&mut self, now: std::time::Instant, error: String) {
+        self.refusal = Some((now, error));
+    }
+
+    /// The refusal of this re-anchor's latest attempt, with its age: one
+    /// older than [`FENCE_REANCHOR_RETRY`] belongs to an earlier attempt.
+    fn recent_refusal(&self, now: std::time::Instant) -> Option<(String, Duration)> {
+        let (at, error) = self.refusal.as_ref()?;
+        let age = now.saturating_duration_since(*at);
+        (age < FENCE_REANCHOR_RETRY).then(|| (error.clone(), age))
+    }
+
+    /// No longer owed at `now`: how long it was, if this engine found it.
+    fn finished(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since;
+        *self = FenceReanchor { marker: Some(None), ..FenceReanchor::default() };
+        since.map(|since| now.saturating_duration_since(since))
+    }
+}
+
+/// What a waiting re-anchor's warning says for `reason` (and the last
+/// anchor `refusal` this engine recorded): its line, whose problem it is,
+/// and what ends it.
+fn reanchor_wait(reason: &str, refusal: Option<&str>) -> (&'static str, &'static str, &'static str) {
+    use crate::prover_tree_syncer::{REANCHOR_NO_TIP, REANCHOR_ON_THIS_NODE, REANCHOR_REFUSED, REANCHOR_UNAVAILABLE};
+    if reason == REANCHOR_UNAVAILABLE {
+        ("no archive holds the fenced frame or its state; waiting for one that does", "archive",
+            "this node retries every 5 minutes on the next known archive; it ends when an archive serves the frame \
+            GLOBAL committed for the session (anchor_frame) and the state before it, an anchor that moves to the \
+            successor's executed tip once GLOBAL executes past the fence; report it with this line if it persists")
+    } else if reason == REANCHOR_REFUSED && refusal.is_some_and(|refusal| refusal.contains(REANCHOR_NOT_COMMITTED)) {
+        ("the frame an archive served is not the one GLOBAL committed as this node holds it; the re-anchor waits",
+            "this node",
+            "this node's GLOBAL view and the archive disagree on the session's committed frame (last_refusal); it \
+            retries every 5 minutes; check this node's GLOBAL sync, and report it with this line if it persists")
+    } else if reason == REANCHOR_REFUSED {
+        ("an archive's copy of the frame GLOBAL committed failed validation; waiting for one that passes", "archive",
+            "last_refusal names the check that refused it; this node retries every 5 minutes on the next known \
+            archive; report it with this line if it persists")
+    } else if reason == REANCHOR_NO_TIP {
+        ("the frame GLOBAL committed for the session is not known here; the re-anchor waits", "this node",
+            "this worker's GLOBAL view lacks the session or did not answer in time; it retries every 5 minutes; \
+            check the master's GLOBAL sync if it persists")
+    } else if reason == REANCHOR_UNTAKEN {
+        ("no shard sync took the requested re-anchor attempt; the re-anchor waits", "this node",
+            "this worker's shard sync is busy with another recovery or not running; it is requested again every \
+            5 minutes; report it with this line if it persists")
+    } else if reason == REANCHOR_HUNG {
+        ("a re-anchor attempt has run for over 30 minutes; the re-anchor waits", "this node",
+            "a long pinned tree sync or a hung recovery; the attempt keeps the shard's sync until it ends; report \
+            it with this line if it persists")
+    } else if reason.contains(REANCHOR_ON_THIS_NODE) {
+        ("a local step of the re-anchor did not complete; it retries", "this node",
+            "this worker's shard engine refused or did not answer the attempt; the reason names the step; it \
+            retries every 5 minutes; report it with this line if it persists")
+    } else if reason.contains("archive anchor") {
+        ("an archive served a malformed or wrong-shard frame for the re-anchor; it retries", "archive",
+            "the next attempt, in 5 minutes, tries another known archive; report it with this line if it persists")
+    } else {
+        let class = crate::worker_execution::failure_class(reason);
+        let (scope, action) = crate::worker_execution::failure_guidance(class);
+        let wait = match class {
+            crate::worker_execution::NO_ARCHIVE => "no archive is known to this node; the re-anchor waits",
+            "connect" | "archive_request" => "an archive request of the re-anchor failed; it retries",
+            "archive_state" => "an archive lacked what the re-anchor asked of it; it retries",
+            _ => "a step of the re-anchor failed on this node; it retries",
+        };
+        (wait, scope, action)
+    }
+}
+
+#[cfg(test)]
+mod fence_reanchor_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// Requested at once and then every five minutes, never on each 10 s
+    /// start retry, and attempted once per request whatever else asks for a
+    /// shard sync. A request no sync took, or an attempt running past half
+    /// an hour, is named at every request while it lasts; an attempt still
+    /// running within that is not. A waiting re-anchor is warned about at
+    /// once and then every half hour, with how long it has been owed.
+    #[test]
+    fn an_owed_reanchor_is_retried_every_five_minutes_and_its_wait_warned_every_half_hour() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let marker = crate::app_handoff::ReanchorMarker { generation: 2, fence: 1015, from_cursor: 1018, head: None };
+        let mut reanchor = FenceReanchor { marker: Some(Some(marker)), ..FenceReanchor::default() };
+        assert!(!reanchor.take_attempt(at(0)), "nothing requested yet");
+        assert_eq!(reanchor.due(at(0)), Some(None));
+        assert!(reanchor.take_attempt(at(0)));
+        for tick in 1..30u64 {
+            assert_eq!(reanchor.due(start + Duration::from_secs(10 * tick)), None, "tick {tick}");
+            assert!(!reanchor.take_attempt(at(0)), "one attempt per request, tick {tick}");
+        }
+        assert_eq!(reanchor.due(at(5)), Some(None), "the attempt is still running: not silent");
+        assert!(!reanchor.take_attempt(at(5)), "none offered while one runs");
+        reanchor.outcome();
+        assert_eq!(reanchor.failed(at(6)), Some(MINUTE * 6), "the first wait");
+        assert_eq!(reanchor.due(at(10)), Some(None));
+        assert_eq!(reanchor.due(at(15)), Some(Some(REANCHOR_UNTAKEN)), "the request at 10 was never taken");
+        assert!(reanchor.take_attempt(at(15)));
+        reanchor.rearm();
+        assert!(reanchor.take_attempt(at(16)), "a sync that could not receive it hands it on");
+        assert_eq!(reanchor.due(at(20)), Some(None));
+        assert_eq!(reanchor.failed(at(20)), None, "warned at 6");
+        assert_eq!(reanchor.due(at(45)), Some(None), "running 29 minutes");
+        assert_eq!(reanchor.due(at(50)), Some(Some(REANCHOR_HUNG)), "running 34 minutes");
+        assert_eq!(reanchor.failed(at(50)), Some(MINUTE * 50));
+        assert_eq!(reanchor.due(at(55)), Some(Some(REANCHOR_HUNG)), "named again while it lasts");
+        assert_eq!(reanchor.failed(at(55)), None);
+        assert!(reanchor.take_attempt(at(56)), "offered again past the bound, in case its outcome was lost");
+        assert_eq!(reanchor.owed(), Some(marker));
+        assert_eq!(reanchor.finished(at(60)), Some(MINUTE * 60));
+        assert_eq!(reanchor.owed(), None);
+        assert_eq!(reanchor.finished(at(61)), None, "once");
+        assert_eq!(reanchor.due(at(61)), Some(None), "a new re-anchor is requested at once");
+    }
+
+    /// Each cause of a wait has its own line and says whose problem it is;
+    /// a refusal because this node's GLOBAL did not commit the frame is this
+    /// node's, not the archive's.
+    #[test]
+    fn a_reanchor_wait_names_its_cause_and_scope() {
+        use crate::prover_tree_syncer::{REANCHOR_NO_TIP, REANCHOR_REFUSED, REANCHOR_UNAVAILABLE};
+        let not_committed = format!("archive sync anchor frame 3: {REANCHOR_NOT_COMMITTED}");
+        let cases = [
+            (REANCHOR_UNAVAILABLE, None, "no archive holds the fenced frame", "archive"),
+            (REANCHOR_REFUSED, None, "failed validation", "archive"),
+            (REANCHOR_REFUSED, Some(not_committed.as_str()), "not the one GLOBAL committed", "this node"),
+            (REANCHOR_NO_TIP, None, "not known here", "this node"),
+            (REANCHOR_UNTAKEN, None, "no shard sync took", "this node"),
+            (REANCHOR_HUNG, None, "over 30 minutes", "this node"),
+            ("no archive known yet", None, "no archive is known", "this node"),
+            ("master has not discovered an archive yet", None, "no archive is known", "this node"),
+            ("archive discovery timed out", None, "no archive is known", "this node"),
+            ("re-anchor installation on this node: shard engine rejected sync completion", None, "local step", "this node"),
+            ("re-anchor validation on this node: shard sync validation timed out", None, "local step", "this node"),
+            ("archive connect: connection refused", None, "archive request", "archive"),
+            ("archive connect: timed out", None, "archive request", "archive"),
+            ("get app-shard frame: status Unavailable", None, "archive request", "archive"),
+            ("get app-shard frame: request timed out", None, "archive request", "archive"),
+            ("archive replay is missing shard frame 9", None, "archive lacked", "archive"),
+            ("invalid argument: malformed or wrong-shard archive anchor", None, "malformed or wrong-shard", "archive"),
+            ("store: write batch failed", None, "failed on this node", "this node"),
+        ];
+        let mut lines = std::collections::HashSet::new();
+        for (reason, refusal, line, scope) in cases {
+            let (wait, whose, action) = reanchor_wait(reason, refusal);
+            assert!(wait.contains(line), "{reason}: {wait}");
+            assert_eq!(whose, scope, "{reason}");
+            assert!(!action.is_empty());
+            lines.insert(wait);
+        }
+        assert_eq!(lines.len(), 12, "a line of its own for each cause");
+        assert_eq!(crate::worker_execution::failure_class(REANCHOR_REFUSED), "archive_state",
+            "the recovery record classes a refused copy as the archive's too");
+        assert_eq!(crate::worker_execution::failure_class(REANCHOR_UNAVAILABLE), "archive_state");
+    }
+
+    /// A refusal names the wait only while it belongs to the re-anchor's
+    /// latest attempt.
+    #[test]
+    fn a_reanchor_names_only_its_own_recent_refusal() {
+        let start = std::time::Instant::now();
+        let mut reanchor = FenceReanchor::default();
+        assert_eq!(reanchor.recent_refusal(start), None);
+        reanchor.refused(start, REANCHOR_NOT_COMMITTED.to_string());
+        assert_eq!(reanchor.recent_refusal(start + MINUTE), Some((REANCHOR_NOT_COMMITTED.to_string(), MINUTE)));
+        assert_eq!(reanchor.recent_refusal(start + MINUTE * 5), None, "an earlier attempt's");
+        reanchor.refused(start + MINUTE * 6, "certificate".to_string());
+        assert!(reanchor.recent_refusal(start + MINUTE * 7).is_some());
+        assert_eq!(reanchor.due(start + MINUTE * 7), Some(None));
+        assert!(reanchor.take_attempt(start + MINUTE * 7));
+        assert_eq!(reanchor.recent_refusal(start + MINUTE * 7), None, "a new attempt starts without one");
+        reanchor.refused(start + MINUTE * 7, "certificate".to_string());
+        reanchor.finished(start + MINUTE * 7);
+        assert_eq!(reanchor.recent_refusal(start + MINUTE * 7), None, "a finished re-anchor keeps none");
+    }
+
+    fn engine() -> (AppConsensusEngine, mpsc::UnboundedReceiver<AppEngineEvent>) {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        std::mem::forget(db);
+        let (events, received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock, global_anchor_store: None, global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (engine, _handle) = AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        (engine, received)
+    }
+
+    /// While a re-anchor is owed the 10 s data-bootstrap re-request stays
+    /// quiet: the re-anchor requests its own attempts.
+    #[tokio::test]
+    async fn an_owed_reanchor_quiets_the_data_bootstrap_rerequest() {
+        use std::sync::atomic::Ordering;
+        let (mut engine, mut events) = engine();
+        engine.inherit_pending.store(true, Ordering::Release);
+        engine.data_ready.store(false, Ordering::Release);
+        engine.request_data_bootstrap_if_unstaged();
+        assert!(matches!(events.try_recv(), Ok(AppEngineEvent::ShardDataBootstrapRequested { .. })));
+        let marker = crate::app_handoff::ReanchorMarker { generation: 2, fence: 3, from_cursor: 6, head: None };
+        engine.fence_reanchor.marker = Some(Some(marker));
+        engine.request_data_bootstrap_if_unstaged();
+        assert!(events.try_recv().is_err(), "nothing while one is owed");
+    }
+
+    /// An expired re-anchor clears its marker and pacing and hands the
+    /// shard to the ordinary sync, with no gate of its own.
+    #[tokio::test]
+    async fn an_expired_reanchor_clears_its_marker_and_requests_the_ordinary_sync() {
+        use std::sync::atomic::Ordering;
+        let (mut engine, mut events) = engine();
+        engine.data_ready.store(true, Ordering::Release);
+        let marker = crate::app_handoff::ReanchorMarker { generation: 2, fence: 3, from_cursor: 6, head: None };
+        crate::app_handoff::write_reanchor_marker(engine.clock_store.as_ref(), &engine.filter, &marker).unwrap();
+        engine.fence_reanchor.marker = Some(Some(marker));
+        engine.expire_reanchor(&marker).unwrap();
+        assert_eq!(crate::app_handoff::load_reanchor_marker(engine.clock_store.as_ref(), &engine.filter).unwrap(),
+            (None, None));
+        assert_eq!(engine.fence_reanchor.owed(), None);
+        assert!(!engine.inherit_pending.load(Ordering::Acquire));
+        assert!(engine.data_ready.load(Ordering::Acquire));
+        assert!(matches!(events.try_recv(), Ok(AppEngineEvent::ShardDataBootstrapRequested { .. })));
+    }
+
+    fn frame(number: u64, output: u8, parent: Vec<u8>) -> quil_types::proto::global::AppShardFrame {
+        quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: vec![5; 32], frame_number: number, output: vec![output; 32],
+                parent_selector: parent, state_roots: vec![vec![number as u8; 32]; 4],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The anchor of a re-anchor at the fence (1015) lies below the head the
+    /// fence discarded (1018): it is installed, where a sync anchor behind
+    /// materialized state is otherwise refused. An anchor below the fence is
+    /// refused all the same.
+    #[test]
+    fn a_reanchor_installs_an_anchor_below_the_discarded_head_but_not_below_the_fence() {
+        let pair = |number: u64| {
+            let parent = quil_crypto::poseidon::hash_bytes_to_32(&[number as u8 - 1; 32]).unwrap().to_vec();
+            (frame(number, number as u8, parent), frame(number - 1, number as u8 - 1, Vec::new()))
+        };
+        let validate = |_: &quil_types::proto::global::AppShardFrame| Ok(true);
+        let (anchor, predecessor) = pair(1015);
+        assert_eq!(validate_archive_sync_anchor_in(&[5; 32], sync_anchor_floor(1018, Some(1015)), &anchor,
+            Some(&predecessor), None, validate).unwrap(), 1014);
+        let error = validate_archive_sync_anchor_in(&[5; 32], sync_anchor_floor(1018, None), &anchor,
+            Some(&predecessor), None, validate).unwrap_err();
+        assert!(error.to_string().contains("behind materialized state"), "{error}");
+        let (below, its_predecessor) = pair(1014);
+        let error = validate_archive_sync_anchor_in(&[5; 32], sync_anchor_floor(1018, Some(1015)), &below,
+            Some(&its_predecessor), None, validate).unwrap_err();
+        assert!(error.to_string().contains("behind materialized state"), "{error}");
     }
 }
 

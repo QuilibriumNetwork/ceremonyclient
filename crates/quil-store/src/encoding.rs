@@ -59,6 +59,12 @@ pub const CONSENSUS_GLOBAL_EXECUTION_PENDING: u8 = 0x06;
 /// `[CONSENSUS, 0x07]` → 8-byte BE GLOBAL frame: this store discarded its
 /// application-shard frame history at the committee-handoff flag day.
 pub const CONSENSUS_APP_HISTORY_DISCARDED: u8 = 0x07;
+/// `[CONSENSUS, 0x08] ‖ filter` → a shard re-anchor at its session fence
+/// whose rebase has not committed: generation, fence and the materialized
+/// cursor it began at, each an 8-byte BE `u64`, then the 32-byte digest of
+/// the local frame at that cursor (zero for none): 56 bytes. A 24-byte
+/// value is the same without the digest.
+pub const CONSENSUS_APP_REANCHOR: u8 = 0x08;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -972,6 +978,14 @@ pub fn app_history_discarded_key() -> Vec<u8> {
     vec![CONSENSUS, CONSENSUS_APP_HISTORY_DISCARDED]
 }
 
+/// Key of `filter`'s pending re-anchor at its session fence. See
+/// [`CONSENSUS_APP_REANCHOR`].
+pub fn app_reanchor_key(filter: &[u8]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_APP_REANCHOR];
+    key.extend_from_slice(filter);
+    key
+}
+
 /// The key ranges that hold application-shard frame chains (as opposed to
 /// application state and GLOBAL frames), each `[start, end)`:
 /// - clock: shard frames, staged shard frames, prover-trie and total-distance
@@ -981,8 +995,8 @@ pub fn app_history_discarded_key() -> Vec<u8> {
 ///   settlements and fee totals (`0xF3..0xF8`; GLOBAL outcomes are `0xF2`,
 ///   GLOBAL request candidates `0xF8`);
 /// - consensus: per-filter legacy state and liveness (a GLOBAL row has no
-///   filter and is kept), application materialized cursors and history
-///   recovery progress.
+///   filter and is kept), application materialized cursors, history
+///   recovery progress and pending re-anchors.
 pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
     let clock = |from: u8, to: u8| (vec![CLOCK_FRAME, from], vec![CLOCK_FRAME, to]);
     vec![
@@ -1001,6 +1015,7 @@ pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
         (vec![CONSENSUS, CONSENSUS_LIVENESS, 0x00], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR]),
         (vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1]),
         (vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY], vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1]),
+        (vec![CONSENSUS, CONSENSUS_APP_REANCHOR], vec![CONSENSUS, CONSENSUS_APP_REANCHOR + 1]),
     ]
 }
 
