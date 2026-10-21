@@ -925,6 +925,12 @@ impl ProverLifecycle {
         self.allocator.set_last_join_attempt(frame_number);
     }
 
+    /// Called by the pipeline when GLOBAL already consumed every seniority
+    /// merge target: no merge is proposed again until the next epoch.
+    pub fn hold_seniority_merge(&self, frame_number: u64) {
+        self.allocator.hold_seniority_merge(frame_number);
+    }
+
     /// Serialize discretionary replacement waves until the workers from the
     /// previous wave are available. Per-cycle pairing cannot prevent the same
     /// destination from funding another leave while its first source still
@@ -1776,7 +1782,10 @@ impl ProverLifecycle {
         // trigger.
         let config_estimate = self.allocator.config_seniority_estimate();
         let current_seniority = prover_info.as_ref().map(|p| p.seniority).unwrap_or(0);
-        if config_estimate > current_seniority && prover_info.is_some() {
+        if config_estimate > current_seniority
+            && prover_info.is_some()
+            && !self.allocator.seniority_merge_held(frame_number)
+        {
             let last_merge = self.allocator.last_seniority_merge_attempt();
             let last_join = self.allocator.last_join_attempt();
             const MERGE_COOLDOWN: u64 = 10;
@@ -4579,6 +4588,40 @@ mod proposal_loop_tests {
             "worker-constrained node (1 free worker) covered only 1 of 2 children — \
              free-worker cap is what makes 40→20/20 STICK (convergence)"
         );
+    }
+
+    fn count_seniority_merges(actions: &[LifecycleAction]) -> usize {
+        actions.iter().filter(|a| matches!(a, LifecycleAction::ProposeSeniorityMerge { .. })).count()
+    }
+
+    /// After a merge found every target consumed, the lifecycle stops
+    /// proposing merges for the rest of the epoch and checks again in the
+    /// next one.
+    #[test]
+    fn a_held_seniority_merge_waits_for_the_next_epoch() {
+        let address = vec![0xCEu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.allocator.set_config_seniority_estimate(100);
+        let merges = |frame: u64| {
+            lifecycle.set_prover_root_verified_frame(frame);
+            count_seniority_merges(&lifecycle.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        let epoch_frames = quil_types::consensus::epoch_length_frames();
+        let first = 100;
+        let next_epoch = (quil_types::consensus::epoch_for_frame(first) + 1) * epoch_frames;
+        assert_eq!(merges(first), 1, "on-chain seniority trails the estimate");
+        assert_eq!(merges(first + 10), 1, "proposed again after the cooldown");
+        lifecycle.hold_seniority_merge(first + 10);
+        assert_eq!(merges(first + 20), 0, "held after a merge with no creditable target");
+        assert_eq!(merges(next_epoch - 1), 0, "held for the rest of the epoch");
+        assert_eq!(merges(next_epoch), 1, "checked again in the next epoch");
     }
 
     #[test]
