@@ -998,6 +998,80 @@ impl FrameSink for AppSeamSink {
 // Finalizer (FrameFinalizer seam) — materialize on finalize.
 // ---------------------------------------------------------------------------
 
+/// How long the head of the pending finalizations may stay undeliverable
+/// before the operator is warned, and how often the warning repeats.
+const HEAD_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const HEAD_STALL_REPEAT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Why a pending finalization was not delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// The frame body is not in the block store.
+    BodyMissing,
+    /// The stored bytes are not this shard's frame or seal under the
+    /// certified digest.
+    BodyMismatch,
+    /// The closing certificate could not be stored durably.
+    SealNotPersisted,
+    /// The engine did not accept the notification.
+    SinkRefused,
+}
+
+impl Held {
+    fn reason(self) -> &'static str {
+        match self {
+            Held::BodyMissing => "frame body not held by this worker",
+            Held::BodyMismatch => "stored bytes do not match the certified digest",
+            Held::SealNotPersisted => "closing certificate not persisted",
+            Held::SinkRefused => "engine did not accept the frame",
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Held::BodyMissing => "expected to clear once archive replay materializes the frame; until then this worker follows the shard by archive replay and sends no reward proofs, full frames or closing certificate; report this line if it persists",
+            Held::BodyMismatch => "a peer served other bytes under this digest; report this line if it persists",
+            Held::SealNotPersisted => "check free space and permissions of this node's store",
+            Held::SinkRefused => "the engine is busy or stalled; check this worker's materialized height",
+        }
+    }
+}
+
+/// The first pending finalization, in view order, that was not delivered.
+struct Head {
+    view: u64,
+    digest: Digest,
+    held: Held,
+    frame: Option<u64>,
+    /// Pending finalizations at later views, waiting behind it.
+    behind: usize,
+}
+
+/// How long the same head has been undeliverable, and when it was reported.
+struct HeadStall {
+    digest: Digest,
+    view: u64,
+    since: std::time::Instant,
+    warned: Option<std::time::Instant>,
+}
+
+/// Pending finalizations dropped since the last line about them.
+#[derive(Default)]
+struct DropReport {
+    last: Option<std::time::Instant>,
+    dropped: usize,
+    /// The lowest and highest dropped view.
+    views: Option<(u64, u64)>,
+}
+
+/// What [`AppSeamFinalizer::retry_pending_at`] told the operator.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadSignal {
+    Stalled,
+    StillStalled,
+    Cleared,
+}
+
 /// Materializes finalized app frames + writes candidates on notarize, via
 /// engine-supplied callbacks (materialize + full-frame publish live in the
 /// engine, keyed by the per-shard hypergraph the seam has no handle to).
@@ -1025,10 +1099,20 @@ pub struct AppSeamFinalizer {
     delivered: std::sync::atomic::AtomicU64,
     // Only consensus-validated finalization certificates enter this queue.
     // Repeated reports for the same digest coalesce; bytes stay in BlockStore.
-    pending: Mutex<HashMap<Digest, (u64, Vec<u8>)>>,
+    // The flag marks a finalization this instance reported, or its own
+    // closing certificate replayed: its view is in this session's numbering.
+    // A replayed record carries the rank of whichever session finalized it.
+    pending: Mutex<HashMap<Digest, (u64, Vec<u8>, bool)>>,
     /// Set once this instance's engine reports a finalization (replayed
     /// records are not reports): its members agreed on its genesis.
     reported: Arc<std::sync::atomic::AtomicBool>,
+    /// The undeliverable head of `pending`, for the operator warning.
+    head_stall: Mutex<Option<HeadStall>>,
+    /// `(materialized cursor, pending count)` at the last scan for entries
+    /// already materialized, so a stuck queue is not rescanned every tick.
+    scanned: Mutex<Option<(u64, usize)>>,
+    /// Entries dropped as already materialized, for the operator.
+    drop_report: Mutex<DropReport>,
 }
 
 impl AppSeamFinalizer {
@@ -1041,7 +1125,8 @@ impl AppSeamFinalizer {
         Self { on_notarized, on_finalized, store, filter, on_sealed: None, sealed_bodies: None,
             closing_certificate: None, seal_persist_error: Default::default(),
             finalized_records: None, materialized: None, delivered: std::sync::atomic::AtomicU64::new(0),
-            pending: Mutex::new(HashMap::new()), reported: Default::default() }
+            pending: Mutex::new(HashMap::new()), reported: Default::default(),
+            head_stall: Default::default(), scanned: Default::default(), drop_report: Default::default() }
     }
 
     /// Whether the engine has reported a finalization (see `reported`).
@@ -1089,7 +1174,7 @@ impl AppSeamFinalizer {
             // An implied ancestor is only a body: it is delivered again with
             // the certified descendant that links to it.
             let Some(cert) = cert else { continue };
-            self.pending.lock().unwrap().entry(digest).or_insert_with(|| (view, cert));
+            self.pending.lock().unwrap().entry(digest).or_insert_with(|| (view, cert, false));
             replayed += 1;
         }
         self.retry_pending();
@@ -1120,7 +1205,7 @@ impl AppSeamFinalizer {
         let digest = digest_from_identity(submission.seal.digest());
         self.store.seal(digest, submission.seal.encode());
         self.pending.lock().unwrap().entry(digest)
-            .or_insert((submission.seal.view, submission.certificate));
+            .or_insert((submission.seal.view, submission.certificate, true));
         self.retry_pending();
         Ok(true)
     }
@@ -1218,23 +1303,47 @@ impl AppSeamFinalizer {
         }
     }
 
-    fn try_deliver(&self, digest: Digest) -> bool {
+    /// The engine's materialized cursor, or, for a host without one, the
+    /// highest frame handed to the engine.
+    fn materialized_floor(&self) -> u64 {
+        match self.materialized.as_ref() {
+            Some(cursor) => cursor.load(std::sync::atomic::Ordering::SeqCst),
+            None => self.delivered.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Hand one pending finalization to the engine, or say why it is still
+    /// held. One that can never be delivered here is dropped instead.
+    fn try_deliver(&self, digest: Digest) -> Result<(), (Held, Option<u64>)> {
         // Serializes delivery across the host, ingress and retry timer. The
         // engine callback only attempts a nonblocking channel send.
         let mut pending = self.pending.lock().unwrap();
-        let Some((_, cert)) = pending.get(&digest) else { return true };
-        let Some((bytes, locally_verified)) = self.store.get_with_verification(&digest) else { return false };
+        let Some((view, cert, _)) = pending.get(&digest) else { return Ok(()) };
+        let view = *view;
+        let Some((bytes, locally_verified)) = self.store.get_with_verification(&digest) else {
+            return Err((Held::BodyMissing, None));
+        };
         if Seal::is_encoding(&bytes) {
+            let Some(seal) = Seal::decode(&bytes).ok().filter(|seal| seal.digest() == digest.0) else {
+                return Err((Held::BodyMismatch, None));
+            };
+            let checkpoint = Some(seal.checkpoint.frame);
             // A terminal seal is not a data frame. Only a session host installs
-            // the sink; elsewhere the reserved encoding can never be delivered.
-            let Some(on_sealed) = self.on_sealed.as_ref() else { return false };
-            let Some(seal) = Seal::decode(&bytes).ok().filter(|seal| seal.digest() == digest.0) else { return false };
+            // the sink; elsewhere the reserved encoding can never be delivered,
+            // and kept, it would hold back every later finalization.
+            let Some(on_sealed) = self.on_sealed.as_ref() else {
+                tracing::warn!(filter = %hex::encode(&self.filter), view,
+                    digest = %hex::encode(&digest.0[..4]), checkpoint = seal.checkpoint.frame,
+                    "dropping a finalized terminal seal this legacy consensus instance cannot deliver: a peer proposed a seal outside a session and the committee finalized it; report this line");
+                pending.remove(&digest);
+                return Ok(());
+            };
             if let Some(record) = self.closing_certificate.as_ref() {
                 if let Err(error) = record.persist(&bytes, cert) {
                     if !self.seal_persist_error.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         tracing::warn!(%error, "closing certificate persistence failed; retaining for retry");
                     }
-                    return false;
+                    return Err((Held::SealNotPersisted, checkpoint));
                 }
                 self.seal_persist_error.store(false, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1251,17 +1360,17 @@ impl AppSeamFinalizer {
                 if let Some(number) = through {
                     self.delivered.fetch_max(number, std::sync::atomic::Ordering::SeqCst);
                 }
-                return true;
+                return Ok(());
             }
-            return false;
+            return Err((Held::SinkRefused, checkpoint));
         }
-        let Some(frame) = decode_app_frame(&bytes) else { return false };
+        let Some(frame) = decode_app_frame(&bytes) else { return Err((Held::BodyMismatch, None)) };
+        let delivered = frame.header.as_ref().map(|h| h.frame_number);
         if frame.header.as_ref().map(|h| h.address.as_slice()) != Some(self.filter.as_slice())
             || app_frame_digest(&frame) != Some(digest)
         {
-            return false;
+            return Err((Held::BodyMismatch, delivered));
         }
-        let delivered = frame.header.as_ref().map(|h| h.frame_number);
         let implied = self.implied_ancestors(&frame);
         // Durable before the queue send: a restart between the send and the
         // engine's commit must not lose a finalized frame.
@@ -1282,20 +1391,146 @@ impl AppSeamFinalizer {
                 self.delivered.fetch_max(number, std::sync::atomic::Ordering::SeqCst);
                 self.prune_delivered(number);
             }
-            return true;
+            return Ok(());
         }
-        false
+        Err((Held::SinkRefused, delivered))
     }
 
     fn retry_pending(&self) {
+        self.retry_pending_at(std::time::Instant::now());
+    }
+
+    /// Deliver pending finalizations in view order, up to the first that
+    /// cannot be delivered, and warn at `now` when that head stays stuck.
+    fn retry_pending_at(&self, now: std::time::Instant) -> Option<HeadSignal> {
+        let mut head = self.deliver_in_order();
+        if head.is_some() && self.drop_materialized(now) > 0 {
+            head = self.deliver_in_order();
+        }
+        self.note_head(head, now)
+    }
+
+    fn deliver_in_order(&self) -> Option<Head> {
         let mut entries: Vec<_> = self.pending.lock().unwrap().iter()
-            .map(|(digest, (view, _))| (*view, *digest)).collect();
+            .map(|(digest, (view, _, _))| (*view, *digest)).collect();
         entries.sort_by_key(|(view, _)| *view);
-        for (_, digest) in entries {
+        let count = entries.len();
+        for (index, (view, digest)) in entries.into_iter().enumerate() {
             // Do not knowingly deliver newer finalizations ahead of a missing
             // earlier body or a backpressured notification.
-            if !self.try_deliver(digest) { break; }
+            if let Err((held, frame)) = self.try_deliver(digest) {
+                return Some(Head { view, digest, held, frame, behind: count - index - 1 });
+            }
         }
+        None
+    }
+
+    /// Drop pending finalizations whose bodies this worker never held once a
+    /// later verified frame or seal shows them materialized. Such a
+    /// finalization (one reported across a restart, its block broadcast
+    /// before it) does not say its frame number, and archive replay, which
+    /// materializes the frame meanwhile, does not supply the body. Finalized
+    /// views form one chain, though: one at a lower view than a frame whose
+    /// parent is materialized, or than a seal whose checkpoint is, finalized
+    /// a frame at or below the cursor too. Only this session's own reports,
+    /// with bytes this node verified, set that bound. An entry with a body is
+    /// never dropped: it is delivered as usual, and the engine republishes a
+    /// materialized frame with its reward proof, which archive replay never
+    /// sends. Returns how many were dropped.
+    fn drop_materialized(&self, now: std::time::Instant) -> usize {
+        let floor = self.materialized_floor();
+        let mut pending = self.pending.lock().unwrap();
+        let key = (floor, pending.len());
+        if self.scanned.lock().unwrap().replace(key) == Some(key) {
+            return 0;
+        }
+        let mut through = None;
+        for (digest, (view, _, reported)) in pending.iter() {
+            if !*reported {
+                continue;
+            }
+            let Some((bytes, true)) = self.store.get_with_verification(digest) else { continue };
+            let below = if Seal::is_encoding(&bytes) {
+                Seal::decode(&bytes).ok().filter(|seal| seal.digest() == digest.0).map(|seal| seal.checkpoint.frame)
+            } else {
+                decode_app_frame(&bytes)
+                    .filter(|frame| app_frame_digest(frame) == Some(*digest))
+                    .and_then(|frame| frame.header)
+                    .filter(|header| header.address == self.filter)
+                    .map(|header| header.frame_number.saturating_sub(1))
+            };
+            if below.is_some_and(|below| below <= floor) {
+                through = through.max(Some(*view));
+            }
+        }
+        let Some(through) = through else { return 0 };
+        let before = pending.len();
+        let mut report = self.drop_report.lock().unwrap();
+        pending.retain(|digest, (view, _, _)| {
+            let dropped = *view < through && self.store.get(digest).is_none();
+            if dropped {
+                report.views = Some(report.views.map_or((*view, *view), |(low, high)| (low.min(*view), high.max(*view))));
+            }
+            !dropped
+        });
+        let dropped = before - pending.len();
+        drop(pending);
+        report.dropped += dropped;
+        if dropped > 0 && report.last.is_none_or(|last| now.saturating_duration_since(last) >= HEAD_STALL_REPEAT) {
+            self.flush_drops(&mut report, now);
+        }
+        dropped
+    }
+
+    /// Log the entries dropped since the last such line, if any.
+    fn flush_drops(&self, report: &mut DropReport, now: std::time::Instant) {
+        let Some((low, high)) = report.views.take() else { return };
+        tracing::info!(filter = %hex::encode(&self.filter), dropped = report.dropped,
+            views = %format!("{low}-{high}"), materialized = self.materialized_floor(),
+            "dropped pending finalizations whose bodies this worker never held: archive replay had already materialized their frames, and later finalizations deliver in order");
+        report.dropped = 0;
+        report.last = Some(now);
+    }
+
+    /// Warn once the same head has been undeliverable for
+    /// [`HEAD_STALL_WARN_AFTER`], again every [`HEAD_STALL_REPEAT`], and say
+    /// when it clears. A missing body with nothing behind it holds nothing
+    /// back: it is the engine's own gap, which the engine reports.
+    fn note_head(&self, head: Option<Head>, now: std::time::Instant) -> Option<HeadSignal> {
+        let mut stall = self.head_stall.lock().unwrap();
+        let mut signal = None;
+        let moved = stall.as_ref().is_some_and(|stall| head.as_ref().is_none_or(|head| head.digest != stall.digest));
+        if let Some(previous) = stall.take_if(|_| moved) {
+            if previous.warned.is_some() {
+                tracing::info!(filter = %hex::encode(&self.filter), view = previous.view,
+                    digest = %hex::encode(&previous.digest.0[..4]),
+                    stalled_secs = now.saturating_duration_since(previous.since).as_secs(),
+                    materialized = self.materialized_floor(),
+                    "finalized app frame delivery resumed: the pending finalization that held back later ones was delivered or dropped");
+                signal = Some(HeadSignal::Cleared);
+            }
+        }
+        let Some(head) = head else {
+            self.flush_drops(&mut self.drop_report.lock().unwrap(), now);
+            return signal;
+        };
+        let stall = stall.get_or_insert_with(|| HeadStall { digest: head.digest, view: head.view, since: now, warned: None });
+        let stuck = now.saturating_duration_since(stall.since);
+        if stuck < HEAD_STALL_WARN_AFTER
+            || (head.held == Held::BodyMissing && head.behind == 0)
+            || stall.warned.is_some_and(|warned| now.saturating_duration_since(warned) < HEAD_STALL_REPEAT)
+        {
+            return signal;
+        }
+        let first = stall.warned.replace(now).is_none();
+        tracing::warn!(filter = %hex::encode(&self.filter), view = head.view,
+            digest = %hex::encode(&head.digest.0[..4]),
+            frame = %head.frame.map_or_else(|| "unknown".to_string(), |frame| frame.to_string()),
+            reason = head.held.reason(), materialized = self.materialized_floor(),
+            stalled_secs = stuck.as_secs(), scope = "this node", action = head.held.action(),
+            "finalized app frames are not reaching this worker's engine: the oldest pending finalization cannot be delivered and holds back {} later finalizations",
+            head.behind);
+        Some(if first { HeadSignal::Stalled } else { HeadSignal::StillStalled })
     }
 
 }
@@ -1321,7 +1556,7 @@ impl FrameFinalizer for AppSeamFinalizer {
         // delivering, including after a delayed body arrives. A certificate by
         // itself never upgrades an unverified candidate into verified data.
         self.reported.store(true, std::sync::atomic::Ordering::Release);
-        self.pending.lock().unwrap().entry(digest).or_insert_with(|| (view, cert.unwrap_or_default()));
+        self.pending.lock().unwrap().entry(digest).or_insert_with(|| (view, cert.unwrap_or_default(), true));
         self.retry_pending();
     }
 
@@ -2073,6 +2308,16 @@ mod tests {
     type Delivered = Arc<Mutex<Vec<(u64, Vec<u8>, Vec<u64>)>>>;
 
     fn implied_host(records: &std::path::Path, cursor: u64, delivered: Delivered) -> (BlockStore, AppSeamFinalizer) {
+        gap_host(records, Arc::new(std::sync::atomic::AtomicU64::new(cursor)), delivered)
+    }
+
+    /// [`implied_host`] with a materialized cursor the test moves, as archive
+    /// replay does.
+    fn gap_host(
+        records: &std::path::Path,
+        cursor: Arc<std::sync::atomic::AtomicU64>,
+        delivered: Delivered,
+    ) -> (BlockStore, AppSeamFinalizer) {
         let store = BlockStore::new();
         let finalizer = AppSeamFinalizer::new(
             Arc::new(|_| {}),
@@ -2086,10 +2331,7 @@ mod tests {
             }),
             store.clone(), vec![1; 32],
         )
-        .with_finalized_records(
-            Arc::new(FinalizedRecords::open(records.to_path_buf()).unwrap()),
-            Arc::new(std::sync::atomic::AtomicU64::new(cursor)),
-        );
+        .with_finalized_records(Arc::new(FinalizedRecords::open(records.to_path_buf()).unwrap()), cursor);
         (store, finalizer)
     }
 
@@ -2426,7 +2668,7 @@ mod tests {
         let (store, legacy) = build(false);
         store.put(digest, seal.encode());
         legacy.on_finalized(9, digest, None, Some(vec![7]), false);
-        assert_eq!(legacy.pending.lock().unwrap().len(), 1);
+        assert!(legacy.pending.lock().unwrap().is_empty(), "dropped: it could never be delivered here");
         // Bytes stored under another digest are not this seal.
         let (store, host) = build(true);
         store.put(digest_from_identity([9; 32]), seal.encode());
@@ -2439,6 +2681,264 @@ mod tests {
         host.on_finalized(9, digest, None, Some(vec![8]), false);
         assert_eq!(*sealed.lock().unwrap(), vec![(seal.encode(), vec![8])]);
         assert_eq!(*data.lock().unwrap(), 0);
+    }
+
+    /// A finalization reported across a restart whose block this worker never
+    /// verified: its body went with the old process, and archive replay
+    /// materializes the frame instead. Later finalizations, the seal included,
+    /// must still reach the engine (2026-10-21: seven workers materialized
+    /// every frame by archive replay until their next session started).
+    #[test]
+    fn a_finalization_whose_body_was_lost_across_a_restart_does_not_hold_back_later_ones() {
+        use quil_cw_consensus::handoff::Checkpoint;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let directory = test_directory("restart-gap");
+        let frames = linked_frames(5, 9);
+        let digest = |number: u64| app_frame_digest(&frames[number as usize - 5]).unwrap();
+        let body = |number: u64| encode_app_frame(&frames[number as usize - 5]);
+        let cursor = Arc::new(AtomicU64::new(5));
+        let delivered: Delivered = Default::default();
+        let sealed = Arc::new(Mutex::new(Vec::new()));
+        let (store, finalizer) = gap_host(&directory, cursor.clone(), delivered.clone());
+        let finalizer = finalizer.with_sealed_sink({
+            let sealed = sealed.clone();
+            Arc::new(move |bytes: Vec<u8>, cert: Vec<u8>, implied: Vec<(AppShardFrame, bool)>| {
+                sealed.lock().unwrap().push((bytes, cert, implied.len()));
+                true
+            })
+        });
+        // Frame 6 finalized across the restart; only the bodies of frames 7
+        // and 8 are held.
+        finalizer.on_finalized(16, digest(6), None, Some(vec![6]), true);
+        for number in [7, 8] {
+            store.seal(digest(number), body(number));
+            finalizer.on_finalized(number + 10, digest(number), None, Some(vec![number as u8]), true);
+        }
+        assert!(delivered.lock().unwrap().is_empty(), "frames 7 and 8 wait for frame 6");
+
+        // Archive replay materializes all three, without the block store.
+        // Frames 7 and 8 still reach the engine, which republishes them with
+        // their reward proofs; frame 6 has no body to deliver.
+        cursor.store(8, Ordering::SeqCst);
+        finalizer.retry_pending();
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        assert_eq!(*delivered.lock().unwrap(), vec![(7, vec![7], vec![]), (8, vec![8], vec![])]);
+
+        // A seal waits behind another lost body until replay passes it.
+        let seal = Seal {
+            request: [4; 32], session: [5; 32], view: 20,
+            checkpoint: Checkpoint { frame: 9, view: 19, digest: digest(9).0, state_roots: [[6; 32]; 4], history_root: [7; 32] },
+        };
+        let seal_digest = digest_from_identity(seal.digest());
+        finalizer.on_finalized(19, digest(9), None, Some(vec![9]), true);
+        store.seal(seal_digest, seal.encode());
+        finalizer.on_finalized(20, seal_digest, None, Some(vec![20]), true);
+        assert!(sealed.lock().unwrap().is_empty(), "the seal waits for frame 9");
+        cursor.store(9, Ordering::SeqCst);
+        finalizer.retry_pending();
+        assert_eq!(*sealed.lock().unwrap(), vec![(seal.encode(), vec![20], 0)]);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        assert_eq!(delivered.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A lost body above the materialized cursor still holds back later
+    /// frames: delivering frame 7 first would skip frame 6. Once the body
+    /// arrives, both go in order, each recorded before it is handed over.
+    #[test]
+    fn a_missing_body_above_the_cursor_still_holds_back_later_finalizations() {
+        let directory = test_directory("gap-in-order");
+        let frames = linked_frames(5, 7);
+        let delivered: Delivered = Default::default();
+        let (store, finalizer) = implied_host(&directory, 5, delivered.clone());
+        finalizer.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        store.seal(app_frame_digest(&frames[2]).unwrap(), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, app_frame_digest(&frames[2]).unwrap(), None, Some(vec![7]), true);
+        finalizer.retry_pending();
+        assert!(delivered.lock().unwrap().is_empty());
+        assert_eq!(finalizer.pending.lock().unwrap().len(), 2);
+        store.put(app_frame_digest(&frames[1]).unwrap(), encode_app_frame(&frames[1]));
+        finalizer.retry_pending();
+        assert_eq!(*delivered.lock().unwrap(), vec![(6, vec![6], vec![]), (7, vec![7], vec![])]);
+        let recorded: Vec<u64> = FinalizedRecords::open(directory.clone()).unwrap()
+            .load_above(5).unwrap().iter().map(|record| record.0).collect();
+        assert_eq!(recorded, vec![6, 7], "kept until the engine materializes them");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A finalization that arrives after archive replay materialized its
+    /// frame still reaches the engine: it republishes the frame with its
+    /// reward proof, which archive replay never sends.
+    #[test]
+    fn a_finalization_the_engine_already_materialized_is_still_handed_over() {
+        let directory = test_directory("already-materialized");
+        let frames = linked_frames(5, 7);
+        let delivered: Delivered = Default::default();
+        let (store, finalizer) = implied_host(&directory, 6, delivered.clone());
+        for frame in &frames[1..] {
+            store.seal(app_frame_digest(frame).unwrap(), encode_app_frame(frame));
+        }
+        finalizer.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        finalizer.on_finalized(17, app_frame_digest(&frames[2]).unwrap(), None, Some(vec![7]), true);
+        assert_eq!(*delivered.lock().unwrap(), vec![(6, vec![6], vec![]), (7, vec![7], vec![])]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A record replayed from an earlier session carries that session's view
+    /// numbering; it must not drop this session's finalizations as if they
+    /// were below it.
+    #[test]
+    fn a_record_from_an_earlier_session_does_not_drop_finalizations_of_this_one() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let directory = test_directory("cross-session-anchor");
+        let mut frames = linked_frames(5, 7);
+        frames[1].header.as_mut().unwrap().rank = 900;
+        FinalizedRecords::open(directory.clone()).unwrap()
+            .persist(6, &[6], true, &encode_app_frame(&frames[1])).unwrap();
+        let accept = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let finalizer = {
+            let (accept, out) = (accept.clone(), delivered.clone());
+            AppSeamFinalizer::new(
+                Arc::new(|_| {}),
+                Arc::new(move |frame: AppShardFrame, _, _, _| {
+                    let accepted = accept.load(Ordering::SeqCst);
+                    if accepted {
+                        out.lock().unwrap().push(frame.header.unwrap().frame_number);
+                    }
+                    accepted
+                }),
+                BlockStore::new(), vec![1; 32],
+            )
+            .with_finalized_records(Arc::new(FinalizedRecords::open(directory.clone()).unwrap()), Arc::new(AtomicU64::new(5)))
+        };
+        assert_eq!(finalizer.replay_finalized_records().unwrap(), 1);
+        // This session's view 16 finalized frame 7, whose body was lost.
+        let later = app_frame_digest(&frames[2]).unwrap();
+        finalizer.on_finalized(16, later, None, Some(vec![7]), true);
+        finalizer.retry_pending();
+        assert!(finalizer.pending.lock().unwrap().contains_key(&later));
+        assert!(delivered.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// After a lost body is dropped, the next frame is still recorded before
+    /// it is handed to the engine.
+    #[test]
+    fn the_frame_after_a_dropped_entry_is_recorded_before_the_send() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let directory = test_directory("record-after-drop");
+        let frames = linked_frames(5, 7);
+        let cursor = Arc::new(AtomicU64::new(5));
+        let recorded_at_send = Arc::new(Mutex::new(Vec::new()));
+        let store = BlockStore::new();
+        let finalizer = {
+            let (seen, records) = (recorded_at_send.clone(), directory.clone());
+            AppSeamFinalizer::new(
+                Arc::new(|_| {}),
+                Arc::new(move |frame: AppShardFrame, _, _, _| {
+                    let held: Vec<u64> = FinalizedRecords::open(records.clone()).unwrap()
+                        .load_above(0).unwrap().iter().map(|record| record.0).collect();
+                    seen.lock().unwrap().push((frame.header.unwrap().frame_number, held));
+                    true
+                }),
+                store.clone(), vec![1; 32],
+            )
+            .with_finalized_records(Arc::new(FinalizedRecords::open(directory.clone()).unwrap()), cursor.clone())
+        };
+        finalizer.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        store.seal(app_frame_digest(&frames[2]).unwrap(), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, app_frame_digest(&frames[2]).unwrap(), None, Some(vec![7]), true);
+        cursor.store(6, Ordering::SeqCst);
+        finalizer.retry_pending();
+        assert_eq!(*recorded_at_send.lock().unwrap(), vec![(7, vec![7])]);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Bytes this node did not verify cannot make a pending finalization look
+    /// materialized: the digest binds only the output, so a peer can store a
+    /// header with a lower frame number under it.
+    #[test]
+    fn unverified_bytes_do_not_drop_pending_finalizations() {
+        let directory = test_directory("unverified-anchor");
+        let frames = linked_frames(5, 7);
+        let delivered: Delivered = Default::default();
+        let (store, finalizer) = implied_host(&directory, 5, delivered.clone());
+        let mut forged = frames[2].clone();
+        forged.header.as_mut().unwrap().frame_number = 3;
+        let forged_digest = app_frame_digest(&forged).unwrap();
+        assert_eq!(forged_digest, app_frame_digest(&frames[2]).unwrap());
+        finalizer.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        store.put(forged_digest, encode_app_frame(&forged));
+        finalizer.on_finalized(17, forged_digest, None, Some(vec![7]), true);
+        finalizer.retry_pending();
+        assert_eq!(finalizer.pending.lock().unwrap().len(), 2);
+        assert!(delivered.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A legacy host drops a finalized seal it can never deliver instead of
+    /// holding every later finalization behind it.
+    #[test]
+    fn a_seal_a_legacy_host_cannot_deliver_does_not_hold_back_later_frames() {
+        use quil_cw_consensus::handoff::Checkpoint;
+        let seal = Seal {
+            request: [1; 32], session: [2; 32], view: 9,
+            checkpoint: Checkpoint { frame: 4, view: 7, digest: [3; 32], state_roots: [[4; 32]; 4], history_root: [5; 32] },
+        };
+        let seal_digest = digest_from_identity(seal.digest());
+        let store = BlockStore::new();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let out = delivered.clone();
+        let finalizer = AppSeamFinalizer::new(
+            Arc::new(|_| {}),
+            Arc::new(move |frame: AppShardFrame, _, _, _| {
+                out.lock().unwrap().push(frame.header.unwrap().frame_number);
+                true
+            }),
+            store.clone(), vec![1; 32],
+        );
+        store.seal(seal_digest, seal.encode());
+        finalizer.on_finalized(9, seal_digest, None, Some(vec![9]), true);
+        let frame = finalized_test_frame(5);
+        store.seal(app_frame_digest(&frame).unwrap(), encode_app_frame(&frame));
+        finalizer.on_finalized(10, app_frame_digest(&frame).unwrap(), None, Some(vec![10]), true);
+        assert_eq!(*delivered.lock().unwrap(), vec![5]);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+    }
+
+    /// The operator hears of a stuck head after 30 s, again every 10 min,
+    /// and when it clears; a missing body with nothing behind it is the
+    /// engine's own gap and stays silent here.
+    #[test]
+    fn a_stuck_head_warns_after_thirty_seconds_repeats_every_ten_minutes_and_reports_its_end() {
+        use std::time::Duration;
+        let directory = test_directory("head-stall");
+        let frames = linked_frames(5, 7);
+        let (_, alone) = implied_host(&directory.join("alone"), 5, Default::default());
+        alone.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        let start = std::time::Instant::now();
+        assert_eq!(alone.retry_pending_at(start + Duration::from_secs(40)), None);
+
+        let delivered: Delivered = Default::default();
+        let (store, finalizer) = implied_host(&directory.join("held"), 5, delivered.clone());
+        finalizer.on_finalized(16, app_frame_digest(&frames[1]).unwrap(), None, Some(vec![6]), true);
+        store.seal(app_frame_digest(&frames[2]).unwrap(), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, app_frame_digest(&frames[2]).unwrap(), None, Some(vec![7]), true);
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        assert_eq!(finalizer.retry_pending_at(at(20)), None);
+        assert_eq!(finalizer.retry_pending_at(at(31)), Some(HeadSignal::Stalled));
+        assert_eq!(finalizer.retry_pending_at(at(300)), None);
+        assert_eq!(finalizer.retry_pending_at(at(631)), Some(HeadSignal::StillStalled));
+        assert_eq!(finalizer.retry_pending_at(at(700)), None);
+        store.put(app_frame_digest(&frames[1]).unwrap(), encode_app_frame(&frames[1]));
+        assert_eq!(finalizer.retry_pending_at(at(701)), Some(HeadSignal::Cleared));
+        assert_eq!(finalizer.retry_pending_at(at(702)), None);
+        assert_eq!(delivered.lock().unwrap().iter().map(|d| d.0).collect::<Vec<_>>(), vec![6, 7]);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
