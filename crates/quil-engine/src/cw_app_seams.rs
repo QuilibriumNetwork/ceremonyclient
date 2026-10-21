@@ -516,6 +516,11 @@ pub struct AppSeamProposer {
     private_waits: Mutex<(u64, u32)>,
     /// Where a session notes why this member declines a turn or refuses a vote.
     liveness: Option<Arc<Liveness>>,
+    /// Takes the unfinalized chain a proposal over a private parent builds
+    /// on ([`Self::resend_parent_bodies`]).
+    ancestor_sink: Option<Arc<dyn FrameSink>>,
+    /// Bounds the re-send log lines while this host keeps re-sending.
+    resent: Mutex<crate::bounded_warn::WarnLimiter<()>>,
 }
 
 /// How far ahead of this node's latest GLOBAL frame a proposal's anchor may
@@ -553,6 +558,8 @@ impl AppSeamProposer {
             gate_private_proposals: true,
             private_waits: Mutex::new((0, 0)),
             liveness: None,
+            ancestor_sink: None,
+            resent: Mutex::new(crate::bounded_warn::WarnLimiter::new()),
         }
     }
 
@@ -579,6 +586,11 @@ impl AppSeamProposer {
 
     pub fn with_sealed_bodies(mut self, bodies: Arc<SealedBodies>) -> Self {
         self.sealed_bodies = Some(bodies);
+        self
+    }
+
+    fn with_ancestor_sink(mut self, sink: Arc<dyn FrameSink>) -> Self {
+        self.ancestor_sink = Some(sink);
         self
     }
 
@@ -666,7 +678,14 @@ impl GlobalProposer for AppSeamProposer {
             Ok(false) => {}
             // The tip, or a state this executor cannot read: the canonical path
             // decides exactly as it did before private parents existed.
-            Ok(true) | Err(_) => return self.propose(context.view, context.parent),
+            Ok(true) => {
+                let proposal = self.propose(context.view, context.parent);
+                if proposal.is_some() {
+                    self.settle_resends();
+                }
+                return proposal;
+            }
+            Err(_) => return self.propose(context.view, context.parent),
         }
         if self.gate_private_proposals {
             let mut waits = self.private_waits.lock().unwrap_or_else(|e| e.into_inner());
@@ -678,11 +697,11 @@ impl GlobalProposer for AppSeamProposer {
                 return None;
             }
         }
-        let leader = match parents
+        let (parent, leader) = match parents
             .prepare(context.parent, context.parent_view)
-            .and_then(|parent| parents.leader_for(&parent, context.view))
+            .and_then(|parent| parents.leader_for(&parent, context.view).map(|leader| (parent, leader)))
         {
-            Ok(leader) => leader,
+            Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(view = context.view, %error, "cw app propose: selected parent not executable privately");
                 self.note(Step::Propose, context.view, "selected parent not executable privately", error.to_string());
@@ -690,7 +709,13 @@ impl GlobalProposer for AppSeamProposer {
                 return None;
             }
         };
-        self.propose_with(leader.as_ref(), context.view, context.parent)
+        let proposal = self.propose_with(leader.as_ref(), context.view, context.parent);
+        // Only with a proposal that goes out: a declined turn is asked again
+        // every 250 ms and would send the chain each time.
+        if proposal.is_some() {
+            self.resend_parent_bodies(&parent, context);
+        }
+        proposal
     }
 
     fn verify_with_context(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
@@ -933,6 +958,55 @@ impl AppSeamProposer {
         }
     }
 
+    /// Queue the bodies of a private parent's unfinalized chain, oldest
+    /// first, on the shard's consensus topic ahead of the proposal built on
+    /// it, once a view was nullified since the parent's. A voter executes
+    /// that chain before it can check the proposal, and holds a body only if
+    /// the block channel delivered it: no peer serves bodies, and archives
+    /// hold only finalized frames. A member that missed one refuses every
+    /// child of the parent, and a committee one vote short of quorum stays
+    /// stuck, since finalizing the parent takes a child's quorum. Right after
+    /// the parent's view every member that voted for it holds it, and the
+    /// parent usually finalizes moments later: nothing is re-sent then.
+    /// Receivers keep the bodies as candidates (peer ingress) and validate
+    /// the whole chain before voting. At most `MAX_PRIVATE_CHAIN` bodies per
+    /// proposal; none once the parent materializes. Returns how many went.
+    fn resend_parent_bodies(&self, parent: &crate::app_engine::PrivateAppParent, context: ProposalContext) -> usize {
+        let Some(sink) = self.ancestor_sink.as_ref() else { return 0 };
+        if context.view <= context.parent_view.saturating_add(1) {
+            return 0;
+        }
+        for (digest, _, bytes) in &parent.chain_bodies {
+            sink.broadcast(*digest, bytes.clone(), Recipients::All);
+        }
+        let report = self.resent.lock().unwrap_or_else(|e| e.into_inner())
+            .failed_at(&(), parent.frame_number, std::time::Instant::now());
+        if let Some(crate::bounded_warn::Report::Failing { attempts, duration }) = report {
+            let frames: Vec<u64> = parent.chain_bodies.iter().map(|(_, number, _)| *number).collect();
+            let digests: Vec<String> = parent.chain_bodies.iter()
+                .map(|(digest, _, _)| hex::encode(&digest_to_identity(digest)[..4]))
+                .collect();
+            tracing::info!(
+                filter = %hex::encode(&self.filter), ?frames, ?digests, view = context.view,
+                parent_view = context.parent_view, resends = attempts, since_secs = duration.as_secs(),
+                "re-sent unfinalized parent bodies to the committee",
+            );
+        }
+        parent.chain_bodies.len()
+    }
+
+    /// A proposal on the materialized tip ends a run of re-sends.
+    fn settle_resends(&self) {
+        let report = self.resent.lock().unwrap_or_else(|e| e.into_inner())
+            .succeeded_at(&(), u64::MAX, std::time::Instant::now());
+        if let Some(crate::bounded_warn::Report::Recovered { attempts, duration }) = report {
+            tracing::info!(
+                filter = %hex::encode(&self.filter), resends = attempts, duration_secs = duration.as_secs(),
+                "stopped re-sending unfinalized parent bodies: proposing on the materialized tip",
+            );
+        }
+    }
+
     fn unready_reason(&self) -> &'static str {
         if !self.data_ready.load(std::sync::atomic::Ordering::Acquire) {
             "covered shard data not staged"
@@ -957,6 +1031,20 @@ fn validation_reason(error: &str) -> &'static str {
     } else {
         "frame validation failed"
     }
+}
+
+/// Bind a host's private-parent executor to its block store, and the
+/// leader's re-sends of unfinalized parents to its block channel.
+pub(crate) fn bind_private_parents(
+    proposer: AppSeamProposer,
+    parents: Option<Arc<crate::app_engine::AppParentExecutor>>,
+    store: &BlockStore,
+    sink: Arc<dyn FrameSink>,
+    gate_proposals: bool,
+) -> AppSeamProposer {
+    let Some(parents) = parents else { return proposer };
+    parents.bind_blocks(store.clone());
+    proposer.with_private_parents(parents, gate_proposals).with_ancestor_sink(sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,16 +1660,13 @@ pub fn activate_app_consensus_cw(
     }
     proposer = proposer.with_liveness(session.as_ref().map(|host| host.liveness.clone()));
     let store = BlockStore::new();
-    if let Some(parents) = private_parents {
-        parents.bind_blocks(store.clone());
-        // A session's handoff proposer waits for the parent before using its
-        // private execution; the plain host waits here.
-        proposer = proposer.with_private_parents(parents, session.is_none());
-    }
+    let sink = Arc::new(AppSeamSink::new(transport.clone(), peers.clone()));
+    // A session's handoff proposer waits for the parent before using its
+    // private execution; the plain host waits here.
+    proposer = bind_private_parents(proposer, private_parents, &store, sink.clone(), session.is_none());
     let proposer = Arc::new(proposer);
     // Seed the genesis parent so the first proposal resolves its frame number.
     proposer.note_frame(genesis_digest, genesis_frame_number);
-    let sink = Arc::new(AppSeamSink::new(transport.clone(), peers.clone()));
     // Restore what this node sealed in an earlier life BEFORE the host can
     // replay a journal that refers to it.
     if let Some(bodies) = sealed_bodies.as_ref() {
@@ -2509,6 +2594,15 @@ mod tests {
         proposer.note_frame(digest, 7);
         ingress(honest.clone());
         assert_eq!(store.get(&digest), Some(honest.clone()));
+        // A frame below those already held, such as an unfinalized parent a
+        // leader re-sends, is kept under its own digest, still unvalidated.
+        let older = AppShardFrame { header: Some(quil_types::proto::global::FrameHeader {
+            address: vec![1; 32], frame_number: 3, output: vec![5; 32], ..Default::default()
+        }), ..Default::default() };
+        let older_digest = app_frame_digest(&older).unwrap();
+        ingress(encode_app_frame(&older));
+        assert_eq!(store.get_with_verification(&older_digest), Some((encode_app_frame(&older), false)));
+        assert!(!proposer.block_meta.lock().unwrap().contains_key(&older_digest));
         frame.header.as_mut().unwrap().frame_number = u64::MAX / 2;
         assert_eq!(app_frame_digest(&frame), Some(digest));
         let forged = encode_app_frame(&frame);

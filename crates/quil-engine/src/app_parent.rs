@@ -16,6 +16,9 @@ use quil_types::proto::global::AppShardFrame;
 /// cover.
 const MAX_PRIVATE_CHAIN: usize = 8;
 
+/// One validated unfinalized frame: `(digest, frame number, exact bytes)`.
+pub(crate) type ChainBody = (Digest, u64, Vec<u8>);
+
 /// Proposal validation (output, committee, storage attestation, structure).
 pub(crate) type ProposalValidation =
     Arc<dyn Fn(&AppShardFrame) -> Result<bool> + Send + Sync>;
@@ -66,6 +69,10 @@ pub struct PrivateAppParent {
     /// Whether each unfinalized frame between the base and the parent (oldest
     /// first) carried no requests: they count toward a session's drain.
     pub(crate) request_free_below: Vec<bool>,
+    /// The bodies of the unfinalized frames above the base, the parent last,
+    /// each validated as part of the chain: a leader building on them may
+    /// re-send them (`AppSeamProposer::resend_parent_bodies`).
+    pub(crate) chain_bodies: Vec<ChainBody>,
     pub(crate) clock: Arc<dyn ClockStore>,
     pub(crate) crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     pub(crate) manager: Arc<quil_execution::ExecutionEngineManager>,
@@ -256,7 +263,7 @@ impl AppParentExecutor {
         // notarized but not finalized; executing only a child of the tip, every
         // member abstained from a parent two frames up and the shard stopped
         // (e.g. frames 5403 and 5404 above tip 5402).
-        let chain = self.unfinalized_chain(&tip, parent, parent_view)?;
+        let (chain, chain_bodies) = self.unfinalized_chain(&tip, parent, parent_view)?;
         // Each frame's own checks; its requests root is checked against the
         // state it extends, which for all but the first is the branch below.
         for frame in &chain {
@@ -371,6 +378,7 @@ impl AppParentExecutor {
             base: tip.cursor,
             frame_number: number,
             request_free_below: chain[..chain.len() - 1].iter().map(|frame| frame.requests.is_empty()).collect(),
+            chain_bodies,
             clock,
             crdt,
             manager,
@@ -408,11 +416,18 @@ impl AppParentExecutor {
     /// the materialized tip, oldest first, from the stored bodies. Each frame
     /// names the one below as its parent, numbers rise by one from the tip,
     /// views rise strictly above the tip's, and the selected parent carries the
-    /// selected view. At most [`MAX_PRIVATE_CHAIN`] frames.
-    fn unfinalized_chain(&self, tip: &Tip, parent: Digest, parent_view: u64) -> Result<Vec<AppShardFrame>> {
+    /// selected view. At most [`MAX_PRIVATE_CHAIN`] frames, with the bytes
+    /// each was decoded from.
+    fn unfinalized_chain(
+        &self,
+        tip: &Tip,
+        parent: Digest,
+        parent_view: u64,
+    ) -> Result<(Vec<AppShardFrame>, Vec<ChainBody>)> {
         let blocks = self.blocks.get().ok_or_else(|| unavailable("selected parent body is not available"))?;
         let refused = || unavailable("selected parent does not extend the materialized tip");
         let mut chain: Vec<AppShardFrame> = Vec::new();
+        let mut bodies = Vec::new();
         let mut next = parent;
         loop {
             let bytes = blocks.get(&next).ok_or_else(|| unavailable("selected parent body is not available"))?;
@@ -431,6 +446,7 @@ impl AppParentExecutor {
             let reaches_tip = header.parent_selector == digest_from_identity(tip.digest).as_ref();
             let (number, selector) = (header.frame_number, header.parent_selector.clone());
             chain.push(frame);
+            bodies.push((next, number, bytes));
             if reaches_tip {
                 if number != tip.cursor + 1 {
                     return Err(refused());
@@ -444,7 +460,8 @@ impl AppParentExecutor {
             next = digest_from_identity(identity);
         }
         chain.reverse();
-        Ok(chain)
+        bodies.reverse();
+        Ok((chain, bodies))
     }
 
     /// The canonical leader rebound to a prepared parent for `rank`.
