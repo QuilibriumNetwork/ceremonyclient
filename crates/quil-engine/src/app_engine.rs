@@ -9947,6 +9947,16 @@ mod tests {
     fn engine_with_session_based_at_seven(local_output: u8) -> (
         AppConsensusEngine, quil_types::proto::global::AppShardFrame, [u8; 32], Arc<quil_hypergraph::HypergraphCrdt>,
     ) {
+        engine_with_sessions_from_seven(local_output, None)
+    }
+
+    /// [`engine_with_session_based_at_seven`], where GLOBAL has also sealed
+    /// generation 2 at frame `later` and authorized generation 3 based on it,
+    /// when `later` is given: the engine's lineage then ends below the head
+    /// session's predecessor seal.
+    fn engine_with_sessions_from_seven(local_output: u8, later: Option<u64>) -> (
+        AppConsensusEngine, quil_types::proto::global::AppShardFrame, [u8; 32], Arc<quil_hypergraph::HypergraphCrdt>,
+    ) {
         use quil_cw_consensus::handoff::{Checkpoint, Seal};
         use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
         use quil_types::crypto::Signer as _;
@@ -9975,7 +9985,7 @@ mod tests {
         handoff::initialize(&state, 2, &source).unwrap();
         commit(2);
         let request = handoff::schedule(&state, 3, vec![filter.clone()],
-            vec![DesiredCommittee { filter: filter.clone(), members }]).unwrap();
+            vec![DesiredCommittee { filter: filter.clone(), members: members.clone() }]).unwrap();
         commit(3);
         let seal = Seal {
             request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
@@ -9990,6 +10000,24 @@ mod tests {
         commit(4);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!((successor.generation, successor.base_frame), (2, 7));
+        if let Some(later) = later {
+            let request = handoff::schedule(&state, 5, vec![filter.clone()],
+                vec![DesiredCommittee { filter: filter.clone(), members }]).unwrap();
+            commit(5);
+            let seal = Seal {
+                request: request.id().unwrap(), session: successor.id().unwrap(), view: 19,
+                checkpoint: Checkpoint {
+                    frame: later, view: 15, digest: quil_crypto::poseidon::hash_bytes_to_32(&[0x50; 32]).unwrap(),
+                    state_roots: [[1; 32]; 4], history_root: [0; 32],
+                },
+            };
+            let certificate = crate::test_support::certify_seal(&successor, &signers, &seal);
+            handoff::record_session_tip(&state, 6, &seal.session, &seal.checkpoint).unwrap();
+            assert!(handoff::apply_submission(&state, 6, &CertificateSubmission { seal, certificate }).unwrap());
+            commit(6);
+            let head = handoff::head(&state, &filter).unwrap().unwrap();
+            assert_eq!((head.generation, head.base_frame), (3, later));
+        }
         let (events, _received) = mpsc::unbounded_channel();
         let private = [7; 57];
         let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
@@ -10074,6 +10102,25 @@ mod tests {
         let error = engine.replay_archive_frame_with(ordinary, Some(&certified_frame_nine(3)), |_| Ok(true)).await
             .unwrap_err().to_string();
         assert_eq!(error, no_state);
+    }
+
+    /// A worker whose lineage ended at a session's base while that session
+    /// ran on, sealed and handed over to another: its next frame is still the
+    /// first frame of the session based at its head, not of GLOBAL's head
+    /// session, and links to that session's genesis.
+    #[tokio::test]
+    async fn archive_replay_links_a_first_frame_below_the_head_sessions_seal() {
+        let (mut engine, _, genesis, _) = engine_with_sessions_from_seven(0x43, Some(12));
+        let no_state = "execution unavailable: archive replay has no local state";
+        let first = uncertified_frame(8, &genesis);
+        let error = engine.replay_archive_frame_with(first.clone(), Some(&certified_frame_nine(2)), |_| Ok(true)).await
+            .unwrap_err().to_string();
+        assert_eq!(error, no_state, "past the link check, replay stops only for want of the fixture's local state");
+        // The head session's epoch cannot authenticate it.
+        let error = engine.replay_archive_frame_with(first, Some(&certified_frame_nine(3)), |_| Ok(true)).await
+            .unwrap_err().to_string();
+        assert_eq!(error, "invalid argument: archive replay frame 8: frame 8 would open generation 2 \
+            at frame 7, but the certified frame 9 authenticating it is of generation 3");
     }
 
     /// The genesis links a first frame only onto the frame its predecessor
