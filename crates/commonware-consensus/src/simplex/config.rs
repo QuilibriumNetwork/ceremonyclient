@@ -3,7 +3,7 @@ use super::{
     types::{Activity, Context, Finalization},
 };
 use crate::{
-    types::{Epoch, ViewDelta},
+    types::{Epoch, View, ViewDelta},
     CertifiableAutomaton, Epochable, Relay, Reporter, Viewable,
 };
 use commonware_cryptography::{certificate::Scheme, Digest};
@@ -39,6 +39,21 @@ impl ForwardingPolicy {
     pub const fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
     }
+}
+
+/// QUILIBRIUM: lets a leader skip a certified parent its application cannot
+/// extend (see `State::find_parent`). Only leaders consult it; voters accept
+/// any certified parent above the last finalized view whose later views are
+/// all nullified, as before.
+pub trait ParentFallback<D: Digest>: Send + Sync {
+    /// Whether the application can build on `payload`, certified at `view`.
+    /// Called only for views that are certified and nullified; it must be
+    /// cheap, as it runs in the voter loop.
+    fn extendable(&self, view: View, payload: &D) -> bool;
+
+    /// The leader of `view` skipped the certified, nullified `skipped` views
+    /// (newest first) and builds on the certified `parent` instead.
+    fn fell_back(&self, view: View, parent: View, skipped: &[View]);
 }
 
 /// The certified root from which a Simplex instance starts.

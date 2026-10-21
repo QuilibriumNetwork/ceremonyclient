@@ -352,7 +352,7 @@ cfg_if::cfg_if! {
 
         mod actors;
         pub mod config;
-        pub use config::{Config, Floor, ForwardingPolicy};
+        pub use config::{Config, Floor, ForwardingPolicy, ParentFallback};
         mod engine;
         pub use engine::Engine;
         mod metrics;
@@ -6369,4 +6369,325 @@ mod tests {
     }
 
     test_for_all_fixtures!(twins, level = "INFO");
+
+    // QUILIBRIUM: a leader's fallback past certified, nullified parents its
+    // application cannot extend (`ParentFallback`), end to end.
+    use commonware_utils::channel::{fallible::OneshotExt as _, oneshot};
+
+    /// Payloads above its last finalized one an application can build on (an
+    /// app shard's private execution limit).
+    const FALLBACK_LIMIT: u64 = 2;
+    /// Views below which certification is late everywhere but at the next
+    /// leader, as when a late member completes a notarization after the others
+    /// passed the certification deadline: each such view is notarized,
+    /// nullified and, late, certified.
+    const LATE_UNTIL: u64 = 14;
+    /// Beyond the certification timeout.
+    const LATE_CERTIFY: Duration = Duration::from_millis(2_500);
+
+    type FallbackFinalizations = Arc<Mutex<HashMap<View, TFinalization<ed25519::Scheme, D>>>>;
+
+    /// What every member's bodies say: each payload's height.
+    #[derive(Default)]
+    struct FallbackChain {
+        heights: Mutex<HashMap<D, u64>>,
+        /// The first payload certified at or after `LATE_UNTIL`, in a split run.
+        split: Mutex<Option<D>>,
+        /// The most payloads any proposal was above its leader's last finalized one.
+        deepest: Mutex<u64>,
+    }
+
+    impl FallbackChain {
+        /// `payload`'s height above the highest one `finalizations` hold.
+        fn depth(&self, finalizations: &FallbackFinalizations, payload: &D) -> Option<u64> {
+            let heights = self.heights.lock();
+            let finalized = finalizations
+                .lock()
+                .values()
+                .filter_map(|finalization| heights.get(&finalization.proposal.payload).copied())
+                .max()
+                .unwrap_or(0);
+            heights.get(payload).map(|height| height.saturating_sub(finalized))
+        }
+    }
+
+    /// A mock application that, like an app shard, cannot build on (or vote
+    /// for a proposal on) a parent more than `FALLBACK_LIMIT` payloads above
+    /// its last finalized one, with late certifications on a schedule.
+    #[derive(Clone)]
+    struct DepthLimited {
+        inner: mocks::application::Mailbox<D, PublicKey>,
+        context: Arc<Mutex<deterministic::Context>>,
+        chain: Arc<FallbackChain>,
+        finalizations: FallbackFinalizations,
+        me: u64,
+        n: u64,
+        epoch: Epoch,
+        /// Certify the first payload at or after `LATE_UNTIL` by a split vote:
+        /// late at half the members, so the view neither finalizes nor nullifies.
+        split_vote: bool,
+    }
+
+    impl DepthLimited {
+        /// The parent's height, if this member can build on it.
+        fn buildable(&self, parent: &D) -> Option<u64> {
+            let depth = self.chain.depth(&self.finalizations, parent)?;
+            (depth <= FALLBACK_LIMIT).then(|| self.chain.heights.lock()[parent])
+        }
+
+        fn late(&self, view: View, payload: D) -> bool {
+            if view.get() < LATE_UNTIL {
+                return (self.epoch.get() + view.get() + 1) % self.n != self.me;
+            }
+            if !self.split_vote {
+                return false;
+            }
+            let mut split = self.chain.split.lock();
+            *split.get_or_insert(payload) == payload && self.me >= self.n / 2
+        }
+    }
+
+    impl crate::Automaton for DepthLimited {
+        type Digest = D;
+        type Context = types::Context<D, PublicKey>;
+
+        async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<D> {
+            let (sender, receiver) = oneshot::channel();
+            // Declined: the dropped sender times the view out.
+            let Some(height) = self.buildable(&context.parent.1) else {
+                return receiver;
+            };
+            let depth = self.chain.depth(&self.finalizations, &context.parent.1).unwrap_or(0) + 1;
+            {
+                let mut deepest = self.chain.deepest.lock();
+                *deepest = (*deepest).max(depth);
+            }
+            let inner = self.inner.propose(context).await;
+            let chain = self.chain.clone();
+            let spawner = self.context.lock().child("propose");
+            spawner.spawn(move |_| async move {
+                if let Ok(payload) = inner.await {
+                    chain.heights.lock().insert(payload, height + 1);
+                    sender.send_lossy(payload);
+                }
+            });
+            receiver
+        }
+
+        async fn verify(&mut self, context: Self::Context, payload: D) -> oneshot::Receiver<bool> {
+            let Some(height) = self.buildable(&context.parent.1) else {
+                let (sender, receiver) = oneshot::channel();
+                sender.send_lossy(false);
+                return receiver;
+            };
+            self.chain.heights.lock().insert(payload, height + 1);
+            self.inner.verify(context, payload).await
+        }
+    }
+
+    impl crate::CertifiableAutomaton for DepthLimited {
+        async fn certify(&mut self, round: Round, payload: D) -> oneshot::Receiver<bool> {
+            let inner = self.inner.certify(round, payload).await;
+            if !self.late(round.view(), payload) {
+                return inner;
+            }
+            let (sender, receiver) = oneshot::channel();
+            let spawner = self.context.lock().child("late");
+            spawner.spawn(move |context| async move {
+                context.sleep(LATE_CERTIFY).await;
+                if let Ok(certified) = inner.await {
+                    sender.send_lossy(certified);
+                }
+            });
+            receiver
+        }
+    }
+
+    impl crate::Relay for DepthLimited {
+        type Digest = D;
+        type PublicKey = PublicKey;
+        type Plan = Plan<PublicKey>;
+
+        fn broadcast(&mut self, payload: D, plan: Plan<PublicKey>) -> commonware_actor::Feedback {
+            self.inner.broadcast(payload, plan)
+        }
+    }
+
+    /// The hook an app shard installs: a nullified parent is extendable while
+    /// a child of it stays within the limit (`headroom`), or, without
+    /// headroom, while it is itself within the limit.
+    struct DepthFallback {
+        chain: Arc<FallbackChain>,
+        finalizations: FallbackFinalizations,
+        headroom: bool,
+    }
+
+    impl ParentFallback<D> for DepthFallback {
+        fn extendable(&self, _view: View, payload: &D) -> bool {
+            self.chain
+                .depth(&self.finalizations, payload)
+                .is_none_or(|depth| depth < FALLBACK_LIMIT || (!self.headroom && depth == FALLBACK_LIMIT))
+        }
+
+        fn fell_back(&self, view: View, parent: View, skipped: &[View]) {
+            debug!(%view, %parent, ?skipped, "leader fell back");
+        }
+    }
+
+    /// Four members (one fault tolerated) through late notarizations; per
+    /// member, its highest finalized view after the late views end. `hooks`
+    /// gives each member's fallback: none, with or without headroom. Asserts
+    /// that the late views drove the chain past the limit.
+    fn late_notarizations(hooks: [Option<bool>; 4], split_vote: bool) -> Vec<Option<View>> {
+        let n = 4;
+        let namespace = b"consensus".to_vec();
+        let executor = deterministic::Runner::timed(Duration::from_secs(600));
+        executor.start(|mut context| async move {
+            let Fixture {
+                participants,
+                schemes,
+                ..
+            } = ed25519::fixture(&mut context, &namespace, n);
+            let mut oracle =
+                start_test_network_with_peers(context.child("network"), participants.clone(), true)
+                    .await;
+            let mut registrations = register_validators(&mut oracle, &participants).await;
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            link_validators(&mut oracle, &participants, Action::Link(link), None).await;
+
+            let elector = <RoundRobin>::default();
+            let relay = Arc::new(mocks::relay::Relay::new());
+            let epoch = Epoch::new(333);
+            let genesis = mocks::application::genesis::<Sha256>(epoch);
+            let chain = Arc::new(FallbackChain::default());
+            chain.heights.lock().insert(genesis, 0);
+            let mut reporters = Vec::new();
+            let mut engines = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                let context = context
+                    .child("validator")
+                    .with_attribute("public_key", validator);
+                let reporter = mocks::reporter::Reporter::new(
+                    context.child("reporter"),
+                    mocks::reporter::Config {
+                        participants: participants.clone().try_into().unwrap(),
+                        scheme: schemes[idx].clone(),
+                        elector: elector.clone(),
+                    },
+                );
+                reporters.push(reporter.clone());
+                let (actor, application) = mocks::application::Application::new(
+                    context.child("application"),
+                    mocks::application::Config {
+                        hasher: Sha256::default(),
+                        relay: relay.clone(),
+                        me: validator.clone(),
+                        propose_latency: (10.0, 5.0),
+                        verify_latency: (10.0, 5.0),
+                        certify_latency: (10.0, 5.0),
+                        should_certify: mocks::application::Certifier::Always,
+                    },
+                );
+                actor.start();
+                let app = DepthLimited {
+                    inner: application,
+                    context: Arc::new(Mutex::new(context.child("depth"))),
+                    chain: chain.clone(),
+                    finalizations: reporter.finalizations.clone(),
+                    me: idx as u64,
+                    n: n as u64,
+                    epoch,
+                    split_vote,
+                };
+                let cfg = config::Config {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker: oracle.control(validator.clone()),
+                    automaton: app.clone(),
+                    relay: app,
+                    reporter: reporter.clone(),
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch,
+                    floor: config::Floor::Genesis(genesis),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(1),
+                    activity_timeout: ViewDelta::new(200),
+                    skip_timeout: ViewDelta::new(100),
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    // Every unfinalized view keeps a writer buffer.
+                    write_buffer: NZUsize!(2 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let mut engine = Engine::new(context.child("engine"), cfg);
+                if let Some(headroom) = hooks[idx] {
+                    engine = engine.with_parent_fallback(Arc::new(DepthFallback {
+                        chain: chain.clone(),
+                        finalizations: reporter.finalizations.clone(),
+                        headroom,
+                    }));
+                }
+                let (pending, recovered, resolver) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                engines.push(engine.start(pending, recovered, resolver));
+            }
+
+            context.sleep(Duration::from_secs(60)).await;
+            for reporter in reporters.iter() {
+                reporter.assert_no_faults();
+                reporter.assert_no_invalid();
+            }
+            assert_eq!(*chain.deepest.lock(), FALLBACK_LIMIT + 1);
+            reporters
+                .iter()
+                .map(|reporter| {
+                    reporter
+                        .finalizations
+                        .lock()
+                        .keys()
+                        .copied()
+                        .filter(|view| view.get() >= LATE_UNTIL)
+                        .max()
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn late_notarizations_stall_a_depth_limited_chain_without_fallback() {
+        assert_eq!(late_notarizations([None; 4], false), vec![None; 4]);
+    }
+
+    #[test]
+    fn late_notarizations_finalize_again_with_fallback() {
+        let finalized = late_notarizations([Some(true); 4], false);
+        assert!(finalized.iter().all(Option::is_some), "{finalized:?}");
+    }
+
+    #[test]
+    fn late_notarizations_finalize_again_with_two_members_falling_back() {
+        let finalized = late_notarizations([Some(true), Some(true), None, None], false);
+        assert!(finalized.iter().all(Option::is_some), "{finalized:?}");
+    }
+
+    #[test]
+    fn a_split_vote_after_a_fallback_leaves_room_with_headroom() {
+        let finalized = late_notarizations([Some(true); 4], true);
+        assert!(finalized.iter().all(Option::is_some), "{finalized:?}");
+    }
+
+    #[test]
+    fn a_split_vote_after_a_fallback_without_headroom_stalls() {
+        assert_eq!(late_notarizations([Some(false); 4], true), vec![None; 4]);
+    }
 }

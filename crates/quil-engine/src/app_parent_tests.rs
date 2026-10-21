@@ -113,14 +113,33 @@ fn executor(
     valid: bool,
     parent_check: AppRequestsRootCheck,
 ) -> AppParentExecutor {
+    executor_with(rig, anchor, Arc::new(move |_: &AppShardFrame| Ok(valid)), parent_check)
+}
+
+fn executor_with(
+    rig: &Rig,
+    anchor: Arc<dyn ClockStore>,
+    validate: ProposalValidation,
+    parent_check: AppRequestsRootCheck,
+) -> AppParentExecutor {
     let led = leader(rig, anchor.clone());
-    executor_led(rig, anchor, valid, parent_check, led)
+    executor_full(rig, anchor, validate, parent_check, led)
 }
 
 fn executor_led(
     rig: &Rig,
     anchor: Arc<dyn ClockStore>,
     valid: bool,
+    parent_check: AppRequestsRootCheck,
+    led: Arc<AppLeaderProvider>,
+) -> AppParentExecutor {
+    executor_full(rig, anchor, Arc::new(move |_: &AppShardFrame| Ok(valid)), parent_check, led)
+}
+
+fn executor_full(
+    rig: &Rig,
+    anchor: Arc<dyn ClockStore>,
+    validate: ProposalValidation,
     parent_check: AppRequestsRootCheck,
     led: Arc<AppLeaderProvider>,
 ) -> AppParentExecutor {
@@ -133,7 +152,7 @@ fn executor_led(
         anchor.clone(),
         rig.outflows.clone(),
         Arc::new(quil_tries::ShaInclusionProver),
-        Arc::new(move |_: &AppShardFrame| Ok(valid)),
+        validate,
         parent_check,
         rig.materialized.clone(),
         led,
@@ -729,4 +748,162 @@ fn seal_checkpoint_rejects_terminal_and_malformed_bodies_without_execution() {
         assert!(executor.prepared.lock().unwrap().is_none());
         assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
     }
+}
+
+/// `count` linked unfinalized frames above the genesis tip, one height and one
+/// view apart, stored but never executed; their digests, lowest first.
+fn linked_frames(rig: &Rig, count: u64) -> Vec<Digest> {
+    let mut below = digest_from_identity(genesis());
+    (1..=count)
+        .map(|number| {
+            let frame = AppShardFrame {
+                header: Some(FrameHeader {
+                    address: rig.filter.clone(),
+                    frame_number: number,
+                    rank: RANK + number - 1,
+                    output: vec![number as u8; 32],
+                    parent_selector: below.as_ref().to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            below = offer(rig, &frame);
+            below
+        })
+        .collect()
+}
+
+/// Commit `frame` as the materialized tip at its height.
+fn materialize(rig: &Rig, frame: &AppShardFrame) {
+    let header = frame.header.as_ref().unwrap();
+    let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap().to_vec();
+    let txn = rig.clock.new_transaction(false).unwrap();
+    rig.clock.stage_shard_clock_frame(&selector, frame, txn.as_ref()).unwrap();
+    txn.commit().unwrap();
+    let txn = rig.clock.new_transaction(false).unwrap();
+    rig.clock.commit_shard_clock_frame(&rig.filter, header.frame_number, &selector, txn.as_ref(), false).unwrap();
+    txn.commit().unwrap();
+    rig.manager.commit_frame_with_app_cursor(header.frame_number, &rig.filter).unwrap();
+    rig.materialized.store(header.frame_number, Ordering::SeqCst);
+}
+
+#[test]
+fn a_nullified_parent_needs_room_for_a_child_and_is_judged_without_execution() {
+    let rig = rig();
+    let validated = Arc::new(AtomicU32::new(0));
+    let counted = validated.clone();
+    let executor = executor_with(
+        &rig,
+        rig.clock.clone(),
+        Arc::new(move |_: &AppShardFrame| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }),
+        Arc::new(|_: &AppShardFrame| Ok(())),
+    );
+    let frames = linked_frames(&rig, MAX_PRIVATE_CHAIN as u64 + 1);
+    let sequence = rig.db.inner().latest_sequence_number();
+    let tip = executor.tip().unwrap();
+    // Eight frames above the tip are within one private execution's reach...
+    assert_eq!(executor.unfinalized_chain(&tip, frames[7], RANK + 7).unwrap().0.len(), MAX_PRIVATE_CHAIN);
+    // ...but a child of the eighth would be the last frame anyone can extend,
+    // so a leader falls back past it, to the seventh.
+    assert!(executor.extendable(frames[6], RANK + 6));
+    assert_eq!(executor.refusal(frames[7], RANK + 7), Some(Refused { depth: 8 }));
+    // The ninth is refused by the chain walk, and so by the leader's check.
+    let error = executor.unfinalized_chain(&tip, frames[8], RANK + 8).unwrap_err().to_string();
+    assert!(error.contains("does not extend the materialized tip"), "{error}");
+    assert_eq!(executor.refusal(frames[8], RANK + 8), Some(Refused { depth: 9 }));
+    // A parent of another view than the one it was certified at is refused.
+    assert!(!executor.extendable(frames[0], RANK + 1));
+    // Judged from the bodies alone: nothing validated, executed or written.
+    assert_eq!(validated.load(Ordering::SeqCst), 0);
+    assert!(executor.prepared.lock().unwrap().is_none());
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+    assert_eq!(executor.verdicts.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn a_verdict_follows_the_materialized_tip() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let frames = linked_frames(&rig, MAX_PRIVATE_CHAIN as u64 + 1);
+    executor.tip().unwrap();
+    assert_eq!(executor.refusal(frames[7], RANK + 7), Some(Refused { depth: 8 }));
+    // The first frame materializes.
+    let first = decode_app_frame(&rig.blocks.get(&frames[0]).unwrap()).unwrap();
+    materialize(&rig, &first);
+    // Until a proposal or vote reads the new tip, the cached verdict is not
+    // used and none is given.
+    assert!(executor.extendable(frames[7], RANK + 7));
+    assert!(executor.extendable(frames[8], RANK + 8));
+    assert_eq!(executor.verdicts.lock().unwrap().len(), 1);
+    assert!(executor.is_canonical_parent(frames[0]).unwrap());
+    // One frame lower: the eighth now leaves room, the ninth does not.
+    assert_eq!(executor.refusal(frames[7], RANK + 7), None);
+    assert_eq!(executor.refusal(frames[8], RANK + 8), Some(Refused { depth: 8 }));
+}
+
+#[test]
+fn a_parent_this_member_cannot_judge_stays_extendable() {
+    use quil_cw_consensus::handoff::{Checkpoint, Seal};
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let frames = linked_frames(&rig, MAX_PRIVATE_CHAIN as u64 + 1);
+    // No proposal or vote has read the tip yet.
+    assert!(executor.extendable(frames[8], RANK + 8));
+    assert!(executor.verdicts.lock().unwrap().is_empty());
+    executor.tip().unwrap();
+    // The materialized tip itself.
+    assert!(executor.extendable(digest_from_identity(genesis()), 0));
+    // A body this member does not hold, one it cannot decode, and a seal.
+    let unknown = digest_from_identity([77; 32]);
+    assert!(executor.extendable(unknown, RANK));
+    let garbage = digest_from_identity([3; 32]);
+    rig.blocks.put(garbage, vec![0xff; 7]);
+    assert!(executor.extendable(garbage, RANK));
+    let checkpoint = Checkpoint { frame: 1, view: 5, digest: [42; 32], state_roots: [[0; 32]; 4], history_root: [0; 32] };
+    let seal = Seal { request: [1; 32], session: [2; 32], view: 6, checkpoint };
+    let sealed = digest_from_identity(seal.digest());
+    rig.blocks.put(sealed, seal.encode());
+    assert!(executor.extendable(sealed, 6));
+    // None of these is cached: the body may still arrive.
+    assert_eq!(executor.verdicts.lock().unwrap().len(), 1);
+    // A tip read at another height than the engine's is not used.
+    rig.materialized.store(1, Ordering::SeqCst);
+    assert!(executor.extendable(frames[8], RANK + 8));
+    rig.materialized.store(0, Ordering::SeqCst);
+    assert!(!executor.extendable(frames[8], RANK + 8));
+    // An executor without a body store yet.
+    let unbound = AppParentExecutor::new(
+        rig.filter.clone(),
+        rig.filter.clone(),
+        rig.manager.clone(),
+        rig.manager.crdt(),
+        rig.clock.clone(),
+        rig.clock.clone(),
+        rig.outflows.clone(),
+        Arc::new(quil_tries::ShaInclusionProver),
+        Arc::new(|_: &AppShardFrame| Ok(true)),
+        Arc::new(|_: &AppShardFrame| Ok(())),
+        rig.materialized.clone(),
+        leader(&rig, rig.clock.clone()),
+        None,
+    );
+    unbound.tip().unwrap();
+    assert!(unbound.extendable(frames[8], RANK + 8));
+}
+
+#[test]
+fn a_parent_that_cannot_be_executed_keeps_the_prepared_one() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let prepared = executor.prepare(digest, RANK).unwrap();
+    // Another leader's proposal on a parent this member cannot execute.
+    let frames = linked_frames(&rig, MAX_PRIVATE_CHAIN as u64 + 1);
+    assert!(executor.prepare(frames[8], RANK + 8).is_err());
+    assert!(Arc::ptr_eq(&executor.prepared.lock().unwrap().clone().unwrap(), &prepared));
+    assert!(Arc::ptr_eq(&executor.prepare(digest, RANK).unwrap(), &prepared));
 }
