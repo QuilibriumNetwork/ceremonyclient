@@ -1145,6 +1145,19 @@ mod tests {
         assert!(calls.lock().unwrap().iter().all(|call| call.starts_with("fetch 0")), "{:?}", calls.lock().unwrap());
     }
 
+    /// A re-anchor owed after a persistent replay mismatch records the
+    /// cursor as its fence, below the frame GLOBAL committed: it anchors at
+    /// that frame, with the trees pinned to its roots, not at the fence.
+    #[tokio::test]
+    async fn a_reanchor_below_the_committed_frame_anchors_at_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let target = Reanchoring::new(&calls, Some(500), Some(505));
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(500)), &target, None).await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 505 });
+        assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249", "install 505"]);
+    }
+
     /// Serves certified frames, but its tree sync never reaches their roots.
     struct StatelessArchive {
         calls: Arc<Mutex<Vec<String>>>,
