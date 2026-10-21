@@ -50,6 +50,11 @@ pub type AppShardsProvider =
 pub type HaltDurationsProvider =
     Arc<dyn Fn(u64) -> std::collections::HashMap<Vec<u8>, u64> + Send + Sync>;
 
+/// The lowest GLOBAL frame whose request bodies the store keeps (`None`:
+/// all of them). A regular node prunes older bodies and keeps only the
+/// headers, which would read as empty frames.
+pub type RequestRetentionProvider = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 /// Inactivity grace before an active prover is evicted, in frames
 /// (`eviction_grace_frames` in `frame_materializer`). Surfaced so the
 /// eviction-risk endpoint reports a prover's exact runway.
@@ -85,6 +90,12 @@ pub struct ExplorerState {
     /// [`production::run_indexer`] last built them; `None` until its first
     /// build. Handlers only read it.
     pub(crate) production_snapshot: Arc<RwLock<Option<Arc<production::Snapshot>>>>,
+    /// `/shards/production/history` rows, recorded and backfilled by
+    /// [`production::run_indexer`]. Handlers only read them.
+    pub(crate) production_history: Arc<RwLock<production::history::Rows>>,
+    /// Outside archive mode, where request-body pruning starts: the history
+    /// backfill stays above it. `None` on archives, which keep every body.
+    pub requests_retained_from: Option<RequestRetentionProvider>,
     /// Outside archive mode, the node's archive shard-info cache: the
     /// production snapshot's grid then comes from it, not from the shards
     /// store (see [`production::GridSource`]). `None` on archives.
@@ -121,8 +132,17 @@ impl ExplorerState {
             cache: Arc::new(RwLock::new(HashMap::new())),
             provers_snapshot: Arc::new(Mutex::new(None)),
             production_snapshot: Arc::new(RwLock::new(None)),
+            production_history: Arc::new(RwLock::new(production::history::Rows::default())),
+            requests_retained_from: None,
             archive_grid: None,
         }
+    }
+
+    /// Keep the history backfill above the frames whose request bodies the
+    /// store pruned: for a node outside archive mode.
+    pub fn with_request_retention(mut self, provider: RequestRetentionProvider) -> Self {
+        self.requests_retained_from = Some(provider);
+        self
     }
 
     /// Take the production snapshot's grid from the node's archive
@@ -155,6 +175,7 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/provers/kicked", any(handlers::handle_kicked))
         .route("/stats", any(handlers::handle_stats))
         .route("/shards/production", any(handlers::handle_shard_production))
+        .route("/shards/production/history", any(handlers::handle_shard_production_history))
         .route("/token/supply", any(handlers::handle_token_supply))
         .route("/token/coin/:address", any(handlers::handle_token_coin))
         .route("/token/coins/:owner", any(handlers::handle_token_coins))
