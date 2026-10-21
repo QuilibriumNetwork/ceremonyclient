@@ -706,6 +706,143 @@ pub async fn recover_sealed_history(
     Ok(installed)
 }
 
+/// Frames past a fenced checkpoint that [`own_session_chain`] walks at most:
+/// a longer local chain is not taken as the session's own. Sessions seen on
+/// mainnet ran a few hundred frames past their fence.
+const MAX_OWN_CHAIN_FRAMES: u64 = 4096;
+
+/// The prefix of [`fence_rewind`]'s refusal of the frames at a fence.
+const FENCE_FRAMES_DIFFER: &str = "local frames at the fence differ from the fenced frame";
+
+/// What a member's frames past its session's fenced same-filter
+/// predecessor checkpoint are ([`own_session_chain`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum OwnChain {
+    /// The frames from the fence to the materialized cursor are the
+    /// session's own: the first names the session's authorized genesis over
+    /// the fenced frame, and each later one extends the one before it.
+    Held,
+    /// The frame after the fence does not name the session's genesis (or is
+    /// absent): what lies past the fence is not the session's.
+    NotOwn,
+    /// The frame after the fence names the session's genesis, but the frames
+    /// contradict its chain, for the reason given.
+    Broken(String),
+    /// The frame after the fence names the session's genesis, but this node
+    /// holds too few of the frames to its head to verify the chain (one is
+    /// missing, or more than [`MAX_OWN_CHAIN_FRAMES`] lie past the fence): a
+    /// shard sync can supply them.
+    Unverified(String),
+}
+
+/// An [`OwnChain::Held`] that one start found, for a session (its ID), a
+/// materialized cursor and the digest of the frame there: the start's later
+/// check reuses it instead of walking the frames again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeldOwnChain(Option<([u8; 32], u64, [u8; 32])>);
+
+/// [`own_session_chain`], reusing and recording `held`.
+fn own_session_chain_held(
+    clock: &dyn ClockStore,
+    session: &Session,
+    checkpoint: &Checkpoint,
+    cursor: u64,
+    held: &mut HeldOwnChain,
+) -> Result<OwnChain> {
+    let head = clock.get_shard_clock_frame(&session.filter, cursor, false).ok()
+        .and_then(|frame| frame.header)
+        .map(|header| quil_crypto::poseidon::hash_bytes_to_32(&header.output))
+        .transpose()?;
+    let key = head.map(|head| session.id().map(|id| (id, cursor, head))).transpose()?;
+    if key.is_some() && held.0 == key {
+        return Ok(OwnChain::Held);
+    }
+    let chain = own_session_chain(clock, session, checkpoint, cursor)?;
+    if chain == OwnChain::Held {
+        held.0 = key;
+    }
+    Ok(chain)
+}
+
+/// Lifecycle lines said once per process for a kind, shard filter, session
+/// generation and fence frame: a start retried every 10 s repeated them.
+/// Bounded; a full set starts over.
+static SAID_ONCE: Mutex<std::collections::BTreeSet<(&'static str, Vec<u8>, u64, u64)>> =
+    Mutex::new(std::collections::BTreeSet::new());
+const MAX_SAID_ONCE: usize = 1024;
+
+/// Whether this process has not yet said `kind` for `session` at `fence`.
+fn first_said(kind: &'static str, session: &Session, fence: u64) -> bool {
+    let mut said = SAID_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    if said.len() >= MAX_SAID_ONCE {
+        said.clear();
+    }
+    said.insert((kind, session.filter.clone(), session.generation, fence))
+}
+
+/// Whether this member's frames past `checkpoint`, the fenced checkpoint
+/// `session` is based at, through materialized cursor `cursor`, are
+/// `session`'s own chain. A session's first frame names its authorized
+/// genesis, not the fenced frame; that genesis derives from the GLOBAL
+/// authorization made after the fence, so no frame of the fenced session
+/// names it. A member restarting inside its session holds such a chain
+/// before GLOBAL has executed any of it, or while GLOBAL's executed tip lies
+/// past its head. This only classifies frames this node already stored; it
+/// accepts none.
+pub fn own_session_chain(
+    clock: &dyn ClockStore,
+    session: &Session,
+    checkpoint: &Checkpoint,
+    cursor: u64,
+) -> Result<OwnChain> {
+    let fence = checkpoint.frame;
+    // The clock store holds a shard's frame `n` only as a frame of that
+    // shard at `n`: it refuses to commit any other there.
+    let header = |number: u64| {
+        clock.get_shard_clock_frame(&session.filter, number, false).ok().and_then(|frame| frame.header)
+    };
+    let Some(first) = header(fence + 1).filter(|first| first.parent_selector == session.genesis) else {
+        return Ok(OwnChain::NotOwn);
+    };
+    if session.base_frame != fence {
+        return Ok(OwnChain::Broken(format!(
+            "frame {} names this session's genesis, but the session is based at {}, not at the fence {fence}",
+            fence + 1, session.base_frame,
+        )));
+    }
+    let fenced = header(fence).map(|fenced| quil_crypto::poseidon::hash_bytes_to_32(&fenced.output)).transpose()?;
+    if fenced != Some(checkpoint.digest) {
+        return Ok(OwnChain::Broken(format!("local frame {fence} at the fence is not the fenced frame")));
+    }
+    let past = cursor.saturating_sub(fence);
+    if past > MAX_OWN_CHAIN_FRAMES {
+        return Ok(OwnChain::Unverified(format!(
+            "{past} frames past the fence exceed the {MAX_OWN_CHAIN_FRAMES} this check walks",
+        )));
+    }
+    let mut parent = first;
+    for number in fence + 2..=cursor {
+        let Some(child) = header(number) else {
+            return Ok(OwnChain::Unverified(format!("no local frame {number} below the head {cursor}")));
+        };
+        if !crate::frame_validator::app_frame_links_to_child(&parent, &child) {
+            return Ok(OwnChain::Broken(format!("local frame {number} does not extend frame {}", number - 1)));
+        }
+        parent = child;
+    }
+    Ok(OwnChain::Held)
+}
+
+/// A refusal of a member's frames past a fence: `prefix`, `detail`, and the
+/// shard, session, local head and GLOBAL's executed tip of the session.
+fn fence_refusal(prefix: &str, detail: &str, session: &Session, cursor: u64, tip: Option<u64>) -> QuilError {
+    QuilError::Consensus(format!(
+        "{prefix}: {detail} (filter {}, generation {}, local_head {cursor}, session_tip {})",
+        hex::encode(&session.filter), session.generation,
+        tip.map_or_else(|| "none".to_string(), |tip| tip.to_string()),
+    ))
+}
+
 /// A successor may vote only over the state its sources ended at. For a source
 /// on this same filter the local committed roots at the checkpoint frame must
 /// equal the sealed roots exactly, and the local outgoing history must
@@ -730,6 +867,18 @@ pub fn successor_state_matches(
     clock: &dyn ClockStore,
     session: &Session,
 ) -> Result<()> {
+    successor_state_matches_held(global, shard, clock, session, &mut HeldOwnChain::default())
+}
+
+/// [`successor_state_matches`], reusing the own chain the start's
+/// [`fence_rewind_held`] found.
+pub fn successor_state_matches_held(
+    global: &Arc<HypergraphCrdt>,
+    shard: &Arc<HypergraphCrdt>,
+    clock: &dyn ClockStore,
+    session: &Session,
+    held: &mut HeldOwnChain,
+) -> Result<()> {
     let view = CommittedView::capture(global)?;
     for (source, checkpoint) in effective_origins(&view, session)?.origins {
         if source.filter != session.filter {
@@ -753,21 +902,45 @@ pub fn successor_state_matches(
                 // shard, every member refusing itself at a restart. Otherwise the member executed
                 // predecessor frames the fence discarded.
                 // A member behind that tip (a new joiner synced between the
-                // fence and it) catches up first.
+                // fence and it, or a member restarted while its session ran
+                // on) catches up first. Before GLOBAL has executed any of the
+                // session's frames, a member holding them as the session's
+                // own chain ([`own_session_chain`]) resumes too.
                 let own_tip = handoff::session_tip(&view, &session.id()?)?
                     .filter(|tip| tip.frame > checkpoint.frame);
-                if own_tip.as_ref().is_some_and(|tip| cursor < tip.frame) {
-                    return Err(unavailable("behind this session's executed frames"));
+                let tip = own_tip.as_ref().map(|tip| tip.frame);
+                if let Some(tip) = tip.filter(|tip| cursor < *tip) {
+                    return Err(unavailable(format!(
+                        "behind this session's executed frames (local_head {cursor}, session_tip {tip})",
+                    )));
                 }
                 let executed = own_tip.and_then(|tip| {
                     let frame = clock.get_shard_clock_frame(&session.filter, tip.frame, false).ok()?;
                     let digest = quil_crypto::poseidon::hash_bytes_to_32(&frame.header?.output).ok()?;
                     Some(digest == tip.digest)
                 });
-                if executed != Some(true) {
-                    return Err(QuilError::Consensus(
-                        "local state is past the predecessor's fenced checkpoint".into(),
+                let refusal = match executed {
+                    Some(true) => None,
+                    Some(false) => Some("the local frame at this session's executed tip is not the one GLOBAL executed".to_string()),
+                    None if tip.is_some() => Some("no local frame at this session's executed tip".to_string()),
+                    None => match own_session_chain_held(clock, session, &checkpoint, cursor, held)? {
+                        OwnChain::Held => None,
+                        OwnChain::NotOwn => Some("the frames past it are not this session's, which GLOBAL has not executed".to_string()),
+                        OwnChain::Broken(reason) | OwnChain::Unverified(reason) => Some(reason),
+                    },
+                };
+                if let Some(detail) = refusal {
+                    return Err(fence_refusal(
+                        "local state is past the predecessor's fenced checkpoint", &detail, session, cursor, tip,
                     ));
+                }
+                if first_said("own-frames-past-fence", session, checkpoint.frame) {
+                    tracing::info!(
+                        filter = hex::encode(&session.filter), generation = session.generation,
+                        fence = checkpoint.frame, local_head = cursor,
+                        session_tip = %tip.map_or_else(|| "none".to_string(), |tip| tip.to_string()),
+                        "this session's own frames past its fenced predecessor's checkpoint pass the fence check",
+                    );
                 }
                 continue;
             }
@@ -788,11 +961,16 @@ pub fn successor_state_matches(
                     "local frame at the fence differs from the fenced frame".into(),
                 ));
             }
-            tracing::warn!(
-                filter = hex::encode(&session.filter), generation = session.generation, frame = cursor,
-                "predecessor was fenced after its closing timeout; accepting its checkpoint without \
-                 a certified history root",
-            );
+            // An accepted lifecycle state, not a fault: said once, though a
+            // worker refused later in its start, such as one not seated,
+            // repeats this check every 10 s.
+            if first_said("fenced-predecessor-accepted", session, cursor) {
+                tracing::info!(
+                    filter = hex::encode(&session.filter), generation = session.generation, frame = cursor,
+                    "predecessor was fenced after its closing timeout; accepting its checkpoint without \
+                     a certified history root",
+                );
+            }
             continue;
         }
         if cursor == checkpoint.frame {
@@ -1013,6 +1191,18 @@ pub fn fence_rewind(
     clock: &dyn ClockStore,
     session: &Session,
 ) -> Result<FenceRewind> {
+    fence_rewind_held(global, shard, clock, session, &mut HeldOwnChain::default())
+}
+
+/// [`fence_rewind`], recording in `held` the session's own chain it finds
+/// for the start's later [`successor_state_matches_held`].
+pub fn fence_rewind_held(
+    global: &Arc<HypergraphCrdt>,
+    shard: &Arc<HypergraphCrdt>,
+    clock: &dyn ClockStore,
+    session: &Session,
+    held: &mut HeldOwnChain,
+) -> Result<FenceRewind> {
     let view = CommittedView::capture(global)?;
     for (source, checkpoint) in effective_origins(&view, session)?.origins {
         if source.filter != session.filter || !handoff::is_fenced(&view, &source.id()?)? {
@@ -1090,17 +1280,41 @@ pub fn fence_rewind(
         };
         let fenced = fenced.header.ok_or_else(|| unavailable("fenced frame has no header"))?;
         let header = next.header.ok_or_else(|| unavailable("frame after the fence has no header"))?;
-        if quil_crypto::poseidon::hash_bytes_to_32(&fenced.output)? != checkpoint.digest
-            || !crate::frame_validator::app_frame_links_to_child(&fenced, &header)
-        {
-            return Err(QuilError::Consensus("local frames at the fence differ from the fenced frame".into()));
+        let tip = executed.as_ref().map(|tip| tip.frame);
+        let differ = |detail: String| fence_refusal(FENCE_FRAMES_DIFFER, &detail, session, cursor, tip);
+        let fenced_digest = quil_crypto::poseidon::hash_bytes_to_32(&fenced.output)?;
+        if fenced_digest != checkpoint.digest {
+            return Err(differ(format!(
+                "local frame {} has digest {}, the fenced frame {}",
+                checkpoint.frame, hex::encode(fenced_digest), hex::encode(checkpoint.digest),
+            )));
         }
-        // This session's own first frame also builds on the fence, anchored
-        // at or after the fenced predecessor's.
+        // This session's own frames past the fence, before GLOBAL has
+        // executed any or while its executed tip lies past this head, are no
+        // predecessor's: kept ([`own_session_chain`]). Its frame at the
+        // executed tip differing from GLOBAL's is refused. Too few of its
+        // frames to verify, behind the executed tip, are left for the
+        // successor check, which asks the shard sync for them.
+        let behind = tip.is_some_and(|tip| tip > cursor);
+        match own_session_chain_held(clock, session, &checkpoint, cursor, held)? {
+            OwnChain::Held if at_tip.is_none() => return Ok(FenceRewind::Untouched),
+            OwnChain::Held => {
+                return Err(differ("this session's local frame at its executed tip is not the one GLOBAL executed".into()));
+            }
+            OwnChain::Unverified(_) if behind => return Ok(FenceRewind::Untouched),
+            OwnChain::Broken(reason) | OwnChain::Unverified(reason) => return Err(differ(reason)),
+            OwnChain::NotOwn => {}
+        }
+        if !crate::frame_validator::app_frame_links_to_child(&fenced, &header) {
+            return Err(differ(format!(
+                "local frame {} names parent {}, neither the fenced frame nor this session's genesis {}",
+                header.frame_number, hex::encode(&header.parent_selector), hex::encode(session.genesis),
+            )));
+        }
+        // A frame that extends the fenced frame is the fenced session's,
+        // whenever it anchors: this session's first frame names its genesis
+        // instead. GLOBAL discarded every frame past the fence.
         let requested = requested_at()?.ok_or_else(|| unavailable("fenced predecessor has no closing request"))?;
-        if header.global_frame_number >= schedule::fence_due_frame(requested) {
-            return Ok(FenceRewind::Untouched);
-        }
         let roots: [[u8; 32]; 4] = header.state_roots.iter()
             .map(|root| <[u8; 32]>::try_from(root.as_slice()).ok())
             .collect::<Option<Vec<_>>>()
@@ -2045,13 +2259,13 @@ mod successor_tests {
         successor_state_matches(&global, &shard, &clock, &successor).unwrap();
         assert_eq!(rewind_past_fence(&global, &shard, &clock, &successor).unwrap(), None, "once");
 
-        // The successor's own first frame builds on the fence too. It anchors
-        // at or after the fence, before GLOBAL has executed it, and stays.
+        // The successor's own first frame names the session's genesis, not
+        // the fenced frame. Before GLOBAL has executed it, it stays.
         shard.add_vertex(&at(4), b"the successor's own").unwrap();
         shard.commit_with_frame_cursor_and_records(4, &cursor_key, &outflow_records(&filter, 4)).unwrap();
         store_frame(quil_types::proto::global::FrameHeader {
             address: filter.clone(), frame_number: 4, rank: 7, output: vec![0x55; 32],
-            parent_selector: fenced_digest.to_vec(), global_frame_number: due,
+            parent_selector: successor.genesis.to_vec(), global_frame_number: due,
             state_roots: fenced_roots.iter().map(|root| root.to_vec()).collect(),
             ..Default::default()
         });
@@ -2187,13 +2401,13 @@ mod successor_tests {
     }
 
     // From the early fence frame GLOBAL fences one epoch after the closing
-    // request, and the rewind dates the fence by the same rule
-    // (`schedule::fence_due_frame`): a frame past the fence anchored the
-    // frame before it is the predecessor's and is discarded, and the
-    // successor's own first frame, anchored at the fence, stays. Dated four
-    // epochs late, the rewind would discard the successor's own frame.
+    // request (`schedule::fence_due_frame`). A frame past the fence that
+    // extends the fenced frame is the predecessor's and is discarded, here
+    // one anchored the frame before the fence; the successor's own first
+    // frame names the session's genesis and stays. The anchor does not tell
+    // them apart (`a_frame_extending_the_fence_is_rewound_however_late_it_anchors`).
     #[test]
-    fn a_rewind_dates_an_early_fence_as_global_does() {
+    fn an_early_fence_rewinds_the_predecessors_frame_and_keeps_the_sessions_own() {
         handoff::set_early_fence_frame_for_thread(Some(0));
         let due = 3 + quil_types::consensus::epoch_length_frames();
         assert_eq!(schedule::fence_due_frame(3), due);
@@ -2206,16 +2420,18 @@ mod successor_tests {
         };
         store_header(&past.clock, header(6, 0x44, due - 1));
         assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), Some(3),
-            "anchored before the fence: the predecessor's");
+            "extends the fenced frame: the predecessor's");
         assert_eq!(past.cursor(), 3);
 
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
         let own = quil_hypergraph::Location { app_address: [0x02; 32], data_address: [4; 32] };
         past.shard.add_vertex(&own, b"the successor's own").unwrap();
         past.shard.commit_with_frame_cursor_and_records(4, &cursor_key, &outflow_records(&past.filter, 4)).unwrap();
-        store_header(&past.clock, header(7, 0x55, due));
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            parent_selector: past.successor.genesis.to_vec(), ..header(7, 0x55, due)
+        });
         assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), None,
-            "anchored at the fence: the successor's own");
+            "names the session's genesis: the successor's own");
         assert_eq!(past.cursor(), 4);
         assert_eq!(past.shard.get_vertex_data(&own), Some(b"the successor's own".to_vec()));
         handoff::set_early_fence_frame_for_thread(None);
@@ -2236,6 +2452,279 @@ mod successor_tests {
         assert_eq!(past.cursor(), 4);
         assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_ok());
         successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    /// The successor's own frames 4 through `through` past the fence at 3,
+    /// anchored at the fence, materialized through the last: the first names
+    /// the session's genesis, as a session's first frame does, and frame `n`
+    /// has output `0x50 | n`.
+    fn own_frames(past: &PastFence, through: u64) {
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        let mut parent = past.successor.genesis;
+        for number in 4..=through {
+            let output = vec![0x50 | number as u8; 32];
+            store_header(&past.clock, quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(), frame_number: number, rank: number, output: output.clone(),
+                parent_selector: parent.to_vec(), global_frame_number: past.due, ..Default::default()
+            });
+            parent = quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap();
+        }
+        past.shard.commit_with_frame_cursor_and_records(through, &cursor_key, &outflow_records(&past.filter, through)).unwrap();
+    }
+
+    /// GLOBAL executes the successor through frame `frame`, whose output is `output`.
+    fn execute_successor_through(past: &PastFence, frame: u64, output: u8) {
+        handoff::record_session_tip(&past.state, past.due + 1, &past.successor.id().unwrap(), &Checkpoint {
+            frame, view: 9, digest: quil_crypto::poseidon::hash_bytes_to_32(&[output; 32]).unwrap(),
+            state_roots: [[3; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(&past.global, &past.state, past.due + 1);
+    }
+
+    /// The fenced checkpoint the successor is based at.
+    fn fence_of(past: &PastFence) -> Checkpoint {
+        let view = CommittedView::capture(&past.global).unwrap();
+        effective_origins(&view, &past.successor).unwrap().origins.remove(0).1
+    }
+
+    // A member restarted inside its session before GLOBAL executed any of
+    // the session's frames holds them past the fence. Its first frame names
+    // the session's genesis, not the fenced frame: it is no predecessor's
+    // and resumes, unrewound. Refused before as frames that "differ from the
+    // fenced frame", the member stayed blocked for its whole session.
+    #[test]
+    fn a_member_restarted_inside_its_session_before_global_executed_it_resumes() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        own_frames(&past, 5);
+        let roots = past.shard.capture_committed_shard(&past.filter).unwrap().roots;
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), None);
+        assert_eq!(past.shard.capture_committed_shard(&past.filter).unwrap().roots, roots);
+        assert_eq!(past.cursor(), 5);
+        assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_ok(), "its own frames stay");
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // A member restarted while its session ran on lies behind GLOBAL's
+    // executed tip of the session. It is told to catch up, which requests
+    // the shard sync, instead of being refused on its own frames, which
+    // requested nothing. Caught up, it resumes.
+    #[test]
+    fn a_member_restarted_behind_its_sessions_executed_tip_catches_up() {
+        let past = past_fence();
+        own_frames(&past, 5);
+        execute_successor_through(&past, 7, 0x57);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(past.cursor(), 5);
+        let error = successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+        assert!(matches!(error, QuilError::ExecutionUnavailable(_)) && error.to_string().contains("behind this session"),
+            "{error}");
+
+        own_frames(&past, 7);
+        assert!(matches!(fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+    }
+
+    // A frame past the fence that extends the fenced frame is the fenced
+    // session's, however late it anchors: GLOBAL discarded every frame past
+    // the fence, and this session's own first frame names its genesis. Kept
+    // when anchored at or after the fence, it left the member refused on it
+    // for good, never rewound or re-anchored.
+    #[test]
+    fn a_frame_extending_the_fence_is_rewound_however_late_it_anchors() {
+        use quil_types::store::ClockStore as _;
+        for late in [0, 5] {
+            let past = past_fence();
+            store_header(&past.clock, quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(), frame_number: 4, rank: 6, output: vec![0x44; 32],
+                parent_selector: past.fenced_digest.to_vec(), global_frame_number: past.due + late,
+                state_roots: past.fenced_roots.iter().map(|root| root.to_vec()).collect(),
+                ..Default::default()
+            });
+            assert_eq!(rewind_past_fence(&past.global, &past.shard, &past.clock, &past.successor).unwrap(), Some(3),
+                "anchored {late} frames after the fence");
+            assert_eq!(past.cursor(), 3);
+            assert!(past.clock.get_shard_clock_frame(&past.filter, 4, false).is_err(), "the discarded frame is deleted");
+            successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        }
+    }
+
+    // A member behind its session's executed tip with a hole in its own
+    // frames cannot verify them, and is asked to sync instead of being
+    // refused on them. Without an executed tip past its head it stays
+    // refused.
+    #[test]
+    fn a_hole_in_the_own_frames_behind_the_executed_tip_asks_for_a_sync() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        own_frames(&past, 6);
+        past.clock.delete_shard_clock_frame_range(&past.filter, 5, 6).unwrap();
+        let error = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+        assert!(error.to_string().contains("differ from the fenced frame"), "{error}");
+        execute_successor_through(&past, 9, 0x59);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(past.cursor(), 6);
+        let error = successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+        assert!(matches!(error, QuilError::ExecutionUnavailable(_)) && error.to_string().contains("behind this session"),
+            "{error}");
+    }
+
+    // Frames past the fence that are not the session's own chain stay
+    // refused: a frame after the fence naming neither the fenced frame nor
+    // the session's genesis, own frames over a frame at the fence that is not
+    // the fenced one, own frames broken by a frame that does not extend the
+    // one before it, and own frames whose frame at GLOBAL's executed tip is
+    // not the one GLOBAL executed.
+    #[test]
+    fn frames_past_a_fence_that_are_not_the_sessions_own_chain_stay_refused() {
+        let refused = |past: &PastFence, case: &str| {
+            let error = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+            assert!(error.to_string().contains("differ from the fenced frame"), "{case}: {error}");
+            let error = successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err();
+            assert!(error.to_string().contains("past the predecessor's fenced checkpoint"), "{case}: {error}");
+        };
+        let past = past_fence();
+        own_frames(&past, 5);
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 4, rank: 6, output: vec![0x54; 32],
+            parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
+        });
+        refused(&past, "neither parent");
+
+        let past = past_fence();
+        own_frames(&past, 5);
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 3, rank: 5, output: vec![0x34; 32], ..Default::default()
+        });
+        refused(&past, "another frame at the fence");
+
+        let past = past_fence();
+        own_frames(&past, 6);
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 5, rank: 5, output: vec![0x55; 32],
+            parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
+        });
+        refused(&past, "a frame that does not extend its parent");
+
+        let past = past_fence();
+        own_frames(&past, 5);
+        execute_successor_through(&past, 5, 0x66);
+        refused(&past, "another frame at the executed tip");
+    }
+
+    // The own-chain check names why frames past a fence are not the
+    // session's own, and walks a bounded number of them.
+    #[test]
+    fn the_own_chain_check_names_why_frames_are_not_the_sessions() {
+        let past = past_fence();
+        let fence = fence_of(&past);
+        assert_eq!(own_session_chain(&past.clock, &past.successor, &fence, 4).unwrap(), OwnChain::NotOwn,
+            "the predecessor's discarded frame names the fenced frame");
+        own_frames(&past, 6);
+        assert_eq!(own_session_chain(&past.clock, &past.successor, &fence, 6).unwrap(), OwnChain::Held);
+        match own_session_chain(&past.clock, &past.successor, &fence, 7).unwrap() {
+            OwnChain::Unverified(reason) => assert!(reason.contains("no local frame 7"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        match own_session_chain(&past.clock, &past.successor, &fence, 3 + MAX_OWN_CHAIN_FRAMES + 1).unwrap() {
+            OwnChain::Unverified(reason) => assert!(reason.contains("exceed"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        let mut elsewhere = past.successor.clone();
+        elsewhere.base_frame = 2;
+        match own_session_chain(&past.clock, &elsewhere, &fence, 6).unwrap() {
+            OwnChain::Broken(reason) => assert!(reason.contains("not at the fence"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        let mut another = past.successor.clone();
+        another.genesis = quil_crypto::poseidon::hash_bytes_to_32(&[0x77; 32]).unwrap();
+        assert_eq!(own_session_chain(&past.clock, &another, &fence, 6).unwrap(), OwnChain::NotOwn,
+            "a frame naming another session's genesis");
+        let mut held = HeldOwnChain::default();
+        assert_eq!(own_session_chain_held(&past.clock, &past.successor, &fence, 6, &mut held).unwrap(), OwnChain::Held);
+        assert_ne!(held, HeldOwnChain::default(), "a held chain is recorded");
+        assert_eq!(own_session_chain_held(&past.clock, &another, &fence, 6, &mut held).unwrap(), OwnChain::NotOwn,
+            "for its own session only");
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 4, rank: 6, output: vec![0x54; 32],
+            parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
+        });
+        let error = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap_err().to_string();
+        assert_eq!(own_session_chain(&past.clock, &past.successor, &fence, 6).unwrap(), OwnChain::NotOwn);
+        for named in [
+            "neither the fenced frame nor this session's genesis".to_string(),
+            format!("filter {}", hex::encode(&past.filter)),
+            format!("generation {}", past.successor.generation),
+            "local_head 6".to_string(),
+            "session_tip none".to_string(),
+        ] {
+            assert!(error.contains(&named), "{named}: {error}");
+        }
+    }
+
+    // A frame of another shard cannot stand as the shard's frame after the
+    // fence, even naming the session's genesis: the clock store refuses to
+    // commit it there, which the own-chain check relies on.
+    #[test]
+    fn a_first_frame_of_another_shard_cannot_stand_after_the_fence() {
+        use quil_types::store::ClockStore as _;
+        let past = past_fence();
+        own_frames(&past, 5);
+        let frame = quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: vec![0x03; 32], frame_number: 4, rank: 4, output: vec![0x54; 32],
+                parent_selector: past.successor.genesis.to_vec(), global_frame_number: past.due, ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let selector = vec![0xf4; 32];
+        let txn = past.clock.new_transaction(false).unwrap();
+        past.clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = past.clock.new_transaction(false).unwrap();
+        assert!(past.clock.commit_shard_clock_frame(&past.filter, 4, &selector, txn.as_ref(), false).is_err());
+        let _ = txn.abort();
+        assert_eq!(own_session_chain(&past.clock, &past.successor, &fence_of(&past), 5).unwrap(), OwnChain::Held,
+            "the session's own frame 4 still stands");
+    }
+
+    // A start at a fenced predecessor's checkpoint says once, at info, that
+    // it accepts the checkpoint, however often the start is retried: it
+    // warned at every 10 s retry of a worker refused later in its start.
+    #[test]
+    fn a_start_at_a_fence_says_once_that_the_predecessor_was_fenced() {
+        let (global, state) = global_state();
+        let filter = vec![0x0c; 32];
+        let (source, _, _) = closing_session(&global, &state, &filter);
+        let clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(clock_db.inner());
+        store_header(&clock, quil_types::proto::global::FrameHeader {
+            address: filter.clone(), frame_number: 3, rank: 5, output: vec![0x33; 32], ..Default::default()
+        });
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&[0x33; 32]).unwrap();
+        handoff::record_session_tip(&state, 4, &source.id().unwrap(),
+            &Checkpoint { frame: 3, view: 5, digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
+        let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        commit(&global, &state, due);
+        let successor = handoff::head(&state, &filter).unwrap().unwrap();
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        let at_fence = crdt();
+        at_fence.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&filter, 3)).unwrap();
+
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        for _ in 0..3 {
+            successor_state_matches(&global, &at_fence, &clock, &successor).unwrap();
+        }
+        let lines = logs.lines_with("predecessor was fenced");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("INFO"), "{lines:?}");
     }
 
     // A member past the fence on the predecessor's discarded frames without
