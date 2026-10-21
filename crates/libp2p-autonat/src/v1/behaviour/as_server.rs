@@ -318,9 +318,9 @@ impl AsServer<'_> {
 
         // Obtain an observed address from non-relayed connections.
         //
-        // Quilibrium-local patch (only delta from upstream libp2p-autonat
-        // 0.15.0): upstream uses `.expect("Peer is connected.")` here, which
-        // panics under a real race — an inbound dial-back request can be
+        // QUILIBRIUM (see PATCHES.md): upstream libp2p-autonat 0.15.0 uses
+        // `.expect("Peer is connected.")` here, which panics under a real
+        // race — an inbound dial-back request can be
         // dispatched on a now-closed connection (`ConnectionClosed` already
         // removed the sender from `self.connected`, but the protocol message
         // was already in flight). The panic kills the whole swarm task, after

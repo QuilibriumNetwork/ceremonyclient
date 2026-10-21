@@ -1,3 +1,5 @@
+mod autonat_health;
+mod autonat_servers;
 pub mod blossomsub_behaviour;
 pub mod direct;
 pub mod ed448_identity;
@@ -5,6 +7,7 @@ pub mod falcon_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
+pub mod external_addr;
 pub mod handler;
 pub mod metrics;
 pub mod node;

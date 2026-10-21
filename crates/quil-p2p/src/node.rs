@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+use crate::autonat_health::{AutonatHealth, ProbeContext, ProbeFailure};
+use crate::external_addr::{ConfirmedExternalAddrs, ExternalAddrTracker};
+
 use quil_config::P2PConfig;
 use quil_types::error::QuilError;
 
@@ -447,9 +450,10 @@ impl P2PNode {
                 // every node to receive and relay ALL global traffic
                 // regardless of role — the root cause of bandwidth
                 // explosion on non-archive clusters.
+                // Probes go to the servers `ProbeServers` registers below.
                 let autonat = libp2p::autonat::Behaviour::new(
                     local_peer_id,
-                    libp2p::autonat::Config::default(),
+                    crate::autonat_servers::autonat_config(),
                 );
 
                 // Hard cap on swarm connections. Without these limits
@@ -562,9 +566,18 @@ impl P2PNode {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(256);
         let peer_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pc_writer = peer_count.clone();
-        let observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
-            std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
-        let observed_addrs_writer = observed_addrs.clone();
+        // The current AutoNAT-confirmed external address of each listener
+        // transport (see `external_addr`), published to the handle.
+        let mut external_tracker =
+            crate::external_addr::ExternalAddrTracker::new(want_tcp, want_quic, is_routable);
+        let (external_tx, external_addrs) =
+            tokio::sync::watch::channel(crate::external_addr::ConfirmedExternalAddrs::default());
+        // AutoNAT's servers: peers that serve it, one per remote IP, and the
+        // configured bootstrap and direct peers.
+        // The listeners bind IPv4 only (see above).
+        let mut probe_servers = crate::autonat_servers::ProbeServers::new(is_routable, true, false);
+        // Operator lines on AutoNAT's status and failing probes.
+        let mut autonat_health = AutonatHealth::new(std::time::Instant::now());
         // P2P prometheus registry: the blossomsub behaviour owns it (its
         // `blossomsub_*` families are registered at construction); add the
         // swarm-level `libp2p_*` connection families alongside, and hand the
@@ -730,6 +743,14 @@ impl P2PNode {
                                             debug!(%e, %dp_peer, "direct peer dial failed");
                                         }
                                     }
+                                    // The configured peers are AutoNAT servers
+                                    // from the start, so the first probe does not
+                                    // wait for identify.
+                                    for (peer, addr) in bootstrap_peers.iter().chain(&direct_peers) {
+                                        let autonat = &mut swarm.behaviour_mut().autonat;
+                                        autonat.add_server(*peer, Some(addr.clone()));
+                                        crate::autonat_servers::apply(autonat, probe_servers.pin(*peer, addr));
+                                    }
                                     // Start Kademlia bootstrap
                                     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                                         debug!(%e, "kad bootstrap failed");
@@ -750,7 +771,11 @@ impl P2PNode {
                                     }
                                 }
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                                crate::autonat_servers::apply(
+                                    &mut swarm.behaviour_mut().autonat,
+                                    probe_servers.on_connection(connection_id, peer_id, endpoint.get_remote_address()),
+                                );
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
                                 swarm_metrics
@@ -760,7 +785,11 @@ impl P2PNode {
                                 swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, peers = count, "peer connected");
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, endpoint, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, endpoint, num_established, .. } => {
+                                crate::autonat_servers::apply(
+                                    &mut swarm.behaviour_mut().autonat,
+                                    probe_servers.on_connection_closed(connection_id, peer_id, num_established),
+                                );
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
                                 swarm_metrics
@@ -779,17 +808,35 @@ impl P2PNode {
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-                                let addr_str = address.to_string();
-                                debug!(%addr_str, "external address confirmed (NAT-observed)");
-                                let mut addrs = observed_addrs_writer.write().unwrap();
-                                if !addrs.contains(&addr_str) {
-                                    addrs.push(addr_str);
-                                }
+                                // AutoNAT's dial-back result. The tracker takes it
+                                // from the probe response below, which names the
+                                // confirming server.
+                                debug!(%address, "external address confirmed (AutoNAT dial-back)");
+                            }
+                            libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
+                                // Nothing emits this today; handled for completeness.
+                                let applied = external_tracker.apply(
+                                    crate::external_addr::ExternalAddrEvent::Expired(&address),
+                                    &swarm.behaviour().autonat.nat_status(),
+                                );
+                                debug!(%address, ?applied, "external address expired");
+                                publish_external(
+                                    &external_tx,
+                                    &mut external_tracker,
+                                    &autonat_health,
+                                    &swarm.behaviour().autonat.nat_status(),
+                                );
                             }
                             libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
                                 NodeBehaviourEvent::Identify(
-                                    libp2p::identify::Event::Received { peer_id, info, .. }
+                                    libp2p::identify::Event::Received { connection_id, peer_id, info, .. }
                                 ) => {
+                                    let serves_autonat =
+                                        info.protocols.contains(&libp2p::autonat::DEFAULT_PROTOCOL_NAME);
+                                    crate::autonat_servers::apply(
+                                        &mut swarm.behaviour_mut().autonat,
+                                        probe_servers.on_identify(connection_id, peer_id, serves_autonat),
+                                    );
                                     let proto_list: Vec<String> = info.protocols.iter()
                                         .map(|p| p.to_string()).collect();
                                     let routable: Vec<&Multiaddr> = info.listen_addrs.iter()
@@ -924,6 +971,62 @@ impl P2PNode {
                                         }
                                         _ => {}
                                     }
+                                }
+                                NodeBehaviourEvent::Autonat(libp2p::autonat::Event::OutboundProbe(probe)) => {
+                                    use crate::external_addr::ExternalAddrEvent;
+                                    use libp2p::autonat::OutboundProbeEvent;
+                                    let now = std::time::Instant::now();
+                                    let (event, notice) = match &probe {
+                                        // Sent, not finished.
+                                        OutboundProbeEvent::Request { .. } => (None, None),
+                                        OutboundProbeEvent::Response { peer, address, .. } => {
+                                            let server = crate::external_addr::ProbeServer {
+                                                peer: *peer,
+                                                ip: probe_servers.ip_of_server(peer),
+                                            };
+                                            (
+                                                Some(ExternalAddrEvent::Probe(Some((address, server)))),
+                                                autonat_health.on_success(now),
+                                            )
+                                        }
+                                        OutboundProbeEvent::Error { peer, error, .. } => {
+                                            let server_ip = peer.as_ref().and_then(|p| probe_servers.ip_of_server(p));
+                                            (
+                                                Some(ExternalAddrEvent::Probe(None)),
+                                                autonat_health.on_failure(ProbeFailure::of(error), server_ip, now),
+                                            )
+                                        }
+                                    };
+                                    if let Some(event) = event {
+                                        // The status already reflects this probe.
+                                        let nat = swarm.behaviour().autonat.nat_status();
+                                        let applied = external_tracker.apply(event, &nat);
+                                        debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
+                                        publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
+                                        let owed = autonat_health.flush_status(&nat, now);
+                                        for notice in owed.iter().chain(&notice) {
+                                            crate::autonat_health::log(
+                                                notice,
+                                                &probe_context(&swarm.behaviour().autonat, &probe_servers),
+                                            );
+                                        }
+                                    }
+                                }
+                                NodeBehaviourEvent::Autonat(
+                                    libp2p::autonat::Event::StatusChanged { old, new }
+                                ) => {
+                                    let applied = external_tracker
+                                        .apply(crate::external_addr::ExternalAddrEvent::StatusChanged, &new);
+                                    debug!(?old, ?new, ?applied, "AutoNAT status changed");
+                                    if let Some(notice) =
+                                        autonat_health.on_status_changed(&new, std::time::Instant::now())
+                                    {
+                                        crate::autonat_health::log(
+                                            &notice,
+                                            &probe_context(&swarm.behaviour().autonat, &probe_servers),
+                                        );
+                                    }
+                                    publish_external(&external_tx, &mut external_tracker, &autonat_health, &new);
                                 }
                                 NodeBehaviourEvent::Direct(event) => {
                                     use crate::direct::DirectOutcome;
@@ -1159,7 +1262,7 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry, direct_stats },
+            P2PHandle { peer_id, cmd_tx, external_addrs, peer_count, metrics_registry, direct_stats },
             msg_rx,
         ))
     }
@@ -1169,8 +1272,9 @@ impl P2PNode {
 pub struct P2PHandle {
     pub peer_id: PeerId,
     cmd_tx: mpsc::Sender<P2PCommand>,
-    /// External addresses observed by the identify protocol (NAT-resolved).
-    observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    /// The current AutoNAT-confirmed external addresses, kept by the swarm
+    /// event loop.
+    external_addrs: tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs>,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
@@ -1532,10 +1636,18 @@ impl P2PHandle {
         self.direct_stats.snapshot()
     }
 
-    /// Externally observed addresses (NAT-resolved) as reported by
-    /// connected peers via the identify protocol.
+    /// The node's current AutoNAT-confirmed external addresses: at most one
+    /// per listener transport, most recently accepted first, globally
+    /// routable and on a listen port (see [`crate::external_addr`]).
     pub fn observed_addresses(&self) -> Vec<String> {
-        self.observed_addrs.read().unwrap().clone()
+        self.external_addrs.borrow().addrs.clone()
+    }
+
+    /// Follow changes to [`observed_addresses`](Self::observed_addresses).
+    pub fn watch_external_addresses(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs> {
+        self.external_addrs.clone()
     }
 
     /// Construct a stub `P2PHandle` for tests that exercise callers of
@@ -1565,7 +1677,7 @@ impl P2PHandle {
         Self {
             peer_id,
             cmd_tx,
-            observed_addrs: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            external_addrs: tokio::sync::watch::channel(Default::default()).1,
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
@@ -1669,12 +1781,46 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
+/// Publish the confirmed addresses with AutoNAT's current view, when either
+/// changed, and log the tracker's pending-move lines.
+fn publish_external(
+    tx: &tokio::sync::watch::Sender<ConfirmedExternalAddrs>,
+    tracker: &mut ExternalAddrTracker,
+    health: &AutonatHealth,
+    nat: &libp2p::autonat::NatStatus,
+) {
+    for notice in tracker.pending_notices(std::time::Instant::now()) {
+        crate::external_addr::log_pending(&notice);
+    }
+    let next = ConfirmedExternalAddrs { autonat: health.summary(nat), ..tracker.snapshot() };
+    tx.send_if_modified(|current| {
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    });
+}
+
+/// AutoNAT's server and request state for an operator line.
+fn probe_context(
+    autonat: &libp2p::autonat::Behaviour,
+    servers: &crate::autonat_servers::ProbeServers,
+) -> ProbeContext {
+    ProbeContext {
+        eligible_servers: autonat.eligible_servers(),
+        servers: servers.count(),
+        addresses_sent: autonat.last_probe_addresses().len(),
+        confidence: autonat.confidence(),
+    }
+}
+
 /// Returns `true` if the multiaddr's IP component is publicly routable
 /// (not loopback, link-local, or private). Identify shares all listen
 /// addresses including localhost/private — we must drop those before adding
 /// them to Kademlia/dial, otherwise we generate thousands of useless dials
 /// against our own machine and rate-limit ourselves out of the network.
-fn is_routable(addr: &Multiaddr) -> bool {
+pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
     use std::net::{Ipv4Addr, Ipv6Addr};
     for proto in addr.iter() {
         match proto {
