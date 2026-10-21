@@ -71,7 +71,7 @@ const FRAME_CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(60
 /// A channel's I/O runs on the runtime that dialed it, and each in-process
 /// worker has its own single-threaded runtime, so one worker's reads never
 /// wait on another's.
-type FrameClientKey = (std::thread::ThreadId, String);
+pub(crate) type FrameClientKey = (std::thread::ThreadId, String);
 
 struct FrameClient<C> {
     id: u64,
@@ -80,22 +80,22 @@ struct FrameClient<C> {
     used: std::time::Instant,
 }
 
-/// Shard frame read connections, one per key and identity: a replay batch
-/// reads frame by frame, and each new connection costs the archive a
-/// PQNoise handshake.
-struct FrameClients<C> {
+/// Archive read connections, one per key and identity, for shard frames
+/// and historical proofs: a replay batch reads frame by frame, and each
+/// new connection costs the archive a PQNoise handshake.
+pub(crate) struct FrameClients<C> {
     next_id: u64,
     entries: std::collections::HashMap<FrameClientKey, FrameClient<C>>,
 }
 
 impl<C: Clone> FrameClients<C> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next_id: 0, entries: Default::default() }
     }
 
     /// The connection for `key` under `signing_key`, if used within the idle
     /// window. Every idle connection is dropped first.
-    fn get(&mut self, key: &FrameClientKey, signing_key: &[u8], now: std::time::Instant) -> Option<C> {
+    pub(crate) fn get(&mut self, key: &FrameClientKey, signing_key: &[u8], now: std::time::Instant) -> Option<C> {
         self.entries.retain(|_, cached| now.saturating_duration_since(cached.used) < FRAME_CLIENT_IDLE);
         let cached = self.entries.get_mut(key).filter(|cached| cached.signing_key == signing_key)?;
         cached.used = now;
@@ -103,14 +103,14 @@ impl<C: Clone> FrameClients<C> {
     }
 
     /// Keep `client` for `key`; its id names it to [`Self::reap`].
-    fn insert(&mut self, key: FrameClientKey, signing_key: &[u8], client: C, now: std::time::Instant) -> u64 {
+    pub(crate) fn insert(&mut self, key: FrameClientKey, signing_key: &[u8], client: C, now: std::time::Instant) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.entries.insert(key, FrameClient { id, signing_key: signing_key.to_vec(), client, used: now });
         id
     }
 
-    fn evict(&mut self, key: &FrameClientKey) {
+    pub(crate) fn evict(&mut self, key: &FrameClientKey) {
         self.entries.remove(key);
     }
 
@@ -126,19 +126,24 @@ impl<C: Clone> FrameClients<C> {
     }
 }
 
-static FRAME_CLIENTS: std::sync::LazyLock<std::sync::Mutex<FrameClients<ArchiveClient>>> =
+pub(crate) static FRAME_CLIENTS: std::sync::LazyLock<std::sync::Mutex<FrameClients<ArchiveClient>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(FrameClients::new()));
 
 fn frame_clients() -> std::sync::MutexGuard<'static, FrameClients<ArchiveClient>> {
     FRAME_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Close connection `id` of `key` once it has been idle, on the runtime
-/// that runs its I/O, so an idle channel does not keep pinging the archive.
-async fn reap_frame_client(key: FrameClientKey, id: u64) {
+/// Close connection `id` of `key` in `clients` once it has been idle, on
+/// the runtime that runs its I/O, so an idle channel does not keep pinging
+/// the archive.
+pub(crate) async fn reap_frame_client<C: Clone>(
+    clients: &'static std::sync::Mutex<FrameClients<C>>,
+    key: FrameClientKey,
+    id: u64,
+) {
     loop {
         tokio::time::sleep(FRAME_CLIENT_IDLE).await;
-        if frame_clients().reap(&key, id, std::time::Instant::now()) {
+        if clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reap(&key, id, std::time::Instant::now()) {
             return;
         }
     }
@@ -146,7 +151,7 @@ async fn reap_frame_client(key: FrameClientKey, id: u64) {
 
 /// Whether a failed read leaves its connection unusable. A busy or
 /// refusing archive answered over a working connection: keep it.
-fn read_breaks_connection(error: &quil_rpc::ArchiveClientError) -> bool {
+pub(crate) fn read_breaks_connection(error: &quil_rpc::ArchiveClientError) -> bool {
     use tonic::Code;
     match error {
         quil_rpc::ArchiveClientError::Rpc(status) => matches!(
@@ -502,7 +507,7 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
                         .await
                         .map_err(|e| (QuilError::Internal(format!("archive connect: {e}")), true))?;
                     let id = frame_clients().insert(key.clone(), &self.falcon_signing_key, client.clone(), std::time::Instant::now());
-                    tokio::spawn(reap_frame_client(key.clone(), id));
+                    tokio::spawn(reap_frame_client(&FRAME_CLIENTS, key.clone(), id));
                     client
                 }
             };
