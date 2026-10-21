@@ -1676,7 +1676,10 @@ pub(crate) async fn start(
             state
         } else {
             let lifecycle = prover_lifecycle.clone();
-            state.with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
+            let clock = clock_store.clone();
+            state
+                .with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
+                .with_request_retention(Arc::new(move || clock.global_requests_retained_from()))
         };
         let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {

@@ -15,7 +15,9 @@
 //! state into a [`Snapshot`] after each advance; the handlers only read the
 //! latest one. Responses name both the head and `indexed_through`, so index
 //! lag is told apart from network lag. Windows are counted in GLOBAL frames;
-//! seconds follow from the median frame interval.
+//! seconds follow from the median frame interval. Every
+//! [`history::ROW_FRAMES`] frames the task also records a history row
+//! (see [`history`]).
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -31,8 +33,10 @@ use quil_types::store::{ClockStore, RequestOutcome, RequestStatus};
 
 /// GLOBAL frames the rate counters cover.
 pub const WINDOW_FRAMES: u64 = 240;
-/// GLOBAL frames re-read on start (one epoch); also how long a shard with no
-/// inclusion keeps its last applied app frame.
+/// How long a shard with no inclusion keeps its last applied app frame (one
+/// epoch): an index started this many frames back knows what a continuous
+/// one does. The start re-reads it, a window and up to a history row
+/// (see [`history::live_start`]).
 pub const REBUILD_FRAMES: u64 = quil_types::consensus::EPOCH_LENGTH_FRAMES;
 /// A frame still missing, or still without outcomes while it carries
 /// requests, once GLOBAL has materialized this many frames past it, is
@@ -739,7 +743,7 @@ pub struct WindowInfo {
     pub median_frame_interval_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ClassCounts {
     pub no_data: u64,
     pub producing: u64,
@@ -1110,6 +1114,24 @@ struct Indexer {
     stall: StallTracker,
     sets: crate::handlers::ShardSets,
     last_build: Option<Instant>,
+    /// Created on the first tick after the rebuild.
+    backfill: Option<history::Backfill>,
+}
+
+/// The backfill's plan, logged once.
+struct BackfillPlan {
+    floor_frame: u64,
+    floor: history::Floor,
+    top: Option<u64>,
+}
+
+/// The backfill's totals once it completes.
+struct BackfillDone {
+    rows: u64,
+    frames: u64,
+    busy: Duration,
+    floor_frame: u64,
+    floor: history::Floor,
 }
 
 struct Tick {
@@ -1119,6 +1141,9 @@ struct Tick {
     build: Option<(BuildTimings, u64)>,
     next: u64,
     through: Option<u64>,
+    planned: Option<BackfillPlan>,
+    backfill: Option<history::Step>,
+    backfill_done: Option<BackfillDone>,
 }
 
 impl Indexer {
@@ -1126,24 +1151,89 @@ impl Indexer {
         let rebuild = self.index.is_none();
         let index = self
             .index
-            .get_or_insert_with(|| ProductionIndex::new(head.saturating_sub(REBUILD_FRAMES - 1), Decoders::default()));
+            .get_or_insert_with(|| ProductionIndex::new(history::live_start(head), Decoders::default()));
         let max = if rebuild { u64::MAX } else { MAX_FRAMES_PER_TICK };
         let source = StoreSource(state.clock_store.as_ref());
-        let advance = index.advance(&source, head, max, &mut || materialized_frame(state));
+        // Stop at the next row frame, so the row reads the window there.
+        let target = history::advance_target(index, head);
+        let advance = index.advance(&source, target, max, &mut || materialized_frame(state));
         let stall = self.stall.observe(advance.waiting, head, Instant::now());
         let view_changed = rebuild || advance.indexed > 0 || stall.is_some();
+        let mut view = (advance.indexed > 0).then(|| index.view());
+        let mut row = view.as_ref().and_then(|view| history::row_of(index, view));
         let mut build = None;
         if snapshot_due(view_changed, self.last_build, Instant::now()) {
-            let mut view = index.view();
+            let mut view = view.take().unwrap_or_else(|| index.view());
             view.waiting_frame = self.stall.waiting_frame();
             view.window_complete &= view.waiting_frame.is_none();
             let (report, timings) = crate::handlers::build_production_report(state, head, &view, &mut self.sets);
+            if let Some(row) = row.as_mut() {
+                history::attach_census(row, &report.summary, head);
+            }
             let live = report.summary.live_shards;
             *state.production_snapshot.write() = Some(Arc::new(Snapshot::new(report)));
             self.last_build = Some(Instant::now());
             build = Some((timings, live));
         }
-        Tick { rebuild, advance, stall, build, next: index.next_frame(), through: index.indexed_through() }
+        if let Some(row) = row {
+            state.production_history.write().insert(row);
+        }
+        let (mut planned, mut backfill, mut backfill_done) = (None, None, None);
+        if !rebuild {
+            if self.backfill.is_none() {
+                let earliest = match state.clock_store.get_earliest_global_clock_frame() {
+                    Ok(frame) => Ok(frame.header.map(|h| h.frame_number)),
+                    Err(QuilError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(e),
+                };
+                match earliest {
+                    Ok(earliest) => {
+                        let retained = state.requests_retained_from.as_ref().and_then(|f| f());
+                        let plan =
+                            history::Backfill::new(history::first_exact_row(index), earliest, retained, Decoders::default());
+                        let (floor_frame, floor) = plan.floor();
+                        planned = Some(BackfillPlan { floor_frame, floor, top: plan.top() });
+                        state.production_history.write().set_backfill(plan.state());
+                        self.backfill = Some(plan);
+                    }
+                    Err(e) => {
+                        backfill = Some(history::Step { error: Some(e.to_string()), ..Default::default() });
+                    }
+                }
+            }
+            if let Some(plan) = self.backfill.as_mut().filter(|plan| !plan.is_done()) {
+                let budget = history::budget(advance.indexed);
+                if budget > 0 {
+                    let step =
+                        plan.step(&source, budget, &mut || materialized_frame(state), &state.production_history);
+                    if step.completed || step.segment.is_some() {
+                        state.production_history.write().set_backfill(plan.state());
+                    }
+                    if step.completed {
+                        let (floor_frame, floor) = plan.floor();
+                        backfill_done = Some(BackfillDone {
+                            rows: plan.rows,
+                            frames: plan.frames,
+                            busy: plan.busy,
+                            floor_frame,
+                            floor,
+                        });
+                    }
+                    backfill = Some(step);
+                }
+            }
+        }
+        Tick {
+            rebuild,
+            advance,
+            stall,
+            build,
+            next: index.next_frame(),
+            through: index.indexed_through(),
+            planned,
+            backfill,
+            backfill_done,
+        }
     }
 }
 
@@ -1207,7 +1297,70 @@ impl BuildLog {
     }
 }
 
-fn log_tick(tick: &Tick, head: u64, elapsed: Duration, failing: &mut Option<String>, builds: &mut BuildLog) {
+/// The backfill's plan, segments, completion and blocked reads (on change).
+fn log_backfill(tick: &Tick, blocked: &mut Option<String>) {
+    if let Some(plan) = &tick.planned {
+        let rows = plan.top.map_or(0, |top| (top - plan.floor_frame) / history::ROW_FRAMES + 1);
+        tracing::info!(
+            first_row = plan.floor_frame,
+            last_row = ?plan.top,
+            rows,
+            floor = ?plan.floor,
+            "explorer production history backfill planned: rows below the live index's first row are \
+             recomputed from stored GLOBAL frames and outcomes, newest day first, within the index's \
+             per-tick frame budget",
+        );
+    }
+    let Some(step) = &tick.backfill else { return };
+    if let Some(s) = &step.segment {
+        tracing::info!(
+            first_row = s.lo,
+            last_row = s.hi,
+            rows = s.rows,
+            frames = s.frames,
+            missing = s.missing,
+            outcome_less = s.outcome_less,
+            busy_ms = ms(s.busy),
+            "explorer production history backfilled a segment",
+        );
+    }
+    if let Some(done) = &tick.backfill_done {
+        tracing::info!(
+            rows = done.rows,
+            frames = done.frames,
+            busy_ms = ms(done.busy),
+            first_row = done.floor_frame,
+            floor = ?done.floor,
+            "explorer production history backfill complete",
+        );
+    }
+    let now = match (&step.error, step.waiting) {
+        (Some(e), _) => Some(format!("cannot read: {e}")),
+        (None, Some(frame)) => Some(format!("waits for frame {frame} to be stored or materialized")),
+        (None, None) => None,
+    };
+    match (&now, &*blocked) {
+        (Some(reason), previous) if previous.as_ref() != Some(reason) => tracing::warn!(
+            frame = ?step.frame,
+            reason = %reason,
+            "explorer production history backfill is blocked at a GLOBAL frame; retrying every tick \
+             (the live index and /shards/production are unaffected)",
+        ),
+        (None, Some(_)) => tracing::info!("explorer production history backfill moves again"),
+        _ => {}
+    }
+    *blocked = now;
+}
+
+fn log_tick(
+    tick: &Tick,
+    head: u64,
+    elapsed: Duration,
+    failing: &mut Option<String>,
+    blocked: &mut Option<String>,
+    builds: &mut BuildLog,
+) {
+    log_backfill(tick, blocked);
     let advance = &tick.advance;
     if tick.rebuild {
         let (build_ms, live_shards, grid_source) =
@@ -1283,8 +1436,9 @@ fn log_tick(tick: &Tick, head: u64, elapsed: Duration, failing: &mut Option<Stri
     }
 }
 
-/// Index new GLOBAL frames every [`TICK`] after rebuilding the last
-/// [`REBUILD_FRAMES`], and rebuild the snapshot the handlers serve. Store
+/// Index new GLOBAL frames every [`TICK`] after rebuilding from
+/// [`history::live_start`], rebuild the snapshot the handlers serve, record
+/// history rows and backfill older ones (see [`history`]). Store
 /// reads and the snapshot build run on blocking workers, so a failed read or
 /// a panic there is logged and retried. Never returns: the caller drops it
 /// on shutdown.
@@ -1293,6 +1447,7 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut indexer: Option<Indexer> = None;
     let mut failing: Option<String> = None;
+    let mut blocked: Option<String> = None;
     let mut builds =
         BuildLog { since: Instant::now(), count: 0, total: Duration::ZERO, max: Duration::ZERO, last_slow: None };
     loop {
@@ -1311,13 +1466,15 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
         .await;
         match result {
             Ok((working, tick)) => {
-                log_tick(&tick, head, started.elapsed(), &mut failing, &mut builds);
+                log_tick(&tick, head, started.elapsed(), &mut failing, &mut blocked, &mut builds);
                 indexer = Some(working);
             }
             Err(e) => tracing::warn!(error = %e, "explorer production index task failed; rebuilding"),
         }
     }
 }
+
+pub mod history;
 
 #[cfg(test)]
 mod tests;
