@@ -614,6 +614,18 @@ pub struct ViewTally {
     pub finalize: usize,
 }
 
+/// Who voted in one recent view ([`Liveness::view_signers`]), by signer
+/// (member) index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewSigners {
+    pub view: u64,
+    /// The signers behind the view's best-supported proposal, as counted by
+    /// [`ViewTally::notarize`].
+    pub notarize: std::collections::BTreeSet<u32>,
+    pub nullify: std::collections::BTreeSet<u32>,
+    pub finalize: std::collections::BTreeSet<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LivenessSnapshot {
     /// Highest view any vote or certificate named.
@@ -631,6 +643,9 @@ pub struct LivenessSnapshot {
     /// Of the last [`LIVENESS_VIEWS`] views, the one whose best proposal had
     /// the most notarize votes.
     pub best: ViewTally,
+    /// Of the last [`LIVENESS_VIEWS`] views, the one with the most nullify
+    /// votes.
+    pub most_nullified: ViewTally,
     /// Messages consensus discarded as invalid, and from how many peers.
     pub blocked: u64,
     pub blocked_peers: usize,
@@ -734,8 +749,22 @@ impl Liveness {
         let tallies = || state.views.iter().map(|(view, votes)| votes.tally(*view));
         snapshot.current = tallies().last().unwrap_or_default();
         snapshot.best = tallies().max_by_key(|tally| (tally.notarize, tally.view)).unwrap_or_default();
+        snapshot.most_nullified = tallies().max_by_key(|tally| (tally.nullify, tally.view)).unwrap_or_default();
         snapshot.blocked_peers = state.blocked.len();
         snapshot
+    }
+
+    /// Who voted in `view` while it is one of the last [`LIVENESS_VIEWS`]
+    /// views; `None` for a view without votes or one that left them.
+    pub fn view_signers(&self, view: u64) -> Option<ViewSigners> {
+        let Ok(state) = self.inner.lock() else { return None };
+        let votes = state.views.get(&view)?;
+        Some(ViewSigners {
+            view,
+            notarize: votes.notarize.values().max_by_key(|signers| signers.len()).cloned().unwrap_or_default(),
+            nullify: votes.nullify.clone(),
+            finalize: votes.finalize.clone(),
+        })
     }
 
     /// Let [`Self::notarized`] read the bodies `store` holds while its host
@@ -1056,6 +1085,7 @@ mod liveness_tests {
         let seen = liveness.snapshot();
         assert_eq!(seen.best, ViewTally { view: 7, notarize: 5, proposals: 2, nullify: 0, finalize: 1 });
         assert_eq!(seen.current, ViewTally { view: 8, notarize: 0, proposals: 0, nullify: 3, finalize: 0 });
+        assert_eq!(seen.most_nullified, seen.current);
         assert_eq!(seen.voters, 8);
         assert_eq!(seen.notarize_votes, 9);
         // Views older than the window leave the tallies and the voter count:
@@ -1064,6 +1094,28 @@ mod liveness_tests {
         let seen = liveness.snapshot();
         assert_eq!(seen.best.notarize, 0);
         assert_eq!(seen.voters, 4);
+    }
+
+    /// A view's signers name the members behind its best-supported proposal
+    /// and its other votes, while the view is recent.
+    #[test]
+    fn view_signers_name_the_members_behind_the_best_proposal() {
+        let liveness = Liveness::default();
+        assert_eq!(liveness.view_signers(7), None, "no votes");
+        for signer in [0, 2, 3] {
+            liveness.notarize(7, signer, [1; 32]);
+        }
+        liveness.notarize(7, 4, [2; 32]);
+        liveness.nullify(7, 4);
+        liveness.nullify(7, 5);
+        liveness.finalize(7, 0);
+        let set = |signers: &[u32]| signers.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            liveness.view_signers(7),
+            Some(ViewSigners { view: 7, notarize: set(&[0, 2, 3]), nullify: set(&[4, 5]), finalize: set(&[0]) }),
+        );
+        liveness.nullify(7 + LIVENESS_VIEWS, 1);
+        assert_eq!(liveness.view_signers(7), None, "left the recent views");
     }
 
     /// Each step ends once per view under the last reason noted for it, and
