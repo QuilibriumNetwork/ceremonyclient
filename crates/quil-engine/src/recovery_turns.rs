@@ -3,7 +3,8 @@
 //! read slots; a few recover at a time rather than all failing busy
 //! together. Turns go in arrival order, except that a worker whose successor
 //! session cannot start until its recovery lands goes first: it reorders the
-//! queue and adds no concurrent recovery.
+//! queue and adds no concurrent recovery. It also keeps its turn for further
+//! replay batches, for at most [`BLOCKED_TURN_BUDGET`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,15 @@ pub(crate) const RECOVERY_TURNS: usize = 2;
 /// blocked.
 const PRIORITY_RUN: usize = 2;
 
+/// How long a blocked successor keeps its turn, replaying batch after batch
+/// while it stays blocked. Its session cannot start until the replay reaches
+/// the predecessor's seal; handing the turn back after each batch re-queued
+/// it behind every waiter, and with 90 to 180 waiting a turn came round every
+/// 1.5 to 3 hours for 32 frames while its shard advanced 30 to 50 an hour.
+/// Holding the turn adds no concurrent archive reads; it delays the waiters
+/// by at most this, plus the batch running when it runs out.
+pub(crate) const BLOCKED_TURN_BUDGET: Duration = Duration::from_secs(5 * 60);
+
 /// How long a worker waits for a turn before the queue counts as saturated.
 const SATURATED_AFTER: Duration = Duration::from_secs(60);
 
@@ -30,6 +40,13 @@ const SATURATED_REPEAT: Duration = Duration::from_secs(10 * 60);
 const SATURATION_TICK: Duration = Duration::from_secs(60);
 
 pub(crate) static SHARD_RECOVERY_TURNS: RecoveryTurns = RecoveryTurns::new(RECOVERY_TURNS);
+
+/// Whether a turn held for `held` replays another batch: only while the
+/// holder's successor-blocked flag (`None`: a recovery holding no turn) is
+/// set, and within [`BLOCKED_TURN_BUDGET`].
+pub(crate) fn holds_turn(blocked: Option<&AtomicBool>, held: Duration) -> bool {
+    held < BLOCKED_TURN_BUDGET && blocked.is_some_and(|blocked| blocked.load(Ordering::Relaxed))
+}
 
 /// A queued worker; `blocked` is its successor-blocked flag, read when a
 /// turn is granted rather than when it queued.
@@ -312,6 +329,19 @@ mod tests {
         }
         let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
         assert_eq!(order, ["b1", "b2", "regular", "b3", "b4"]);
+    }
+
+    /// A blocked successor replays further batches in its turn until the
+    /// budget runs out or it is no longer blocked; others hand it back.
+    #[test]
+    fn only_a_blocked_successor_holds_its_turn_and_only_within_the_budget() {
+        let blocked = flag(true);
+        assert!(holds_turn(Some(&*blocked), Duration::ZERO));
+        assert!(holds_turn(Some(&*blocked), BLOCKED_TURN_BUDGET - Duration::from_millis(1)));
+        assert!(!holds_turn(Some(&*blocked), BLOCKED_TURN_BUDGET));
+        blocked.store(false, Ordering::Relaxed);
+        assert!(!holds_turn(Some(&*blocked), Duration::ZERO));
+        assert!(!holds_turn(None, Duration::ZERO));
     }
 
     #[test]

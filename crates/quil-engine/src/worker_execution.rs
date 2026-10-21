@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 
-use crate::prover_tree_syncer::ShardRecoveryProgress;
+use crate::prover_tree_syncer::{ReplayTurn, ShardRecoveryProgress};
 
 tokio::task_local! {
     /// The record of the worker whose archive recovery runs on this task.
@@ -235,9 +235,14 @@ impl SharedWorkerExecution {
         let filter = hex::encode(filter);
         match failure {
             None => {
+                let turn = match &result {
+                    Ok(ShardRecoveryProgress::Replayed { turn, .. }) => *turn,
+                    _ => ReplayTurn::default(),
+                };
                 tracing::info!(%filter, outcome = %ended.last_outcome, source,
                     attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
-                    installed_leaves = ended.attempt_installed_leaves, "archive recovery batch complete");
+                    installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
+                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, "archive recovery batch complete");
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
                         "archive recovery succeeded after a failure streak");

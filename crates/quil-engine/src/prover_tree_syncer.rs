@@ -7,6 +7,9 @@
 //! call `quil-rpc` from `quil-engine` (circular dep), so the trait
 //! lives here and the implementation lives in `quil-node`.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
+
 use async_trait::async_trait;
 use quil_types::error::Result;
 use quil_types::proto::global::AppShardFrame;
@@ -131,12 +134,22 @@ pub enum ReanchorAttempt {
     Elsewhere,
 }
 
+/// One turn's replay: the frames it materialized, the batches they took,
+/// and its time spent on archive requests and on the engine's replay.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayTurn {
+    pub frames: u64,
+    pub batches: u32,
+    pub fetch_ms: u64,
+    pub replay_ms: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ShardRecoveryProgress {
     /// `archive_tip`: the highest tip an archive reported (`None`: none had a
     /// frame of the shard). `committed_tip`: GLOBAL's executed frame of the
     /// session. Materialized below the committed tip is not up to date.
-    Replayed { materialized: u64, archive_tip: Option<u64>, committed_tip: Option<u64> },
+    Replayed { materialized: u64, archive_tip: Option<u64>, committed_tip: Option<u64>, turn: ReplayTurn },
     Anchored { frame: u64 },
     Inherited { pinned: bool },
     NotReady(&'static str),
@@ -150,7 +163,7 @@ impl std::fmt::Display for ShardRecoveryProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tip = |tip: &Option<u64>| tip.map_or_else(|| "none".to_string(), |tip| tip.to_string());
         match self {
-            Self::Replayed { materialized, archive_tip, committed_tip } => write!(f,
+            Self::Replayed { materialized, archive_tip, committed_tip, .. } => write!(f,
                 "replayed to frame {materialized} (archive tip {}, committed tip {})", tip(archive_tip), tip(committed_tip)),
             Self::Anchored { frame } => write!(f, "installed the archive checkpoint at frame {frame}"),
             Self::Inherited { pinned: true } => f.write_str("inherited the origins' sealed state"),
@@ -163,11 +176,17 @@ impl std::fmt::Display for ShardRecoveryProgress {
 /// Common recovery path for thread and separate-process workers. A saved
 /// lineage replays certified bodies; an empty worker fetches and authenticates
 /// the archive checkpoint before tree writes, then waits for actor installation.
+///
+/// `blocked`: the successor-blocked flag of a worker holding a recovery turn
+/// (`None` without one). A turn replays one batch, and while the flag stays
+/// set further batches up to the replay target, within the turn budget
+/// ([`crate::recovery_turns::holds_turn`]).
 pub(crate) async fn recover_shard_from_latest(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: Option<AppShardFrame>,
     target: &dyn ShardRecoveryTarget,
+    blocked: Option<&AtomicBool>,
 ) -> Result<ShardRecoveryProgress> {
     use crate::worker_execution::recovery_phase;
     // No archive extends a head the fence discarded: the local lineage is
@@ -188,11 +207,32 @@ pub(crate) async fn recover_shard_from_latest(
     if let Some(local) = local {
         recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
-        let replay = replay_shard_from_latest(
-            syncer, filter, local, target.materialized(), committed_tip, |frame, child| target.replay(frame, child),
-        ).await?;
+        let (started, from, replay_us) = (Instant::now(), target.materialized(), &AtomicU64::new(0));
+        let (mut materialized, mut batches) = (from, 0);
+        // A batch short of its target replayed all its frames: each frame
+        // advances the replay or fails it.
+        let replay = loop {
+            let replay = replay_shard_from_latest(
+                syncer, filter, local.clone(), materialized, committed_tip, |frame, child| async move {
+                    let at = Instant::now();
+                    let advanced = target.replay(frame, child).await;
+                    replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    advanced
+                },
+            ).await?;
+            batches += 1;
+            if replay.materialized >= replay.target || !crate::recovery_turns::holds_turn(blocked, started.elapsed()) {
+                break replay;
+            }
+            materialized = replay.materialized;
+        };
+        let replay_ms = replay_us.load(Ordering::Relaxed) / 1000;
+        let turn = ReplayTurn {
+            frames: replay.materialized.saturating_sub(from), batches,
+            fetch_ms: (started.elapsed().as_millis() as u64).saturating_sub(replay_ms), replay_ms,
+        };
         return Ok(ShardRecoveryProgress::Replayed {
-            materialized: replay.materialized, archive_tip: replay.archive_tip, committed_tip,
+            materialized: replay.materialized, archive_tip: replay.archive_tip, committed_tip, turn,
         });
     }
     let anchors = target.origin_anchors().await.unwrap_or_else(|error| {
@@ -568,6 +608,9 @@ mod tests {
         cursor: std::sync::atomic::AtomicU64,
         valid: bool,
         install_ok: bool,
+        /// The successor-blocked flag, cleared once frame `unblock_at` replays.
+        blocked: AtomicBool,
+        unblock_at: u64,
     }
     #[async_trait]
     impl ShardRecoveryTarget for Target {
@@ -577,6 +620,7 @@ mod tests {
             assert_eq!(number, self.materialized()+1);
             self.calls.lock().unwrap().push(format!("replay {number}"));
             self.cursor.store(number, std::sync::atomic::Ordering::SeqCst);
+            if number == self.unblock_at { self.blocked.store(false, std::sync::atomic::Ordering::SeqCst); }
             Ok(number)
         }
         async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool> {
@@ -600,8 +644,8 @@ mod tests {
         for (valid, install_ok) in [(true, true), (false, true), (true, false)] {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let archive = Archive { latest:Some(frame(500)), calls:calls.clone() };
-            let target = Target { calls:calls.clone(), cursor:0.into(), valid, install_ok };
-            let result = recover_shard_from_latest(&archive, &[5;32], None, &target).await;
+            let target = Target { calls:calls.clone(), cursor:0.into(), valid, install_ok, blocked:false.into(), unblock_at:0 };
+            let result = recover_shard_from_latest(&archive, &[5;32], None, &target, None).await;
             let mut expected = vec!["fetch 0", "fetch 499", "validate 500"];
             if valid { expected.extend(["sync 244", "install 500"]); }
             assert_eq!(*calls.lock().unwrap(), expected);
@@ -616,12 +660,58 @@ mod tests {
     async fn existing_worker_lineage_replays_instead_of_replacing_its_tree() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest:Some(frame(500)), calls:calls.clone() };
-        let target = Target { calls:calls.clone(), cursor:129.into(), valid:false, install_ok:false };
-        let result = recover_shard_from_latest(&archive, &[5;32], Some(frame(130)), &target).await.unwrap();
-        assert_eq!(result, ShardRecoveryProgress::Replayed { materialized:161, archive_tip:Some(500), committed_tip:None });
+        let target = Target { calls:calls.clone(), cursor:129.into(), valid:false, install_ok:false, blocked:false.into(), unblock_at:0 };
+        let result = recover_shard_from_latest(&archive, &[5;32], Some(frame(130)), &target, None).await.unwrap();
+        let ShardRecoveryProgress::Replayed { materialized, archive_tip, committed_tip, turn } = result else { panic!("expected a replay") };
+        assert_eq!((materialized, archive_tip, committed_tip, turn.frames, turn.batches), (161, Some(500), None, 32, 1));
         let calls = calls.lock().unwrap();
         assert_eq!(calls.iter().filter(|s| s.starts_with("replay ")).count(), 32);
         assert!(!calls.iter().any(|s| s.starts_with("sync ") || s.starts_with("install ")));
+    }
+
+    /// A blocked successor keeps its turn: it replays batch after batch up to
+    /// its target, while any other recovery replays one batch per turn.
+    #[tokio::test]
+    async fn a_blocked_successor_replays_to_its_target_in_one_turn() {
+        for (blocked, expected, batches) in [(Some(true), 200, 3), (Some(false), 161, 1), (None, 161, 1)] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let archive = Archive { latest: Some(frame(200)), calls: calls.clone() };
+            let target = Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
+                blocked: blocked.unwrap_or(false).into(), unblock_at: 0 };
+            let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target,
+                blocked.map(|_| &target.blocked)).await.unwrap();
+            let ShardRecoveryProgress::Replayed { materialized, archive_tip, turn, .. } = result else { panic!("expected a replay") };
+            assert_eq!((materialized, archive_tip, turn.frames, turn.batches), (expected, Some(200), expected - 129, batches), "{blocked:?}");
+            let calls = calls.lock().unwrap();
+            let replayed: Vec<_> = calls.iter().filter(|call| call.starts_with("replay ")).cloned().collect();
+            assert_eq!(replayed, (130..=expected).map(|n| format!("replay {n}")).collect::<Vec<_>>());
+            assert_eq!(calls.iter().filter(|call| *call == "fetch 0").count(), batches as usize, "one tip probe per batch");
+        }
+    }
+
+    /// The turn ends with the batch in which the successor stopped being
+    /// blocked.
+    #[tokio::test]
+    async fn a_successor_no_longer_blocked_hands_its_turn_back_after_the_batch() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
+        let target = Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
+            blocked: true.into(), unblock_at: 170 };
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked)).await.unwrap();
+        let ShardRecoveryProgress::Replayed { materialized, turn, .. } = result else { panic!("expected a replay") };
+        assert_eq!((materialized, turn.frames, turn.batches), (193, 64, 2));
+    }
+
+    /// A failed batch ends a blocked successor's turn with the failure; the
+    /// frames replayed before it stay materialized.
+    #[tokio::test]
+    async fn a_blocked_successors_turn_ends_at_a_failed_batch() {
+        let archive = ChainArchive { missing: Some(170), wrong_shard: false, unsigned_end: 0 };
+        let target = Target { calls: Arc::new(Mutex::new(Vec::new())), cursor: 130.into(), valid: false, install_ok: false,
+            blocked: true.into(), unblock_at: 0 };
+        let error = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked)).await.unwrap_err();
+        assert!(error.to_string().contains("missing shard frame 170"), "{error}");
+        assert_eq!(target.materialized(), 169);
     }
 
     struct Archive {
@@ -1042,7 +1132,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 505 });
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249", "install 505"]);
         assert!(target.failures.lock().unwrap().is_empty());
@@ -1050,7 +1140,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let target = Reanchoring::new(&calls, None, Some(505));
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert!(matches!(result, ShardRecoveryProgress::Replayed { .. }), "{result:?}");
         assert!(calls.lock().unwrap().iter().all(|call| call.starts_with("fetch 0")), "{:?}", calls.lock().unwrap());
     }
@@ -1082,7 +1172,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let frameless = FramelessArchive { calls: Arc::new(Mutex::new(Vec::new())), refuse: None };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&frameless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&frameless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
         assert!(frameless.calls.lock().unwrap().is_empty(), "no tree sync at all");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
@@ -1090,7 +1180,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let stateless = StatelessArchive { calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249"], "never installed");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
@@ -1099,7 +1189,7 @@ mod tests {
         let stateless = StatelessArchive { calls: calls.clone() };
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.valid_through = 504;
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_REFUSED));
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505"], "no tree write");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_REFUSED]);
@@ -1107,7 +1197,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let stateless = StatelessArchive { calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), None);
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_NO_TIP));
         assert!(calls.lock().unwrap().is_empty(), "nothing asked of an archive");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_NO_TIP]);
@@ -1117,7 +1207,7 @@ mod tests {
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.install_fails = true;
-        assert!(recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target).await.is_err());
+        assert!(recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.is_err());
         let failures = target.failures.lock().unwrap();
         assert!(failures.len() == 1 && failures[0].contains("re-anchor installation on this node: "), "{failures:?}");
         drop(failures);
@@ -1129,7 +1219,7 @@ mod tests {
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.elsewhere = true;
         for local in [Some(frame(507)), None] {
-            let result = recover_shard_from_latest(&archive, &[5; 32], local, &target).await.unwrap();
+            let result = recover_shard_from_latest(&archive, &[5; 32], local, &target, None).await.unwrap();
             assert_eq!(result, ShardRecoveryProgress::Deferred(REANCHOR_ELSEWHERE));
         }
         assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
