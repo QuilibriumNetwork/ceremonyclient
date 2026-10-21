@@ -15,16 +15,26 @@ use quil_execution::{
 use quil_store::encoding;
 use quil_types::{
     error::{QuilError, Result},
-    proto::global::FrameHeader,
+    proto::global::{AppShardFrame, FrameHeader},
     store::{ClockStore, SnapshotReadable},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::Arc,
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
-use crate::{app_engine::DeliveryFrameSource, frame_validator::BlsAppFrameValidator};
+use crate::{
+    app_engine::DeliveryFrameSource,
+    frame_validator::{
+        app_frame_links_to_child, validate_archive_replay_chain, BlsAppFrameValidator,
+        MAX_REPLAY_DESCENDANTS,
+    },
+};
 
 const MAX_FRAMES: usize = 8;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -175,11 +185,35 @@ fn header_roots(header: &FrameHeader) -> Result<Roots> {
     Ok(roots)
 }
 
+/// The digest GLOBAL committed for a frame of the shard being recovered
+/// ([`crate::app_handoff::committed_frame_digest`]).
+type CommittedDigest<'a> = &'a (dyn Fn(u64) -> Result<Option<[u8; 32]>> + Sync);
+
+/// Headers one batch keeps authenticated for the frames below them.
+const MAX_AUTHENTICATED: usize = 2 * MAX_REPLAY_DESCENDANTS + MAX_FRAMES;
+/// Frames one batch may ask peers for, runs up to a certified descendant
+/// and second reads of a local frame included.
+const MAX_PEER_FETCHES: usize = 2 * MAX_REPLAY_DESCENDANTS;
+/// How long one batch may spend reading headers: one frame fetched from a
+/// peer and prepared, with margin. The batch checks its 3 s only between
+/// frames, and one frame's run up to a certified descendant can read many.
+const BATCH_BUDGET: Duration = Duration::from_secs(30);
+
 struct Headers<'a> {
     filter: &'a [u8],
+    /// The generation whose history is read, named in refusals.
+    generation: Option<u64>,
     clock: &'a dyn ClockStore,
     validator: &'a BlsAppFrameValidator,
     source: Option<&'a DeliveryFrameSource>,
+    committed: CommittedDigest<'a>,
+    /// Headers this batch authenticated. Recovery reads downward, so each
+    /// one authenticates the frame below it when that frame has no
+    /// certificate of its own.
+    authenticated: Mutex<BTreeMap<u64, FrameHeader>>,
+    /// When this batch stops reading ([`BATCH_BUDGET`]).
+    deadline: Instant,
+    peer_fetches: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -197,21 +231,117 @@ const FRAME_FETCH_BUDGET: Duration = Duration::from_secs(8);
 /// retry tick; the batch still stops after 3 s between frames.
 const FRAME_HISTORY_BUDGET: Duration = Duration::from_secs(17);
 
-#[async_trait::async_trait]
-impl VerifiedHeaders for Headers<'_> {
-    async fn get(&self, number: u64) -> Result<FrameHeader> {
-        let frame = match self.clock.get_shard_clock_frame(self.filter, number, false) {
-            Ok(frame) => frame,
-            Err(QuilError::NotFound(_)) => {
+/// A frame's header without its body, which linked validation never reads.
+fn header_only(header: &FrameHeader) -> AppShardFrame {
+    AppShardFrame {
+        header: Some(header.clone()),
+        requests: Vec::new(),
+        storage_attestation: None,
+    }
+}
+
+fn validate_linked(validator: &BlsAppFrameValidator, frame: &AppShardFrame) -> Result<bool> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validator.validate_linked_without_storage(frame)
+    }))
+    .unwrap_or_else(|_| Err(QuilError::Internal("linked frame validation panicked".into())))
+}
+
+/// Whether `child` names the last frame of `run` as its parent.
+fn extends(run: &[(FrameHeader, bool)], child: &AppShardFrame) -> bool {
+    run.last()
+        .zip(child.header.as_ref())
+        .is_some_and(|((parent, _), child)| app_frame_links_to_child(parent, child))
+}
+
+impl<'a> Headers<'a> {
+    fn new(
+        filter: &'a [u8],
+        generation: Option<u64>,
+        clock: &'a dyn ClockStore,
+        validator: &'a BlsAppFrameValidator,
+        source: Option<&'a DeliveryFrameSource>,
+        committed: CommittedDigest<'a>,
+    ) -> Self {
+        Self {
+            filter,
+            generation,
+            clock,
+            validator,
+            source,
+            committed,
+            authenticated: Mutex::new(BTreeMap::new()),
+            deadline: Instant::now() + BATCH_BUDGET,
+            peer_fetches: AtomicUsize::new(0),
+        }
+    }
+
+    fn known(&self, number: u64) -> Option<FrameHeader> {
+        self.authenticated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&number)
+            .cloned()
+    }
+
+    /// Keep `header` authenticated, dropping the highest others past
+    /// [`MAX_AUTHENTICATED`]: recovery reads downward.
+    fn remember(&self, header: FrameHeader) {
+        let number = header.frame_number;
+        let mut authenticated = self.authenticated.lock().unwrap_or_else(|e| e.into_inner());
+        authenticated.insert(number, header);
+        while authenticated.len() > MAX_AUTHENTICATED {
+            let Some(highest) = authenticated.keys().rev().copied().find(|key| *key != number) else {
+                break;
+            };
+            authenticated.remove(&highest);
+        }
+    }
+
+    /// The time left of this batch's budget for reading frame `number`.
+    fn remaining(&self, number: u64) -> Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(unavailable(format!(
+                "reading historical frame {number} would pass the batch's {} s budget; the next start resumes",
+                BATCH_BUDGET.as_secs(),
+            )));
+        }
+        Ok(left)
+    }
+
+    /// Frame `number` from the local store, or from a peer when the store
+    /// lacks it or `from_peer`, and whether the store supplied it.
+    async fn fetch(&self, number: u64, from_peer: bool) -> Result<(AppShardFrame, bool)> {
+        let stored = if from_peer {
+            None
+        } else {
+            match self.clock.get_shard_clock_frame(self.filter, number, false) {
+                Ok(frame) => Some(frame),
+                Err(QuilError::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let local = stored.is_some();
+        let frame = match stored {
+            Some(frame) => frame,
+            None => {
                 let source = self
                     .source
                     .ok_or_else(|| unavailable(format!("no source for historical frame {number}")))?;
-                tokio::time::timeout(FRAME_FETCH_BUDGET, source(self.filter.to_vec(), number))
+                if self.peer_fetches.fetch_add(1, Ordering::Relaxed) >= MAX_PEER_FETCHES {
+                    return Err(unavailable(format!(
+                        "historical frame {number}: this batch already asked peers for {MAX_PEER_FETCHES} \
+                         frames; the next start resumes"
+                    )));
+                }
+                let budget = FRAME_FETCH_BUDGET.min(self.remaining(number)?);
+                tokio::time::timeout(budget, source(self.filter.to_vec(), number))
                     .await
-                    .map_err(|_| unavailable(format!("fetching historical frame {number} timed out")))?
+                    .map_err(|_| unavailable(format!(
+                        "fetching historical frame {number} timed out after {} ms", budget.as_millis())))?
                     .ok_or_else(|| unavailable(format!("no peer served historical frame {number}")))?
             }
-            Err(error) => return Err(error),
         };
         if frame.encoded_len() > MAX_FRAME_BYTES
             || frame
@@ -221,19 +351,161 @@ impl VerifiedHeaders for Headers<'_> {
         {
             return Err(unavailable(format!("historical frame {number} is the wrong frame or oversized")));
         }
-        tokio::time::timeout(FRAME_HISTORY_BUDGET, self.validator.prepare_storage_history(&frame))
-            .await
-            .map_err(|_| unavailable(format!("preparing historical frame {number}'s anchor and storage history timed out")))?
+        Ok((frame, local))
+    }
+
+    /// Fetch the GLOBAL anchor and storage registrations `frame`'s
+    /// validation reads: as a frame with its own certificate, or as one
+    /// final through a certified descendant.
+    async fn prepare(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
+        let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        let budget = FRAME_HISTORY_BUDGET.min(self.remaining(number)?);
+        let prepared = if certified {
+            tokio::time::timeout(budget, self.validator.prepare_storage_history(frame)).await
+        } else {
+            tokio::time::timeout(budget, self.validator.prepare_storage_history_of_linked(frame)).await
+        };
+        prepared
+            .map_err(|_| unavailable(format!(
+                "preparing historical frame {number}'s anchor and storage history timed out after {} ms",
+                budget.as_millis(),
+            )))?
             .map_err(|error| match error {
                 QuilError::ExecutionUnavailable(message) => unavailable(format!("historical frame {number}: {message}")),
                 other => other,
-            })?;
-        if !crate::app_engine::validate_app_frame_panic_safe(self.validator, &frame, false)? {
+            })
+    }
+
+    /// Authenticate `frame` by itself: by its own certificate, or by the
+    /// digest GLOBAL committed for it (a sealed checkpoint or an executed
+    /// tip, whose certificate GLOBAL verified). False for a frame with
+    /// neither, which only a certified descendant can authenticate.
+    async fn authenticate(&self, frame: &AppShardFrame) -> Result<bool> {
+        let header = frame.header.as_ref().ok_or_else(|| unavailable("historical frame has no header"))?;
+        let number = header.frame_number;
+        if header.public_key_signature_bls48581.is_some() {
+            self.prepare(frame, true).await?;
+            if !crate::app_engine::validate_app_frame_panic_safe(self.validator, frame, false)? {
+                return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
+            }
+            return Ok(true);
+        }
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
+        if (self.committed)(number)? != Some(digest) {
+            return Ok(false);
+        }
+        let body = header_only(header);
+        self.prepare(&body, false).await?;
+        if !validate_linked(self.validator, &body)? {
             return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
         }
+        Ok(true)
+    }
+
+    /// Why frame `number`, which has no certificate of its own, was not
+    /// authenticated through a descendant.
+    fn unlinked(&self, number: u64, reason: impl std::fmt::Display) -> QuilError {
+        let generation = self.generation.map_or_else(String::new, |g| format!(" of generation {g}"));
+        unavailable(format!(
+            "historical frame {number}{generation} (filter {}) has no certificate of its own, and {reason}",
+            hex::encode(self.filter),
+        ))
+    }
+
+    /// Authenticate a frame without a certificate of its own through the
+    /// frame that made it final (Simplex finalizes a view's ancestors with
+    /// it): the run above it, each frame naming the one below as its
+    /// parent, up to the nearest frame authenticated by itself or earlier
+    /// in this batch, at most `MAX_REPLAY_DESCENDANTS` frames up. A local
+    /// frame that breaks the run is read once more from a peer: the store
+    /// can hold a frame of another chain at that height.
+    async fn linked(&self, header: FrameHeader, stored: bool) -> Result<FrameHeader> {
+        let number = header.frame_number;
+        // The run's frames, and whether the local store supplied each.
+        let mut run = vec![(header, stored)];
+        let terminal = loop {
+            self.remaining(number)?;
+            let next = run.last().expect("the run holds the frame").0.frame_number + 1;
+            if run.len() > MAX_REPLAY_DESCENDANTS {
+                return Err(self.unlinked(number, format!(
+                    "frames {}-{} above it carry none (nearest certified descendant: none within \
+                     {MAX_REPLAY_DESCENDANTS} frames)",
+                    number + 1,
+                    next - 1,
+                )));
+            }
+            let cached = self.known(next);
+            let (mut child, mut child_stored) = match &cached {
+                Some(header) => (header_only(header), false),
+                None => self.fetch(next, false).await.map_err(|error| self.unlinked(number, format!(
+                    "its descendant frame {next} is unavailable (nearest certified descendant: unknown): {error}")))?,
+            };
+            if !extends(&run, &child) && child_stored && self.source.is_some() {
+                if let Ok((fetched, _)) = self.fetch(next, true).await {
+                    child = fetched;
+                    child_stored = false;
+                }
+            }
+            if !extends(&run, &child) && run.last().is_some_and(|(_, stored)| *stored) && self.source.is_some() {
+                if let Ok((fetched, _)) = self.fetch(next - 1, true).await {
+                    let parent = fetched.header.expect("fetch checked the header");
+                    let below = run.len().checked_sub(2).map(|i| &run[i].0);
+                    if below.is_none_or(|below| app_frame_links_to_child(below, &parent)) {
+                        *run.last_mut().expect("the run holds the frame") = (parent, false);
+                    }
+                }
+            }
+            if !extends(&run, &child) {
+                return Err(self.unlinked(number, format!(
+                    "frame {next} does not name frame {} as its parent (nearest certified descendant: unknown)",
+                    next - 1,
+                )));
+            }
+            let child_header = child.header.clone().expect("fetch checked the header");
+            if cached.is_some() {
+                run.push((child_header.clone(), false));
+                break child_header;
+            }
+            let authenticated = self.authenticate(&child).await?;
+            run.push((child_header.clone(), child_stored));
+            if authenticated {
+                self.remember(child_header.clone());
+                break child_header;
+            }
+        };
+        let frames: Vec<AppShardFrame> = run.iter().map(|(header, _)| header_only(header)).collect();
+        for frame in frames[..frames.len() - 1].iter().rev() {
+            self.prepare(frame, false).await?;
+        }
+        validate_archive_replay_chain(
+            &frames[0],
+            &frames[1..],
+            // Authenticated above, by itself or earlier in this batch.
+            |frame| Ok(frame.header.as_ref() == Some(&terminal)),
+            |frame| validate_linked(self.validator, frame),
+        )?;
+        for (header, _) in &run[..run.len() - 1] {
+            self.remember(header.clone());
+        }
+        Ok(run.swap_remove(0).0)
+    }
+}
+
+#[async_trait::async_trait]
+impl VerifiedHeaders for Headers<'_> {
+    async fn get(&self, number: u64) -> Result<FrameHeader> {
+        if let Some(header) = self.known(number) {
+            return Ok(header);
+        }
+        let (frame, stored) = self.fetch(number, false).await?;
+        let header = frame.header.clone().expect("fetch checked the header");
+        if !self.authenticate(&frame).await? {
+            return self.linked(header, stored).await;
+        }
+        self.remember(header.clone());
         // Recovery consumes authenticated headers only. Unchecked request
         // bodies are never installed into the canonical frame store.
-        Ok(frame.header.expect("checked above"))
+        Ok(header)
     }
 }
 
@@ -389,20 +661,29 @@ fn recorded_report(records: &dyn SnapshotReadable, filter: &[u8], frame: u64) ->
 
 /// One bounded batch; false means the caller must remain out of consensus and
 /// retry. Completed records and the next recovery position share one write.
+/// `global` supplies the digests GLOBAL committed for the shard's frames,
+/// which authenticate a frame without a certificate of its own.
 pub async fn recover(
     session: &Session,
     manager: Arc<ExecutionEngineManager>,
     clock: Arc<dyn ClockStore>,
     validator: Arc<BlsAppFrameValidator>,
+    global: Option<&Arc<quil_hypergraph::HypergraphCrdt>>,
     source: Option<&DeliveryFrameSource>,
     expected_cursor: u64,
 ) -> Result<bool> {
-    let headers = Headers {
-        filter: &session.filter,
-        clock: clock.as_ref(),
-        validator: validator.as_ref(),
-        source,
+    let committed = |number: u64| match global {
+        Some(global) => crate::app_handoff::committed_frame_digest(global, &session.filter, number),
+        None => Ok(None),
     };
+    let headers = Headers::new(
+        &session.filter,
+        Some(session.generation),
+        clock.as_ref(),
+        validator.as_ref(),
+        source,
+        &committed,
+    );
     recover_with_headers(session, manager, &headers, expected_cursor).await
 }
 
@@ -670,20 +951,21 @@ async fn recover_with_headers(
 /// carry window. Anything else stays unknown. Existing records are never
 /// replaced, and one that contradicts the certified headers fails the whole
 /// batch. Returns the frames written and the first frame left unresolved.
+/// `global` authenticates headers as in [`recover`].
 pub async fn recover_carry_window(
     filter: &[u8],
     manager: Arc<ExecutionEngineManager>,
     clock: Arc<dyn ClockStore>,
     validator: Arc<BlsAppFrameValidator>,
+    global: Option<&Arc<quil_hypergraph::HypergraphCrdt>>,
     source: Option<&DeliveryFrameSource>,
     cursor: u64,
 ) -> Result<(usize, Option<u64>)> {
-    let headers = Headers {
-        filter,
-        clock: clock.as_ref(),
-        validator: validator.as_ref(),
-        source,
+    let committed = |number: u64| match global {
+        Some(global) => crate::app_handoff::committed_frame_digest(global, filter, number),
+        None => Ok(None),
     };
+    let headers = Headers::new(filter, None, clock.as_ref(), validator.as_ref(), source, &committed);
     recover_carry_window_with_headers(filter, manager, clock.as_ref(), &headers, cursor).await
 }
 
@@ -1558,6 +1840,7 @@ mod tests {
                 manager.clone(),
                 clock.clone(),
                 validator.clone(),
+                None,
                 Some(&source),
                 95,
             )
@@ -1565,8 +1848,8 @@ mod tests {
             .unwrap_err();
             if variant == 0 {
                 assert!(
-                    error.to_string().contains("app shard frame 95 ")
-                        && error.to_string().contains("missing BLS signature"),
+                    error.to_string().contains("historical frame 95 of generation 2 ")
+                        && error.to_string().contains("no certificate of its own"),
                     "{error}"
                 );
             }
@@ -1593,6 +1876,412 @@ mod tests {
                 Some(vec![9; 32])
             );
         }
+    }
+
+    fn validator() -> BlsAppFrameValidator {
+        BlsAppFrameValidator::new(
+            Arc::new(crate::test_support::TestProverRegistry::new()),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+    }
+
+    /// A validator whose live legacy committee is `signer` alone.
+    fn validator_trusting(signer: &quil_crypto::FalconSigner) -> BlsAppFrameValidator {
+        use quil_types::consensus::{ProverInfo, ProverStatus};
+        BlsAppFrameValidator::new(
+            Arc::new(crate::test_support::TestProverRegistry::with_prover(ProverInfo {
+                public_key: signer.public_key().to_vec(),
+                address: vec![7; 32],
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![],
+                available_storage: 0,
+                seniority: 0,
+                delegate_address: vec![],
+            })),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+    }
+
+    /// Give `header` a legacy CW finalization certificate of `signer`.
+    fn certify(header: &mut FrameHeader, signer: &quil_crypto::FalconSigner) {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::{encode_finalization, wrap_cert_for_header},
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+        };
+        let key = FalconPrivateKey::from_bytes(signer.private_key(), signer.public_key()).unwrap();
+        let participants: Set<_> = vec![key.public_key()].try_into().unwrap();
+        let mut namespace = b"appshard".to_vec();
+        namespace.extend_from_slice(&header.address);
+        let scheme = Generic::<Namespace>::signer(&namespace, participants, key).unwrap();
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(0), View::new(header.rank)),
+            View::new(header.rank - 1),
+            Digest(digest(header)),
+        );
+        let vote = scheme
+            .sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal })
+            .unwrap();
+        let certificate = scheme.assemble::<SimplexFalconScheme, _, N3f1>(vec![vote]).unwrap();
+        header.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
+            signature: wrap_cert_for_header(&encode_finalization(&Finalization { proposal, certificate })),
+            bitmask: vec![1],
+            ..Default::default()
+        });
+    }
+
+    fn digest(header: &FrameHeader) -> [u8; 32] {
+        quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap()
+    }
+
+    /// Frames `from..=to` of one shard with no certificate of their own,
+    /// each naming the one below as its parent at a later rank, with the
+    /// output the validator recomputes.
+    fn uncertified_chain(session: &Session, from: u64, to: u64, roots: Roots) -> Vec<FrameHeader> {
+        let mut parent = vec![7; 32];
+        (from..=to)
+            .map(|n| {
+                let mut h = header(session, n, roots);
+                h.rank = n;
+                h.parent_selector = parent.clone();
+                h.output = quil_crypto::porep::deterministic_app_frame_output(
+                    &h.parent_selector,
+                    &h.requests_root,
+                    &h.state_roots,
+                    &quil_crypto::porep::derive_storage_beacon(0, &[]),
+                    h.frame_number,
+                    h.rank,
+                    &h.prover,
+                    h.difficulty,
+                    h.fee_multiplier_vote,
+                    h.timestamp,
+                    &h.storage_attestation_root,
+                    quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&h.fee_total),
+                    &h.settlements,
+                    &h.accumulator,
+                    &h.spends,
+                );
+                parent = digest(&h).to_vec();
+                h
+            })
+            .collect()
+    }
+
+    fn store(clock: &quil_store::RocksClockStore, header: &FrameHeader) {
+        let selector = digest(header).to_vec();
+        let txn = clock.new_transaction(false).unwrap();
+        clock.stage_shard_clock_frame(&selector, &header_only(header), txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .commit_shard_clock_frame(&header.address, header.frame_number, &selector, txn.as_ref(), false)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn opened() -> (Directory, quil_store::RocksDb) {
+        let directory = Directory::new();
+        let db = quil_store::RocksDb::open(&directory.0).unwrap();
+        (directory, db)
+    }
+
+    fn stored(session: &Session, from: u64, to: u64) -> (Directory, quil_store::RocksDb, Vec<FrameHeader>) {
+        let (directory, db) = opened();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let chain = uncertified_chain(session, from, to, [[0; 32]; 4]);
+        for header in &chain {
+            store(&clock, header);
+        }
+        (directory, db, chain)
+    }
+
+    /// A peer source serving `frames` by number, counting requests.
+    fn serving(frames: &[FrameHeader], calls: Arc<AtomicUsize>) -> DeliveryFrameSource {
+        let frames: BTreeMap<u64, FrameHeader> = frames.iter().map(|h| (h.frame_number, h.clone())).collect();
+        Arc::new(move |_, number| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let frame = frames.get(&number).map(header_only);
+            Box::pin(async move { frame })
+        })
+    }
+
+    fn read<'a>(
+        session: &'a Session,
+        clock: &'a quil_store::RocksClockStore,
+        validator: &'a BlsAppFrameValidator,
+        committed: CommittedDigest<'a>,
+    ) -> Headers<'a> {
+        Headers::new(&session.filter, Some(session.generation), clock, validator, None, committed)
+    }
+
+    // Simplex finalizes a view's ancestors with it, so they carry no
+    // certificate of their own. Recovery refused each ("missing BLS
+    // signature"), and a member that joined a shard through an archive
+    // never started consensus (2026-10-20: frame 3051 of g15 on
+    // ...000807, 7 h).
+    #[tokio::test]
+    async fn frames_without_a_certificate_are_recovered_below_the_frame_global_committed() {
+        let directory = Directory::new();
+        let session = session();
+        let (db, _store, manager) = open(&directory.0);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let chain = uncertified_chain(&session, 78, 95, [[0; 32]; 4]);
+        for header in &chain {
+            store(&clock, header);
+        }
+        let top = digest(chain.last().unwrap());
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 95).then_some(top)) };
+        let validator = validator();
+        let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
+        manager
+            .crdt()
+            .commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95))
+            .unwrap();
+        let mut batches = 0;
+        while !recover_with_headers(&session, manager.clone(), &read(&session, &clock, &validator, &committed), 95)
+            .await
+            .unwrap()
+        {
+            batches += 1;
+            assert!(batches < 20, "recovery stalls");
+        }
+        let complete = manager.crdt().capture_committed_shard(&session.filter).unwrap();
+        for n in 78..=95 {
+            for (key, value) in tip(&session, n).into_iter().take(3) {
+                assert_eq!(complete.records.read_record(&key).unwrap(), Some(value), "frame {n}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_below_a_certified_frame_are_authenticated_by_its_certificate() {
+        let session = session();
+        let signer = quil_crypto::FalconSigner::generate();
+        let mut chain = uncertified_chain(&session, 90, 96, [[0; 32]; 4]);
+        certify(&mut chain[6], &signer);
+        let (_directory, db) = opened();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        for header in &chain {
+            store(&clock, header);
+        }
+        let committed = |_: u64| -> Result<Option<[u8; 32]>> { Ok(None) };
+        let validator = validator_trusting(&signer);
+        let headers = read(&session, &clock, &validator, &committed);
+        assert_eq!(headers.get(93).await.unwrap(), chain[3]);
+        assert_eq!(headers.get(96).await.unwrap(), chain[6]);
+        let stranger = validator_trusting(&quil_crypto::FalconSigner::generate());
+        assert!(read(&session, &clock, &stranger, &committed).get(93).await.is_err(),
+            "a certificate of another committee authenticates nothing");
+    }
+
+    #[tokio::test]
+    async fn a_run_through_a_frame_with_an_invalid_certificate_is_refused() {
+        let session = session();
+        let signer = quil_crypto::FalconSigner::generate();
+        let mut chain = uncertified_chain(&session, 90, 96, [[0; 32]; 4]);
+        certify(&mut chain[5], &quil_crypto::FalconSigner::generate());
+        let (_directory, db) = opened();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        for header in &chain {
+            store(&clock, header);
+        }
+        let top = digest(&chain[6]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 96).then_some(top)) };
+        let validator = validator_trusting(&signer);
+        let error = read(&session, &clock, &validator, &committed).get(94).await.unwrap_err();
+        assert!(matches!(error, QuilError::InvalidSignature(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_frame_its_descendant_does_not_name_is_refused() {
+        let session = session();
+        let (_directory, db, chain) = stored(&session, 90, 95);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        // A valid frame 94 of other contents, which frame 95 does not name.
+        let other = uncertified_chain(&session, 90, 94, [[5; 32]; 4]);
+        store(&clock, &other[4]);
+        let top = digest(&chain[5]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 95).then_some(top)) };
+        let validator = validator();
+        let headers = read(&session, &clock, &validator, &committed);
+        assert_eq!(headers.get(95).await.unwrap(), chain[5]);
+        let error = headers.get(94).await.unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, QuilError::ExecutionUnavailable(_))
+                && text.contains("historical frame 94 of generation 2 ")
+                && text.contains(&hex::encode(&session.filter))
+                && text.contains("frame 95 does not name frame 94 as its parent"),
+            "{text}"
+        );
+        assert!(headers.get(93).await.is_err(), "nothing below the other frame is authenticated");
+    }
+
+    // The store can hold a frame of another chain at a height (a member
+    // past a fence); a peer serves the canonical one.
+    #[tokio::test]
+    async fn a_local_frame_that_breaks_the_run_is_read_again_from_a_peer() {
+        let session = session();
+        let validator = validator();
+        for wrong in [95u64, 94] {
+            let (_directory, db, chain) = stored(&session, 90, 96);
+            let clock = quil_store::RocksClockStore::new(db.inner());
+            let other = uncertified_chain(&session, 90, wrong, [[5; 32]; 4]);
+            store(&clock, other.last().unwrap());
+            let committed_frame = wrong + 1;
+            let top = digest(&chain[(committed_frame - 90) as usize]);
+            let committed =
+                move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == committed_frame).then_some(top)) };
+            let source = serving(&chain, Arc::new(AtomicUsize::new(0)));
+            let headers = Headers::new(
+                &session.filter, Some(session.generation), &clock, &validator, Some(&source), &committed,
+            );
+            assert_eq!(headers.get(committed_frame).await.unwrap(), chain[(committed_frame - 90) as usize]);
+            assert_eq!(headers.get(94).await.unwrap(), chain[4], "the local frame {wrong} is another chain's");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_without_a_certificate_needs_globals_digest_or_a_certified_descendant() {
+        let session = session();
+        let (_directory, db, chain) = stored(&session, 90, 95);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let validator = validator();
+        for answer in [None, Some([1; 32])] {
+            let committed = move |_: u64| -> Result<Option<[u8; 32]>> { Ok(answer) };
+            let error = read(&session, &clock, &validator, &committed).get(95).await.unwrap_err();
+            let text = error.to_string();
+            assert!(
+                matches!(error, QuilError::ExecutionUnavailable(_))
+                    && text.contains("historical frame 95 of generation 2 ")
+                    && text.contains(&hex::encode(&session.filter))
+                    && text.contains("descendant frame 96 is unavailable"),
+                "{text}"
+            );
+        }
+        let top = digest(&chain[5]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 95).then_some(top)) };
+        assert_eq!(read(&session, &clock, &validator, &committed).get(95).await.unwrap(), chain[5]);
+    }
+
+    #[tokio::test]
+    async fn the_search_for_a_certified_descendant_is_bounded() {
+        let session = session();
+        let (_directory, db, chain) = stored(&session, 95, 128);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let validator = validator();
+        let far = digest(&chain[33]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 128).then_some(far)) };
+        let error = read(&session, &clock, &validator, &committed).get(95).await.unwrap_err();
+        assert!(
+            matches!(error, QuilError::ExecutionUnavailable(_))
+                && error.to_string().contains("frames 96-127 above it carry none")
+                && error.to_string().contains("none within 32 frames"),
+            "{error}"
+        );
+        let near = digest(&chain[32]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 127).then_some(near)) };
+        assert_eq!(read(&session, &clock, &validator, &committed).get(95).await.unwrap(), chain[0]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_asks_peers_for_a_bounded_number_of_frames() {
+        let session = session();
+        let (_directory, db) = opened();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let validator = validator();
+        let chain = uncertified_chain(&session, 90, 200, [[0; 32]; 4]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = serving(&chain, calls.clone());
+        let committed = |_: u64| -> Result<Option<[u8; 32]>> { Ok(None) };
+        let headers =
+            Headers::new(&session.filter, Some(session.generation), &clock, &validator, Some(&source), &committed);
+        let first = headers.get(100).await.unwrap_err();
+        assert!(first.to_string().contains("none within 32 frames"), "{first}");
+        let second = headers.get(99).await.unwrap_err();
+        assert!(second.to_string().contains("already asked peers for 64 frames"), "{second}");
+        assert_eq!(calls.load(Ordering::SeqCst), 64);
+    }
+
+    #[tokio::test]
+    async fn a_slow_peer_stops_the_batch_at_its_deadline() {
+        let session = session();
+        let (_directory, db) = opened();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let chain = uncertified_chain(&session, 90, 96, [[0; 32]; 4]);
+        for header in chain.iter().filter(|h| h.frame_number != 95) {
+            store(&clock, header);
+        }
+        let top = digest(&chain[6]);
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 96).then_some(top)) };
+        let silent: DeliveryFrameSource = Arc::new(|_, _| Box::pin(std::future::pending::<Option<AppShardFrame>>()));
+        let validator = validator();
+        let mut headers =
+            Headers::new(&session.filter, Some(session.generation), &clock, &validator, Some(&silent), &committed);
+        headers.deadline = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        let error = headers.get(94).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4), "the deadline bounds the read");
+        assert!(
+            matches!(error, QuilError::ExecutionUnavailable(_))
+                && error.to_string().contains("descendant frame 95 is unavailable"),
+            "{error}"
+        );
+        assert!(headers.get(93).await.unwrap_err().to_string().contains("budget"), "a spent budget reads nothing");
+    }
+
+    #[tokio::test]
+    async fn the_frame_that_authenticates_a_run_survives_a_full_cache() {
+        let session = session();
+        let (_directory, db, chain) = stored(&session, 1, 130);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let digests: BTreeMap<u64, [u8; 32]> = chain
+            .iter()
+            .filter(|h| (10..=81).contains(&h.frame_number) || h.frame_number == 120)
+            .map(|h| (h.frame_number, digest(h)))
+            .collect();
+        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok(digests.get(&n).copied()) };
+        let validator = validator();
+        let headers = read(&session, &clock, &validator, &committed);
+        for n in 10..=81 {
+            headers.get(n).await.unwrap();
+        }
+        assert_eq!(headers.get(100).await.unwrap(), chain[99]);
+    }
+
+    // A heartbeat lookup reads a frame well below the last one read.
+    #[tokio::test]
+    async fn a_header_authenticated_earlier_in_the_batch_authenticates_frames_below_it() {
+        let session = session();
+        let (_directory, db, chain) = stored(&session, 64, 96);
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let validator = validator();
+        let top = digest(&chain[32]);
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let committed = |n: u64| -> Result<Option<[u8; 32]>> {
+            Ok((n == 96 && !asked.swap(true, Ordering::SeqCst)).then_some(top))
+        };
+        let headers = read(&session, &clock, &validator, &committed);
+        assert_eq!(headers.get(96).await.unwrap(), chain[32]);
+        assert_eq!(headers.get(70).await.unwrap(), chain[6]);
+        assert_eq!(headers.get(71).await.unwrap(), chain[7]);
+        assert!(
+            read(&session, &clock, &validator, &committed).get(70).await.is_err(),
+            "without the earlier header nothing authenticates it"
+        );
     }
 
     /// A member that joined at the tip: the tip's nonempty report and the
