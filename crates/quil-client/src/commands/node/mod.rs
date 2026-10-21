@@ -33,8 +33,8 @@ pub enum NodeCommand {
         #[command(subcommand)]
         command: archive::ArchiveCommand,
     },
-    /// Opt-in diagnostics from other nodes: their health reports and,
-    /// approved by their operators, their redacted logs.
+    /// Opt-in diagnostics from other nodes: their health reports and their
+    /// redacted logs, as their operators allow.
     Diagnostics {
         #[command(subcommand)]
         command: diagnostics::DiagnosticsCommand,

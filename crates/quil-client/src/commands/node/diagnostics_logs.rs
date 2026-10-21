@@ -1,13 +1,16 @@
 //! `qclient node diagnostics request|status|fetch|pending|approve|deny` —
-//! a peer's redacted logs, exported only after its operator approves.
+//! a peer's redacted logs, sent as its operator's allowlist consents.
 //!
 //! The requester signs a [`LogRequest`] with its node's network key and a
 //! fresh sntrup761 key of that request, whose secret stays in this node's
-//! `.diagnostics/requests`. The target queues it; its operator lists it with
-//! `pending` and runs `approve`, which exports the window with `node log
-//! export`'s redaction and preview, seals the bundle to the request's key
-//! and hands it to the operator's own node. Only the requester's qclient
-//! can `fetch` and open it; the token map stays with the target's operator.
+//! `.diagnostics/requests`. The target queues it and, when it writes log
+//! files, approves it itself: listing the requester in its allowedPeers is
+//! that consent. A target that writes no log files leaves it to its
+//! operator, who lists it with `pending` and runs `approve`, which exports
+//! the window with `node log export`'s redaction and preview, seals the
+//! bundle to the request's key and hands it to the operator's own node.
+//! Either way the export and seal are [`bundle`]'s. Only the requester's
+//! qclient can `fetch` and open it; the token map stays with the target.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -18,17 +21,18 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use quil_p2p::PeerId;
+use quil_rpc::diagnostics_logs::bundle::{self, Approval, BUNDLE_FILES};
 use quil_rpc::diagnostics_logs as logs;
 use quil_rpc::diagnostics_service::peer_tail;
+use quil_rpc::log_export::{self, redact::format_rfc3339_utc, BUNDLE_LOG};
 use quil_types::proto::diagnostics::{
     DenyLogRequestRequest, FetchLogBundleRequest, GetLogRequestStatusRequest, ListLogRequestsRequest,
-    ListLogRequestsResponse, LogRequest, LogRequestRefusal, LogRequestStatus, LogRequestStatusResponse,
-    PendingLogRequest, SubmitLogRequestResponse, UploadLogBundleChunk,
+    ListLogRequestsResponse, LogRequest, LogRequestDenial, LogRequestRefusal, LogRequestStatus,
+    LogRequestStatusResponse, PendingLogRequest, SubmitLogRequestResponse, UploadLogBundleChunk,
 };
 
 use super::diagnostics::{error_chain, printable};
-use super::log::export::{self, LogSource, Selection, BUNDLE_LOG};
-use super::log::redact::format_rfc3339_utc;
+use super::log::export::{self, LogSource};
 use crate::context::{Context, GlobalArgs};
 use crate::rpc;
 
@@ -92,9 +96,6 @@ pub struct DecideArgs {
 
 /// The largest sealed bundle `fetch` accepts.
 const MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
-/// The plaintext a target seals: these files, in this order.
-const BUNDLE_MAGIC: &[u8; 8] = b"QLOGEXP1";
-const BUNDLE_FILES: [&str; 3] = [BUNDLE_LOG, "manifest.json", "SHA256SUMS"];
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -125,10 +126,10 @@ fn window_text(since: u64, until: u64) -> String {
 /// The window of `since`/`until` at `now`, at most 24 h.
 pub(crate) fn parse_window(since: &str, until: Option<&str>, now: i64) -> anyhow::Result<(u64, u64)> {
     let until = match until {
-        Some(until) => export::parse_when(until, now)?,
+        Some(until) => log_export::parse_when(until, now)?,
         None => now,
     };
-    let since = export::parse_when(since, now)?;
+    let since = log_export::parse_when(since, now)?;
     anyhow::ensure!(since < until, "--since must be before --until");
     anyhow::ensure!(
         (until - since) as u64 <= logs::MAX_WINDOW_SECS,
@@ -428,44 +429,6 @@ fn request_keys(dir: &Path, target: &PeerId) -> Vec<(PathBuf, RequestKey, Vec<u8
         .collect()
 }
 
-/// The plaintext a target seals: the three bundle files, framed.
-pub(crate) fn pack_bundle(files: &[(&str, &[u8]); 3]) -> Vec<u8> {
-    let mut out = BUNDLE_MAGIC.to_vec();
-    for (name, data) in files {
-        out.push(name.len() as u8);
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        out.extend_from_slice(data);
-    }
-    out
-}
-
-/// The three bundle files of a fetched plaintext, in [`BUNDLE_FILES`]
-/// order, checked against its `SHA256SUMS`.
-pub(crate) fn unpack_bundle(plaintext: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
-    let malformed = || anyhow::anyhow!("the bundle is not a log export of this version");
-    let mut rest = plaintext.strip_prefix(BUNDLE_MAGIC.as_slice()).ok_or_else(malformed)?;
-    let mut files = Vec::new();
-    for expected in BUNDLE_FILES {
-        let (&name_len, after) = rest.split_first().ok_or_else(malformed)?;
-        let name = after.get(..name_len as usize).ok_or_else(malformed)?;
-        anyhow::ensure!(name == expected.as_bytes(), "the bundle holds an unexpected file");
-        let after = &after[name_len as usize..];
-        let len: [u8; 8] = after.get(..8).ok_or_else(malformed)?.try_into().map_err(|_| malformed())?;
-        let len = usize::try_from(u64::from_le_bytes(len)).map_err(|_| malformed())?;
-        let data = after.get(8..8usize.checked_add(len).ok_or_else(malformed)?).ok_or_else(malformed)?;
-        files.push(data.to_vec());
-        rest = &after[8 + len..];
-    }
-    anyhow::ensure!(rest.is_empty(), "the bundle holds more than a log export");
-    let sums = String::from_utf8_lossy(&files[2]).into_owned();
-    for (name, data) in BUNDLE_FILES[..2].iter().zip(&files) {
-        let expected = format!("{}  {name}", hex::encode(Sha256::digest(data)));
-        anyhow::ensure!(sums.lines().any(|line| line == expected), "{name} does not match the bundle's SHA256SUMS");
-    }
-    Ok(files)
-}
-
 /// Write fetched bundle files into a new directory `out`.
 fn write_bundle(out: &Path, files: &[Vec<u8>]) -> anyhow::Result<()> {
     anyhow::ensure!(!out.exists(), "{} already exists", out.display());
@@ -540,10 +503,15 @@ pub(crate) fn render_submitted(
         }
         status => {
             let _ = writeln!(out, "Asked {target} for {filters} of {}: request {id}.", window_text(since, until));
+            let expires = span(response.expires_unix_ms.saturating_sub(now_ms));
             let _ = match status {
+                LogRequestStatus::Pending if response.automatic => writeln!(out,
+                    "{target} approves it itself, as its operator allows for this peer: it exports the window with \
+                     'node log export' redaction and seals it to this request's key, usually within minutes; \
+                     it expires in {expires} unless approved."),
                 LogRequestStatus::Pending => writeln!(out,
                     "It waits for {target}'s operator, who sees a redacted preview before anything is sent; \
-                     it expires in {} unless approved.", span(response.expires_unix_ms.saturating_sub(now_ms))),
+                     it expires in {expires} unless approved."),
                 status => writeln!(out, "It was submitted before and is {}.", logs::status_name(status)),
             };
             let _ = writeln!(out, "Check it with: qclient node diagnostics status {peer} {short}");
@@ -559,14 +527,27 @@ pub(crate) fn render_status(target: &str, peer: &str, response: &LogRequestStatu
     let short = &id[..8.min(id.len())];
     let expires = span(response.expires_unix_ms.saturating_sub(now_ms));
     match response.status() {
-        LogRequestStatus::Pending => format!("Request {short} at {target}: pending its operator's approval; expires in {expires}.\n"),
+        LogRequestStatus::Pending => format!(
+            "Request {short} at {target}: pending: its node is exporting it, or its operator has yet to approve it; \
+             expires in {expires}.\n"
+        ),
         LogRequestStatus::Ready | LogRequestStatus::Served => format!(
             "Request {short} at {target}: approved, {} sealed bytes{}; fetchable for {expires}.\n\
              Fetch it with: qclient node diagnostics fetch {peer} {short}\n",
             response.bundle_bytes,
             if response.status() == LogRequestStatus::Served { ", fetched before" } else { "" }
         ),
-        LogRequestStatus::Denied => format!("Request {short} at {target}: denied by its operator.\n"),
+        LogRequestStatus::Denied => match response.denial() {
+            LogRequestDenial::Operator => format!("Request {short} at {target}: denied by its operator.\n"),
+            LogRequestDenial::TooLarge => format!(
+                "Request {short} at {target}: denied by its node: the export exceeds its \
+                 diagnostics.logRequests.maxBundleBytes; ask for a shorter window or fewer shard filters.\n"
+            ),
+            LogRequestDenial::ExportFailed => format!(
+                "Request {short} at {target}: denied by its node: its export failed, for a reason its log names; \
+                 ask again later.\n"
+            ),
+        },
         LogRequestStatus::Expired => format!("Request {short} at {target}: expired before it was approved or fetched.\n"),
         status => format!("Request {short} at {target}: {}.\n", logs::status_name(status)),
     }
@@ -614,7 +595,12 @@ pub(crate) fn render_pending(list: &ListLogRequestsResponse, now_ms: u64) -> Str
             let _ = writeln!(out, "  {}", hex::encode(filter));
         }
     }
-    if list.requests.iter().any(|request| request.status() == LogRequestStatus::Pending) {
+    if list.automatic {
+        let _ = writeln!(out,
+            "This node approves these requests itself, as its allowedPeers consent: it exports each window with \
+             'node log export' redaction and seals it to the requester. Deny one with \
+             'qclient node diagnostics deny <request>', which also withdraws an approved bundle, fetched or not.");
+    } else if list.requests.iter().any(|request| request.status() == LogRequestStatus::Pending) {
         let _ = writeln!(out,
             "Approve one with 'qclient node diagnostics approve <request>': it exports that window with \
              'node log export' redaction and shows a preview before sending; deny it with \
@@ -641,54 +627,6 @@ pub(crate) fn settle_key(status: LogRequestStatus, key: Option<&Path>) -> Option
     Some("Its key is deleted: there is nothing left to fetch.\n".to_string())
 }
 
-/// How long approve keeps token maps in .diagnostics/token-maps.
-pub(crate) const TOKEN_MAP_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
-
-/// Delete the log request token maps in `dir` older than `keep` at `now`;
-/// how many.
-pub(crate) fn prune_token_maps(dir: &Path, now: std::time::SystemTime, keep: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
-    entries
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("log-request-") && name.ends_with(".map.txt")
-        })
-        .filter(|entry| {
-            entry.metadata().and_then(|m| m.modified()).is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > keep))
-        })
-        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
-        .count()
-}
-
-/// The export selection of a peer's request: its window and filters, every
-/// level, no text match.
-pub(crate) fn request_selection(request: &PendingLogRequest) -> anyhow::Result<Selection> {
-    let since = i64::try_from(request.since_unix).map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
-    let until = i64::try_from(request.until_unix).map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
-    anyhow::ensure!(since < until, "the request's window is invalid");
-    Ok(Selection { since, until, min_level: 0, filters: request.filters.iter().map(hex::encode).collect(), matches: Vec::new() })
-}
-
-/// The export approve seals for `request`, as `node log export` makes it
-/// with the same window and filters (`salt` set by tests).
-fn approve_export(
-    readers: Vec<export::RecordReader>,
-    child: Option<std::process::Child>,
-    source: &export::SourceInfo,
-    request: &PendingLogRequest,
-    requester: &str,
-    max: usize,
-    salt: Option<[u8; 32]>,
-) -> anyhow::Result<export::Export<Capped>> {
-    let selection = request_selection(request)?;
-    let mut produced = export::produce_salted(readers, child, source, &selection, false, Capped { data: Vec::new(), cap: max }, salt)?;
-    produced.manifest["tool"] = "qclient node diagnostics approve".into();
-    produced.manifest["request"] = serde_json::json!({ "id": hex::encode(&request.request_id), "requester": requester });
-    Ok(produced)
-}
-
 /// The preview line naming where an approved bundle goes.
 fn destination(request: &PendingLogRequest) -> String {
     let requester = logs::peer_from_bytes(&request.requester_peer_id).map_or_else(|| "unknown".into(), |peer| peer_tail(&peer));
@@ -697,29 +635,6 @@ fn destination(request: &PendingLogRequest) -> String {
          the sealed bundle until it is fetched or expires.",
         logs::short_id(&request.request_id)
     )
-}
-
-/// Collects the gzipped log in memory, refusing more than its cap.
-struct Capped {
-    data: Vec<u8>,
-    cap: usize,
-}
-
-impl std::io::Write for Capped {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.data.len() + buf.len() > self.cap {
-            return Err(std::io::Error::other(format!(
-                "the export exceeds this node's diagnostics.logRequests.maxBundleBytes ({} bytes)",
-                self.cap
-            )));
-        }
-        self.data.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// The sealed upload of `sealed` for request `id`.
@@ -743,7 +658,7 @@ pub(crate) fn open_fetched(sealed: &[u8], key: &RequestKey) -> anyhow::Result<Ve
     let secret = hex::decode(&key.kem_secret_key)?;
     let plaintext = quil_crypto::seal::open(sealed, &secret, &id)
         .map_err(|_| anyhow::anyhow!("the bundle does not open with this request's key"))?;
-    unpack_bundle(&plaintext)
+    bundle::unpack_bundle(&plaintext)
 }
 
 pub async fn request(global: GlobalArgs, args: &RequestArgs) -> anyhow::Result<()> {
@@ -857,7 +772,7 @@ pub async fn fetch(global: GlobalArgs, args: &FetchArgs) -> anyhow::Result<()> {
     let out: PathBuf = args
         .out
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("node-log-export-{}-{tail}", export::compact_ts(now_secs()))));
+        .unwrap_or_else(|| PathBuf::from(format!("node-log-export-{}-{tail}", log_export::compact_ts(now_secs()))));
     anyhow::ensure!(!out.exists(), "{} already exists", out.display());
     let addr = target_addr(node.as_ref(), &target, &who.peer, args.request.addr.as_deref()).await?;
     let mut client = logs::connect_log_peer(&addr, &who.key, target)
@@ -971,34 +886,29 @@ pub async fn approve(global: GlobalArgs, args: &DecideArgs) -> anyhow::Result<()
         logs::status_name(request.status())
     );
     let requester = logs::peer_from_bytes(&request.requester_peer_id).map_or_else(|| "unknown".into(), |peer| peer_tail(&peer));
-    let selection = request_selection(&request)?;
+    let selection = bundle::request_selection(request.since_unix, request.until_unix, &request.filters)?;
     let max = usize::try_from(listed.max_bundle_bytes).unwrap_or(usize::MAX);
     let (readers, source, child) = export::open_source(&ctx.global, LogSource::Auto, selection.since, selection.until)?;
-    let produced = approve_export(readers, child, &source, &request, &requester, max, None)?;
+    let home_paths = [dir.clone()];
+    let options = log_export::ExportOptions { home_paths: &home_paths, ..Default::default() };
+    let produced = bundle::request_export(readers, child, &source, &selection, &id, &requester, Approval::Operator, max, &options)
+        .map_err(too_large_advice)?;
     let maps = dir.join(".diagnostics").join("token-maps");
-    let pruned = prune_token_maps(&maps, std::time::SystemTime::now(), TOKEN_MAP_RETENTION);
+    let pruned = bundle::prune_token_maps(&maps, std::time::SystemTime::now(), bundle::TOKEN_MAP_RETENTION);
     if pruned > 0 {
         println!("Deleted {pruned} token map(s) older than 7 days from {}.", maps.display());
     }
-    let map_path = maps.join(format!("log-request-{}-{}.map.txt", logs::short_id(&id), export::compact_ts(now_secs())));
+    let map_path = maps.join(bundle::token_map_name(&id, now_secs()));
     println!("Log request {} from {requester}:", logs::short_id(&id));
-    print!("{}", export::preview(&produced.manifest, &produced.stats, &destination(&request), &map_path));
+    print!("{}", log_export::preview(&produced.manifest, &produced.stats, &destination(&request), &map_path));
     if !export::confirm(&ctx.global, &format!("Type yes to seal the bundle and send it to {requester}: "))? {
         println!("Nothing sent. The request stays pending until it expires; deny it with 'qclient node diagnostics deny {}'.", logs::short_id(&id));
         return Ok(());
     }
-    let (manifest_text, sums) = export::bundle_texts(&produced.manifest, &produced.log)?;
-    let plaintext = pack_bundle(&[(BUNDLE_LOG, &produced.out.data), ("manifest.json", manifest_text.as_bytes()), ("SHA256SUMS", sums.as_bytes())]);
-    let sealed_len = quil_crypto::seal::sealed_len(plaintext.len());
-    anyhow::ensure!(
-        sealed_len <= max,
-        "the sealed bundle has {sealed_len} bytes, over this node's diagnostics.logRequests.maxBundleBytes ({max}); \
-         deny the request and ask for a narrower window or filters, or raise the limit and restart"
-    );
-    let sealed = quil_crypto::seal::seal(&plaintext, &request.recipient_kem_public_key, &id)
-        .map_err(|e| anyhow::anyhow!("seal the bundle: {e}"))?;
+    let sealed = bundle::seal_export(produced, &id, &request.recipient_kem_public_key, max).map_err(too_large_advice)?;
     private_dir(&maps)?;
-    export::write_token_map(&map_path, &format!("log request {} of {requester}", logs::short_id(&id)), &produced.token_map)?;
+    log_export::write_token_map(&map_path, &format!("log request {} of {requester}", logs::short_id(&id)), &sealed.token_map)?;
+    let sealed = sealed.sealed;
     let upload = logs::timed(futures::stream::iter(upload_chunks(&id, &sealed)), logs::upload_timeout(sealed.len() as u64));
     match client.upload_log_bundle(upload).await {
         Ok(response) => {
@@ -1011,6 +921,15 @@ pub async fn approve(global: GlobalArgs, args: &DecideArgs) -> anyhow::Result<()
             anyhow::bail!("this node did not take the bundle: {:?}: {}", status.code(), printable(status.message()))
         }
     }
+}
+
+/// `error`, with what the operator can do when the export is over
+/// `maxBundleBytes`.
+fn too_large_advice(error: anyhow::Error) -> anyhow::Error {
+    if !bundle::is_too_large(&error) {
+        return error;
+    }
+    anyhow::anyhow!("{error:#}; deny the request and ask for a narrower window or filters, or raise the limit and restart")
 }
 
 pub(crate) fn render_approved(requester: &str, id: &[u8], bytes: usize, expires: &str, map_path: &Path) -> String {
@@ -1026,6 +945,7 @@ pub(crate) fn render_approved(requester: &str, id: &[u8], bytes: usize, expires:
 mod tests {
     use super::*;
     use prost::Message as _;
+    use quil_rpc::diagnostics_logs::bundle::{pack_bundle, unpack_bundle, Capped};
 
     const NOW: u64 = 1_792_000_000_000;
 
@@ -1065,6 +985,7 @@ mod tests {
                 pending_request(0x5e, LogRequestStatus::Ready, Vec::new()),
             ],
             max_bundle_bytes: 1 << 25,
+            automatic: false,
         };
         let a1 = "a1".repeat(32);
         let b2 = "b2".repeat(32);
@@ -1078,11 +999,16 @@ Filters of 3f3f3f3f:
   {b2}
 Approve one with 'qclient node diagnostics approve <request>': it exports that window with 'node log export' redaction and shows a preview before sending; deny it with 'qclient node diagnostics deny <request>', which also withdraws an approved bundle.
 "));
+        let automatic = render_pending(&ListLogRequestsResponse { automatic: true, ..list.clone() }, NOW);
+        assert!(automatic.ends_with("\
+This node approves these requests itself, as its allowedPeers consent: it exports each window with 'node log export' redaction and seals it to the requester. Deny one with 'qclient node diagnostics deny <request>', which also withdraws an approved bundle, fetched or not.
+"), "{automatic}");
+        assert!(!automatic.contains("Approve one"), "{automatic}");
         assert_eq!(render_pending(&ListLogRequestsResponse::default(), NOW), "No log requests from peers.\n");
         let peer = quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key()).unwrap().public().to_peer_id();
         let mut from_peer = pending_request(0x11, LogRequestStatus::Served, Vec::new());
         from_peer.requester_peer_id = peer.to_bytes();
-        let text = render_pending(&ListLogRequestsResponse { requests: vec![from_peer], max_bundle_bytes: 0 }, NOW);
+        let text = render_pending(&ListLogRequestsResponse { requests: vec![from_peer], ..Default::default() }, NOW);
         assert!(text.lines().nth(2).unwrap().starts_with(&format!("11111111  {}  served", peer_tail(&peer))), "{text}");
         assert!(!text.contains("Approve one"), "nothing waits for a decision");
     }
@@ -1098,6 +1024,13 @@ It waits for …Ab12cd's operator, who sees a redacted preview before anything i
 Check it with: qclient node diagnostics status QmTarget 3f3f3f3f
 Once approved, fetch it with: qclient node diagnostics fetch QmTarget 3f3f3f3f
 "));
+        response.automatic = true;
+        assert_eq!(render_submitted("…Ab12cd", "QmTarget", 1_791_978_400, 1_792_000_000, 0, &response, NOW), format!("\
+Asked …Ab12cd for every line of 2026-10-14T11:46:40Z .. 2026-10-14T17:46:40Z (UTC): request {id}.
+…Ab12cd approves it itself, as its operator allows for this peer: it exports the window with 'node log export' redaction and seals it to this request's key, usually within minutes; it expires in 24h unless approved.
+Check it with: qclient node diagnostics status QmTarget 3f3f3f3f
+Once approved, fetch it with: qclient node diagnostics fetch QmTarget 3f3f3f3f
+"));
         response.set_status(LogRequestStatus::Refused);
         response.set_refusal(LogRequestRefusal::OverBudget);
         assert_eq!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW),
@@ -1106,12 +1039,25 @@ Once approved, fetch it with: qclient node diagnostics fetch QmTarget 3f3f3f3f
 
     #[test]
     fn a_status_names_the_next_step() {
+        let denied = |denial: LogRequestDenial| {
+            let mut response = LogRequestStatusResponse { request_id: vec![0x3f; 16], ..Default::default() };
+            response.set_status(LogRequestStatus::Denied);
+            response.set_denial(denial);
+            render_status("…Ab12cd", "QmTarget", &response, NOW)
+        };
         let status = |status: LogRequestStatus, bundle_bytes| {
             let mut response = LogRequestStatusResponse { request_id: vec![0x3f; 16], bundle_bytes, expires_unix_ms: NOW + 90 * 60_000, ..Default::default() };
             response.set_status(status);
             render_status("…Ab12cd", "QmTarget", &response, NOW)
         };
-        assert_eq!(status(LogRequestStatus::Pending, 0), "Request 3f3f3f3f at …Ab12cd: pending its operator's approval; expires in 1h 30m.\n");
+        assert_eq!(status(LogRequestStatus::Pending, 0),
+            "Request 3f3f3f3f at …Ab12cd: pending: its node is exporting it, or its operator has yet to approve it; expires in 1h 30m.\n");
+        assert_eq!(denied(LogRequestDenial::TooLarge), "\
+Request 3f3f3f3f at …Ab12cd: denied by its node: the export exceeds its diagnostics.logRequests.maxBundleBytes; ask for a shorter window or fewer shard filters.
+");
+        assert_eq!(denied(LogRequestDenial::ExportFailed),
+            "Request 3f3f3f3f at …Ab12cd: denied by its node: its export failed, for a reason its log names; ask again later.\n");
+        assert_eq!(denied(LogRequestDenial::Operator), "Request 3f3f3f3f at …Ab12cd: denied by its operator.\n");
         assert_eq!(status(LogRequestStatus::Ready, 2048), "\
 Request 3f3f3f3f at …Ab12cd: approved, 2048 sealed bytes; fetchable for 1h 30m.
 Fetch it with: qclient node diagnostics fetch QmTarget 3f3f3f3f
@@ -1429,22 +1375,6 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
         assert_eq!(settle_key(LogRequestStatus::Denied, None), None);
     }
 
-    /// Approve keeps token maps for 7 days and leaves other files alone.
-    #[test]
-    fn old_token_maps_are_pruned() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = std::time::SystemTime::now();
-        let old = now - TOKEN_MAP_RETENTION - std::time::Duration::from_secs(60);
-        for (name, at) in [("log-request-aa-1.map.txt", old), ("log-request-bb-2.map.txt", now), ("notes.txt", old)] {
-            let file = std::fs::File::create(dir.path().join(name)).unwrap();
-            file.set_modified(at).unwrap();
-        }
-        assert_eq!(prune_token_maps(dir.path(), now, TOKEN_MAP_RETENTION), 1);
-        assert!(!dir.path().join("log-request-aa-1.map.txt").exists());
-        assert!(dir.path().join("log-request-bb-2.map.txt").exists() && dir.path().join("notes.txt").exists());
-        assert_eq!(prune_token_maps(&dir.path().join("absent"), now, TOKEN_MAP_RETENTION), 0);
-    }
-
     #[test]
     fn deny_says_whether_it_withdrew_a_bundle() {
         assert_eq!(render_denied(&pending_request(0x3f, LogRequestStatus::Pending, Vec::new())), "Denied log request 3f3f3f3f from unknown.\n");
@@ -1478,10 +1408,12 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
         let mut request = pending_request(0x3f, LogRequestStatus::Pending, vec![vec![0xa1; 32]]);
         (request.since_unix, request.until_unix) = (since, until);
         let salt = [7u8; 32];
-        let readers = || export::file_readers(dir.path(), since as i64, until as i64).unwrap();
+        let readers = || log_export::file_readers(dir.path(), since as i64, until as i64).unwrap();
         let (approve_readers, names) = readers();
-        let source = export::SourceInfo::Files(names);
-        let approved = approve_export(approve_readers, None, &source, &request, "…Ab12cd", 1 << 20, Some(salt)).unwrap();
+        let source = log_export::SourceInfo::Files(names);
+        let selection = bundle::request_selection(request.since_unix, request.until_unix, &request.filters).unwrap();
+        let approved = bundle::request_export(approve_readers, None, &source, &selection, &request.request_id, "…Ab12cd",
+            Approval::Operator, 1 << 20, &log_export::ExportOptions { salt: Some(salt), ..Default::default() }).unwrap();
 
         let args = export::ExportArgs {
             since: format_rfc3339_utc(since as i64),
@@ -1494,7 +1426,8 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
             out: None,
         };
         let manual_selection = export::selection(&args, NOW as i64 / 1000).unwrap();
-        let manual = export::produce_salted(readers().0, None, &source, &manual_selection, false, Vec::new(), Some(salt)).unwrap();
+        let options = log_export::ExportOptions { salt: Some(salt), ..Default::default() };
+        let manual = log_export::produce(readers().0, None, &source, &manual_selection, Vec::new(), &options).unwrap();
 
         assert_eq!(approved.out.data, manual.out, "the same redacted log");
         assert_eq!(approved.token_map, manual.token_map);
@@ -1502,11 +1435,12 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
         let mut approved_manifest = approved.manifest.clone();
         assert_eq!(approved_manifest["tool"], "qclient node diagnostics approve");
         assert_eq!(approved_manifest["request"]["id"], "3f".repeat(16));
+        assert_eq!(approved_manifest["request"]["approval"], "operator");
         let object = approved_manifest.as_object_mut().unwrap();
         object.remove("request");
         object.insert("tool".into(), manual.manifest["tool"].clone());
         assert_eq!(approved_manifest, manual.manifest);
-        let preview = export::preview(&approved.manifest, &approved.stats, &destination(&request), Path::new("m.map.txt"));
+        let preview = log_export::preview(&approved.manifest, &approved.stats, &destination(&request), Path::new("m.map.txt"));
         assert!(preview.contains(&format!("Shard filters (their lines, plus every warn and error line):\n  {filter}\n")), "{preview}");
     }
 

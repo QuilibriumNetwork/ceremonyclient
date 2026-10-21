@@ -1587,6 +1587,10 @@ pub(crate) async fn start(
     grpc::spawn_all(&mut sup, grpc::GrpcArgs {
         frame_observations_path: std::path::Path::new(config_dir).join("frame-observations.bin"),
         diagnostics_spool: std::path::Path::new(config_dir).join(".diagnostics").join("log-bundles"),
+        diagnostics_auto: config.logger.log_dir(config_dir).map(|log_dir| quil_rpc::diagnostics_logs::AutoApproval {
+            log_dir,
+            token_maps: config_dir.join(".diagnostics").join("token-maps"),
+        }),
         historical_committees: historical_committees.clone(),
         halt_state: halt_state.clone(),
         committed_shard_sizes: committed_shard_sizes.clone(),

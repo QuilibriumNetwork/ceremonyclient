@@ -1,17 +1,26 @@
-//! Operator-approved log requests, served on the authenticated peer listener.
+//! Log requests from peers this node's operator allowlists, served on the
+//! authenticated peer listener.
 //!
 //! An allowlisted peer submits a [`LogRequest`] signed by its network key:
 //! a window of at most 24 h, optional shard filters and a fresh sntrup761
-//! key of that request alone. The node queues it in memory and asks its
-//! operator, in a warning repeated hourly, to review it with
-//! `qclient node diagnostics pending|approve|deny`. Approval runs
-//! `node log export` in the operator's qclient, with its redaction and
-//! preview, seals the bundle to the request's key and uploads it here over
-//! [`DiagnosticsOperatorService`], which only this node's own identity
+//! key of that request alone. The node queues it in memory. Listing a peer
+//! in `diagnostics.logRequests.allowedPeers` is consent to send it this
+//! node's redacted logs, so a node that writes log files approves the
+//! request itself: one at a time, off the async runtime, it exports the
+//! window from its log files with `node log export`'s redaction, seals the
+//! bundle to the request's key ([`bundle`]) and writes the token map to its
+//! config directory's `.diagnostics/token-maps`. An export over
+//! `maxBundleBytes`, or one that fails, denies the request with its reason.
+//!
+//! A node that writes no log files asks its operator instead, in a warning
+//! repeated hourly, to review the request with `qclient node diagnostics
+//! pending|approve|deny`. That approval runs `node log export` in the
+//! operator's qclient, with its preview, and uploads the sealed bundle here
+//! over [`DiagnosticsOperatorService`], which only this node's own identity
 //! reaches: whoever holds this node's network key acts as its operator
-//! there. The node keeps the sealed bundle in its diagnostics spool until
-//! the request expires and serves it only to the requester; it never holds
-//! the plaintext or the token map.
+//! there; it also lists requests and denies them, withdrawing an approved
+//! bundle. The node keeps the sealed bundle in its diagnostics spool until
+//! the request expires and serves it only to the requester.
 //!
 //! A caller without a handshake identity, one not allowlisted, a node that
 //! has not enabled requests, a request whose key is not the caller's or whose
@@ -23,6 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -43,13 +53,18 @@ use quil_types::proto::diagnostics::diagnostics_operator_service_server::{
 };
 use quil_types::proto::diagnostics::{
     DenyLogRequestRequest, DenyLogRequestResponse, FetchLogBundleRequest, GetLogRequestStatusRequest,
-    ListLogRequestsRequest, ListLogRequestsResponse, LogBundleChunk, LogRequest, LogRequestRefusal,
+    ListLogRequestsRequest, ListLogRequestsResponse, LogBundleChunk, LogRequest, LogRequestDenial, LogRequestRefusal,
     LogRequestStatus, LogRequestStatusResponse, PendingLogRequest, SignedLogRequest, SubmitLogRequestResponse,
     UploadLogBundleChunk, UploadLogBundleResponse,
 };
 
 use crate::diagnostics_service::{parse_allowed, peer_tail, DENIED, REFUSAL_SUMMARY_INTERVAL};
+use crate::log_export::redact::format_rfc3339_utc;
 use crate::peer_auth_middleware::AuthenticatedPeer;
+
+pub mod bundle;
+
+pub use bundle::AutoApproval;
 
 /// The signature domain of a [`LogRequest`].
 pub const DOMAIN: &[u8] = b"quil/diagnostics/log-request/v1";
@@ -100,6 +115,12 @@ pub fn upload_timeout(bytes: u64) -> Duration {
 
 /// How long a unary call may take.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long this node's own export of a request may run; past this it
+/// denies the request as failed and stops the export.
+pub const AUTO_EXPORT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How often the automatic approval looks for requests it was not woken for.
+const AUTO_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A request's ID: the first 16 bytes of a tagged SHA-256 of its bytes, so
 /// the same request resubmitted keeps its ID.
@@ -226,27 +247,73 @@ struct Entry {
     bundle_sha256: Vec<u8>,
     /// The upload in progress: its token and when the node gives it up.
     upload: Option<Upload>,
+    /// This node's automatic approval took it: it is not taken again.
+    attempted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Upload {
     token: u64,
     deadline_ms: u64,
+    /// This node's own export, rather than its operator's upload.
+    automatic: bool,
 }
 
 #[derive(Debug, Default)]
 struct State {
     /// Pending, ready and served requests.
     entries: BTreeMap<[u8; ID_LEN], Entry>,
-    /// Denied and expired requests, oldest first: `(id, requester, status)`.
-    finished: VecDeque<([u8; ID_LEN], PeerId, LogRequestStatus)>,
+    /// Denied and expired requests, oldest first.
+    finished: VecDeque<Finished>,
     /// Nonces of queued requests: request ID and when it was queued.
     nonces: HashMap<(PeerId, Vec<u8>), ([u8; ID_LEN], u64)>,
     /// When each peer's requests in the last 24 h were queued.
     queued: HashMap<PeerId, VecDeque<u64>>,
     /// The token of the next upload.
     uploads: u64,
+    /// This node's own export, from when it is taken until its blocking
+    /// task ends, even after its request was denied or timed out: no other
+    /// export or upload starts meanwhile.
+    export: Option<RunningExport>,
     refusals: RefusalSummary,
+}
+
+/// This node's export of a request and the flag that stops it.
+#[derive(Debug, Clone)]
+struct RunningExport {
+    id: [u8; ID_LEN],
+    token: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+/// What builds an automatic approval's bundle: [`bundle::build_automatic`],
+/// or a stand-in in tests.
+#[derive(Clone, Copy)]
+struct Exporter(fn(&AutoApproval, &bundle::AutoRequest, usize, i64, &AtomicBool) -> anyhow::Result<bundle::AutoBundle>);
+
+impl std::fmt::Debug for Exporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Exporter")
+    }
+}
+
+fn build_automatic(
+    auto: &AutoApproval,
+    request: &bundle::AutoRequest,
+    max: usize,
+    now_secs: i64,
+    cancel: &AtomicBool,
+) -> anyhow::Result<bundle::AutoBundle> {
+    bundle::build_automatic(auto, request, max, now_secs, cancel, None)
+}
+
+/// A denied or expired request, as its requester can still read it.
+#[derive(Debug, Clone, Copy)]
+struct Finished {
+    id: [u8; ID_LEN],
+    requester: PeerId,
+    status: LogRequestStatus,
+    denial: LogRequestDenial,
 }
 
 /// What [`LogRequests::tick`] did, for tests.
@@ -257,8 +324,8 @@ pub struct Tick {
     pub abandoned: usize,
 }
 
-/// The queue of log requests: admission, the operator's decisions and the
-/// spool of sealed bundles.
+/// The queue of log requests: admission, approval (this node's own or its
+/// operator's), denial and the spool of sealed bundles.
 #[derive(Debug)]
 pub struct LogRequests {
     enabled: bool,
@@ -267,6 +334,17 @@ pub struct LogRequests {
     own: PeerId,
     limits: LogRequestsConfig,
     spool: PathBuf,
+    /// Where this node approves requests itself from; `None` leaves them
+    /// to its operator.
+    auto: Option<AutoApproval>,
+    /// Wakes the automatic approval when a request is queued or an export
+    /// ends.
+    wake: tokio::sync::Notify,
+    /// [`AUTO_EXPORT_TIMEOUT`] and [`AUTO_POLL_INTERVAL`], shorter or
+    /// longer in tests.
+    auto_timeout: Duration,
+    auto_poll: Duration,
+    exporter: Exporter,
     state: Mutex<State>,
 }
 
@@ -297,9 +375,17 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 impl LogRequests {
     /// The queue of `config` for the node `own`, with sealed bundles in
-    /// `spool`. Bundles left from an earlier run are deleted: their requests
-    /// were in memory only.
+    /// `spool`, whose requests wait for its operator.
     pub fn new(config: &LogRequestsConfig, own: PeerId, spool: PathBuf) -> Self {
+        Self::with_approval(config, own, spool, None)
+    }
+
+    /// The queue of `config` for the node `own`, with sealed bundles in
+    /// `spool`. With `auto` the node approves requests itself from its log
+    /// files ([`Self::run_automatic_approval`]); without, they wait for its
+    /// operator. Bundles left from an earlier run are deleted: their requests
+    /// were in memory only.
+    pub fn with_approval(config: &LogRequestsConfig, own: PeerId, spool: PathBuf, auto: Option<AutoApproval>) -> Self {
         let limits = config.clamped();
         let (allowed, invalid) = parse_allowed(&limits.allowed_peers);
         if !invalid.is_empty() {
@@ -311,12 +397,19 @@ impl LogRequests {
         if removed > 0 {
             info!(removed, "diagnostics log bundles of an earlier run deleted");
         }
-        if limits.enabled {
+        let serves = if allowed.is_empty() { "this node only" } else { "this node and the allowlisted peers" };
+        if limits.enabled && auto.is_some() {
             info!(log_peers = allowed.len(), requests_per_day = limits.requests_per_day,
                 max_pending = limits.max_pending, ttl_secs = limits.ttl_secs,
-                max_bundle_bytes = limits.max_bundle_bytes, approval = "manual",
-                serves = if allowed.is_empty() { "this node only" } else { "this node and the allowlisted peers" },
-                "diagnostics log requests enabled");
+                max_bundle_bytes = limits.max_bundle_bytes, approval = "automatic", serves,
+                "diagnostics log requests enabled: requests from diagnostics.logRequests.allowedPeers are now approved \
+                 automatically; this node exports, redacts and seals each requested window itself, without its operator");
+        } else if limits.enabled {
+            info!(log_peers = allowed.len(), requests_per_day = limits.requests_per_day,
+                max_pending = limits.max_pending, ttl_secs = limits.ttl_secs,
+                max_bundle_bytes = limits.max_bundle_bytes, approval = "manual", serves,
+                "diagnostics log requests enabled: this node writes no log files, so each request waits for \
+                 'qclient node diagnostics approve', which exports from the journal");
         } else if !limits.allowed_peers.is_empty() {
             info!(allowed_peers = limits.allowed_peers.len(),
                 "diagnostics.logRequests.allowedPeers is ignored until diagnostics.logRequests.enabled is set");
@@ -325,14 +418,24 @@ impl LogRequests {
             enabled: limits.enabled,
             allowed: if limits.enabled { allowed } else { HashSet::new() },
             own,
+            auto: if limits.enabled { auto } else { None },
             limits,
             spool,
+            wake: tokio::sync::Notify::new(),
+            auto_timeout: AUTO_EXPORT_TIMEOUT,
+            auto_poll: AUTO_POLL_INTERVAL,
+            exporter: Exporter(build_automatic),
             state: Mutex::default(),
         }
     }
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether this node approves requests itself.
+    pub fn automatic(&self) -> bool {
+        self.auto.is_some()
     }
 
     fn clear_spool(spool: &Path) -> usize {
@@ -396,24 +499,28 @@ impl LogRequests {
         Err(Status::permission_denied(DENIED))
     }
 
-    fn finish(&self, state: &mut State, id: [u8; ID_LEN], status: LogRequestStatus) {
+    /// End request `id`, stopping this node's export of it.
+    fn finish(&self, state: &mut State, id: [u8; ID_LEN], status: LogRequestStatus, denial: LogRequestDenial) {
+        if let Some(export) = state.export.as_ref().filter(|export| export.id == id) {
+            export.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(entry) = state.entries.remove(&id) {
             if entry.bundle_bytes > 0 || entry.upload.is_some() {
                 let _ = std::fs::remove_file(self.bundle_path(&id));
             }
-            state.finished.push_back((id, entry.requester, status));
+            state.finished.push_back(Finished { id, requester: entry.requester, status, denial });
             while state.finished.len() > FINISHED_KEPT {
                 state.finished.pop_front();
             }
         }
     }
 
-    /// Expire requests past their time and remind the operator of waiting
-    /// ones, at most hourly.
+    /// Expire requests past their time, give up stalled uploads, and remind
+    /// the operator of waiting ones, at most hourly.
     fn sweep(&self, state: &mut State, now_ms: u64) -> Tick {
         let mut tick = Tick::default();
         for (id, entry) in state.entries.iter_mut() {
-            if entry.upload.is_some_and(|upload| now_ms >= upload.deadline_ms) {
+            if entry.upload.is_some_and(|upload| !upload.automatic && now_ms >= upload.deadline_ms) {
                 entry.upload = None;
                 let _ = std::fs::remove_file(self.bundle_path(id));
                 warn!(request = %short_id(id), requester = %peer_tail(&entry.requester), scope = "this node",
@@ -430,11 +537,11 @@ impl LogRequests {
             .collect();
         for (id, was) in expired {
             let requester = peer_tail(&state.entries[&id].requester);
-            self.finish(state, id, LogRequestStatus::Expired);
+            self.finish(state, id, LogRequestStatus::Expired, LogRequestDenial::Operator);
             info!(request = %short_id(&id), %requester, was, "diagnostics log request expired");
             tick.expired += 1;
         }
-        for (id, entry) in state.entries.iter_mut() {
+        for (id, entry) in state.entries.iter_mut().filter(|_| self.auto.is_none()) {
             if entry.status == LogRequestStatus::Pending && now_ms.saturating_sub(entry.reminded_ms) >= REMINDER_INTERVAL_MS {
                 entry.reminded_ms = now_ms;
                 log_awaiting(id, entry, now_ms);
@@ -458,11 +565,21 @@ impl LogRequests {
     }
 
     /// The status `caller` sees of request `id`: none of another peer's.
-    fn lookup(state: &State, caller: &PeerId, id: &[u8; ID_LEN]) -> Option<(LogRequestStatus, u64, u64)> {
+    fn lookup(state: &State, caller: &PeerId, id: &[u8; ID_LEN]) -> Option<Seen> {
         if let Some(entry) = state.entries.get(id).filter(|entry| entry.requester == *caller) {
-            return Some((entry.status, entry.bundle_bytes, entry.expires_ms));
+            return Some(Seen {
+                status: entry.status,
+                bundle_bytes: entry.bundle_bytes,
+                expires_ms: entry.expires_ms,
+                denial: LogRequestDenial::Operator,
+            });
         }
-        state.finished.iter().rev().find(|(i, peer, _)| i == id && peer == caller).map(|(_, _, status)| (*status, 0, 0))
+        state.finished.iter().rev().find(|f| f.id == *id && f.requester == *caller).map(|f| Seen {
+            status: f.status,
+            bundle_bytes: 0,
+            expires_ms: 0,
+            denial: f.denial,
+        })
     }
 
     /// Queue a signed request from `caller`, or refuse it.
@@ -491,9 +608,14 @@ impl LogRequests {
             state.refusals.note(Refused::BadSignature, Some(&caller), now_ms);
             return Err(Status::permission_denied(DENIED));
         }
-        if let Some((status, _, expires_ms)) = Self::lookup(&state, &caller, &id) {
-            let mut response = SubmitLogRequestResponse { request_id: id.to_vec(), expires_unix_ms: expires_ms, ..Default::default() };
-            response.set_status(status);
+        if let Some(seen) = Self::lookup(&state, &caller, &id) {
+            let mut response = SubmitLogRequestResponse {
+                request_id: id.to_vec(),
+                expires_unix_ms: seen.expires_ms,
+                automatic: self.automatic(),
+                ..Default::default()
+            };
+            response.set_status(seen.status);
             return Ok(response);
         }
         let malformed = request.schema != REQUEST_SCHEMA
@@ -542,11 +664,17 @@ impl LogRequests {
             bundle_bytes: 0,
             bundle_sha256: Vec::new(),
             upload: None,
+            attempted: false,
         };
-        log_awaiting(&id, &entry, now_ms);
+        if self.automatic() {
+            self.wake.notify_one();
+        } else {
+            log_awaiting(&id, &entry, now_ms);
+        }
         let expires_unix_ms = entry.expires_ms;
         state.entries.insert(id, entry);
-        let mut response = SubmitLogRequestResponse { request_id: id.to_vec(), expires_unix_ms, ..Default::default() };
+        let mut response =
+            SubmitLogRequestResponse { request_id: id.to_vec(), expires_unix_ms, automatic: self.automatic(), ..Default::default() };
         response.set_status(LogRequestStatus::Pending);
         Ok(response)
     }
@@ -557,9 +685,15 @@ impl LogRequests {
         let caller = self.requester(&mut state, caller, now_ms)?;
         self.sweep(&mut state, now_ms);
         let id = parse_id(id)?;
-        let (status, bundle_bytes, expires_unix_ms) = Self::lookup(&state, &caller, &id).ok_or_else(not_found)?;
-        let mut response = LogRequestStatusResponse { request_id: id.to_vec(), bundle_bytes, expires_unix_ms, ..Default::default() };
-        response.set_status(status);
+        let seen = Self::lookup(&state, &caller, &id).ok_or_else(not_found)?;
+        let mut response = LogRequestStatusResponse {
+            request_id: id.to_vec(),
+            bundle_bytes: seen.bundle_bytes,
+            expires_unix_ms: seen.expires_ms,
+            ..Default::default()
+        };
+        response.set_status(seen.status);
+        response.set_denial(seen.denial);
         Ok(response)
     }
 
@@ -569,7 +703,7 @@ impl LogRequests {
         let caller = self.requester(&mut state, caller, now_ms)?;
         self.sweep(&mut state, now_ms);
         let id = parse_id(id)?;
-        let (status, _, _) = Self::lookup(&state, &caller, &id).ok_or_else(not_found)?;
+        let status = Self::lookup(&state, &caller, &id).ok_or_else(not_found)?.status;
         if !matches!(status, LogRequestStatus::Ready | LogRequestStatus::Served) {
             return Err(Status::failed_precondition(format!("the log request is {}", status_name(status))));
         }
@@ -614,7 +748,7 @@ impl LogRequests {
                 pending
             })
             .collect();
-        Ok(ListLogRequestsResponse { requests, max_bundle_bytes: self.limits.max_bundle_bytes })
+        Ok(ListLogRequestsResponse { requests, max_bundle_bytes: self.limits.max_bundle_bytes, automatic: self.automatic() })
     }
 
     /// Deny a request, for this node's operator: a pending one (even while
@@ -629,7 +763,7 @@ impl LogRequests {
         let (requester, was) = (peer_tail(&entry.requester), status_name(entry.status));
         let withdrawn = entry.status != LogRequestStatus::Pending;
         let bytes = entry.bundle_bytes;
-        self.finish(&mut state, id, LogRequestStatus::Denied);
+        self.finish(&mut state, id, LogRequestStatus::Denied, LogRequestDenial::Operator);
         if withdrawn {
             info!(request = %short_id(&id), %requester, was, bytes, "diagnostics log bundle withdrawn");
         } else {
@@ -645,8 +779,8 @@ impl LogRequests {
         let mut state = self.state();
         self.sweep(&mut state, now_ms);
         let id = parse_id(id)?;
-        if state.entries.values().any(|entry| entry.upload.is_some()) {
-            return Err(Status::resource_exhausted("another log bundle upload is running"));
+        if state.export.is_some() || state.entries.values().any(|entry| entry.upload.is_some()) {
+            return Err(Status::resource_exhausted("another log bundle upload or this node's own export is running"));
         }
         state.uploads += 1;
         let token = state.uploads;
@@ -661,7 +795,7 @@ impl LogRequests {
             )));
         }
         let deadline_ms = now_ms + upload_timeout(total_bytes).as_millis() as u64 + 60_000;
-        entry.upload = Some(Upload { token, deadline_ms });
+        entry.upload = Some(Upload { token, deadline_ms, automatic: false });
         Ok((id, token))
     }
 
@@ -675,22 +809,27 @@ impl LogRequests {
         }
     }
 
-    /// Store the bundle of upload `token` of `id`, or abandon the upload.
+    /// Store the bundle of upload `token` of `id`, or abandon the upload;
+    /// `automatic` describes this node's own approval for its log line.
     fn finish_upload(
         &self,
         id: &[u8; ID_LEN],
         token: u64,
         bundle: Result<(Vec<u8>, Vec<u8>), Status>,
         now_ms: u64,
+        automatic: Option<&Approved<'_>>,
     ) -> Result<UploadLogBundleResponse, Status> {
         let stored = bundle.and_then(|(data, sha256)| {
             mkdir_private(&self.spool)
                 .and_then(|()| write_private(&self.bundle_path(id), &data))
                 .map_err(|error| {
-                    warn!(request = %short_id(id), %error, scope = "this node",
-                        action = "check that the node can write its config directory's .diagnostics/log-bundles",
-                        "diagnostics log bundle not stored");
-                    Status::internal("the node could not store the bundle")
+                    // An automatic approval logs its own failure.
+                    if automatic.is_none() {
+                        warn!(request = %short_id(id), %error, scope = "this node",
+                            action = "check that the node can write its config directory's .diagnostics/log-bundles",
+                            "diagnostics log bundle not stored");
+                    }
+                    Status::internal(format!("the node could not store the bundle in .diagnostics/log-bundles: {error}"))
                 })
                 .map(|()| (data.len() as u64, sha256))
         });
@@ -712,11 +851,244 @@ impl LogRequests {
         entry.bundle_bytes = bytes;
         entry.bundle_sha256 = sha256;
         entry.expires_ms = now_ms + self.ttl_ms();
-        info!(request = %short_id(id), requester = %peer_tail(&entry.requester), bytes,
-            expires_in_secs = self.limits.ttl_secs, "diagnostics log request approved");
+        match automatic {
+            Some(approved) => info!(request = %short_id(id), requester = %peer_tail(&entry.requester),
+                window = %window_text(&entry.request), filters = entry.request.filters.len(), lines = approved.lines,
+                bytes, duration_ms = approved.duration_ms, token_map = %approved.token_map,
+                expires_in_secs = self.limits.ttl_secs, scope = "this node",
+                "diagnostics log request approved automatically: its requester is in diagnostics.logRequests.allowedPeers"),
+            None => info!(request = %short_id(id), requester = %peer_tail(&entry.requester), bytes,
+                expires_in_secs = self.limits.ttl_secs, "diagnostics log request approved"),
+        }
         let mut response = UploadLogBundleResponse { expires_unix_ms: entry.expires_ms, ..Default::default() };
         response.set_status(LogRequestStatus::Ready);
         Ok(response)
+    }
+}
+
+/// What `caller` sees of a request.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    status: LogRequestStatus,
+    bundle_bytes: u64,
+    expires_ms: u64,
+    denial: LogRequestDenial,
+}
+
+/// This node's own approval of a request, for its log line.
+struct Approved<'a> {
+    lines: u64,
+    duration_ms: u64,
+    /// The token map, from the node's working directory when under it.
+    token_map: &'a str,
+}
+
+/// A request the automatic approval took, the token of its export and the
+/// flag that stops it.
+#[derive(Debug, Clone)]
+struct AutoJob {
+    id: [u8; ID_LEN],
+    token: u64,
+    cancel: Arc<AtomicBool>,
+    request: bundle::AutoRequest,
+}
+
+/// Ends this node's export when its blocking task ends, however it ends,
+/// and wakes the approval for the next request.
+struct ExportDone {
+    queue: Arc<LogRequests>,
+    token: u64,
+}
+
+impl Drop for ExportDone {
+    fn drop(&mut self) {
+        self.queue.export_done(self.token);
+    }
+}
+
+/// Stops an export whose approval was dropped before it ended (node
+/// shutdown), unless disarmed.
+struct StopOnDrop(Option<Arc<AtomicBool>>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl LogRequests {
+    /// Take the oldest pending request no approval took yet, unless an
+    /// export or an upload runs: one export at a time, each request once.
+    fn take_auto_job(&self, now_ms: u64) -> Option<AutoJob> {
+        let mut state = self.state();
+        self.sweep(&mut state, now_ms);
+        if state.export.is_some() || state.entries.values().any(|entry| entry.upload.is_some()) {
+            return None;
+        }
+        let id = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.status == LogRequestStatus::Pending && !entry.attempted)
+            .min_by_key(|(_, entry)| entry.received_ms)
+            .map(|(id, _)| *id)?;
+        state.uploads += 1;
+        let token = state.uploads;
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.export = Some(RunningExport { id, token, cancel: cancel.clone() });
+        let entry = state.entries.get_mut(&id)?;
+        entry.attempted = true;
+        // The export's own timeout ends it, not the upload deadline.
+        entry.upload = Some(Upload { token, deadline_ms: u64::MAX, automatic: true });
+        let request = bundle::AutoRequest {
+            id: id.to_vec(),
+            requester: peer_tail(&entry.requester),
+            since_unix: entry.request.since_unix,
+            until_unix: entry.request.until_unix,
+            filters: entry.request.filters.clone(),
+            recipient_kem_public_key: entry.request.recipient_kem_public_key.clone(),
+        };
+        Some(AutoJob { id, token, cancel, request })
+    }
+
+    /// The export of `token` ended: let the next one start.
+    fn export_done(&self, token: u64) {
+        let mut state = self.state();
+        if state.export.as_ref().is_some_and(|export| export.token == token) {
+            state.export = None;
+        }
+        drop(state);
+        self.wake.notify_one();
+    }
+
+    /// Deny the request of export `token` of `id` as failed for `reason`, if
+    /// it still waits for that export.
+    fn abort_auto(&self, id: [u8; ID_LEN], token: u64, reason: &str, duration_ms: u64) {
+        let mut state = self.state();
+        let Some(entry) = state.entries.get(&id).filter(|entry| {
+            entry.status == LogRequestStatus::Pending && entry.upload.is_some_and(|upload| upload.token == token)
+        }) else {
+            return;
+        };
+        let (requester, window, filters) = (peer_tail(&entry.requester), window_text(&entry.request), entry.request.filters.len());
+        self.finish(&mut state, id, LogRequestStatus::Denied, LogRequestDenial::ExportFailed);
+        warn!(request = %short_id(&id), %requester, %window, filters, denial = denial_name(LogRequestDenial::ExportFailed),
+            reason, duration_ms, scope = "this node",
+            action = "check the node's disk and its log directory; the requester sees it denied as failed and can ask again",
+            "diagnostics log request automatic approval failed; request denied");
+    }
+
+    /// Store the bundle of automatic approval `job`, or deny its request with
+    /// the reason it failed; drop it when the request was denied or expired
+    /// meanwhile.
+    fn settle_auto(&self, job: &AutoJob, built: anyhow::Result<bundle::AutoBundle>, duration_ms: u64, now_ms: u64) {
+        let failure = match built {
+            Ok(built) => {
+                let token_map = node_relative(&built.token_map);
+                let approved = Approved { lines: built.lines_kept, duration_ms, token_map: &token_map };
+                match self.finish_upload(&job.id, job.token, Ok((built.sealed, built.sha256)), now_ms, Some(&approved)) {
+                    Ok(_) => return,
+                    Err(status) => {
+                        let _ = std::fs::remove_file(&built.token_map);
+                        anyhow::anyhow!("{}", status.message())
+                    }
+                }
+            }
+            Err(error) => error,
+        };
+        let denial =
+            if bundle::is_too_large(&failure) { LogRequestDenial::TooLarge } else { LogRequestDenial::ExportFailed };
+        let mut state = self.state();
+        let Some(entry) = state.entries.get(&job.id).filter(|entry| {
+            entry.status == LogRequestStatus::Pending && entry.upload.is_none_or(|upload| upload.token == job.token)
+        }) else {
+            info!(request = %short_id(&job.id), requester = %job.request.requester, duration_ms,
+                "diagnostics log request automatic export dropped: the request was denied, expired or timed out meanwhile");
+            return;
+        };
+        let window = window_text(&entry.request);
+        let filters = entry.request.filters.len();
+        self.finish(&mut state, job.id, LogRequestStatus::Denied, denial);
+        let action = if denial == LogRequestDenial::TooLarge {
+            "the requester sees it denied as too large and can ask for a shorter window or fewer shard filters; \
+             to send more, raise diagnostics.logRequests.maxBundleBytes and restart"
+        } else {
+            "check that the node can read its log directory and write its config directory's .diagnostics; \
+             the requester sees it denied as failed and can ask again"
+        };
+        warn!(request = %short_id(&job.id), requester = %job.request.requester, %window, filters,
+            denial = denial_name(denial), reason = %format!("{failure:#}"), duration_ms, scope = "this node", action,
+            "diagnostics log request automatic approval failed; request denied");
+    }
+
+    /// Approve the oldest waiting request from this node's log files;
+    /// whether there was one. The export, the seal and every file write run
+    /// on a blocking task, which stops when the request is denied, its
+    /// export runs over [`AUTO_EXPORT_TIMEOUT`], or this future is dropped.
+    pub async fn approve_next(self: &Arc<Self>) -> bool {
+        let Some(auto) = self.auto.clone() else { return false };
+        let started = now_ms();
+        let Some(job) = self.take_auto_job(started) else { return false };
+        let (id, token, cancel) = (job.id, job.token, job.cancel.clone());
+        let mut stop = StopOnDrop(Some(cancel.clone()));
+        let (queue, exporter) = (self.clone(), self.exporter);
+        let max = usize::try_from(self.limits.max_bundle_bytes).unwrap_or(usize::MAX);
+        let export = tokio::task::spawn_blocking(move || {
+            let _done = ExportDone { queue: queue.clone(), token };
+            let built = (exporter.0)(&auto, &job.request, max, (now_ms() / 1000) as i64, &job.cancel);
+            let done = now_ms();
+            queue.settle_auto(&job, built, done.saturating_sub(started), done);
+        });
+        match tokio::time::timeout(self.auto_timeout, export).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.abort_auto(id, token, &format!("the export task ended: {error}"), now_ms().saturating_sub(started)),
+            Err(_) => {
+                cancel.store(true, Ordering::Relaxed);
+                let reason = format!("the export ran over {} s", self.auto_timeout.as_secs());
+                self.abort_auto(id, token, &reason, now_ms().saturating_sub(started));
+            }
+        }
+        stop.0 = None;
+        true
+    }
+
+    /// Approve requests as they are queued, one at a time; runs until
+    /// dropped, which stops a running export. Does nothing on a node whose
+    /// operator approves.
+    pub async fn run_automatic_approval(self: &Arc<Self>) {
+        if !self.automatic() {
+            return;
+        }
+        loop {
+            while self.approve_next().await {}
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                _ = tokio::time::sleep(self.auto_poll) => {}
+            }
+        }
+    }
+}
+
+/// `path` from the node's working directory when under it, as its operator
+/// finds it from the node directory.
+fn node_relative(path: &Path) -> String {
+    let relative = std::env::current_dir().ok().and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf));
+    relative.as_deref().unwrap_or(path).display().to_string()
+}
+
+/// A request's window, as logs show it.
+fn window_text(request: &LogRequest) -> String {
+    let utc = |secs: u64| format_rfc3339_utc(i64::try_from(secs).unwrap_or(i64::MAX));
+    format!("{}..{}", utc(request.since_unix), utc(request.until_unix))
+}
+
+/// The name of `denial` as logs show it.
+pub fn denial_name(denial: LogRequestDenial) -> &'static str {
+    match denial {
+        LogRequestDenial::Operator => "operator",
+        LogRequestDenial::TooLarge => "too_large",
+        LogRequestDenial::ExportFailed => "export_failed",
     }
 }
 
@@ -911,7 +1283,7 @@ impl LogRequestServer {
         }
         .await;
         let requests = self.requests.clone();
-        let stored = tokio::task::spawn_blocking(move || requests.finish_upload(&id, token, received, now_ms()))
+        let stored = tokio::task::spawn_blocking(move || requests.finish_upload(&id, token, received, now_ms(), None))
             .await
             .map_err(|_| Status::internal("the bundle store was interrupted"))?;
         // finish_upload settled the upload either way.
@@ -1264,9 +1636,9 @@ mod tests {
         assert_eq!(queue.begin_upload(&id, 64 * 1024 * 1024, NOW).unwrap_err().code(), tonic::Code::InvalidArgument, "over maxBundleBytes");
         let (_, token) = queue.begin_upload(&id, 5, NOW).unwrap();
         assert_eq!(queue.begin_upload(&id, 5, NOW).unwrap_err().code(), tonic::Code::ResourceExhausted, "one upload at a time");
-        assert_eq!(queue.finish_upload(&id, token + 1, Ok((b"x".to_vec(), vec![1; 32])), NOW).unwrap_err().code(),
+        assert_eq!(queue.finish_upload(&id, token + 1, Ok((b"x".to_vec(), vec![1; 32])), NOW, None).unwrap_err().code(),
             tonic::Code::FailedPrecondition, "another upload's token");
-        let ready = queue.finish_upload(&id, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW + 1_000).unwrap();
+        let ready = queue.finish_upload(&id, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW + 1_000, None).unwrap();
         assert_eq!((ready.status(), ready.expires_unix_ms), (LogRequestStatus::Ready, NOW + 1_000 + 86_400_000));
         let path = dir.path().join("log-bundles").join(format!("{}.sealed", hex::encode(id)));
         assert_eq!(std::fs::read(&path).unwrap(), b"seal!");
@@ -1323,7 +1695,7 @@ mod tests {
         let deadline = started + upload_timeout(32 * 1024 * 1024).as_millis() as u64 + 60_000;
         assert_eq!(queue.tick(deadline - 1).expired, 0, "the upload in progress holds the request");
         assert_eq!(queue.tick(deadline), Tick { expired: 1, abandoned: 1, ..Tick::default() });
-        assert_eq!(queue.finish_upload(&id, token, Ok((b"late".to_vec(), vec![1; 32])), deadline).unwrap_err().code(),
+        assert_eq!(queue.finish_upload(&id, token, Ok((b"late".to_vec(), vec![1; 32])), deadline, None).unwrap_err().code(),
             tonic::Code::FailedPrecondition, "a late upload is not stored");
         assert_eq!(queue.status(Some(&listed.peer), &id, deadline).unwrap().status(), LogRequestStatus::Expired);
     }
@@ -1382,7 +1754,7 @@ mod tests {
         let id: [u8; ID_LEN] = queue.submit(Some(&listed.peer), &signed(&listed, &request(&listed, &own.peer, 1)), NOW)
             .unwrap().request_id.try_into().unwrap();
         let (_, token) = queue.begin_upload(&id, 5, NOW).unwrap();
-        queue.finish_upload(&id, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW).unwrap();
+        queue.finish_upload(&id, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW, None).unwrap();
         queue.served(&id);
         let path = dir.path().join("log-bundles").join(format!("{}.sealed", hex::encode(id)));
         assert!(path.exists());
@@ -1505,5 +1877,324 @@ mod tests {
         assert_eq!(resumed.iter().flat_map(|c| c.data.clone()).collect::<Vec<u8>>(), sealed[300_000..]);
         accept.abort();
         serve.abort();
+    }
+
+    /// A node that writes `lines` to its log directory and approves its
+    /// allowlisted peers' requests itself, at `dir`.
+    fn automatic_queue(config: &LogRequestsConfig, own: &Key, dir: &Path, lines: &str) -> Arc<LogRequests> {
+        Arc::new(automatic_requests(config, own, dir, lines))
+    }
+
+    fn automatic_requests(config: &LogRequestsConfig, own: &Key, dir: &Path, lines: &str) -> LogRequests {
+        let log_dir = dir.join(".log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("master.log"), lines).unwrap();
+        let auto = AutoApproval { log_dir, token_maps: dir.join(".diagnostics").join("token-maps") };
+        LogRequests::with_approval(config, own.peer, dir.join(".diagnostics").join("log-bundles"), Some(auto))
+    }
+
+    /// A node log line `ago_secs` before `now_ms`.
+    fn log_line(now_ms: u64, ago_secs: u64, level: &str, message: &str, fields: &str) -> String {
+        let at = format_rfc3339_utc((now_ms / 1000 - ago_secs) as i64);
+        format!("{at}\t{level}\tquil_node/src/main.rs:7\t{message}\t{fields}\n")
+    }
+
+    /// A request for the hour before `now_ms`, sealed to `kem`.
+    fn fresh(from: &Key, target: &PeerId, nonce: u8, now_ms: u64, kem: &[u8]) -> LogRequest {
+        LogRequest {
+            issued_unix_ms: now_ms,
+            since_unix: now_ms / 1000 - 3600,
+            until_unix: now_ms / 1000,
+            filters: Vec::new(),
+            recipient_kem_public_key: kem.to_vec(),
+            ..request(from, target, nonce)
+        }
+    }
+
+    fn submit_fresh(queue: &LogRequests, from: &Key, own: &Key, nonce: u8, kem: &[u8]) -> SubmitLogRequestResponse {
+        let now = now_ms();
+        queue.submit(Some(&from.peer), &signed(from, &fresh(from, &own.peer, nonce, now, kem)), now).unwrap()
+    }
+
+    fn token_maps(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir.join(".diagnostics").join("token-maps")) else { return Vec::new() };
+        entries.flatten().map(|entry| entry.path()).collect()
+    }
+
+    /// An allowlisted peer's request is approved by this node itself: the
+    /// window is exported with `node log export`'s redaction, sealed to the
+    /// request's key alone, and its token map kept owner-only beside the
+    /// node's config; the requester sees it approved and opens it.
+    #[tokio::test]
+    async fn this_node_approves_an_allowlisted_peers_request_itself() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let lines = [
+            log_line(now, 7200, "info", "before the window", "{}"),
+            log_line(now, 1800, "info", "dialing 192.0.2.10:8340", r#"{"coreId":0}"#),
+            log_line(now, 60, "warn", "archive slow", r#"{"coreId":0}"#),
+        ]
+        .concat();
+        let queue = automatic_queue(&config(true, &[&listed]), &own, dir.path(), &lines);
+        assert!(queue.automatic());
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let submitted = submit_fresh(&queue, &listed, &own, 1, &kem.public);
+        assert_eq!((submitted.status(), submitted.automatic), (LogRequestStatus::Pending, true));
+        let id: [u8; ID_LEN] = submitted.request_id.clone().try_into().unwrap();
+        assert!(queue.list(Some(&own.peer), now).unwrap().automatic);
+
+        assert!(queue.approve_next().await, "the queued request is exported");
+        assert!(!queue.approve_next().await, "each request once");
+        let status = queue.status(Some(&listed.peer), &id, now_ms()).unwrap();
+        assert_eq!(status.status(), LogRequestStatus::Ready);
+        let (_, path, bytes, sha256) = queue.bundle(Some(&listed.peer), &id, now_ms()).unwrap();
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!((sealed.len() as u64, Sha256::digest(&sealed).to_vec()), (bytes, sha256));
+        assert_eq!(status.bundle_bytes, bytes);
+        let files = bundle::unpack_bundle(&quil_crypto::seal::open(&sealed, &kem.secret, &id).unwrap()).unwrap();
+        let mut log = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(files[0].as_slice()), &mut log).unwrap();
+        assert_eq!(log.lines().count(), 2, "the window's lines, every level: {log}");
+        assert!(!log.contains("192.0.2.10") && log.contains("ip4#") && log.contains("archive slow"), "{log}");
+        let manifest: serde_json::Value = serde_json::from_slice(&files[1]).unwrap();
+        assert_eq!(manifest["request"]["approval"], "automatic");
+        assert_eq!(manifest["request"]["id"], hex::encode(id));
+        assert_eq!(manifest["tool"], "quil-node automatic log request approval");
+        assert!(quil_crypto::seal::open(&sealed, &quil_crypto::Sntrup761KeyPair::generate().secret, &id).is_err());
+
+        let maps = token_maps(dir.path());
+        assert_eq!(maps.len(), 1);
+        let name = maps[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(&format!("log-request-{}-", short_id(&id))) && name.ends_with(".map.txt"), "{name}");
+        assert!(std::fs::read_to_string(&maps[0]).unwrap().contains("192.0.2.10"), "the map holds the original");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&maps[0]).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(maps[0].parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    /// Requests from a peer not listed are refused before anything is
+    /// exported, and a node without log files leaves requests to its
+    /// operator.
+    #[tokio::test]
+    async fn only_allowlisted_peers_requests_are_exported() {
+        let (own, listed, unlisted) = (key(), key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let queue = automatic_queue(&config(true, &[&listed]), &own, dir.path(), &log_line(now, 60, "info", "x", "{}"));
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        denied(queue.submit(Some(&unlisted.peer), &signed(&unlisted, &fresh(&unlisted, &own.peer, 1, now, &kem.public)), now));
+        assert!(!queue.approve_next().await, "nothing to export");
+        assert!(token_maps(dir.path()).is_empty() && queue.state().entries.is_empty());
+        let disabled = automatic_queue(&config(false, &[&listed]), &own, dir.path(), "");
+        assert!(!disabled.automatic(), "disabled requests are never exported");
+        denied(disabled.submit(Some(&listed.peer), &signed(&listed, &fresh(&listed, &own.peer, 1, now, &kem.public)), now));
+
+        let (manual, _dir) = self::queue(&config(true, &[&listed]), &own);
+        let manual = Arc::new(manual);
+        assert!(!manual.automatic());
+        let submitted = submit_fresh(&manual, &listed, &own, 1, &kem.public);
+        assert_eq!((submitted.status(), submitted.automatic), (LogRequestStatus::Pending, false));
+        assert!(!manual.approve_next().await, "it waits for the operator");
+        assert!(!manual.list(Some(&own.peer), now).unwrap().automatic);
+    }
+
+    /// The daily budget and the queue's places still bound automatically
+    /// approved requests: a ready bundle holds its place until fetched and
+    /// expired, or withdrawn.
+    #[tokio::test]
+    async fn the_limits_bound_automatic_approval() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = config(true, &[&listed]);
+        (limits.requests_per_day, limits.max_pending) = (3, 4);
+        let now = now_ms();
+        let queue = automatic_queue(&limits, &own, dir.path(), &log_line(now, 60, "info", "x", "{}"));
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        for nonce in 1..=2 {
+            assert_eq!(submit_fresh(&queue, &listed, &own, nonce, &kem.public).status(), LogRequestStatus::Pending);
+            assert!(queue.approve_next().await);
+        }
+        let ready = queue.list(Some(&own.peer), now_ms()).unwrap().requests;
+        assert!(ready.iter().all(|request| request.status() == LogRequestStatus::Ready), "{ready:?}");
+        assert_eq!(submit_fresh(&queue, &listed, &own, 3, &kem.public).refusal(), LogRequestRefusal::TooManyPending);
+        queue.deny(Some(&own.peer), &ready[0].request_id, now_ms()).unwrap();
+        assert_eq!(submit_fresh(&queue, &listed, &own, 3, &kem.public).status(), LogRequestStatus::Pending);
+        assert_eq!(submit_fresh(&queue, &listed, &own, 4, &kem.public).refusal(), LogRequestRefusal::OverBudget);
+    }
+
+    /// An export over maxBundleBytes denies its request as too large and
+    /// keeps nothing; one that fails denies it as failed. Either frees the
+    /// requester's place at once.
+    #[tokio::test]
+    async fn a_failed_automatic_approval_denies_the_request_with_its_reason() {
+        use rand::RngCore as _;
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let mut noise = vec![0u8; 1024];
+        let lines: String = (0..400)
+            .map(|n| {
+                rand::thread_rng().fill_bytes(&mut noise);
+                log_line(now, 600 + n, "info", "noise", &format!("{{\"data\":\"{}\"}}", hex::encode(&noise)))
+            })
+            .collect();
+        let mut limits = config(true, &[&listed]);
+        limits.max_bundle_bytes = *quil_config::LOG_BUNDLE_BYTES.start();
+        (limits.requests_per_day, limits.max_pending) = (4, 2);
+        let queue = automatic_queue(&limits, &own, dir.path(), &lines);
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let id = submit_fresh(&queue, &listed, &own, 1, &kem.public).request_id;
+        assert!(queue.approve_next().await);
+        let status = queue.status(Some(&listed.peer), &id, now_ms()).unwrap();
+        assert_eq!((status.status(), status.denial()), (LogRequestStatus::Denied, LogRequestDenial::TooLarge));
+        assert!(token_maps(dir.path()).is_empty(), "no token map of a bundle not kept");
+        assert!(queue.state().entries.is_empty(), "its place is free");
+        assert!(std::fs::read_dir(dir.path().join(".diagnostics").join("log-bundles")).map_or(true, |mut d| d.next().is_none()));
+
+        std::fs::remove_dir_all(dir.path().join(".log")).unwrap();
+        let id = submit_fresh(&queue, &listed, &own, 2, &kem.public).request_id;
+        assert!(queue.approve_next().await);
+        let status = queue.status(Some(&listed.peer), &id, now_ms()).unwrap();
+        assert_eq!((status.status(), status.denial()), (LogRequestStatus::Denied, LogRequestDenial::ExportFailed));
+        assert!(queue.state().entries.is_empty());
+        assert_eq!(submit_fresh(&queue, &listed, &own, 3, &kem.public).status(), LogRequestStatus::Pending, "it can ask again");
+    }
+
+    /// The operator can deny an automatically approved bundle, fetched or
+    /// not, and a request denied or expired during its export is not
+    /// approved by it: its bundle and token map are dropped.
+    #[tokio::test]
+    async fn deny_withdraws_an_automatic_approval() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let queue = automatic_queue(&config(true, &[&listed]), &own, dir.path(), &log_line(now, 60, "info", "x", "{}"));
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        for fetched in [false, true] {
+            let id = submit_fresh(&queue, &listed, &own, 1 + fetched as u8, &kem.public).request_id;
+            assert!(queue.approve_next().await);
+            let (id, path, _, _) = queue.bundle(Some(&listed.peer), &id, now_ms()).unwrap();
+            if fetched {
+                queue.served(&id);
+            }
+            assert!(path.exists());
+            assert_eq!(queue.deny(Some(&own.peer), &id, now_ms()).unwrap().status(), LogRequestStatus::Denied);
+            assert!(!path.exists(), "the withdrawn bundle is deleted");
+            let status = queue.status(Some(&listed.peer), &id, now_ms()).unwrap();
+            assert_eq!((status.status(), status.denial()), (LogRequestStatus::Denied, LogRequestDenial::Operator));
+        }
+
+        let id: [u8; ID_LEN] = submit_fresh(&queue, &listed, &own, 3, &kem.public).request_id.try_into().unwrap();
+        let job = queue.take_auto_job(now_ms()).unwrap();
+        assert_eq!(job.id, id);
+        assert!(queue.take_auto_job(now_ms()).is_none(), "one export at a time");
+        assert_eq!(queue.begin_upload(&id, 5, now_ms()).unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert!(!job.cancel.load(Ordering::Relaxed));
+        queue.deny(Some(&own.peer), &id, now_ms()).unwrap();
+        assert!(job.cancel.load(Ordering::Relaxed), "deny stops the export");
+        let auto = queue.auto.clone().unwrap();
+        let built = bundle::build_automatic(&auto, &job.request, 1 << 20, (now_ms() / 1000) as i64, &AtomicBool::new(false), None).unwrap();
+        let map = built.token_map.clone();
+        queue.settle_auto(&job, Ok(built), 1, now_ms());
+        assert!(!map.exists(), "the late export's token map is dropped");
+        assert!(!queue.bundle_path(&id).exists());
+        assert_eq!(queue.status(Some(&listed.peer), &id, now_ms()).unwrap().denial(), LogRequestDenial::Operator);
+        assert!(queue.take_auto_job(now_ms()).is_none(), "until the export's task ends");
+        queue.export_done(job.token);
+        submit_fresh(&queue, &listed, &own, 4, &kem.public);
+        assert!(queue.take_auto_job(now_ms()).is_some(), "then the next one starts");
+    }
+
+    /// Opened by a test to let a stand-in export end once cancelled.
+    static GATE: AtomicBool = AtomicBool::new(false);
+
+    /// An export that runs until it is cancelled and [`GATE`] is open.
+    fn stalled_export(
+        _: &AutoApproval,
+        _: &bundle::AutoRequest,
+        _: usize,
+        _: i64,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<bundle::AutoBundle> {
+        let start = std::time::Instant::now();
+        while !(cancel.load(Ordering::Relaxed) && GATE.load(Ordering::Relaxed)) && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(crate::log_export::Cancelled.into())
+    }
+
+    async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        assert!(waited.await.is_ok(), "{what}");
+    }
+
+    /// An export over its time denies its request as failed and is
+    /// stopped; until its task ends, no other export or upload starts.
+    /// Dropping the approval (shutdown) stops its export too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_over_its_time_is_denied_and_stopped() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let mut requests = automatic_requests(&config(true, &[&listed]), &own, dir.path(), "");
+        (requests.auto_timeout, requests.exporter) = (Duration::from_millis(200), Exporter(stalled_export));
+        let queue = Arc::new(requests);
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let id = submit_fresh(&queue, &listed, &own, 1, &kem.public).request_id;
+        assert!(queue.approve_next().await);
+        let status = queue.status(Some(&listed.peer), &id, now_ms()).unwrap();
+        assert_eq!((status.status(), status.denial()), (LogRequestStatus::Denied, LogRequestDenial::ExportFailed));
+        let cancel = queue.state().export.as_ref().map(|export| export.cancel.clone()).expect("still running");
+        assert!(cancel.load(Ordering::Relaxed), "the timeout stops it");
+        let next: [u8; ID_LEN] = submit_fresh(&queue, &listed, &own, 2, &kem.public).request_id.try_into().unwrap();
+        assert!(!queue.approve_next().await, "no second export while the first runs");
+        assert_eq!(queue.begin_upload(&next, 5, now_ms()).unwrap_err().code(), tonic::Code::ResourceExhausted);
+        GATE.store(true, Ordering::Relaxed);
+        wait_for("the stopped export ends", || queue.state().export.is_none()).await;
+
+        let mut requests = automatic_requests(&config(true, &[&listed]), &own, dir.path(), "");
+        (requests.auto_timeout, requests.exporter) = (Duration::from_secs(3600), Exporter(stalled_export));
+        let queue = Arc::new(requests);
+        submit_fresh(&queue, &listed, &own, 1, &kem.public);
+        let approval = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.approve_next().await }
+        });
+        wait_for("the export starts", || queue.state().export.is_some()).await;
+        approval.abort();
+        let _ = approval.await;
+        wait_for("a dropped approval stops its export", || queue.state().export.is_none()).await;
+    }
+
+    /// The automatic approval wakes for a queued request rather than
+    /// waiting for its poll, here an hour.
+    #[tokio::test]
+    async fn the_automatic_approval_wakes_for_a_queued_request() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let mut requests = automatic_requests(&config(true, &[&listed]), &own, dir.path(), &log_line(now, 60, "info", "x", "{}"));
+        requests.auto_poll = Duration::from_secs(3600);
+        let queue = Arc::new(requests);
+        let runner = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.run_automatic_approval().await }
+        });
+        // Let it find nothing and park.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let id = submit_fresh(&queue, &listed, &own, 1, &quil_crypto::Sntrup761KeyPair::generate().public).request_id;
+        wait_for("approved well before the hour's poll", || {
+            queue.status(Some(&listed.peer), &id, now_ms()).unwrap().status() != LogRequestStatus::Pending
+        })
+        .await;
+        assert_eq!(queue.status(Some(&listed.peer), &id, now_ms()).unwrap().status(), LogRequestStatus::Ready);
+        runner.abort();
     }
 }

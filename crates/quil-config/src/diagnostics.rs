@@ -42,9 +42,13 @@ pub struct DiagnosticsConfig {
     /// counts; no text, addresses or keys) on the peer gRPC listener.
     #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub health_report: HealthReportConfig,
-    /// Requests from the listed peers for this node's redacted logs, each
-    /// queued until this node's operator approves or denies it with
-    /// `qclient node diagnostics approve|deny`.
+    /// Requests from the listed peers for this node's redacted logs.
+    /// Listing a peer is consent: the node exports, redacts and seals each
+    /// requested window itself and keeps the sealed bundle for that peer
+    /// alone, writing the token map to `.diagnostics/token-maps`; `qclient
+    /// node diagnostics pending|deny` lists requests and withdraws a bundle.
+    /// A node that writes no log files leaves each request to its operator's
+    /// `qclient node diagnostics approve`.
     #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub log_requests: LogRequestsConfig,
 }
@@ -73,7 +77,8 @@ impl Default for HealthReportConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LogRequestsConfig {
-    /// Queue log requests from the peers in `allowedPeers` for approval.
+    /// Take log requests from the peers in `allowedPeers` and approve them:
+    /// listing a peer consents to sending it this node's redacted logs.
     #[serde(default)]
     pub enabled: bool,
     /// Base58 peer IDs allowed to ask, as for `healthReport`.
@@ -85,12 +90,13 @@ pub struct LogRequestsConfig {
     /// Requests waiting for a decision or a fetch at once (1..=16).
     #[serde(default = "default_max_pending")]
     pub max_pending: u32,
-    /// Seconds a request waits for a decision, and an approved bundle for
-    /// its fetch (600..=604800).
+    /// Seconds a request waits for approval, and an approved bundle for its
+    /// fetch (600..=604800).
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
-    /// Largest sealed bundle this node accepts from its operator and keeps
-    /// for a peer (65536..=268435456).
+    /// Largest sealed bundle this node builds itself or accepts from its
+    /// operator, and keeps for a peer (65536..=268435456); this node denies a
+    /// request whose own export is larger.
     #[serde(default = "default_max_bundle_bytes")]
     pub max_bundle_bytes: u64,
 }

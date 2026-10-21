@@ -1,5 +1,5 @@
-//! Redaction of personal data from node log lines, for `qclient node log
-//! export`.
+//! Redaction of personal data from node log lines, for log exports:
+//! `qclient node log export` and the bundles of peers' log requests.
 //!
 //! Pure: no I/O. A [`Redactor`] replaces each sensitive value with a token
 //! `<class>#<8 hex>` (first 4 bytes of HMAC-SHA256 over the class and the

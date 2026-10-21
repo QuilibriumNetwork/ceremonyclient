@@ -154,8 +154,10 @@ service DiagnosticsService {
 }
 
 // A peer's request for this node's redacted logs (`diagnostics.logRequests`),
-// signed by the requester's network key. The target's operator reviews a
-// redacted preview, then seals the export to `recipient_kem_public_key`.
+// signed by the requester's network key. The target seals a redacted export
+// of the window to `recipient_kem_public_key`: its node does so itself, as
+// its operator's allowlist consents, or, when it writes no log files, its
+// operator after reviewing a redacted preview.
 message LogRequest {
   // 1.
   uint32 schema = 1;
@@ -187,7 +189,7 @@ message SignedLogRequest {
 
 enum LogRequestStatus {
   LOG_REQUEST_STATUS_UNSPECIFIED = 0;
-  // Waiting for the target's operator.
+  // Being exported by the target's node, or waiting for its operator.
   LOG_REQUEST_STATUS_PENDING = 1;
   // Approved: the sealed bundle waits for its fetch.
   LOG_REQUEST_STATUS_READY = 2;
@@ -227,10 +229,23 @@ message SubmitLogRequestResponse {
   LogRequestStatus status = 2;
   LogRequestRefusal refusal = 3;
   uint64 expires_unix_ms = 4;
+  // The target's node approves the request itself rather than waiting for
+  // its operator.
+  bool automatic = 5;
 }
 
 message GetLogRequestStatusRequest {
   bytes request_id = 1;
+}
+
+// Who denied a request, and why.
+enum LogRequestDenial {
+  // The target's operator, or a node that reports no reason.
+  LOG_REQUEST_DENIAL_OPERATOR = 0;
+  // The target's node: the export exceeds its `maxBundleBytes`.
+  LOG_REQUEST_DENIAL_TOO_LARGE = 1;
+  // The target's node: its export failed; its log names the reason.
+  LOG_REQUEST_DENIAL_EXPORT_FAILED = 2;
 }
 
 message LogRequestStatusResponse {
@@ -239,6 +254,8 @@ message LogRequestStatusResponse {
   // The sealed bundle's size, once approved.
   uint64 bundle_bytes = 3;
   uint64 expires_unix_ms = 4;
+  // Once denied.
+  LogRequestDenial denial = 5;
 }
 
 message FetchLogBundleRequest {
@@ -275,6 +292,8 @@ message ListLogRequestsResponse {
   repeated PendingLogRequest requests = 1;
   // `maxBundleBytes`: the largest sealed bundle this node accepts.
   uint64 max_bundle_bytes = 2;
+  // This node approves pending requests itself.
+  bool automatic = 3;
 }
 
 message DenyLogRequestRequest {
@@ -314,6 +333,7 @@ service DiagnosticsOperatorService {
   // Deny a pending request, or withdraw an approved bundle, deleting it.
   rpc DenyLogRequest(DenyLogRequestRequest) returns (DenyLogRequestResponse);
   // Approve a pending request with its bundle, sealed by the operator's
-  // qclient to the request's key.
+  // qclient to the request's key, on a node that does not approve requests
+  // itself.
   rpc UploadLogBundle(stream UploadLogBundleChunk) returns (UploadLogBundleResponse);
 }
