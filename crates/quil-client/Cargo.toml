@@ -31,6 +31,10 @@ quil-p2p = { path = "../quil-p2p" }
 quil-rpc = { path = "../quil-rpc" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-lattice-ct = { path = "../quil-lattice-ct" }
+# `node diagnostics dial`: a subset of the features quil-p2p enables, so
+# neither adds a crate or a feature to the build.
+libp2p = { version = "0.56", features = ["tokio", "tcp", "quic", "yamux", "identify", "ping", "macros"] }
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
 
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }

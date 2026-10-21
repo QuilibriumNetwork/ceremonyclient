@@ -5795,6 +5795,8 @@ dependencies = [
  "flate2",
  "futures",
  "hex 0.4.3",
+ "libp2p",
+ "libp2p-identity",
  "num-bigint 0.4.6",
  "prost 0.13.5",
  "quil-config",
