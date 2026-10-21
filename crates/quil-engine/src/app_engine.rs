@@ -11648,10 +11648,10 @@ mod tests {
     async fn the_sync_anchor_check_links_an_uncertified_first_frame_to_its_session_genesis() {
         let (mut engine, predecessor, genesis, global) = engine_with_session_based_at_seven(0x43);
         let anchor = uncertified_frame(8, &genesis);
-        let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor)).await.unwrap_err().to_string();
+        let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor), None).await.unwrap_err().to_string();
         assert!(error.starts_with("invalid argument: archive sync anchor frame 8: invalid argument: has no certificate"),
             "{error}");
-        let error = engine.validate_archive_sync_anchor(&uncertified_frame(8, &[0x99; 32]), Some(&predecessor)).await
+        let error = engine.validate_archive_sync_anchor(&uncertified_frame(8, &[0x99; 32]), Some(&predecessor), None).await
             .unwrap_err().to_string();
         assert_eq!(error, "invalid argument: anchor does not link to predecessor");
         // Once GLOBAL committed it as the session's tip, the anchor takes the
@@ -11667,7 +11667,7 @@ mod tests {
         state.commit().unwrap();
         state.abort();
         global.commit_with_global_cursor(5, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
-        let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor)).await.unwrap_err().to_string();
+        let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor), None).await.unwrap_err().to_string();
         assert!(error.starts_with("invalid argument: archive sync anchor frame 8: ")
             && !error.contains("has no certificate"), "{error}");
     }
