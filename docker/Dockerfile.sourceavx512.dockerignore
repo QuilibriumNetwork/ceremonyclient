@@ -3,6 +3,7 @@
 !Cargo.toml
 !Cargo.lock
 !rust-toolchain.toml
+!subpatch
 !.nextest.toml
 !.cargo/
 !.cargo/**
