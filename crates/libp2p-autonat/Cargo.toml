@@ -63,17 +63,10 @@ v2 = [
 name = "libp2p_autonat"
 path = "src/lib.rs"
 
-[[test]]
-name = "autonatv2"
-path = "tests/autonatv2.rs"
-
-[[test]]
-name = "test_client"
-path = "tests/test_client.rs"
-
-[[test]]
-name = "test_server"
-path = "tests/test_server.rs"
+# QUILIBRIUM: the integration tests (`tests/`) need `libp2p-swarm-test`,
+# which the published manifest drops, so their targets and the
+# dev-dependencies only they use are removed; the unit tests run with the
+# workspace. See PATCHES.md.
 
 [dependencies.async-trait]
 version = "0.1"
@@ -133,25 +126,10 @@ version = "0.1.41"
 version = "1.1.0"
 optional = true
 
-[dev-dependencies.libp2p-identify]
-version = "0.47.0"
-
-[dev-dependencies.libp2p-swarm]
-version = "0.47.0"
-features = ["macros"]
-
-[dev-dependencies.tokio]
-version = "1.38"
-features = [
-    "macros",
-    "rt",
-    "sync",
-]
-default-features = false
-
-[dev-dependencies.tracing-subscriber]
-version = "0.3"
-features = ["env-filter"]
+# QUILIBRIUM: `PeerId::random` in the unit tests.
+[dev-dependencies.libp2p-identity]
+version = "0.2.12"
+features = ["rand"]
 
 [lints.clippy]
 dbg_macro = "warn"
