@@ -82,6 +82,24 @@ pub struct RemoteWorkerManager {
     /// engine runs and the report on this node's clock
     /// (`refresh_executions`).
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
+    /// Each standalone worker running consensus that did not answer the
+    /// latest report request, as its filter and the reason
+    /// (`refresh_executions`).
+    unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+}
+
+/// Why a standalone worker running consensus gave no report.
+const NO_ANSWER: &str = "worker does not answer";
+const NOT_CONNECTED: &str = "worker not connected";
+
+/// What a standalone worker gave for its execution report.
+enum Answer {
+    Report(quil_types::proto::node::WorkerExecution),
+    /// It answered without a usable report: for another filter, without a
+    /// record, or from a build without the call.
+    Nothing,
+    /// It did not answer in time, or the node holds no connection to it.
+    Unanswered(&'static str),
 }
 
 /// What became of a shard consensus message handed to a standalone worker.
@@ -165,6 +183,7 @@ impl RemoteWorkerManager {
             event_rx: Mutex::new(Some(event_rx)),
             client_tls,
             executions: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
         }
     }
 
@@ -270,21 +289,23 @@ impl RemoteWorkerManager {
 
     /// Fetch the execution report of every standalone worker running
     /// consensus: its engine's phase, which the lifecycle reads to renew only
-    /// seats whose worker hosts its committee session. A worker that does not
-    /// answer, answers for another filter, or whose build lacks the call has
-    /// no report; nothing is inferred from its silence.
+    /// seats whose worker hosts its committee session. A worker that answers
+    /// for another filter, or whose build lacks the call, has no report. One
+    /// that does not answer in time, or that the node holds no connection
+    /// to, hosts nothing: it is listed as unanswered.
     pub async fn refresh_executions(&self) {
-        let targets: Vec<(u32, Vec<u8>, Channel)> = match self.workers.lock() {
+        let targets: Vec<(u32, Vec<u8>, Option<Channel>)> = match self.workers.lock() {
             Ok(workers) => workers
                 .values()
                 .filter(|w| Self::runs(w, &w.filter))
-                .filter_map(|w| w.channel.clone().map(|channel| (w.core_id, w.filter.clone(), channel)))
+                .map(|w| (w.core_id, w.filter.clone(), w.channel.clone()))
                 .collect(),
             Err(_) => return,
         };
         let mut fetches = tokio::task::JoinSet::new();
         for (core_id, filter, channel) in targets {
             fetches.spawn(async move {
+                let Some(channel) = channel else { return (core_id, filter, Answer::Unanswered(NOT_CONNECTED)) };
                 let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
                     .max_decoding_message_size(64 << 10);
                 let answer = tokio::time::timeout(
@@ -292,17 +313,21 @@ impl RemoteWorkerManager {
                     client.get_worker_execution(quil_types::proto::node::GetWorkerExecutionRequest {}),
                 )
                 .await;
-                let report = match answer {
+                let answer = match answer {
                     Ok(Ok(response)) => {
                         let response = response.into_inner();
                         (response.filter == filter)
                             .then_some(response.execution)
                             .flatten()
-                            .map(|execution| on_local_clock(execution, response.now_unix_ms, crate::worker_execution::now_ms()))
+                            .map_or(Answer::Nothing, |execution| Answer::Report(
+                                on_local_clock(execution, response.now_unix_ms, crate::worker_execution::now_ms())))
                     }
-                    _ => None,
+                    Ok(Err(status)) if matches!(status.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) =>
+                        Answer::Unanswered(NO_ANSWER),
+                    Ok(Err(_)) => Answer::Nothing,
+                    Err(_) => Answer::Unanswered(NO_ANSWER),
                 };
-                (core_id, filter, report)
+                (core_id, filter, answer)
             });
         }
         let mut fetched = Vec::new();
@@ -311,11 +336,18 @@ impl RemoteWorkerManager {
                 fetched.push(entry);
             }
         }
-        let Ok(mut executions) = self.executions.lock() else { return };
+        let (Ok(mut executions), Ok(mut unanswered)) = (self.executions.lock(), self.unanswered.lock()) else { return };
         executions.clear();
-        for (core_id, filter, report) in fetched {
-            if let Some(report) = report {
-                executions.insert(core_id, (filter, report));
+        unanswered.clear();
+        for (core_id, filter, answer) in fetched {
+            match answer {
+                Answer::Report(report) => {
+                    executions.insert(core_id, (filter, report));
+                }
+                Answer::Unanswered(reason) => {
+                    unanswered.insert(core_id, (filter, reason));
+                }
+                Answer::Nothing => {}
             }
         }
     }
@@ -657,6 +689,19 @@ impl WorkerManager for RemoteWorkerManager {
             .collect()
     }
 
+    /// The workers `refresh_executions` found unanswered, still running the
+    /// filter they were asked for.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        let (Ok(workers), Ok(unanswered)) = (self.workers.lock(), self.unanswered.lock()) else {
+            return Vec::new();
+        };
+        unanswered
+            .iter()
+            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| Self::runs(w, filter)))
+            .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
+            .collect()
+    }
+
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
         let workers = self.workers.lock().unwrap();
         Ok(workers.values()
@@ -901,13 +946,17 @@ mod fee_relay_tests {
         async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("not used by fee relay"))
         }
-        /// Mode 5 is an older build without the call; otherwise the engine
-        /// runs `[7; 32]`, blocked, observed a minute before the answer, on
-        /// a clock an hour ahead of the master's.
+        /// Mode 5 is an older build without the call, mode 6 never answers
+        /// and mode 7 answers unavailable; otherwise the engine runs
+        /// `[7; 32]`, blocked, observed a minute before the answer, on a
+        /// clock an hour ahead of the master's.
         async fn get_worker_execution(&self, _: tonic::Request<node::GetWorkerExecutionRequest>)
             -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status> {
-            if self.mode.load(Ordering::SeqCst) == 5 {
-                return Err(tonic::Status::unimplemented("older worker"));
+            match self.mode.load(Ordering::SeqCst) {
+                5 => return Err(tonic::Status::unimplemented("older worker")),
+                6 => std::future::pending::<()>().await,
+                7 => return Err(tonic::Status::unavailable("worker going down")),
+                _ => {}
             }
             let now = crate::worker_execution::now_ms() + 3_600_000;
             Ok(tonic::Response::new(node::GetWorkerExecutionResponse {
@@ -961,6 +1010,58 @@ mod fee_relay_tests {
         assert!(manager.worker_execution().is_empty(), "an older build leaves no report");
         stop.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+    }
+
+    /// A standalone worker running consensus that stops answering its
+    /// report request (no answer in time, or unavailable), or that the
+    /// master never reached, is listed unanswered; one that answers, even
+    /// from a build without the call, is not, nor is one no longer running
+    /// consensus.
+    #[tokio::test]
+    async fn a_worker_that_does_not_answer_is_listed_unanswered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(5));
+        let server = SnapshotServer {
+            mode: mode.clone(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming(Incoming(listener)).await.unwrap();
+        });
+        // Core 2's endpoint cannot be dialled (a reachable one that refuses
+        // would be retried for seconds), so the master never connects to it.
+        let manager = RemoteWorkerManager::new(vec![(1, endpoint), (2, "http://no such host".into())], String::new(), None);
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        manager.set_worker_filter(2, &[9; 32], true).unwrap();
+        let listed = || {
+            let mut listed = manager.unanswered_workers();
+            listed.sort();
+            listed
+        };
+        manager.refresh_executions().await;
+        assert!(manager.worker_execution().is_empty());
+        assert_eq!(listed(), vec![(2, vec![9; 32], NOT_CONNECTED)], "an older build answers");
+
+        mode.store(0, Ordering::SeqCst);
+        manager.refresh_executions().await;
+        assert_eq!(manager.worker_execution().len(), 1);
+        assert_eq!(listed(), vec![(2, vec![9; 32], NOT_CONNECTED)]);
+
+        for silent in [6, 7] {
+            mode.store(silent, Ordering::SeqCst);
+            manager.refresh_executions().await;
+            assert!(manager.worker_execution().is_empty(), "mode {silent}");
+            assert_eq!(listed(), vec![(1, vec![7; 32], NO_ANSWER), (2, vec![9; 32], NOT_CONNECTED)], "mode {silent}");
+        }
+
+        manager.set_worker_filter(1, &[7; 32], false).unwrap();
+        assert_eq!(listed(), vec![(2, vec![9; 32], NOT_CONNECTED)], "a worker no longer running consensus is not listed");
+        serving.abort();
     }
 
     /// A shard a worker runs consensus for is served, and a direct message

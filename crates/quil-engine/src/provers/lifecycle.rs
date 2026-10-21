@@ -1611,15 +1611,36 @@ impl ProverLifecycle {
                 .map(|w| (w.core_id, w.filter.clone())).collect();
             let filters: Vec<Vec<u8>> = bound.iter().map(|(_, filter)| filter.clone()).collect();
             let members = self.allocator.session_member_filters(&filters, &prover.public_key);
+            let lapsed: std::collections::HashSet<&[u8]> = prover.allocations.iter()
+                .filter(|a| a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch)
+                .map(|a| a.confirmation_filter.as_slice()).collect();
             let executions = worker_manager.worker_execution();
+            let unanswered = worker_manager.unanswered_workers();
             let now = crate::worker_execution::now_ms();
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
+            let epoch_frames = quil_types::consensus::epoch_length_frames();
             for (core_id, filter) in &bound {
+                use super::session_hosting::{classify, Hosting, Seat};
                 let report = executions.iter()
                     .find(|(id, reported, _)| id == core_id && reported == filter)
                     .map(|(_, _, execution)| execution);
-                hosting.observe(frame_number, filter, *core_id, members.contains(filter),
-                    super::session_hosting::classify(report, now));
+                let seat = if members.contains(filter) { Seat::Member }
+                    else if lapsed.contains(filter.as_slice()) { Seat::Lapsed }
+                    else { Seat::Outside };
+                let observed = match classify(report, now) {
+                    Hosting::Unknown => unanswered.iter()
+                        .find(|(id, reported, _)| id == core_id && reported == filter)
+                        .map_or(Hosting::Unknown, |(_, _, reason)| super::session_hosting::unanswered(reason)),
+                    observed => observed,
+                };
+                let hosts = observed == Hosting::Hosting;
+                if let Some(run) = hosting.observe(frame_number, epoch_frames, filter, *core_id, seat, observed) {
+                    tracing::info!(frame = frame_number, filter = hex::encode(filter), core_id,
+                        withheld_since = run.since, scope = "local",
+                        able = if hosts { "hosts its committee session" }
+                            else { "passed its shard state checks; only its seat keeps it out of the session" },
+                        "seat renewal resumes: its worker can host the committee session again");
+                }
             }
             hosting.retain_bound(&worker_bound_filters);
         }
@@ -1727,34 +1748,57 @@ impl ProverLifecycle {
         // still unbound after the grace is left by the orphan sweep.
         //
         // Nor does a bound seat whose worker has gone an epoch without
-        // hosting the committee session that counts it (decided 2026-10-18,
-        // `session_hosting`): workers refused their predecessor's state for
-        // hours while their seats renewed, so their committees stayed below
-        // quorum. Hosting again renews it, late if need be (through the
-        // recovery epoch); otherwise it lapses, the allocator releases the
-        // worker and the orphan sweep leaves it.
+        // hosting the committee session that counts it, or answering the
+        // node (decided 2026-10-18, `session_hosting`): workers refused their
+        // predecessor's state for hours while their seats renewed, so their
+        // committees stayed below quorum. Hosting again renews it, late if
+        // need be (through the recovery epoch); otherwise it lapses, the
+        // allocator releases the worker and the orphan sweep leaves it.
+        // Lapsing does not lift it (2026-10-21), and after a restart a worker
+        // seen unable to host is given a settle period, not a fresh epoch.
         let epoch_frames = quil_types::consensus::epoch_length_frames();
+        let mut settling: Vec<(Vec<u8>, u64)> = Vec::new();
         let renewal_filters: Vec<Vec<u8>> = {
+            use super::session_hosting::Hold;
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
-            expired_epoch_filters.into_iter()
+            let renewals = expired_epoch_filters.into_iter()
                 .filter(|f| worker_bound_filters.contains(f))
                 .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
                     None => true,
-                    Some(withheld) => {
+                    Some(Hold::Settling { until }) => {
+                        settling.push((f.clone(), until));
+                        false
+                    }
+                    Some(Hold::Withheld(withheld)) => {
                         if withheld.first {
+                            let basis = if withheld.run.from_start { "not seen hosting since this node started" }
+                                else { "an epoch without hosting the session that counts it" };
                             tracing::warn!(frame = frame_number, filter = hex::encode(f), core_id = withheld.run.core_id,
-                                unhosted_since = withheld.run.since, state = %withheld.run.state,
+                                unhosted_since = withheld.run.since, basis, state = %withheld.run.state,
                                 blocker = %withheld.run.blocker, scope = "local", action = "check",
-                                "seat renewal withheld: its worker has not hosted the committee session that counts it \
-                                 for an epoch; renewed once the worker hosts, otherwise the seat lapses and is left");
+                                "seat renewal withheld: its worker cannot host the committee session; renewed once \
+                                 the worker hosts or, if the seat lapsed, passes its shard state checks; otherwise \
+                                 the seat stays lapsed and is left");
                         }
                         false
                     }
                 })
-                .collect()
+                .collect();
+            if let Some((_, until)) = settling.first() {
+                if hosting.report_settling() {
+                    tracing::info!(frame = frame_number, seats = settling.len(), settle_until = until,
+                        filters = ?settling.iter().map(|(f, _)| hex::encode(f)).collect::<Vec<_>>(), scope = "local",
+                        "seat renewals wait for workers seen unable to host after this start: each renews once \
+                         its worker can host; one still unable when the settle period ends is withheld");
+                }
+            }
+            renewals
         };
-        // Seats a worker served at startup keep it until this decision.
-        self.allocator.note_renewals_offered();
+        // Seats a worker served at startup keep it until this decision,
+        // which waits for the settle period's seats.
+        if settling.is_empty() {
+            self.allocator.note_renewals_offered();
+        }
         if !renewal_filters.is_empty() {
             // Never renew an abandoned orphan we may propose leaving below.
             // The pipeline reserves filters before spawning; failed preparation
@@ -4193,9 +4237,9 @@ mod proposal_loop_tests {
     }
 
     /// A seat whose worker has gone an epoch without hosting the committee
-    /// session that counts it is not renewed (decided 2026-10-18); a hosting
-    /// worker, an unobservable one, and a seat its session does not count
-    /// renew as before.
+    /// session that counts it, or without answering the node, is not renewed
+    /// (decided 2026-10-18); a hosting worker, one that gives no report, and a
+    /// seat its session does not count renew as before.
     #[test]
     fn a_seat_whose_worker_never_hosts_its_session_is_not_renewed() {
         use quil_cw_consensus::handoff::Session;
@@ -4244,13 +4288,15 @@ mod proposal_loop_tests {
             matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(filter)));
         // (worker report on `held`, whether `held` renews at 725)
         for (observed, renewed) in [(Some("blocked"), false), (Some("syncing"), false),
-            (Some("serving"), true), (None, true)]
+            (Some("serving"), true), (None, true), (Some("unanswered"), false)]
         {
             let wm = Arc::new(ConfigurableWorkerManager::new());
             wm.add(allocated_worker(1, held.clone()));
             wm.add(allocated_worker(2, outside.clone()));
-            if let Some(state) = observed {
-                wm.set_execution(1, &held, report(state));
+            match observed {
+                Some("unanswered") => wm.set_unanswered(1, &held, "worker does not answer"),
+                Some(state) => wm.set_execution(1, &held, report(state)),
+                None => {}
             }
             wm.set_execution(2, &outside, report("blocked"));
             let reg = Arc::new(ConfigurableRegistry::new());
@@ -4281,6 +4327,146 @@ mod proposal_loop_tests {
                 lc.set_prover_root_verified_frame(730);
                 let late = lc.evaluate(730, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
                 assert!(renews(&late, &held), "{late:?}");
+            }
+        }
+    }
+
+    /// Authenticated GLOBAL state in which each filter's committee session
+    /// has the given members.
+    fn session_authority(sessions: &[(&Vec<u8>, Vec<Vec<u8>>)]) -> Arc<quil_hypergraph::HypergraphCrdt> {
+        use quil_cw_consensus::handoff::Session;
+        use quil_execution::global_intrinsic::handoff;
+        use quil_execution::hypergraph_state::HypergraphState;
+
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        commit(1);
+        for (filter, members) in sessions {
+            let mut members = members.clone();
+            members.sort();
+            handoff::initialize(&state, 2, &Session {
+                chain_id: [7; 32], filter: filter.to_vec(), generation: 1,
+                genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+                base_frame: 0, authorization: [0; 32], members,
+            }).unwrap();
+        }
+        commit(2);
+        global
+    }
+
+    /// A seat whose renewal was withheld because its worker cannot host
+    /// stays lapsed while the worker still fails its shard state checks, and
+    /// renews once only its seat keeps the worker out (2026-10-21: a lapsed
+    /// seat renewed three frames later). After a restart, a member or lapsed
+    /// seat whose worker cannot host waits out the settle period and is then
+    /// withheld, while a hosting worker, an unobservable one and a seat not
+    /// yet seated renew at once.
+    #[test]
+    fn a_seat_its_worker_cannot_host_stays_lapsed_across_lapse_and_restart() {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB1; 32];
+        let unseated = vec![0xB2; 32];
+        // `held`'s session counts this prover until the seat lapses; no
+        // session seats it on `unseated`.
+        let seated = session_authority(&[(&held, vec![local.clone(), other.clone()]), (&unseated, vec![other.clone()])]);
+        let left_out = session_authority(&[(&held, vec![other.clone()]), (&unseated, vec![other.clone()])]);
+        let report = |state: &str, blocker: &str| WorkerExecution {
+            state: state.into(), blocker: blocker.into(),
+            observed_unix_ms: crate::worker_execution::now_ms(), ..Default::default()
+        };
+        let unable = || report("blocked", "state unavailable");
+        let seat_only = || report("blocked", "committee admission unavailable");
+        let renews = |actions: &[LifecycleAction], filter: &Vec<u8>| actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(filter)));
+        // Confirmed for these epochs: renewal is due from the epoch's first
+        // frame and the seat lapses in the next.
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let register = |held_epoch: u64, unseated_epoch: u64| {
+            let allocation = |filter: &Vec<u8>, epoch: u64| ProverAllocationInfo { epoch,
+                ..alloc(filter.clone(), ProverStatus::Active, 10) };
+            reg.set_prover(ProverInfo { public_key: local.clone(), ..prover(address.clone(),
+                vec![allocation(&held, held_epoch), allocation(&unseated, unseated_epoch)]) });
+        };
+        reg.set_summaries(vec![shard_summary(held.clone(), 50), shard_summary(unseated.clone(), 50)]);
+        let workers = |held_report: Option<WorkerExecution>| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, unseated.clone()));
+            if let Some(report) = held_report {
+                wm.set_execution(1, &held, report);
+            }
+            wm.set_execution(2, &unseated, unable());
+            wm
+        };
+        let started = |wm: &Arc<ConfigurableWorkerManager>, authority: &Arc<quil_hypergraph::HypergraphCrdt>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(authority.clone());
+            lc
+        };
+        let evaluate = |lc: &ProverLifecycle, wm: &ConfigurableWorkerManager, frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm).unwrap();
+            assert_eq!(count_proposed_leaves(&actions), 0, "{frame}: {actions:?}");
+            actions
+        };
+        let settle = crate::provers::session_hosting::settle_frames(quil_types::consensus::epoch_length_frames());
+
+        // An epoch as a member whose worker never hosts withholds the renewal.
+        register(1, 1);
+        let wm = workers(Some(unable()));
+        let lc = started(&wm, &seated);
+        evaluate(&lc, &wm, 5);
+        let actions = evaluate(&lc, &wm, 725);
+        assert!(!renews(&actions, &held) && renews(&actions, &unseated), "{actions:?}");
+        // The seat lapses and the next session leaves it out.
+        lc.allocator.set_session_authority(left_out.clone());
+        let actions = evaluate(&lc, &wm, 1_445);
+        assert!(!renews(&actions, &held), "a lapsed seat whose worker cannot host stays lapsed: {actions:?}");
+        wm.set_execution(1, &held, seat_only());
+        let actions = evaluate(&lc, &wm, 1_450);
+        assert!(renews(&actions, &held), "only its seat keeps the worker out: {actions:?}");
+
+        // A restart in the recovery epoch, the worker still unable: the
+        // lapsed seat waits, then is withheld; the unseated one renews.
+        register(1, 2);
+        let wm = workers(Some(unable()));
+        let lc = started(&wm, &left_out);
+        let actions = evaluate(&lc, &wm, 1_500);
+        assert!(!renews(&actions, &held) && renews(&actions, &unseated), "{actions:?}");
+        let actions = evaluate(&lc, &wm, 1_500 + settle);
+        assert!(!renews(&actions, &held), "still unable after the settle period: {actions:?}");
+        wm.set_execution(1, &held, seat_only());
+        assert!(renews(&evaluate(&lc, &wm, 1_501 + settle), &held));
+
+        // A restart with the seat a member and due: a worker that cannot host
+        // waits, then is withheld until it hosts; a hosting or unobservable
+        // one renews at once.
+        register(1, 1);
+        for (observed, at_start) in [(Some(unable()), false), (Some(report("serving", "")), true), (None, true)] {
+            let wm = workers(observed.clone());
+            let lc = started(&wm, &seated);
+            let actions = evaluate(&lc, &wm, 800);
+            assert_eq!(renews(&actions, &held), at_start, "{observed:?}: {actions:?}");
+            if !at_start {
+                assert!(!renews(&evaluate(&lc, &wm, 800 + settle), &held));
+                wm.set_execution(1, &held, report("serving", ""));
+                assert!(renews(&evaluate(&lc, &wm, 801 + settle), &held));
             }
         }
     }

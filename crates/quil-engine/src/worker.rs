@@ -43,6 +43,12 @@ pub trait WorkerManager: Send + Sync {
     fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
         Vec::new()
     }
+    /// Filter-bound workers that did not answer their last execution report
+    /// request, or that the node holds no connection to, with the reason; a
+    /// build without the call is not listed. Unsupported managers return none.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        Vec::new()
+    }
     fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()>;
 
     /// Record the frame at which a join proposal was submitted for this
