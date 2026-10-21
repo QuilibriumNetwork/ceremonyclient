@@ -893,7 +893,8 @@ pub trait ProverRegistry: Send + Sync {
     /// The epoch-aligned committee under `filter` as of `frame_number` — the
     /// same `effective_status` view the rest of the node uses. Includes `Active`
     /// and `Leaving`-within-grace (a departing member stays in the frozen
-    /// committee until the E+2 boundary); excludes `Joining` (incl.
+    /// committee until the E+2 boundary; from the leaver currency frame only
+    /// one that was current when it left); excludes `Joining` (incl.
     /// deferred-activation — a just-confirmed prover that is pre-E+2 and not yet
     /// running its consensus loop), `ExpiredEpoch` (storage-stale), `Leaving`
     /// past grace, and terminal allocations. An empty-committee floor re-admits

@@ -784,6 +784,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions one epoch after their request"
     );
+    let leaver_currency_from = quil_execution::prover_registry::init_leaver_currency_frame(args.network);
+    info!(
+        leaver_currency_frame = %if leaver_currency_from == u64::MAX { "never".to_string() } else { leaver_currency_from.to_string() },
+        "committees counting a leaving allocation only if it was current when it left"
+    );
     let confirm_release_from =
         quil_execution::global_intrinsic::prover_release::init_confirm_release_frame(args.network);
     info!(
