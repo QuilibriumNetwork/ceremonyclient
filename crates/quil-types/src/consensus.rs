@@ -628,6 +628,49 @@ impl ProverAllocationInfo {
     }
 }
 
+/// The first frame of `epoch`.
+pub fn epoch_start_frame(epoch: u64) -> u64 {
+    epoch.saturating_mul(epoch_length_frames())
+}
+
+/// What a join of this prover waits for before its allocation joins the
+/// committee: a join proposed in epoch E must be confirmed in epoch E+1 and
+/// activates at the boundary after its confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinWait {
+    /// Not confirmed yet: the confirm is due in `epoch`, which also sets the
+    /// earliest activation.
+    Confirmation { epoch: u64 },
+    /// Confirmed: the allocation joins its committee at frame `frame`.
+    Activation { frame: u64 },
+}
+
+impl JoinWait {
+    /// The first frame the allocation can serve at: the activation frame
+    /// once confirmed, else the boundary after the confirm epoch.
+    pub fn activation_frame(self) -> u64 {
+        match self {
+            JoinWait::Confirmation { epoch } => epoch_start_frame(epoch + 1),
+            JoinWait::Activation { frame } => frame,
+        }
+    }
+}
+
+impl ProverAllocationInfo {
+    /// What the allocation's join waits for at `frame`, by its
+    /// [`AllocationPhase`]; `None` unless it is joining or activating
+    /// (or a genesis/test allocation without a join frame).
+    pub fn join_wait(&self, frame: u64) -> Option<JoinWait> {
+        match self.phase(frame)? {
+            AllocationPhase::Joining if self.join_frame_number > 0 =>
+                Some(JoinWait::Confirmation { epoch: epoch_for_frame(self.join_frame_number) + 1 }),
+            AllocationPhase::Activating =>
+                Some(JoinWait::Activation { frame: epoch_start_frame(epoch_for_frame(self.join_confirm_frame_number) + 1) }),
+            _ => None,
+        }
+    }
+}
+
 /// A shard's provers counted by [`AllocationPhase`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PhaseCounts {
@@ -1150,6 +1193,30 @@ pub(crate) mod epoch_tests {
             }
         }
         assert_eq!(counts, PhaseCounts { joining: 1, activating: 1, active: 2, paused: 1, leaving: 1, departing: 1 });
+    }
+
+    /// A join waits for its confirmation in the epoch after the join, then,
+    /// once confirmed, for the boundary after the confirmation; an active
+    /// allocation waits for neither.
+    #[test]
+    fn a_join_waits_for_its_confirm_epoch_then_its_activation_boundary() {
+        let _guard = epoch_length_guard();
+        let e = EPOCH_LENGTH_FRAMES;
+        let mut a = active_alloc(vec![7], 0);
+        a.status = ProverStatus::Joining;
+        a.join_frame_number = 1275 * e + 7;
+        let wait = a.join_wait(1275 * e + 29);
+        assert_eq!(wait, Some(JoinWait::Confirmation { epoch: 1276 }));
+        assert_eq!(wait.map(JoinWait::activation_frame), Some(1277 * e));
+        a.status = ProverStatus::Active;
+        a.join_confirm_frame_number = 1276 * e + 8;
+        a.epoch = 1277;
+        assert_eq!(a.join_wait(1276 * e + 9), Some(JoinWait::Activation { frame: 1277 * e }));
+        assert_eq!(a.join_wait(1277 * e), None, "active from the boundary");
+        a.join_frame_number = 0;
+        a.join_confirm_frame_number = 0;
+        a.status = ProverStatus::Joining;
+        assert_eq!(a.join_wait(5), None, "a genesis join has no confirm epoch");
     }
 
     fn active_alloc(filter: Vec<u8>, epoch: u64) -> ProverAllocationInfo {

@@ -2542,8 +2542,9 @@ pub(crate) fn spawn_all(
                 peer_id,
             ));
             let (view, head, crdt) = (workers_view.clone(), last_global_head_frame.clone(), crdt.clone());
+            let registry = prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
             let source: quil_rpc::diagnostics_service::HealthSource =
-                Arc::new(move || health_inputs(&view, &head, &crdt));
+                Arc::new(move || health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address));
             let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
                 .expect("build script emits a SHA-256 fingerprint");
             tonic::service::interceptor::InterceptedService::new(
@@ -2813,12 +2814,15 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
         .collect()
 }
 
-/// What a health report reads: the worker view, the GLOBAL head and the
-/// committed session head of each allocated worker's shard.
+/// What a health report reads: the worker view, the GLOBAL head, the
+/// committed session head of each allocated worker's shard and what this
+/// prover's joining allocations wait for in the prover registry.
 fn health_inputs(
     view: &std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>,
     head: &std::sync::atomic::AtomicU64,
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    prover_address: &[u8],
 ) -> quil_rpc::diagnostics_service::HealthInputs {
     let workers = view.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let filters: Vec<Vec<u8>> =
@@ -2830,11 +2834,18 @@ fn health_inputs(
             Default::default()
         }
     };
-    quil_rpc::diagnostics_service::HealthInputs {
-        workers,
-        committee_heads,
-        global_head_frame: head.load(std::sync::atomic::Ordering::Relaxed),
-    }
+    let global_head_frame = head.load(std::sync::atomic::Ordering::Relaxed);
+    let join_waits = match registry.get_prover_info(prover_address) {
+        Ok(Some(prover)) if global_head_frame > 0 => prover.allocations.iter()
+            .filter_map(|a| Some((a.confirmation_filter.clone(), a.join_wait(global_head_frame)?)))
+            .collect(),
+        Ok(_) => Default::default(),
+        Err(error) => {
+            debug!(%error, "health report without join waits: prover registry unavailable");
+            Default::default()
+        }
+    };
+    quil_rpc::diagnostics_service::HealthInputs { workers, committee_heads, global_head_frame, join_waits }
 }
 
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
@@ -2923,6 +2934,21 @@ mod health_input_tests {
             state: "serving".into(), materialized_frame: Some(5), observed_unix_ms: 1, ..Default::default() };
         workers.set_execution(1, &filter, serving);
         workers.set_execution(2, &[9; 32], quil_types::proto::node::WorkerExecution { state: "blocked".into(), ..Default::default() });
+        // A join proposed at frame 90 waits for its confirm in epoch 1.
+        let joining = vec![4; 32];
+        workers.add_with_filter(4, joining.clone());
+        let address = vec![0xAA; 32];
+        let registry = quil_engine::test_support::TestProverRegistry::with_prover(quil_types::consensus::ProverInfo {
+            public_key: Vec::new(), address: address.clone(), status: quil_types::consensus::ProverStatus::Active,
+            kick_frame_number: 0, available_storage: 0, seniority: 0, delegate_address: Vec::new(),
+            allocations: vec![quil_types::consensus::ProverAllocationInfo {
+                status: quil_types::consensus::ProverStatus::Joining, confirmation_filter: joining.clone(),
+                rejection_filter: Vec::new(), join_frame_number: 90, leave_frame_number: 0, pause_frame_number: 0,
+                resume_frame_number: 0, kick_frame_number: 0, join_confirm_frame_number: 0, join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0, leave_reject_frame_number: 0, last_active_frame_number: 0,
+                last_signed_frame_number: 0, epoch: 0, ring: 0, vertex_address: Vec::new(),
+            }],
+        });
         let view = std::sync::RwLock::new(worker_entries(&workers));
         let head = std::sync::atomic::AtomicU64::new(100);
 
@@ -2932,9 +2958,9 @@ mod health_input_tests {
             Arc::new(quil_types::crypto::NoopInclusionProver),
         ));
         crdt.set_forest(quil_forest::Forest::new(db.inner()));
-        let unread = health_inputs(&view, &head, &crdt);
+        let unread = health_inputs(&view, &head, &crdt, &registry, &address);
         assert!(unread.committee_heads.is_empty(), "no committed GLOBAL state yet");
-        assert_eq!(unread.workers.len(), 3, "the workers are reported without it");
+        assert_eq!(unread.workers.len(), 4, "the workers are reported without it");
 
         let state = HypergraphState::new(crdt.clone());
         let signer = quil_crypto::FalconSigner::generate();
@@ -2947,7 +2973,7 @@ mod health_input_tests {
         state.commit().unwrap(); state.abort();
         crdt.commit_with_global_cursor(100, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
 
-        let inputs = health_inputs(&view, &head, &crdt);
+        let inputs = health_inputs(&view, &head, &crdt, &registry, &address);
         assert_eq!(inputs.global_head_frame, 100);
         assert_eq!(inputs.committee_heads.keys().collect::<Vec<_>>(), [&filter], "only shards with a session");
         let report = build_report(&inputs, &[], 0);
@@ -2956,8 +2982,12 @@ mod health_input_tests {
         assert_eq!(rows, [
             (1, true, Phase::Serving, Some(5), Some(0), Some(1)),
             (2, true, Phase::Unspecified, None, None, None),
+            (4, true, Phase::Joining, None, None, None),
             (3, false, Phase::Unspecified, None, None, None),
         ], "a report for another filter is not the worker's");
+        let joining = &report.workers[2];
+        assert_eq!((joining.join_confirm_epoch, joining.activation_frame),
+            (Some(1), Some(2 * quil_types::consensus::epoch_length_frames())));
     }
 }
 

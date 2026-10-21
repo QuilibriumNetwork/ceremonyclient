@@ -48,7 +48,9 @@ pub enum DiagnosticsCommand {
     /// prints.
     ///
     /// Columns: PHASE is the worker's lifecycle phase (stale when its last
-    /// observation is over 30s old), REASON why that phase holds, LOCAL the
+    /// observation is over 30s old; joining while its allocation awaits its
+    /// join confirmation or activation), REASON why that phase holds (with
+    /// the frame by which committed GLOBAL state ends a wait), LOCAL the
     /// worker's materialized app frame, COMMITTEE and GEN the head frame and
     /// generation of the shard's session in committed GLOBAL state as the
     /// target sees it, ADVANCE the age of LOCAL's last advance (unobserved:
@@ -432,6 +434,10 @@ fn phase(worker: &WorkerHealth, now: u64) -> String {
     if phase == Phase::Unspecified {
         return "unobserved".into();
     }
+    // The registry's view: a joining worker may run no engine to observe.
+    if phase == Phase::Joining {
+        return "joining".into();
+    }
     if now.saturating_sub(worker.observed_unix_ms) > diag::STALE_AFTER_MS {
         return "stale".into();
     }
@@ -478,8 +484,28 @@ const COLUMNS: [(&str, bool); 11] = [
     ("RECOVERY", false),
 ];
 
+/// What a joining worker awaits: its confirm epoch, or once confirmed the
+/// frame it activates at.
+fn join_reason(worker: &WorkerHealth) -> Option<String> {
+    match (worker.join_confirm_epoch, worker.activation_frame) {
+        (Some(epoch), _) => Some(format!("awaiting join confirmation (epoch {epoch})")),
+        (None, Some(frame)) => Some(format!("awaiting activation at frame {frame}")),
+        (None, None) => None,
+    }
+}
+
 fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
-    let reason = Blocker::try_from(worker.blocker).map_or("unrecognized", diag::blocker_text);
+    let blocker = Blocker::try_from(worker.blocker).map_or("unrecognized", diag::blocker_text);
+    let waiting = worker.phase == Phase::Waiting as i32;
+    let reason = match (join_reason(worker), worker.awaited_frame) {
+        (Some(join), _) if worker.phase == Phase::Joining as i32 => join,
+        _ if blocker.is_empty() => "-".into(),
+        // Refused only its committee seat, which committed GLOBAL state grants.
+        (_, Some(frame)) if waiting && worker.blocker == Blocker::CommitteeAdmissionUnavailable as i32 =>
+            format!("awaiting a committee seat (by frame {frame})"),
+        (_, Some(frame)) if waiting => format!("{blocker} (by frame {frame})"),
+        _ => blocker.into(),
+    };
     let seal = worker.seal_generation.map_or_else(
         || "-".into(),
         |generation| {
@@ -494,7 +520,7 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
         worker.core_id.to_string(),
         if worker.allocated { "yes" } else { "no" }.into(),
         phase(worker, now),
-        if reason.is_empty() { "-".into() } else { reason.into() },
+        reason,
         optional(worker.materialized_frame),
         optional(worker.committee_head_frame),
         worker.committed_generation.map_or_else(|| "-".into(), |generation| format!("g{generation}")),
@@ -670,6 +696,39 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         assert!(lines[0].ends_with("; 2 workers, 4 more not sent (report size bound)."), "{}", lines[0]);
         assert!(lines[2].contains(" stale "), "{}", lines[2]);
         assert_eq!(lines[3], "   3  no     unobserved  -           -          -  -    unobserved  -     -                                                                 -");
+    }
+
+    /// A joining worker says what it awaits instead of reading as
+    /// unobserved or blocked; its recovery stays in its column.
+    #[test]
+    fn a_joining_worker_names_its_confirm_epoch_or_activation_frame() {
+        let mut unconfirmed = WorkerHealth {
+            core_id: 4,
+            filter: vec![0xc3; 32],
+            allocated: true,
+            join_confirm_epoch: Some(1_276),
+            activation_frame: Some(919_440),
+            ..Default::default()
+        };
+        unconfirmed.set_phase(Phase::Joining);
+        let mut activating = two_workers().remove(1);
+        activating.set_phase(Phase::Joining);
+        activating.set_blocker(Blocker::ConsensusStartupUnavailable);
+        activating.activation_frame = Some(918_720);
+        let text = render_report("this node", &report(vec![unconfirmed, activating], 0));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("   4  yes    joining  awaiting join confirmation (epoch 1276)  "), "{}", lines[2]);
+        assert!(lines[3].starts_with("  12  yes    joining  awaiting activation at frame 918720      "), "{}", lines[3]);
+        assert!(lines[3].ends_with("installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 \
+            archive_state:1, last failure connect <60s, longest turn wait 95s"), "{}", lines[3]);
+
+        let mut seat = two_workers().remove(1);
+        seat.set_phase(Phase::Waiting);
+        seat.set_blocker(Blocker::CommitteeAdmissionUnavailable);
+        seat.awaited_frame = Some(919_440);
+        let text = render_report("this node", &report(vec![seat], 0));
+        assert!(text.lines().nth(2).unwrap().starts_with("  12  yes    wait   awaiting a committee seat (by frame 919440)  "),
+            "{text}");
     }
 
     #[test]

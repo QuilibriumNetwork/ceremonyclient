@@ -3611,7 +3611,7 @@ impl AppConsensusEngine {
     /// wait is named; the legacy passive retry stays at debug.
     fn note_start_refused(&mut self, error: &QuilError, now: std::time::Instant) {
         debug!(core_id = self.core_id, %error, "cw retry: app consensus not startable yet");
-        if quil_types::consensus::committee_handoff_policy().is_none() && !expected_admission_wait(error) {
+        if quil_types::consensus::committee_handoff_policy().is_none() && !refused_while_joining(error, &self.start_context) {
             return;
         }
         let refusal = classify_start_refusal(error, &self.start_context);
@@ -3654,12 +3654,38 @@ impl AppConsensusEngine {
     fn local_seat(&self, session: Option<&quil_cw_consensus::handoff::Session>) -> NotSeated {
         let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-        let allocations = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
-            .map(|p| p.allocations.iter().filter(|a| a.confirmation_filter == self.filter)
-                .map(|a| a.effective_status(global_frame)).collect())
+        let own: Vec<quil_types::consensus::ProverAllocationInfo> = self.prover_registry
+            .get_prover_info(&self.local_prover_address).ok().flatten()
+            .map(|p| p.allocations.into_iter().filter(|a| a.confirmation_filter == self.filter).collect())
             .unwrap_or_default();
+        let allocations = own.iter().map(|a| a.effective_status(global_frame)).collect();
+        let join_wait = own.iter().find_map(|a| a.join_wait(global_frame));
         let release = session.and_then(|session| self.release_shortfall(session, global_frame));
-        NotSeated { allocations, global_frame, release }
+        let current = own.iter().any(|a| a.effective_status(global_frame) == quil_types::consensus::EffectiveStatus::Active);
+        let session_wait = session.filter(|_| current).and_then(|session| self.session_wait(session, global_frame));
+        NotSeated { allocations, global_frame, release, join_wait, session_wait }
+    }
+
+    /// What seats this worker, whose allocation is active and current, in
+    /// `session`'s shard, read from committed GLOBAL state: membership
+    /// changes only at the first session pass of an epoch, and only for an
+    /// active session; a closing one keeps its committee until it seals or
+    /// GLOBAL fences it.
+    fn session_wait(&self, session: &quil_cw_consensus::handoff::Session, global_frame: u64) -> Option<SessionWait> {
+        use quil_execution::global_intrinsic::handoff::{self, schedule};
+        let view = handoff::CommittedView::capture(self.global_hypergraph.as_ref()?).ok()?;
+        match handoff::status(&view, &session.id().ok()?).ok()? {
+            handoff::Status::Active => Some(SessionWait::Boundary {
+                frame: quil_types::consensus::epoch_start_frame(quil_types::consensus::epoch_for_frame(global_frame) + 1),
+            }),
+            handoff::Status::Sealing(request) => {
+                let request = handoff::request(&view, &request).ok()??;
+                let seats = request.targets.iter().any(|target| target.committee.filter == self.filter
+                    && target.committee.members.iter().any(|key| *key == self.local_bls_pubkey));
+                Some(SessionWait::Seal { fence_frame: schedule::fence_due_frame(request.frame), seats })
+            }
+            handoff::Status::Closed(_) => None,
+        }
     }
 
     /// This prover's recorded release on the shard, when the minimum GLOBAL
@@ -4402,7 +4428,7 @@ impl AppConsensusEngine {
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                                             "shard commonware-simplex consensus running after transport readiness");
                                     }
-                                    Err(e) if expected_admission_wait(&e)
+                                    Err(e) if refused_while_joining(&e, &self.start_context)
                                         || quil_types::consensus::committee_handoff_policy().is_some() =>
                                         self.note_start_refused(&e, std::time::Instant::now()),
                                     Err(e) => warn!(core_id = self.core_id, error = %e,
@@ -5239,7 +5265,7 @@ impl AppConsensusEngine {
             Ok(_) => self.observe_consensus_phase(),
             Err(error) => {
                 let text = error.to_string();
-                if expected_admission_wait(error) {
+                if refused_while_joining(error, &self.start_context) {
                     self.execution.state("waiting", "awaiting allocation activation");
                     return result;
                 }
@@ -5251,7 +5277,15 @@ impl AppConsensusEngine {
                     else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") { "state unavailable" }
                     else if text.contains("committee build failed") { "committee admission unavailable" }
                     else { "consensus startup unavailable" };
-                self.execution.state("blocked", blocker);
+                // Refused for its seat alone, by a committee that predates its
+                // active allocation: a wait for committed GLOBAL state. The
+                // blocker stays: renewals read it as able to host.
+                let seat_wait = (blocker == "committee admission unavailable")
+                    .then(|| self.start_context.not_seated.as_ref().and_then(NotSeated::awaits_seat)).flatten();
+                match seat_wait {
+                    Some(wait) => self.execution.waiting_until(blocker, wait.frame()),
+                    None => self.execution.state("blocked", blocker),
+                }
             }
         }
         result
@@ -7115,6 +7149,13 @@ impl AppConsensusEngine {
 
 fn expected_admission_wait(error: &QuilError) -> bool {
     matches!(error, QuilError::ExecutionUnavailable(reason) if reason == "awaiting allocation activation")
+}
+
+/// Whether a refused start waits for this worker's allocation to activate:
+/// whichever gate refused it, a worker its committee does not seat because
+/// its allocation is joining cannot start before activation.
+fn refused_while_joining(error: &QuilError, context: &StartContext) -> bool {
+    expected_admission_wait(error) || context.not_seated.as_ref().is_some_and(NotSeated::joining)
 }
 
 /// How bootstrap authenticates one of its two frames.
@@ -9124,6 +9165,34 @@ struct NotSeated {
     global_frame: u64,
     /// Set when sessions require a release this prover has not recorded.
     release: Option<ReleaseShortfall>,
+    /// What a joining allocation of this prover for the shard waits for.
+    join_wait: Option<quil_types::consensus::JoinWait>,
+    /// What seats an active, current allocation, from committed GLOBAL state.
+    session_wait: Option<SessionWait>,
+}
+
+/// The committed GLOBAL event that seats a worker whose allocation is
+/// active and current but whose shard's committee session predates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionWait {
+    /// The session is active: the first session pass of the epoch starting
+    /// at `frame` schedules a successor that seats the worker, and that
+    /// successor starts once the session seals.
+    Boundary { frame: u64 },
+    /// The session is closing: its successor is authorized when it seals, or
+    /// when GLOBAL fences it at `fence_frame`; `seats` whether that
+    /// successor counts the worker (else a later epoch's pass seats it).
+    Seal { fence_frame: u64, seats: bool },
+}
+
+impl SessionWait {
+    /// The GLOBAL frame by which the awaited event happens.
+    fn frame(self) -> u64 {
+        match self {
+            SessionWait::Boundary { frame } => frame,
+            SessionWait::Seal { fence_frame, .. } => fence_frame,
+        }
+    }
 }
 
 /// A recorded release below the minimum a session's committee required:
@@ -9152,6 +9221,12 @@ impl ReleaseShortfall {
 }
 
 impl NotSeated {
+    /// The committed GLOBAL event this worker waits for, when its allocation
+    /// is active and current and only its seat is missing.
+    fn awaits_seat(&self) -> Option<SessionWait> {
+        self.session_wait.filter(|_| self.allocations.contains(&quil_types::consensus::EffectiveStatus::Active))
+    }
+
     fn joining(&self) -> bool {
         self.allocations.contains(&quil_types::consensus::EffectiveStatus::Joining)
     }
@@ -9217,8 +9292,16 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
     let refusal = |key: String, reason: String, scope: StartScope, action: &'static str, repeats: bool| {
         StartRefusal { key: refusal_key(&key), reason, scope, action, repeats }
     };
-    if expected_admission_wait(error) || context.not_seated.as_ref().is_some_and(NotSeated::joining) {
-        let reason = "this worker's allocation is joining".to_string();
+    if refused_while_joining(error, context) {
+        use quil_types::consensus::JoinWait;
+        let reason = match context.not_seated.as_ref().and_then(|seat| seat.join_wait) {
+            Some(JoinWait::Activation { frame }) =>
+                format!("this worker's allocation is joining: confirmed, it activates at GLOBAL frame {frame}"),
+            Some(wait @ JoinWait::Confirmation { epoch }) => format!(
+                "this worker's allocation is joining: its join awaits confirmation in epoch {epoch}, \
+                    to activate at GLOBAL frame {}", wait.activation_frame()),
+            None => "this worker's allocation is joining".to_string(),
+        };
         return refusal(reason.clone(), reason, ExpectedWait,
             "it starts when the allocation activates at its activation epoch", true);
     }
@@ -9242,6 +9325,29 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
                 "this build records its release with the allocation's next epoch reconfirm, and a session formed \
                     after that seats it; check this worker's prover confirmation (dispatch and publish in the \
                     master log) if it persists past the next epoch",
+                true,
+            );
+        }
+        if let Some(wait) = seat.awaits_seat() {
+            let awaited = match wait {
+                SessionWait::Boundary { frame } => format!("the shard's committee session is active and changes \
+                    membership only at the first session pass of an epoch: the pass at GLOBAL frame {frame} \
+                    schedules a successor session that seats it if its reconfirm for that epoch is recorded, \
+                    which starts once the current session seals"),
+                SessionWait::Seal { fence_frame, seats: true } => format!("the shard's committee session is \
+                    closing and its successor seats it: it starts once the session seals, or once GLOBAL fences it \
+                    at frame {fence_frame}"),
+                SessionWait::Seal { fence_frame, seats: false } => format!("the shard's committee session is \
+                    closing and its successor was drawn without this allocation: a later epoch's first session pass \
+                    seats it, after the session seals or GLOBAL fences it at frame {fence_frame}"),
+            };
+            return refusal(
+                format!("not seated yet: {wait:?}"),
+                format!("not seated yet: this worker's allocation is active and current (GLOBAL frame {}), but {awaited}",
+                    seat.global_frame),
+                ExpectedWait,
+                "committed GLOBAL state seats this worker at that event, for every new member of the shard; \
+                    nothing to do on this node; report it with this line if it persists past that frame",
                 true,
             );
         }
@@ -9498,7 +9604,7 @@ mod start_block_tests {
         let lapsed = StartContext {
             generation: Some(19),
             members: Some(4),
-            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234, release: None }),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234, release: None, join_wait: None, session_wait: None }),
             ..StartContext::default()
         };
         let seat = classify_start_refusal(&committee_build_failed(), &lapsed);
@@ -9511,10 +9617,30 @@ mod start_block_tests {
         assert_eq!(earlier.key, seat.key, "the gate that refused first does not change the refusal");
 
         let unseated_joining = StartContext {
-            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1, release: None }),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1, release: None, join_wait: None, session_wait: None }),
             ..StartContext::default()
         };
         assert_eq!(classify_start_refusal(&committee_build_failed(), &unseated_joining).scope, StartScope::ExpectedWait);
+        // Observed: a confirmed join awaiting its activation boundary was refused
+        // by a predecessor-recovery gate; the refusal names the frame it awaits.
+        let predecessor = QuilError::ExecutionUnavailable(
+            "app committee session: predecessor state has not been recovered through its seal".into());
+        let activating = StartContext {
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 918_100, release: None,
+                join_wait: Some(quil_types::consensus::JoinWait::Activation { frame: 918_720 }), session_wait: None }),
+            ..StartContext::default()
+        };
+        assert!(refused_while_joining(&predecessor, &activating) && !refused_while_joining(&predecessor, &lapsed));
+        let waits = classify_start_refusal(&predecessor, &activating);
+        assert_eq!(waits.scope, StartScope::ExpectedWait);
+        assert!(waits.reason.ends_with("confirmed, it activates at GLOBAL frame 918720"), "{}", waits.reason);
+        let unconfirmed = StartContext {
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 918_029, release: None,
+                join_wait: Some(quil_types::consensus::JoinWait::Confirmation { epoch: 1_276 }), session_wait: None }),
+            ..StartContext::default()
+        };
+        let reason = classify_start_refusal(&committee_build_failed(), &unconfirmed).reason;
+        assert!(reason.contains("confirmation in epoch 1276, to activate at GLOBAL frame"), "{reason}");
         assert!(!refusal(committee_build_failed()).reason.contains("not seated"), "no committee read, no seat claim");
 
         let look_through = unready("app committee session: too many sessions sealed at their base to look through");
@@ -9525,6 +9651,37 @@ mod start_block_tests {
         let retired = refusal(QuilError::Consensus("app committee session unavailable: head session is retired".into()));
         assert_eq!(retired.scope, StartScope::ExpectedWait);
         assert_eq!(joining().scope, StartScope::ExpectedWait);
+    }
+
+    /// An active, current allocation its shard's committee does not seat waits
+    /// for committed GLOBAL state, naming the frame of the event that seats it;
+    /// one that missed its reconfirm keeps the advice to check it.
+    #[test]
+    fn an_active_unseated_allocation_waits_for_the_frame_that_seats_it() {
+        let seat = |allocations: Vec<EffectiveStatus>, session_wait| StartContext {
+            not_seated: Some(NotSeated { allocations, global_frame: 918_900, release: None, join_wait: None, session_wait }),
+            ..StartContext::default()
+        };
+        let boundary = classify_start_refusal(&committee_build_failed(),
+            &seat(vec![EffectiveStatus::Active], Some(SessionWait::Boundary { frame: 919_440 })));
+        assert_eq!(boundary.scope, StartScope::ExpectedWait);
+        assert!(boundary.reason.contains("active and current (GLOBAL frame 918900)")
+            && boundary.reason.contains("the pass at GLOBAL frame 919440 schedules a successor"), "{}", boundary.reason);
+        assert!(boundary.action.contains("nothing to do on this node"), "{}", boundary.action);
+        let closing = classify_start_refusal(&committee_build_failed(),
+            &seat(vec![EffectiveStatus::Active], Some(SessionWait::Seal { fence_frame: 920_000, seats: true })));
+        assert!(closing.reason.contains("successor seats it") && closing.reason.contains("fences it at frame 920000"),
+            "{}", closing.reason);
+        let drawn_without = classify_start_refusal(&committee_build_failed(),
+            &seat(vec![EffectiveStatus::Active], Some(SessionWait::Seal { fence_frame: 920_000, seats: false })));
+        assert!(drawn_without.reason.contains("a later epoch's first session pass"), "{}", drawn_without.reason);
+        assert!(boundary.key != closing.key && closing.key != drawn_without.key);
+        let lapsed = classify_start_refusal(&committee_build_failed(),
+            &seat(vec![EffectiveStatus::ExpiredEpoch], Some(SessionWait::Boundary { frame: 919_440 })));
+        assert_eq!(lapsed.scope, StartScope::ThisNode);
+        assert!(lapsed.action.contains("missed its epoch reconfirm"), "{}", lapsed.action);
+        let unread = classify_start_refusal(&committee_build_failed(), &seat(vec![EffectiveStatus::Active], None));
+        assert_eq!(unread.scope, StartScope::ThisNode, "without committed session state, no wait is claimed");
     }
 
     /// A worker sessions do not seat for its recorded release says so, with
@@ -9540,7 +9697,7 @@ mod start_block_tests {
             let shortfall = ReleaseShortfall::of(recorded, minimum, 777, scheduled).expect("below the minimum");
             let context = StartContext {
                 not_seated: Some(NotSeated {
-                    allocations: vec![EffectiveStatus::Active], global_frame: 1234, release: Some(shortfall),
+                    allocations: vec![EffectiveStatus::Active], global_frame: 1234, release: Some(shortfall), join_wait: None, session_wait: None,
                 }),
                 ..StartContext::default()
             };
@@ -11547,6 +11704,34 @@ mod tests {
         engine.commit_shard_clock_head(&predecessor, 7).unwrap();
         engine.set_materialized_frame(7);
         (engine, predecessor, successor.genesis, global)
+    }
+
+    /// What seats an active, current allocation, from committed GLOBAL state:
+    /// an active session's next epoch boundary, or a closing session's seal or
+    /// fence, with whether its successor counts this worker.
+    #[tokio::test]
+    async fn an_unseated_worker_waits_for_the_boundary_or_the_seal_of_its_session() {
+        use quil_execution::global_intrinsic::handoff::{self, schedule, DesiredCommittee};
+        use quil_types::crypto::Signer as _;
+        let (mut engine, _, _, global) = engine_with_session_based_at_seven(0x45);
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let head = handoff::head(&state, &engine.filter).unwrap().unwrap();
+        let e = quil_types::consensus::epoch_length_frames();
+        assert_eq!(engine.session_wait(&head, e + 30), Some(SessionWait::Boundary { frame: 2 * e }));
+        let joiner = quil_crypto::FalconSigner::generate().public_key().to_vec();
+        let mut members = head.members.clone();
+        members.push(joiner.clone());
+        members.sort();
+        let request = handoff::schedule(&state, 8, vec![engine.filter.clone()],
+            vec![DesiredCommittee { filter: engine.filter.clone(), members }]).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global.commit_with_global_cursor(8, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        let fence_frame = schedule::fence_due_frame(request.frame);
+        assert_eq!(engine.session_wait(&head, 9), Some(SessionWait::Seal { fence_frame, seats: false }),
+            "a successor drawn without this worker's key");
+        engine.local_bls_pubkey = joiner;
+        assert_eq!(engine.session_wait(&head, 9), Some(SessionWait::Seal { fence_frame, seats: true }));
     }
 
     /// Frame `number` of QUIL_TOKEN naming `parent`, without a certificate.

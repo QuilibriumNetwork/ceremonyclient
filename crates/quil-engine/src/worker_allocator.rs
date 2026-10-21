@@ -1264,11 +1264,22 @@ impl WorkerAllocator {
                         // the prover is Active, kick off the
                         // AppConsensusEngine for this filter.
                         if !worker.allocated && desired_allocated {
-                            info!(
-                                core_id = worker.core_id,
-                                filter = hex::encode(&worker.filter),
-                                "alloc transitioned to Active — starting consensus engine"
-                            );
+                            match alloc.join_wait(frame_number) {
+                                // Confirmed, but the committee stays frozen
+                                // until the next epoch boundary.
+                                Some(wait) => info!(
+                                    core_id = worker.core_id,
+                                    filter = hex::encode(&worker.filter),
+                                    activation_frame = wait.activation_frame(),
+                                    "join confirmed — starting consensus engine; it waits for the \
+                                     allocation to activate at activation_frame"
+                                ),
+                                None => info!(
+                                    core_id = worker.core_id,
+                                    filter = hex::encode(&worker.filter),
+                                    "alloc transitioned to Active — starting consensus engine"
+                                ),
+                            }
                             self.worker_manager.set_worker_filter(
                                 worker.core_id,
                                 &worker.filter,
@@ -1447,11 +1458,19 @@ impl WorkerAllocator {
             })
         });
 
+        // Unconfirmed joins bound in this pass, by the epoch their confirm is
+        // due in: (count, first join frame, last join frame).
+        let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> = Default::default();
         for alloc in bind_candidates {
             // Prefer a manually-pending (user-picked) worker before
             // falling back to the auto-managed idle pool.
             let pick = manual_pending.pop().or_else(|| idle_workers.pop());
             if let Some(core_id) = pick {
+                if let Some(quil_types::consensus::JoinWait::Confirmation { epoch }) = alloc.join_wait(frame_number) {
+                    let join = alloc.join_frame_number;
+                    let entry = landed_joins.entry(epoch).or_insert((0, join, join));
+                    *entry = (entry.0 + 1, entry.1.min(join), entry.2.max(join));
+                }
                 // Leaving counts as participating — the worker must run
                 // the shard's consensus engine until the leave confirms.
                 let start_consensus = matches!(
@@ -1547,6 +1566,28 @@ impl WorkerAllocator {
                     ),
                 ),
             }
+        }
+
+        for (epoch, (count, first_join, last_join)) in landed_joins {
+            let window_start = quil_types::consensus::epoch_start_frame(epoch);
+            let activation = quil_types::consensus::JoinWait::Confirmation { epoch }.activation_frame();
+            let join_frames = if first_join == last_join {
+                first_join.to_string()
+            } else {
+                format!("{first_join}..{last_join}")
+            };
+            let confirm_window = format!("{window_start}..{}", activation - 1);
+            info!(
+                frame = frame_number,
+                allocations = count,
+                join_frames = %join_frames,
+                confirm_epoch = epoch,
+                confirm_window = %confirm_window,
+                activation_frame = activation,
+                "joins landed in the registry: their workers are bound without consensus until this \
+                 prover confirms them in confirm_window, then activate at activation_frame; an \
+                 unconfirmed join expires after its confirm epoch and frees its worker"
+            );
         }
 
         Ok(())
@@ -3118,5 +3159,59 @@ mod tests {
         alloc.schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE).unwrap();
         assert_eq!(wm.evictions(), vec![(1, vec![filter(0x00), filter(0x60), filter(0x61), filter(0x62)])],
             "a change of shards nobody holds protects nothing");
+    }
+
+    /// Joins that land are announced once per batch with the epoch their
+    /// confirm is due in and the frame they activate at; a confirmed join
+    /// starts its engine naming the frame it activates at.
+    #[test]
+    fn landed_joins_are_announced_once_with_their_confirm_window_and_activation() {
+        fn reconcile_log(alloc: &WorkerAllocator, frame: u64) -> String {
+            #[derive(Clone, Default)]
+            struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Lines {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let lines = Lines::default();
+            let writer = lines.clone();
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || alloc.on_new_frame(frame).unwrap());
+            let bytes = lines.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+        let e = quil_types::consensus::epoch_length_frames();
+        let joining = |filter: u8, join_frame: u64| ProverAllocationInfo {
+            status: ProverStatus::Joining,
+            join_frame_number: join_frame,
+            join_confirm_frame_number: 0,
+            ..make_alloc(vec![filter; 32])
+        };
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=3u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining(1, e + 2), joining(2, e + 3)])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAAu8; 32]);
+        let logged = reconcile_log(&alloc, e + 29);
+        assert_eq!(logged.matches("joins landed in the registry").count(), 1, "{logged}");
+        for field in [
+            "allocations=2".to_string(),
+            format!("join_frames={}..{}", e + 2, e + 3),
+            "confirm_epoch=2".to_string(),
+            format!("confirm_window={}..{}", 2 * e, 3 * e - 1),
+            format!("activation_frame={}", 3 * e),
+        ] {
+            assert!(logged.contains(&field), "{field}: {logged}");
+        }
+        assert_eq!(bound_cores(&wm), vec![1, 2]);
+        assert!(!reconcile_log(&alloc, e + 30).contains("joins landed"), "announced once");
+
+        let mut confirmed = joining(1, e + 2);
+        (confirmed.status, confirmed.join_confirm_frame_number, confirmed.epoch) = (ProverStatus::Active, 2 * e + 8, 3);
+        reg.set_prover(prover_with(vec![confirmed, joining(2, e + 3)]));
+        let logged = reconcile_log(&alloc, 2 * e + 9);
+        assert_eq!(logged.matches("join confirmed — starting consensus engine").count(), 1, "{logged}");
+        assert!(logged.contains(&format!("activation_frame={}", 3 * e)), "{logged}");
     }
 }

@@ -127,6 +127,10 @@ message WorkerExecution {
   // finalized, and its submission to GLOBAL. Absent while the session runs
   // and on older nodes.
   SessionSeal seal = 7;
+  // While `state` is "waiting" on committed GLOBAL state: the GLOBAL frame
+  // by which the awaited event happens (e.g. the epoch boundary whose
+  // session pass seats this worker). Absent otherwise and on older nodes.
+  optional uint64 awaited_frame = 8;
 }
 
 // A finalized terminal seal and its submission to GLOBAL. GLOBAL accepts a
