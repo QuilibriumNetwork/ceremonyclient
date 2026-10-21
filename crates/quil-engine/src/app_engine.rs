@@ -2172,6 +2172,8 @@ pub struct AppConsensusEngine {
     /// Full `AppShardFrame`s received on `shard_frame_bitmask`, buffered
     /// by frame number until they can be materialized in order.
     received_full_frames: HashMap<u64, quil_types::proto::global::AppShardFrame>,
+    /// Frames received above one missing, for bounded logging.
+    frame_gap: FrameGap,
     pending_follower_clock: Option<(u64, quil_types::proto::global::AppShardFrame)>,
     /// Consecutive `commit_frame` failure counts per frame number, so a
     /// frame that can't be materialized is dropped + repaired via sync
@@ -2408,6 +2410,7 @@ impl AppConsensusEngine {
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             finalized_requests_roots: HashMap::new(),
             received_full_frames: HashMap::new(),
+            frame_gap: FrameGap::default(),
             pending_follower_clock: None,
             materialize_failures: HashMap::new(),
             cancel,
@@ -3045,6 +3048,18 @@ impl AppConsensusEngine {
             now = n,
             "app-shard materialized height advanced"
         );
+        if let Some((Report::Recovered { attempts, duration }, opened_at)) =
+            self.frame_gap.materialized(n, std::time::Instant::now())
+        {
+            let outcome = if n < opened_at {
+                "cursor reset below the frame it stood at when the gap opened"
+            } else {
+                "materialized through the highest buffered frame"
+            };
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), opened_at, materialized = n,
+                filled = n.saturating_sub(opened_at), sync_requests = attempts, gap_secs = duration.as_secs(),
+                outcome, "app-shard frame gap closed");
+        }
     }
 
     /// Persist a certified shard frame as the shard clock head so the next
@@ -6779,12 +6794,19 @@ impl AppConsensusEngine {
             .filter(|&f| f > next_needed)
             .collect();
         if !self.received_full_frames.contains_key(&next_needed) && !ahead.is_empty() {
-            warn!(
-                core_id = self.core_id,
-                missing_from = next_needed,
-                buffered_ahead = ahead.len(),
-                "app-shard frame gap — node behind; shard sync needed (step 4)"
-            );
+            let cursor = self.last_materialized_frame;
+            let highest = ahead.iter().copied().max().unwrap_or(next_needed);
+            if let Some((Report::Failing { attempts, duration }, filled, highest_buffered)) =
+                self.frame_gap.observed(cursor, highest, std::time::Instant::now())
+            {
+                warn!(
+                    core_id = self.core_id, filter = hex::encode(&self.filter), missing_from = next_needed,
+                    materialized = cursor, buffered_ahead = ahead.len(), highest_buffered, filled,
+                    sync_requests = attempts, ongoing_secs = duration.as_secs(),
+                    "app-shard frame gap: this worker holds frames above one it has not received and \
+                     requests a shard sync; they materialize in order once the missing frames arrive",
+                );
+            }
             let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
                 filter: self.filter.clone(),
                 missing_frames: vec![next_needed],
@@ -10327,6 +10349,180 @@ mod session_view_lag_tests {
         assert!(!session_view_behind(1_000, 1_720, 720));
         assert!(session_view_behind(1_000, 1_721, 720));
         assert!(!session_view_behind(2_000, 1_000, 720));
+    }
+}
+
+/// Frames received above one this worker has not received, so the
+/// follower cannot materialize past it: one condition from the first check
+/// that finds such a gap until the cursor reaches the highest frame
+/// buffered above a gap since. Every frame received above the gap checks
+/// again, and a catch-up that fills frames one at a time finds a new gap
+/// after each; without it each check warned (6,124 lines in 12 h for one
+/// missing frame on one worker).
+struct FrameGap {
+    limiter: bounded_warn::WarnLimiter<()>,
+    /// The cursor when the condition started and the highest frame buffered
+    /// above a gap since, while it lasts.
+    span: Option<(u64, u64)>,
+}
+
+impl Default for FrameGap {
+    fn default() -> Self {
+        Self { limiter: bounded_warn::WarnLimiter::new(), span: None }
+    }
+}
+
+impl FrameGap {
+    /// A check at `now` found the frame above `cursor` missing below
+    /// received frames up to `highest`: what to warn, at onset and at most
+    /// every [`bounded_warn::WARN_REPEAT`], with the frames filled since
+    /// onset and the highest frame buffered so far.
+    fn observed(&mut self, cursor: u64, highest: u64, now: std::time::Instant) -> Option<(Report, u64, u64)> {
+        let (start, top) = self.span.get_or_insert((cursor, highest));
+        *top = (*top).max(highest);
+        let (filled, top) = (cursor.saturating_sub(*start), *top);
+        Some((self.limiter.failed_at(&(), top, now)?, filled, top))
+    }
+
+    /// The cursor moved to `cursor` at `now`: the end of the condition, with
+    /// the cursor it started at, once it reaches the highest buffered frame
+    /// or falls below that start (a reset).
+    fn materialized(&mut self, cursor: u64, now: std::time::Instant) -> Option<(Report, u64)> {
+        let (start, _) = self.span?;
+        let position = if cursor < start { u64::MAX } else { cursor };
+        let ended = self.limiter.succeeded_at(&(), position, now)?;
+        self.span = None;
+        Some((ended, start))
+    }
+}
+
+#[cfg(test)]
+mod frame_gap_tests {
+    use super::*;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// A worker missing frame 534 received 6,124 frames above it in 12 h
+    /// (one every 7 s): it warns at onset and then once per repeat
+    /// interval, each line with the checks since the previous one.
+    #[test]
+    fn frames_above_one_gap_warn_at_onset_then_at_the_interval() {
+        let start = std::time::Instant::now();
+        let mut gap = FrameGap::default();
+        let mut lines = Vec::new();
+        for i in 0..6_124u64 {
+            lines.extend(gap.observed(533, 535 + i, start + SECOND * u32::try_from(i * 7).unwrap()));
+        }
+        assert_eq!(lines[0], (Report::Failing { attempts: 1, duration: Duration::ZERO }, 0, 535));
+        assert_eq!(lines[1], (Report::Failing { attempts: 86, duration: SECOND * 602 }, 0, 535 + 86));
+        assert_eq!(lines.len(), 72, "onset plus one per 602 s of 42,861 s: {lines:?}");
+        let counted: u64 = lines.iter().map(|(report, ..)| match report {
+            Report::Failing { attempts, .. } => *attempts,
+            Report::Recovered { .. } => panic!("a check never ends the gap"),
+        }).sum();
+        assert_eq!(counted, 1 + 71 * 86, "each repeat counts the 86 checks since the previous line");
+    }
+
+    /// A catch-up that fills 500 frames one at a time over 30 min, finding
+    /// a new gap after each, is one condition: onset, a repeat per 10 min
+    /// and one end when the cursor reaches the highest buffered frame.
+    #[test]
+    fn a_catch_up_filling_one_frame_at_a_time_is_one_condition() {
+        let start = std::time::Instant::now();
+        let mut gap = FrameGap::default();
+        let at = |i: u64| start + Duration::from_millis(i * 3_600);
+        let mut warned = Vec::new();
+        let mut ended = Vec::new();
+        warned.extend(gap.observed(100, 600, at(0)));
+        for i in 1..=500u64 {
+            ended.extend(gap.materialized(100 + i, at(i)));
+            if 100 + i < 600 {
+                warned.extend(gap.observed(100 + i, 600, at(i)));
+            }
+        }
+        assert_eq!(warned, [
+            (Report::Failing { attempts: 1, duration: Duration::ZERO }, 0, 600),
+            (Report::Failing { attempts: 167, duration: Duration::from_millis(601_200) }, 167, 600),
+            (Report::Failing { attempts: 167, duration: Duration::from_millis(1_202_400) }, 334, 600),
+        ]);
+        assert_eq!(ended, [(Report::Recovered { attempts: 500, duration: SECOND * 1_800 }, 100)]);
+    }
+
+    /// The condition lasts until the cursor reaches the highest frame
+    /// buffered while it lasted, ends once, and a later gap starts afresh.
+    #[test]
+    fn the_cursor_reaching_the_highest_buffered_frame_ends_it_once() {
+        let start = std::time::Instant::now();
+        let mut gap = FrameGap::default();
+        assert_eq!(gap.materialized(534, start), None, "no gap");
+        gap.observed(533, 536, start);
+        assert_eq!(gap.materialized(534, start + SECOND), None);
+        assert_eq!(gap.materialized(535, start + SECOND * 2), None, "536 is still ahead");
+        assert_eq!(gap.observed(535, 540, start + SECOND * 3), None, "the same condition");
+        assert_eq!(gap.materialized(536, start + SECOND * 4), None, "540 is still ahead");
+        assert_eq!(gap.materialized(540, start + SECOND * 5),
+            Some((Report::Recovered { attempts: 2, duration: SECOND * 5 }, 533)));
+        assert_eq!(gap.materialized(541, start + SECOND * 6), None, "named once");
+        assert_eq!(gap.observed(541, 545, start + SECOND * 7),
+            Some((Report::Failing { attempts: 1, duration: Duration::ZERO }, 0, 545)), "a new condition");
+    }
+
+    /// A cursor reset below where the condition started ends it.
+    #[test]
+    fn a_cursor_reset_below_the_start_ends_it() {
+        let start = std::time::Instant::now();
+        let mut gap = FrameGap::default();
+        gap.observed(533, 540, start);
+        assert_eq!(gap.materialized(533, start + SECOND), None, "not below the start");
+        assert_eq!(gap.materialized(0, start + SECOND * 2),
+            Some((Report::Recovered { attempts: 1, duration: SECOND * 2 }, 533)));
+        assert_eq!(gap.materialized(540, start + SECOND * 3), None, "already ended");
+    }
+
+    /// The engine opens the condition where received frames sit above a
+    /// missing one, still requesting a sync at each check; its cursor
+    /// reaching the highest of them, or a reset, ends it.
+    #[tokio::test]
+    async fn the_follower_opens_a_gap_and_its_cursor_closes_it() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: Arc::new(quil_store::RocksClockStore::new(db.inner())),
+            global_anchor_store: None, global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, _handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        engine.set_materialized_frame(533);
+        engine.received_full_frames.insert(535, Default::default());
+        engine.received_full_frames.insert(536, Default::default());
+        engine.try_materialize_follower_frames().await;
+        engine.try_materialize_follower_frames().await;
+        let requests = std::iter::from_fn(|| received.try_recv().ok()).filter(|event| matches!(event,
+            AppEngineEvent::AncestorSyncRequested { missing_frames, .. } if *missing_frames == [534])).count();
+        assert_eq!(requests, 2, "each check still requests a sync");
+        assert_eq!(engine.frame_gap.span, Some((533, 536)));
+        engine.set_materialized_frame(534);
+        assert_eq!(engine.frame_gap.span, Some((533, 536)), "536 is still ahead");
+        engine.set_materialized_frame(536);
+        assert_eq!(engine.frame_gap.span, None, "the cursor closed the gap");
+        engine.received_full_frames.insert(538, Default::default());
+        engine.try_materialize_follower_frames().await;
+        assert_eq!(engine.frame_gap.span, Some((536, 538)));
+        engine.set_materialized_frame(0);
+        assert_eq!(engine.frame_gap.span, None, "a reset ended it");
     }
 }
 
