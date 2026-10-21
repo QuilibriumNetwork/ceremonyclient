@@ -50,13 +50,21 @@ fn rig() -> Rig {
 }
 
 fn leader(rig: &Rig, anchor: Arc<dyn ClockStore>) -> Arc<AppLeaderProvider> {
+    leader_with(rig, anchor, Arc::new(crate::test_support::TestProverRegistry::new()))
+}
+
+fn leader_with(
+    rig: &Rig,
+    anchor: Arc<dyn ClockStore>,
+    registry: Arc<crate::test_support::TestProverRegistry>,
+) -> Arc<AppLeaderProvider> {
     Arc::new(AppLeaderProvider {
         filter: rig.filter.clone(),
         clock_store: rig.clock.clone(),
         frame_outflows: rig.outflows.clone(),
         global_anchor_store: anchor,
         frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
-        prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+        prover_registry: registry,
         message_collector: Arc::new(MessageCollector::new()),
         mempool: Arc::new(MessageCollector::new()),
         fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
@@ -105,6 +113,17 @@ fn executor(
     valid: bool,
     parent_check: AppRequestsRootCheck,
 ) -> AppParentExecutor {
+    let led = leader(rig, anchor.clone());
+    executor_led(rig, anchor, valid, parent_check, led)
+}
+
+fn executor_led(
+    rig: &Rig,
+    anchor: Arc<dyn ClockStore>,
+    valid: bool,
+    parent_check: AppRequestsRootCheck,
+    led: Arc<AppLeaderProvider>,
+) -> AppParentExecutor {
     let executor = AppParentExecutor::new(
         rig.filter.clone(),
         rig.filter.clone(),
@@ -117,7 +136,7 @@ fn executor(
         Arc::new(move |_: &AppShardFrame| Ok(valid)),
         parent_check,
         rig.materialized.clone(),
-        leader(rig, anchor),
+        led,
         None,
     );
     executor.bind_blocks(rig.blocks.clone());
@@ -252,6 +271,147 @@ fn the_seam_leader_waits_before_a_private_parent_and_voters_use_it_at_once() {
     assert!(voter.verify_with_context(context, child_digest, Some(bytes.clone())));
     // Without private parents the vote is refused.
     assert!(!seam(false).verify_with_context(context, child_digest, Some(bytes)));
+}
+
+fn validator() -> Arc<BlsAppFrameValidator> {
+    Arc::new(BlsAppFrameValidator::new(
+        Arc::new(crate::test_support::TestProverRegistry::default()),
+        Arc::new(quil_crypto::FalconKeyConstructor),
+        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+    ))
+}
+
+/// A host's proposer over `parents`, bound as the host binds it, with its
+/// re-sends going to `sent`.
+fn seam(
+    rig: &Rig,
+    led: Arc<AppLeaderProvider>,
+    parents: Arc<AppParentExecutor>,
+    sent: Arc<Sent>,
+) -> crate::cw_app_seams::AppSeamProposer {
+    let proposer = crate::cw_app_seams::AppSeamProposer::new(
+        led,
+        validator(),
+        Arc::new(|state: &quil_consensus::models::State<crate::app_types::AppShardState>| {
+            Some(crate::cw_app_seams::app_frame_from_state(state, Vec::new(), Vec::new()))
+        }),
+        rig.filter.clone(),
+        Some(canonical_check(rig)),
+        Arc::new(AtomicBool::new(true)),
+    );
+    crate::cw_app_seams::bind_private_parents(proposer, Some(parents), &rig.blocks, sent, false)
+}
+
+/// What a leader sends on the block channel: digest, bytes, and whether to
+/// the whole committee.
+#[derive(Default)]
+struct Sent(std::sync::Mutex<Vec<(Digest, Vec<u8>, bool)>>);
+
+impl quil_cw_consensus::adapters::FrameSink for Sent {
+    fn broadcast(
+        &self,
+        digest: Digest,
+        bytes: Vec<u8>,
+        recipients: quil_cw_consensus::adapters::Recipients<quil_cw_consensus::falcon_base::FalconPublicKey>,
+    ) {
+        let all = matches!(recipients, quil_cw_consensus::adapters::Recipients::All);
+        self.0.lock().unwrap().push((digest, bytes, all));
+    }
+}
+
+/// A rig whose shard has this node's prover active, so a leader proposes.
+fn active_registry() -> Arc<crate::test_support::TestProverRegistry> {
+    Arc::new(crate::test_support::TestProverRegistry::with_prover(quil_types::consensus::ProverInfo {
+        public_key: Vec::new(),
+        address: vec![1; 32],
+        status: quil_types::consensus::ProverStatus::Active,
+        kick_frame_number: 0,
+        allocations: Vec::new(),
+        available_storage: 0,
+        seniority: 0,
+        delegate_address: Vec::new(),
+    }))
+}
+
+/// A member that missed a notarized parent's body refuses every child of it:
+/// no peer serves bodies and archives hold only finalized frames. Once the
+/// body arrives on the block channel, stored as peer ingress stores it, the
+/// same member checks the child in full and votes for it. Unchanged by the
+/// re-send itself: it shows an earlier release takes the re-sent body.
+#[test]
+fn a_member_missing_the_parent_body_votes_once_the_body_arrives() {
+    use quil_cw_consensus::adapters::{GlobalProposer as _, ProposalContext};
+    let holder = rig();
+    let holder_parents = executor(&holder, holder.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&holder, 0);
+    offer(&holder, &frame);
+    let child = child_of(&holder, &holder_parents.prepare(digest, RANK).unwrap(), digest);
+    let child_digest = app_frame_digest(&child).unwrap();
+    let bytes = prost::Message::encode_to_vec(&child);
+    let context = ProposalContext { epoch: 0, view: RANK + 1, parent_view: RANK, parent: digest };
+
+    let member = rig();
+    let led = leader(&member, member.clock.clone());
+    let parents = Arc::new(executor_led(&member, member.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())), led.clone()));
+    let voter = seam(&member, led, parents.clone(), Arc::new(Sent::default()));
+    assert!(!voter.verify_with_context(context, child_digest, Some(bytes.clone())));
+    let missing = parents.prepare(digest, RANK).err().map(|error| error.to_string()).unwrap_or_default();
+    assert!(missing.contains("selected parent body is not available"), "{missing}");
+    offer(&member, &frame);
+    assert!(voter.verify_with_context(context, child_digest, Some(bytes)));
+}
+
+/// A leader building on an unfinalized parent after a nullified view queues
+/// the parent's unfinalized chain, oldest first, for the whole committee
+/// with its proposal. Right after the parent's view it sends nothing: every
+/// member that voted for the parent holds it.
+#[test]
+fn a_leader_after_a_nullified_view_resends_the_unfinalized_chain() {
+    use quil_cw_consensus::adapters::{GlobalProposer as _, ProposalContext};
+    let rig = rig();
+    let led = leader_with(&rig, rig.clock.clone(), active_registry());
+    let parents = Arc::new(executor_led(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())), led.clone()));
+    let (first, first_digest) = parent(&rig, 0);
+    offer(&rig, &first);
+    let second = child_of(&rig, &parents.prepare(first_digest, RANK).unwrap(), first_digest);
+    let second_digest = offer(&rig, &second);
+    let sent = Arc::new(Sent::default());
+    let proposer = seam(&rig, led, parents, sent.clone());
+    proposer.note_frame(second_digest, 2);
+    let next = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK + 1, parent: second_digest };
+    assert!(proposer.propose_with_context(next).is_some(), "the leader proposes over the private parent");
+    assert!(sent.0.lock().unwrap().is_empty(), "nothing re-sent right after the parent's view");
+    let later = ProposalContext { view: RANK + 4, ..next };
+    assert!(proposer.propose_with_context(later).is_some());
+    let encoded = |frame: &AppShardFrame| prost::Message::encode_to_vec(frame);
+    assert_eq!(
+        *sent.0.lock().unwrap(),
+        vec![(first_digest, encoded(&first), true), (second_digest, encoded(&second), true)],
+    );
+}
+
+/// Nothing is re-sent by a turn that proposes nothing, though it executed
+/// the parent after a nullified view: a declined turn is asked again every
+/// 250 ms.
+#[test]
+fn a_declined_turn_resends_nothing() {
+    use quil_cw_consensus::adapters::{GlobalProposer as _, ProposalContext};
+    let rig = rig();
+    let led = leader(&rig, rig.clock.clone());
+    let parents = Arc::new(executor_led(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())), led.clone()));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let sent = Arc::new(Sent::default());
+    let proposer = seam(&rig, led, parents.clone(), sent.clone());
+    proposer.note_frame(digest, 1);
+    let context = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK, parent: digest };
+    // This rig has no active provers: each turn is declined after the parent
+    // executed privately.
+    for _ in 0..3 {
+        assert!(proposer.propose_with_context(context).is_none());
+    }
+    assert!(parents.prepared.lock().unwrap().is_some(), "the parent executed privately");
+    assert!(sent.0.lock().unwrap().is_empty());
 }
 
 #[test]
