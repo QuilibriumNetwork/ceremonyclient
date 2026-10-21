@@ -2250,6 +2250,8 @@ pub struct AppConsensusEngine {
     /// or foreign PeerInfo key): Simplex drops such a vote as a signer
     /// mismatch.
     cw_nonmember: u64,
+    /// Paces archive requests for a frame received blocks show missing.
+    ancestor_sync: AncestorSyncPacing,
     /// Which members of the running session were heard, to name those that
     /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
     session_silent: SilentMembers,
@@ -2417,6 +2419,7 @@ impl AppConsensusEngine {
             cw_inbound: [0; 4],
             cw_unresolved: 0,
             cw_nonmember: 0,
+            ancestor_sync: AncestorSyncPacing::default(),
             session_silent: SilentMembers::default(),
             private_parents: None,
             sealed_session: None,
@@ -3751,10 +3754,21 @@ impl AppConsensusEngine {
                                         let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
                                         let session = || self.cw_session.as_ref().and_then(|session| session.id().ok());
                                         if let Some(missing) = block_sync_from(&data, cursor, session) {
-                                            let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
-                                                filter: self.filter.clone(),
-                                                missing_frames: vec![missing],
-                                            });
+                                            match self.ancestor_sync.admit(cursor, missing, std::time::Instant::now()) {
+                                                AncestorSync::Request => {
+                                                    let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                                                        filter: self.filter.clone(),
+                                                        missing_frames: vec![missing],
+                                                    });
+                                                }
+                                                AncestorSync::Hold { first: true, retry_in } => info!(
+                                                    filter = %hex::encode(&self.filter), missing, materialized = cursor,
+                                                    retry_in_secs = retry_in.as_secs(),
+                                                    reason = "requested recently; an archive serves a frame only once it finalizes",
+                                                    "holding back archive requests for a missing app frame",
+                                                ),
+                                                AncestorSync::Hold { .. } => {}
+                                            }
                                         }
                                         (h.ingest_block)(data);
                                     } else {
@@ -7374,6 +7388,71 @@ fn block_sync_from(bytes: &[u8], cursor: u64, session: impl FnOnce() -> Option<[
     (frame.header?.frame_number > next).then_some(next)
 }
 
+/// The first repeat of an archive request for the same missing frame; each
+/// later repeat waits twice as long, up to [`ANCESTOR_SYNC_REPEAT_MAX`].
+const ANCESTOR_SYNC_REPEAT: Duration = Duration::from_secs(60);
+
+/// The longest wait between repeated archive requests for one missing
+/// frame: about 6 requests an hour, where every received block asked again.
+const ANCESTOR_SYNC_REPEAT_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Whether the frame a received block shows missing goes to the archives.
+#[derive(Debug, PartialEq, Eq)]
+enum AncestorSync {
+    Request,
+    /// Requested recently: ask again in `retry_in`. `first` marks the first
+    /// hold since the last request.
+    Hold { first: bool, retry_in: Duration },
+}
+
+/// Paces the archive requests [`block_sync_from`] asks for. Every later
+/// proposal shows the same frame missing, and while it is only notarized no
+/// archive holds it: requesting it at each block repeated a recovery that
+/// cannot succeed, about every 35 s, each holding a recovery turn the node's
+/// other workers wait for. The first request for a frame goes at once;
+/// repeats wait [`ANCESTOR_SYNC_REPEAT`], doubling to
+/// [`ANCESTOR_SYNC_REPEAT_MAX`]. Another materialized or missing frame starts
+/// afresh.
+#[derive(Debug, Default)]
+struct AncestorSyncPacing {
+    last: Option<PacedSync>,
+}
+
+#[derive(Debug)]
+struct PacedSync {
+    materialized: u64,
+    missing: u64,
+    at: std::time::Instant,
+    interval: Duration,
+    /// A hold was reported since the last request.
+    held: bool,
+}
+
+impl AncestorSyncPacing {
+    fn admit(&mut self, materialized: u64, missing: u64, now: std::time::Instant) -> AncestorSync {
+        match self.last.as_mut() {
+            Some(last) if last.materialized == materialized && last.missing == missing => {
+                let due = last.at + last.interval;
+                if now >= due {
+                    last.at = now;
+                    last.interval = (last.interval * 2).min(ANCESTOR_SYNC_REPEAT_MAX);
+                    last.held = false;
+                    AncestorSync::Request
+                } else {
+                    let first = !std::mem::replace(&mut last.held, true);
+                    AncestorSync::Hold { first, retry_in: due - now }
+                }
+            }
+            _ => {
+                self.last = Some(PacedSync {
+                    materialized, missing, at: now, interval: ANCESTOR_SYNC_REPEAT, held: false,
+                });
+                AncestorSync::Request
+            }
+        }
+    }
+}
+
 /// Why this member's state looks like no one else's, given, since the last
 /// frame it materialized, the proposals whose pre-state it did not reproduce
 /// and the seals it verified that `agreed` with its state roots or
@@ -9147,6 +9226,32 @@ mod tests {
         }.encode_to_vec();
         assert_eq!(block_sync_from(&frame(2505), 2504, ours), None, "the next frame");
         assert_eq!(block_sync_from(&frame(2506), 2504, ours), Some(2505));
+    }
+
+    /// Archive requests for one missing frame go at once, then after a
+    /// minute, doubling to ten minutes; another frame starts afresh.
+    #[test]
+    fn archive_requests_for_one_missing_frame_are_paced() {
+        let t0 = std::time::Instant::now();
+        let second = Duration::from_secs(1);
+        let at = |seconds: u32| t0 + second * seconds;
+        let mut pacing = AncestorSyncPacing::default();
+        assert_eq!(pacing.admit(19646, 19647, t0), AncestorSync::Request);
+        assert_eq!(pacing.admit(19646, 19647, at(35)), AncestorSync::Hold { first: true, retry_in: 25 * second });
+        assert_eq!(pacing.admit(19646, 19647, at(50)), AncestorSync::Hold { first: false, retry_in: 10 * second });
+        assert_eq!(pacing.admit(19646, 19647, at(60)), AncestorSync::Request);
+        // Then 2, 4, 8 and 10 minutes, and no longer.
+        for due in [180, 420, 900, 1500, 2100] {
+            assert_eq!(pacing.admit(19646, 19647, at(due - 1)),
+                AncestorSync::Hold { first: true, retry_in: second }, "second {}", due - 1);
+            assert_eq!(pacing.admit(19646, 19647, at(due)), AncestorSync::Request, "second {due}");
+        }
+        // The materialized frame advanced: its next frame goes at once.
+        assert_eq!(pacing.admit(19647, 19648, at(2101)), AncestorSync::Request);
+        assert!(matches!(pacing.admit(19647, 19648, at(2102)), AncestorSync::Hold { first: true, .. }));
+        // So does another missing frame, and a return to the first.
+        assert_eq!(pacing.admit(19647, 19650, at(2103)), AncestorSync::Request);
+        assert_eq!(pacing.admit(19647, 19648, at(2104)), AncestorSync::Request);
     }
 
     /// Resolver messages carry the members they are addressed to; votes,
