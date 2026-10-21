@@ -84,10 +84,14 @@ pub enum DiagnosticsCommand {
     /// encryption key of this request alone, whose secret stays in
     /// .diagnostics/requests until the fetch. The target queues the request
     /// only when its operator set `diagnostics.logRequests.enabled: true` and
-    /// listed this node's peer ID in `diagnostics.logRequests.allowedPeers`;
-    /// that operator then reviews a redacted preview and approves or denies
-    /// it. With --filter only lines mentioning those shard filters are
-    /// exported, plus every warn and error line.
+    /// listed this node's peer ID in `diagnostics.logRequests.allowedPeers`.
+    /// That listing is consent: the target's node then exports the window
+    /// with the redaction of `node log export` and seals it to this request
+    /// on its own, usually within minutes, or denies it when the export
+    /// exceeds its maxBundleBytes. A target that writes no log files, or
+    /// runs an older release, leaves it to its operator, who reviews a
+    /// redacted preview first. With --filter only lines mentioning those
+    /// shard filters are exported, plus every warn and error line.
     ///
     /// The target sees the IP address you connect from; use a network you
     /// are willing to reveal. With --identity <file> (from `qclient
@@ -96,29 +100,37 @@ pub enum DiagnosticsCommand {
     /// then pass --addr (`resolve` prints it), and keep the identity file
     /// for `status` and `fetch`, which need --identity too.
     Request(super::diagnostics_logs::RequestArgs),
-    /// Show the state of a log request at the peer it was made to.
+    /// Show the state of a log request at the peer it was made to: pending,
+    /// approved (fetch it), denied and by whom, or expired.
     Status(super::diagnostics_logs::PeerRequestArgs),
     /// Download an approved log request and decrypt it into a
     /// node-log-export folder (node.log.gz, manifest.json, SHA256SUMS).
     Fetch(super::diagnostics_logs::FetchArgs),
     /// List peers' log requests to this node (its operator only).
     ///
-    /// Like approve and deny, it dials this node's peer listener with this
-    /// node's network key, the only key these operator commands admit:
-    /// whoever holds it acts as this node's operator.
+    /// A node that writes log files approves its allowlisted peers' requests
+    /// itself, writing each token map to .diagnostics/token-maps; this lists
+    /// them with their state until they expire. Like approve and deny, it
+    /// dials this node's peer listener with this node's network key, the
+    /// only key these operator commands admit: whoever holds it acts as this
+    /// node's operator.
     Pending,
-    /// Approve a peer's log request.
+    /// Approve a peer's log request by hand.
     ///
-    /// Exports the request's window and filters from this node's logs with
-    /// the redaction of `node log export` and shows its preview; after you
-    /// type yes (or with the global --yes) it seals the bundle to the
-    /// requester's key and hands it to this node, which serves it to that
-    /// peer alone until the request expires. The token map goes to
+    /// A node that writes log files approves its allowlisted peers'
+    /// requests itself; approve is for a node that logs to the journal only,
+    /// or a release that predates automatic approval. It exports the
+    /// request's window and filters from this node's logs with the
+    /// redaction of `node log export` and shows its preview; after you type
+    /// yes (or with the global --yes) it seals the bundle to the requester's
+    /// key and hands it to this node, which serves it to that peer alone
+    /// until the request expires. The token map goes to
     /// .diagnostics/token-maps, owner-readable only: keep it private;
     /// approve deletes maps older than 7 days there.
     Approve(super::diagnostics_logs::DecideArgs),
     /// Deny a peer's pending log request, or withdraw an approved bundle,
-    /// fetched or not: this node deletes it and the peer sees it denied.
+    /// fetched or not, whoever approved it: this node deletes it and the
+    /// peer sees it denied.
     Deny(super::diagnostics_logs::DecideArgs),
     /// Dial a node's libp2p address and print what the node reports.
     ///

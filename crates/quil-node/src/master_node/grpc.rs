@@ -81,6 +81,10 @@ pub(crate) struct GrpcArgs {
     pub frame_observations_path: std::path::PathBuf,
     /// Where approved diagnostics log bundles wait for their requester.
     pub diagnostics_spool: std::path::PathBuf,
+    /// Where this node approves allowlisted peers' log requests itself
+    /// from: its log files and token-map directory; `None` when it writes
+    /// no log files, leaving requests to its operator.
+    pub diagnostics_auto: Option<quil_rpc::diagnostics_logs::AutoApproval>,
     /// Rebuilds legacy committees; served to the node's standalone workers.
     pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
     /// Holds standalone workers' reward proofs back during a coverage halt, as
@@ -733,6 +737,7 @@ pub(crate) fn spawn_all(
     let GrpcArgs {
         frame_observations_path,
         diagnostics_spool,
+        diagnostics_auto,
         historical_committees,
         halt_state,
         committed_shard_sizes,
@@ -2549,13 +2554,26 @@ pub(crate) fn spawn_all(
 
         // Peers' requests for this node's redacted logs, on the same
         // listener: the requester service for allowlisted peers, the
-        // operator service for this node's own identity only.
+        // operator service for this node's own identity only. Listing a
+        // peer consents to sending it these logs, so the node approves its
+        // requests itself, one export at a time off the async runtime.
         let (log_request_service, log_operator_service) = {
-            let requests = Arc::new(quil_rpc::diagnostics_logs::LogRequests::new(
+            let requests = Arc::new(quil_rpc::diagnostics_logs::LogRequests::with_approval(
                 &config.diagnostics.log_requests,
                 peer_id,
                 diagnostics_spool,
+                diagnostics_auto,
             ));
+            if requests.automatic() {
+                let requests = requests.clone();
+                sup.spawn("diagnostics-log-approval", move |token| async move {
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = requests.run_automatic_approval() => {}
+                    }
+                    Ok(())
+                });
+            }
             if requests.enabled() {
                 let requests = requests.clone();
                 sup.spawn("diagnostics-log-requests", move |token| async move {

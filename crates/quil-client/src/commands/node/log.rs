@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Subcommand;
+use quil_rpc::log_export::is_rotated_log;
 
 use crate::context::GlobalArgs;
 use crate::{nodeconfig, system};
 
 pub mod export;
-pub(crate) mod redact;
 
 #[derive(Debug, Subcommand)]
 pub enum LogCommand {
@@ -162,16 +162,6 @@ fn log_file_name(core: u32) -> String {
     } else {
         format!("worker-{core}.log")
     }
-}
-
-/// Whether `name` is a rotated node log: `master.log.<suffix>` or
-/// `worker-N.log.<suffix>`, never a live `.log`.
-fn is_rotated_log(name: &str) -> bool {
-    let Some((base, suffix)) = name.split_once(".log.") else {
-        return false;
-    };
-    let worker = base.strip_prefix("worker-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    (base == "master" || worker) && !suffix.is_empty()
 }
 
 fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Result<()> {
