@@ -336,8 +336,9 @@ impl Redactor {
         }
     }
 
-    /// Redact a JSON value in place: balances removed, `*version*` keys
-    /// kept, self-identity keys tokenized, every other string swept.
+    /// Redact a JSON value in place: balances removed, release versions
+    /// under a version or release key kept, self-identity keys tokenized,
+    /// every other string swept.
     fn redact_value(&mut self, value: &mut Value) {
         match value {
             Value::Object(map) => {
@@ -347,7 +348,7 @@ impl Redactor {
                             *child = Value::String(REMOVED.to_string());
                             self.st.count("balance");
                         }
-                    } else if key.to_ascii_lowercase().contains("version") {
+                    } else if is_release_key(key) && is_version_value(child) {
                         // Versions are kept verbatim (they look like IPv4).
                     } else if SELF_KEYS.contains(&key.as_str()) && child.is_string() {
                         let v = child.as_str().unwrap_or_default().to_string();
@@ -571,15 +572,98 @@ fn sweep_literals(st: &mut State, mut text: String) -> String {
     text
 }
 
+/// The lowercase words of a JSON key: `peer_version` and `peerVersion`
+/// are `peer`, `version`.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = vec![String::new()];
+    let mut previous_lower = false;
+    for c in key.chars() {
+        if !c.is_ascii_alphanumeric() {
+            words.push(String::new());
+            previous_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && previous_lower {
+            words.push(String::new());
+        }
+        previous_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        words.last_mut().expect("never empty").push(c.to_ascii_lowercase());
+    }
+    words.retain(|word| !word.is_empty());
+    words
+}
+
+/// Whether a JSON key names release versions: a whole word of it is
+/// `version`, `release` or their plural (`version`, `peer_version`,
+/// `releases`, `release_eligibility`; not `released_by`).
+fn is_release_key(key: &str) -> bool {
+    key_words(key).iter().any(|word| matches!(word.as_str(), "version" | "versions" | "release" | "releases"))
+}
+
+/// Words the node logs beside release versions (`this node: 24`, `no peer
+/// info: 3,8`).
+const RELEASE_LABELS: &[&str] =
+    &["this", "node", "no", "peer", "info", "fingerprint", "malformed", "version", "none", "never", "unknown"];
+
+/// Whether `text` holds release versions only: dotted numbers (`2.1.0.25`,
+/// `v2.1.0.25.96`), numbers, [`RELEASE_LABELS`] and the separators `,`,
+/// `;`, `=` and a trailing `:`. An address with a port, a multiaddr, a path
+/// or a peer ID is none of these.
+fn is_version_text(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '=')).all(|token| {
+        let token = token.strip_suffix(':').unwrap_or(token);
+        let number = token.strip_prefix('v').unwrap_or(token);
+        token.is_empty()
+            || number.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            || RELEASE_LABELS.contains(&token.to_ascii_lowercase().as_str())
+    })
+}
+
+/// Whether a JSON value under a release key is kept verbatim: a number, or
+/// a string or array of strings of [`is_version_text`]. Anything else, an
+/// object included, is redacted as usual.
+fn is_version_value(value: &Value) -> bool {
+    match value {
+        Value::Number(_) => true,
+        Value::String(text) => is_version_text(text),
+        Value::Array(items) => items.iter().all(|item| item.as_str().is_some_and(is_version_text)),
+        _ => false,
+    }
+}
+
+/// Release file names: `node-` or `qclient-`, the version, then a platform
+/// followed by `-` or the end: `node-2.1.0.25-linux-amd64`.
+const RELEASE_BINARIES: &[&str] = &["node-", "qclient-"];
+const RELEASE_PLATFORMS: &[&str] = &["-linux", "-darwin", "-windows", "-freebsd"];
+
+/// Whether the dotted quad at `text[start..end]` is the version of a
+/// release file name.
+fn in_release_file_name(text: &str, start: usize, end: usize) -> bool {
+    let named = RELEASE_BINARIES.iter().any(|binary| {
+        text[..start].strip_suffix(binary).is_some_and(|before| before.chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric()))
+    });
+    named
+        && RELEASE_PLATFORMS
+            .iter()
+            .any(|platform| text[end..].strip_prefix(platform).is_some_and(|rest| rest.is_empty() || rest.starts_with('-')))
+}
+
 /// Whether the dotted quad at `text[start..end]` is an address rather than
-/// part of a longer dotted string or a version (`version 2.1.0.25`,
-/// `"version":"2.1.0.25"`, `v2.1.0.25`).
+/// part of a longer dotted string, a version (`version 2.1.0.25`,
+/// `"version":"2.1.0.25"`, `v2.1.0.25`) or a release file name
+/// (`node-2.1.0.25-linux-amd64`). A quad with a port is an address.
 fn is_ipv4_candidate(text: &str, start: usize, end: usize) -> bool {
     let bytes = text.as_bytes();
     if start > 0 && matches!(bytes[start - 1], b'.' | b'_') {
         return false;
     }
     if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if bytes.get(end) == Some(&b':') && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if in_release_file_name(text, start, end) {
         return false;
     }
     let before = text[..start].trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\''));
@@ -592,7 +676,9 @@ fn is_ipv4_candidate(text: &str, start: usize, end: usize) -> bool {
         .rev()
         .collect::<String>()
         .to_ascii_lowercase();
-    !(word.ends_with("version") || word == "v" || word == "ver")
+    // The last word of `version`, `peer_version`; not `conversion`.
+    let word = word.rsplit('_').next().unwrap_or_default();
+    !matches!(word, "version" | "versions" | "v" | "ver")
 }
 
 /// The UTC Unix time of a node log line's leading `YYYY-MM-DDTHH:MM:SSZ`
@@ -803,6 +889,87 @@ mod tests {
         assert_eq!(r.total(), 0);
         let real = r.redact_line(&line("peer at 192.0.2.10", r#"{"coreId":0}"#));
         assert_eq!(real, line("peer at ip4#6fe0c5ee", r#"{"coreId":0}"#));
+    }
+
+    /// Committee builds by member index name bare 4-part releases; a
+    /// release or version key keeps versions only, and an address in
+    /// another field of the line is still tokenized.
+    #[test]
+    fn release_fields_keep_bare_versions() {
+        let mut r = redactor();
+        let releases = r#""releases":"2.1.0.25.96: 3,8,11; 2.1.0.25: 1,2,5; no peer info: 4; this node: 24""#;
+        let kept = line("app committee member builds by member index", &format!("{{\"coreId\":4,{releases}}}"));
+        assert_eq!(r.redact_line(&kept), kept);
+        for kept in [
+            line("release eligibility", r#"{"coreId":0,"release_eligibility":"910000=2.1.0.25,920000=2.1.0.26"}"#),
+            line("confirm", r#"{"coreId":0,"release":"2.1.0.25"}"#),
+            line("builds", r#"{"coreId":0,"peerVersion":"v2.1.0.24","releases":["2.1.0.25","2.1.0.25.96"],"version":1}"#),
+        ] {
+            assert_eq!(r.redact_line(&kept), kept);
+        }
+        assert_eq!(r.total(), 0);
+        let mixed = line("app committee member builds by member index", &format!("{{\"peer\":\"192.0.2.10:8340\",{releases}}}"));
+        assert_eq!(r.redact_line(&mixed), line("app committee member builds by member index",
+            &format!("{{\"peer\":\"ip4#6fe0c5ee:8340\",{releases}}}")));
+    }
+
+    /// A release or version key keeps nothing but versions: an address,
+    /// multiaddr, peer ID or home path under it, or in an object under it,
+    /// is tokenized, and so is any value of a key that only contains the
+    /// word (`released_by`).
+    #[test]
+    fn release_keys_keep_no_addresses() {
+        let mut r = redactor();
+        for (fields, original) in [
+            (r#"{"release_addr":"/ip4/198.51.100.7/tcp/8336"}"#, "198.51.100.7"),
+            (r#"{"release":{"peer":"192.0.2.10:8340"}}"#, "192.0.2.10"),
+            (r#"{"releases":["2.1.0.25","/home/alice/quil"]}"#, "alice"),
+            (&*format!(r#"{{"release":"{QM}"}}"#), QM),
+            (r#"{"version":"192.0.2.10:8340"}"#, "192.0.2.10"),
+            (r#"{"version":"[2001:db8::1]:8336"}"#, "2001:db8::1"),
+            (r#"{"released_by":"192.0.2.10"}"#, "192.0.2.10"),
+            (r#"{"conversion":"192.0.2.10"}"#, "192.0.2.10"),
+        ] {
+            let redacted = r.redact_line(&line("peer", fields));
+            assert!(!redacted.contains(original), "{fields}: {redacted}");
+        }
+    }
+
+    /// Release binary names keep their version, in paths and free text;
+    /// addresses beside them, with a port or in a multiaddr, are tokenized.
+    #[test]
+    fn release_file_names_keep_their_version() {
+        let mut r = redactor();
+        let worker = r.redact_line(&line("token proof worker configured",
+            r#"{"coreId":0,"worker":"/home/alice/quil/node-2.1.0.25-linux-amd64"}"#));
+        assert!(worker.contains(r#"/node-2.1.0.25-linux-amd64""#) && !worker.contains("ip4#") && !worker.contains("alice"), "{worker}");
+        for name in ["qclient-2.1.0.25-darwin-arm64", "node-2.1.0.25-windows-amd64.exe", "node-2.1.0.25-freebsd-amd64", "node-2.1.0.25-linux"] {
+            let kept = line(&format!("downloaded {name}"), r#"{"coreId":0}"#);
+            assert_eq!(r.redact_line(&kept), kept);
+        }
+        assert_eq!(r.total(), 1, "only the home path");
+        let near = r.redact_line(&line("node-2.1.0.25-linux-amd64 dialing 192.0.2.10:8340 via /ip4/198.51.100.7/tcp/8336", r#"{"coreId":0}"#));
+        assert_eq!(near, line("node-2.1.0.25-linux-amd64 dialing ip4#6fe0c5ee:8340 via /ip4/ip4#3f6c10d6/tcp/8336", r#"{"coreId":0}"#));
+        for text in ["host-192.0.2.10-backup", "host-192.0.2.10-linux", "foo-192.0.2.10-linux-amd64", "mynode-192.0.2.10-linux-amd64",
+            "node-192.0.2.10-linuxbox", "node-192.0.2.10:8336-linux-amd64"] {
+            let redacted = r.redact_line(&line(text, r#"{"coreId":0}"#));
+            assert!(!redacted.contains("192.0.2.10") && redacted.contains("ip4#6fe0c5ee"), "{text}: {redacted}");
+        }
+    }
+
+    /// Only the exact words version, v and ver before a quad keep it, and
+    /// never with a port.
+    #[test]
+    fn only_a_version_word_keeps_a_quad_in_text() {
+        let mut r = redactor();
+        for text in ["release 192.0.2.10", "release=192.0.2.10", "release 192.0.2.10:8336", "prerelease 192.0.2.10",
+            "conversion 192.0.2.10", "version 192.0.2.10:8336", "peer_version=192.0.2.10:8336"] {
+            let redacted = r.redact_text(text);
+            assert!(!redacted.contains("192.0.2.10"), "{text}: {redacted}");
+        }
+        for text in ["version 2.1.0.25", "peer_version=2.1.0.24", "ver 2.1.0.25"] {
+            assert_eq!(r.redact_text(text), text);
+        }
     }
 
     #[test]
