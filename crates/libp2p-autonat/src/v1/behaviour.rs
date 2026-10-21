@@ -217,8 +217,18 @@ pub struct Behaviour {
     probe_id: ProbeId,
 
     listen_addresses: ListenAddresses,
-    other_candidates: HashSet<Multiaddr>,
+    // QUILIBRIUM: most recent first, at most `MAX_CANDIDATES` (upstream: an
+    // unbounded hash set that never forgets an address).
+    other_candidates: VecDeque<Multiaddr>,
+    // QUILIBRIUM: the addresses of the latest probe request.
+    last_probe_addresses: Vec<Multiaddr>,
 }
+
+/// QUILIBRIUM: how many external address candidates the client keeps.
+/// Identify reports a candidate per connection, and peers behind address
+/// translation report a different port each; only the most recent ones are
+/// kept for the probe list (see `as_client::probe_addresses`).
+const MAX_CANDIDATES: usize = 16;
 
 impl Behaviour {
     pub fn new(local_peer_id: PeerId, config: Config) -> Self {
@@ -246,6 +256,7 @@ impl Behaviour {
             probe_id: ProbeId(0),
             listen_addresses: Default::default(),
             other_candidates: Default::default(),
+            last_probe_addresses: Vec::new(),
         }
     }
 
@@ -287,8 +298,44 @@ impl Behaviour {
 
     /// Explicitly probe the provided address for external reachability.
     pub fn probe_address(&mut self, candidate: Multiaddr) {
-        self.other_candidates.insert(candidate);
+        // QUILIBRIUM: a repeated candidate moves to the front; the oldest
+        // beyond `MAX_CANDIDATES` is forgotten.
+        self.other_candidates.retain(|a| *a != candidate);
+        self.other_candidates.push_front(candidate);
+        self.other_candidates.truncate(MAX_CANDIDATES);
         self.as_client().on_new_address();
+    }
+
+    /// QUILIBRIUM: the dial-back addresses of the latest probe request
+    /// (empty before the first).
+    pub fn last_probe_addresses(&self) -> &[Multiaddr] {
+        &self.last_probe_addresses
+    }
+
+    /// QUILIBRIUM: how many servers the next probe can choose from: the
+    /// servers (and, with [`Config::use_connected`], the connected peers with
+    /// a qualified address) not throttled by
+    /// [`Config::throttle_server_period`].
+    pub fn eligible_servers(&self) -> usize {
+        let now = Instant::now();
+        let throttled = |peer: &PeerId| {
+            self.throttled_servers.iter().any(|(id, time)| {
+                id == peer && *time + self.config.throttle_server_period >= now
+            })
+        };
+        let mut eligible = self.servers.iter().filter(|p| !throttled(*p)).count();
+        if self.config.use_connected {
+            eligible += self
+                .connected
+                .iter()
+                .filter(|&(id, addrs)| {
+                    !self.servers.contains(id)
+                        && addrs.values().any(Option::is_some)
+                        && !throttled(id)
+                })
+                .count();
+        }
+        eligible
     }
 
     fn as_client(&mut self) -> AsClient<'_> {
@@ -307,6 +354,7 @@ impl Behaviour {
             schedule_probe: &mut self.schedule_probe,
             listen_addresses: &self.listen_addresses,
             other_candidates: &self.other_candidates,
+            last_probe_addresses: &mut self.last_probe_addresses,
         }
     }
 
@@ -692,5 +740,81 @@ impl GlobalIp for std::net::Ipv6Addr {
             None => is_unicast_global(self),
             _ => false,
         }
+    }
+}
+
+// QUILIBRIUM: tests of the local patches (see PATCHES.md).
+#[cfg(test)]
+mod tests {
+    use libp2p_core::transport::ListenerId;
+    use libp2p_swarm::behaviour::NewListenAddr;
+
+    use super::*;
+
+    fn junk(n: u16) -> Multiaddr {
+        format!("/ip4/203.0.113.7/tcp/{}", 40_000 + n).parse().unwrap()
+    }
+
+    #[test]
+    fn candidates_are_bounded_most_recent_first() {
+        let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+        for n in 0..40 {
+            behaviour.probe_address(junk(n));
+        }
+        let candidates = &behaviour.other_candidates;
+        assert_eq!(candidates.len(), MAX_CANDIDATES);
+        assert_eq!(candidates.front(), Some(&junk(39)));
+        assert_eq!(candidates.back(), Some(&junk(40 - MAX_CANDIDATES as u16)));
+        // A repeated observation moves to the front instead of adding a copy.
+        behaviour.probe_address(junk(30));
+        let candidates = &behaviour.other_candidates;
+        assert_eq!(candidates.len(), MAX_CANDIDATES);
+        assert_eq!(candidates.front(), Some(&junk(30)));
+        assert_eq!(candidates.iter().filter(|a| **a == junk(30)).count(), 1);
+    }
+
+    /// After many ephemeral-port observations, a probe still offers the
+    /// listen port first, within the limits, and throttles its server.
+    #[test]
+    fn a_probe_offers_the_listen_port_first() {
+        let config = Config {
+            boot_delay: Duration::ZERO,
+            ..Config::default()
+        };
+        let mut behaviour = Behaviour::new(PeerId::random(), config);
+        let listen: Multiaddr = "/ip4/10.0.0.2/tcp/9336".parse().unwrap();
+        behaviour.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+            listener_id: ListenerId::next(),
+            addr: &listen,
+        }));
+        for n in 0..40 {
+            behaviour.probe_address(junk(n));
+        }
+        let server = PeerId::random();
+        behaviour.add_server(server, None);
+        assert_eq!(behaviour.eligible_servers(), 1);
+        assert!(behaviour.last_probe_addresses().is_empty());
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut probed = None;
+        for _ in 0..500 {
+            match behaviour.poll(&mut cx) {
+                Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundProbe(
+                    OutboundProbeEvent::Request { peer, .. },
+                ))) => {
+                    probed = Some(peer);
+                    break;
+                }
+                Poll::Ready(_) => {}
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(probed, Some(server));
+        let sent = behaviour.last_probe_addresses();
+        assert_eq!(sent.first(), Some(&listen));
+        assert_eq!(sent.len(), as_client::MAX_PROBE_ADDRESSES);
+        assert_eq!(sent[1], junk(39));
+        assert_eq!(behaviour.eligible_servers(), 0);
     }
 }

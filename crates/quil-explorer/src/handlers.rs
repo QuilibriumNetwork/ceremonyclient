@@ -1443,6 +1443,9 @@ struct StatsResponse {
     /// appended last, so the keys above keep their order. `null` until the
     /// first snapshot.
     app_shards: Option<production::AppShardsStats>,
+    /// The `/shards/production/history` rows held; appended after
+    /// `app_shards`.
+    app_shard_history: production::history::HistoryStats,
 }
 
 pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) -> Response {
@@ -1481,6 +1484,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     }
     let halted_shards = halts.values().filter(|&&v| v == u64::MAX).count() as u64;
     let app_shards = state.production_snapshot.read().as_ref().map(|s| s.report.stats());
+    let app_shard_history = state.production_history.read().stats();
 
     let response = StatsResponse {
         current_frame: frame,
@@ -1492,6 +1496,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         at_risk,
         halted_shards,
         app_shards,
+        app_shard_history,
     };
     json_ok(&response, None)
 }
@@ -1633,6 +1638,34 @@ pub async fn handle_shard_production(
         &snapshot.report.response(class, filter.as_deref()),
         Some(production::CACHE_CONTROL),
     )
+}
+
+/// `/shards/production/history`: a row every `ROW_FRAMES` GLOBAL frames,
+/// ascending, each the `/shards/production` window at its frame plus what
+/// GLOBAL applied in its own frames. Optional `from_frame` and `to_frame`
+/// (inclusive) select at most one week of rows, the last week by default;
+/// `bucket=epoch` rolls the selected rows (all held by default) up per
+/// epoch. Rows carry the live-set census only when recorded live.
+pub async fn handle_shard_production_history(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let query = match production::history::parse_query(&params) {
+        Ok(query) => query,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let body = {
+        let rows = state.production_history.read();
+        match rows.response(&query) {
+            Ok(response) => json_value(&response),
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        }
+    };
+    build_response(StatusCode::OK, body, Some(production::history::CACHE_CONTROL))
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,9 +2527,11 @@ mod tests {
             at_risk: 1,
             halted_shards: 0,
             app_shards,
+            app_shard_history: production::history::Rows::default().stats(),
         };
         let old = r#"{"current_frame":7,"eviction_threshold":360,"total_provers":2,"by_status":{"active":2},"total_seniority":5,"eviction_pending":1,"at_risk":1,"halted_shards":0"#;
-        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null}}"#));
+        let history = r#""app_shard_history":{"rows":0,"first_row_frame":null,"last_row_frame":null,"backfill_complete":false}"#;
+        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null,{history}}}"#));
 
         let (none, empty) = (HashMap::new(), BTreeSet::new());
         let grid = production::GridView { grid: Some(BTreeSet::new()), ..Default::default() };
@@ -2519,7 +2554,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            s.ends_with(r#""grid_source":"local_store","grid_shards":0,"grid_digest":"e3b0c442","grid_unavailable":null}}"#),
+            s.ends_with(&format!(r#""grid_source":"local_store","grid_shards":0,"grid_digest":"e3b0c442","grid_unavailable":null}},{history}}}"#)),
             "{s}"
         );
     }

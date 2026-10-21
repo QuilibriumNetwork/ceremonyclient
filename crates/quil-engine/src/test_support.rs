@@ -220,6 +220,7 @@ pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
+    unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
 }
 
 impl Default for TestWorkerManager {
@@ -234,12 +235,18 @@ impl TestWorkerManager {
             workers: Mutex::new(HashMap::new()),
             evictions: Mutex::new(Vec::new()),
             executions: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
         }
     }
 
     /// The execution report `core_id`'s engine gives for `filter`.
     pub fn set_execution(&self, core_id: u32, filter: &[u8], execution: quil_types::proto::node::WorkerExecution) {
         self.executions.lock().unwrap().insert(core_id, (filter.to_vec(), execution));
+    }
+
+    /// `core_id`, bound to `filter`, does not answer its report request.
+    pub fn set_unanswered(&self, core_id: u32, filter: &[u8], reason: &'static str) {
+        self.unanswered.lock().unwrap().insert(core_id, (filter.to_vec(), reason));
     }
 
     /// Payload evictions requested so far, as `(core, protected filters)`.
@@ -278,6 +285,15 @@ impl WorkerManager for TestWorkerManager {
         self.executions.lock().unwrap().iter()
             .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| &w.filter == filter))
             .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
+            .collect()
+    }
+
+    /// Workers set with `set_unanswered`, still bound to their filter.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        let workers = self.workers.lock().unwrap();
+        self.unanswered.lock().unwrap().iter()
+            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| &w.filter == filter))
+            .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
             .collect()
     }
 

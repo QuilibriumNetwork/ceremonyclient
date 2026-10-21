@@ -822,13 +822,14 @@ impl ThreadWorkerManager {
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
                                                                         // time rather than all failing busy together. A
-                                                                        // blocked successor session goes first.
+                                                                        // blocked successor session goes first and keeps
+                                                                        // its turn for further replay batches.
                                                                         let attempt = async {
                                                                             crate::worker_execution::recovery_phase("waiting_for_permit");
                                                                             let blocked = lb.execution_record().successor_blocked_flag();
-                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked).await;
+                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked.clone()).await;
                                                                             crate::prover_tree_syncer::recover_shard_from_latest(
-                                                                                syncer.as_ref(), &filter, local, &lb,
+                                                                                syncer.as_ref(), &filter, local, &lb, Some(&*blocked),
                                                                             ).await
                                                                         };
                                                                         let _ = lb.execution_record().recovering(&filter, attempt).await;

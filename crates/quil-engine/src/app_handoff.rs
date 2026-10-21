@@ -973,6 +973,37 @@ pub fn successor_state_matches_held(
             }
             continue;
         }
+        // Past a sealed checkpoint lies this session's own chain, whose first
+        // frame names its genesis.
+        if cursor > checkpoint.frame {
+            let first = clock.get_shard_clock_frame(&session.filter, checkpoint.frame + 1, false).ok()
+                .and_then(|frame| frame.header);
+            // A frame there naming another genesis, such as a looked-through
+            // session's that [`fence_rewind`] discards, carries state GLOBAL
+            // never executed, unless GLOBAL's executed tip of this session
+            // vouches for the head above it ([`holds_executed_tip`]). A member
+            // behind that tip catches up first. A member holding no frame
+            // there, such as an archive-anchored joiner, is not checked here.
+            if let Some(first) = first.filter(|first| first.parent_selector != session.genesis) {
+                let own_tip = handoff::session_tip(&view, &session.id()?)?;
+                let tip = own_tip.as_ref().map(|tip| tip.frame);
+                if !own_tip.as_ref().is_some_and(|own| holds_executed_tip(clock, session, &checkpoint, own, cursor)) {
+                    if let Some(tip) = tip.filter(|tip| *tip > checkpoint.frame && cursor < *tip) {
+                        return Err(unavailable(format!(
+                            "behind this session's executed frames (local_head {cursor}, session_tip {tip})",
+                        )));
+                    }
+                    return Err(fence_refusal(
+                        "local state is past the predecessor's sealed checkpoint",
+                        &format!(
+                            "local frame {} names parent {}, not this session's genesis {}",
+                            first.frame_number, hex::encode(&first.parent_selector), hex::encode(session.genesis),
+                        ),
+                        session, cursor, tip,
+                    ));
+                }
+            }
+        }
         if cursor == checkpoint.frame {
             if local.roots != checkpoint.state_roots {
                 // This member does not hold the state its predecessor sealed
@@ -1017,12 +1048,18 @@ pub struct EffectiveOrigins {
     /// A looked-through origin had no origins of its own (a first session):
     /// part of the state was never certified.
     pub uncertified: bool,
+    /// The same-filter sessions looked through. Each ended at its base, the
+    /// checkpoint frame of the origin it was based at, so GLOBAL executed
+    /// none of its frames: a member's frames of one past that checkpoint
+    /// are discarded ([`fence_rewind`]).
+    pub looked_through: Vec<Session>,
 }
 
 pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<EffectiveOrigins> {
     let start = session.id()?;
     let mut origins = Vec::new();
     let mut uncertified = false;
+    let mut looked_through = Vec::new();
     let mut pending = vec![(start, session.generation)];
     while let Some((id, generation)) = pending.pop() {
         let direct = handoff::origins(view, &id)?;
@@ -1039,12 +1076,13 @@ pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<Effe
                     return Err(QuilError::Store("a same-filter origin does not precede its successor".into()));
                 }
                 pending.push((source.id()?, source.generation));
+                looked_through.push(source);
             } else {
                 origins.push((source, checkpoint));
             }
         }
     }
-    Ok(EffectiveOrigins { origins, uncertified })
+    Ok(EffectiveOrigins { origins, uncertified, looked_through })
 }
 
 /// The digest (`poseidon(output)`) GLOBAL committed for `filter`'s frame
@@ -1071,6 +1109,11 @@ pub fn committed_frame_digest(global: &Arc<HypergraphCrdt>, filter: &[u8], numbe
         }
         if checkpoint.frame == number && checkpoint.frame != source.base_frame {
             return Ok(Some(checkpoint.digest));
+        }
+        // Frames an origin executed past its checkpoint are not this
+        // shard's history: its successor continues from the checkpoint.
+        if number > checkpoint.frame {
+            continue;
         }
         if let Some(digest) = tip_of(&source)? {
             return Ok(Some(digest));
@@ -1204,8 +1247,9 @@ pub fn fence_rewind_held(
     held: &mut HeldOwnChain,
 ) -> Result<FenceRewind> {
     let view = CommittedView::capture(global)?;
-    for (source, checkpoint) in effective_origins(&view, session)?.origins {
-        if source.filter != session.filter || !handoff::is_fenced(&view, &source.id()?)? {
+    let EffectiveOrigins { origins, looked_through, .. } = effective_origins(&view, session)?;
+    for (source, checkpoint) in origins {
+        if source.filter != session.filter {
             continue;
         }
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&session.filter);
@@ -1213,6 +1257,36 @@ pub fn fence_rewind_held(
         let cursor = local.records.read_record(&cursor_key)?
             .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes))
             .unwrap_or(0);
+        if !handoff::is_fenced(&view, &source.id()?)? {
+            // Past a sealed checkpoint lies this session's own chain, which
+            // `successor_state_matches` checks, or a looked-through session's.
+            if cursor > checkpoint.frame {
+                if let Some(outcome) =
+                    rewind_looked_through(&view, shard, clock, session, &checkpoint, &looked_through, cursor)?
+                {
+                    return Ok(outcome);
+                }
+                // Any other frame there that is not this session's, with no
+                // executed tip of it vouching for the head, is state to start
+                // over neither (`successor_state_matches` refuses it) nor to
+                // rewind here: a re-anchor at the checkpoint replaces it.
+                let foreign = clock.get_shard_clock_frame(&session.filter, checkpoint.frame + 1, false).ok()
+                    .and_then(|frame| frame.header)
+                    .is_some_and(|first| first.parent_selector != session.genesis);
+                let executed = handoff::session_tip(&view, &session.id()?)?;
+                if foreign && !executed.as_ref().is_some_and(|tip| holds_executed_tip(clock, session, &checkpoint, tip, cursor)) {
+                    return Ok(FenceRewind::Unrewindable {
+                        fence: UnrewindableFence {
+                            generation: session.generation, local_head: cursor, fence: checkpoint.frame,
+                            session_tip: executed.map(|tip| tip.frame),
+                            reason: "local frame after the checkpoint is not this session's",
+                        },
+                        error: None,
+                    });
+                }
+            }
+            continue;
+        }
         if cursor <= checkpoint.frame {
             return Ok(FenceRewind::Untouched);
         }
@@ -1228,8 +1302,15 @@ pub fn fence_rewind_held(
             let digest = quil_crypto::poseidon::hash_bytes_to_32(&frame.header?.output).ok()?;
             Some(digest == tip.digest)
         });
-        if at_tip == Some(true) {
+        if at_tip == Some(true) && executed.as_ref().is_some_and(|tip| cursor >= tip.frame) {
             return Ok(FenceRewind::Untouched);
+        }
+        // A session looked through to this fence, GLOBAL having ended it at
+        // its base, left its frames here.
+        if let Some(outcome) =
+            rewind_looked_through(&view, shard, clock, session, &checkpoint, &looked_through, cursor)?
+        {
+            return Ok(outcome);
         }
         let unrewindable = |reason: &'static str, error: Option<QuilError>| FenceRewind::Unrewindable {
             fence: UnrewindableFence {
@@ -1322,21 +1403,11 @@ pub fn fence_rewind_held(
             .ok_or_else(|| QuilError::Consensus("frame after the fence carries malformed state roots".into()))?;
         match shard.rewind_app_shard(&session.filter, &roots) {
             Ok(()) => {}
-            // A member that pruned the fenced state (or never held it).
-            Err(error @ QuilError::ExecutionUnavailable(_)) if error.to_string().contains("not retained here") => {
+            Err(error) if not_retained(&error) => {
                 return Ok(unrewindable("fence state not retained locally", Some(error)));
             }
             Err(error) => return Err(error),
         }
-        shard.checkpoint_frame_cursor(checkpoint.frame, &cursor_key)?;
-        for frame in checkpoint.frame + 1..=cursor {
-            shard.invalidate_domain_shard_commit(frame, &session.filter[..32])?;
-        }
-        let stored = clock.get_latest_shard_clock_frame(&session.filter).ok()
-            .and_then(|frame| frame.header.map(|header| header.frame_number))
-            .unwrap_or(cursor);
-        clock.set_latest_shard_clock_frame_number(&session.filter, checkpoint.frame)?;
-        clock.delete_shard_clock_frame_range(&session.filter, checkpoint.frame + 1, cursor.max(stored) + 1)?;
         tracing::warn!(
             filter = hex::encode(&session.filter), generation = session.generation,
             from = cursor, to = checkpoint.frame, after_epochs = schedule::fence_after_epochs(requested),
@@ -1369,6 +1440,60 @@ impl ReanchorMarker {
         self.head = local_frame_digest(clock, filter, self.from_cursor);
         self
     }
+}
+
+/// The re-anchor a shard owes once certified archive frames have kept
+/// failing to replay onto this worker's trees at materialized cursor
+/// `cursor` (a pre-state mismatch): the trees no longer hold the state the
+/// local lineage claims, and no replay can bring them back. It anchors at
+/// `committed`, the frame GLOBAL committed for the shard
+/// ([`committed_tip`]), which must lie above the cursor: the cursor stands
+/// as the fence, so the rebase ([`rebase_for_reanchor`]) keeps the lineage
+/// through it and drops only frames stored past it, and the trees are
+/// synced pinned to the anchor's roots. `None` without a committed frame
+/// above the cursor: nothing GLOBAL committed names the state to sync.
+pub fn replay_mismatch_reanchor(generation: u64, cursor: u64, committed: Option<u64>) -> Option<ReanchorMarker> {
+    committed.filter(|&tip| tip > cursor)
+        .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
+}
+
+/// Why a shard owes a re-anchor, read from its marker: a head past its
+/// session fence records the fence below that head ([`fence_rewind`]), a
+/// persistent replay mismatch records the cursor itself
+/// ([`replay_mismatch_reanchor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReanchorCause {
+    /// The head lies past its session's fence on frames the fence discarded.
+    PastFence,
+    /// The trees no longer hold the state the local lineage claims.
+    ReplayMismatch,
+}
+
+impl ReanchorCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PastFence => "head past the session fence",
+            Self::ReplayMismatch => "persistent replay mismatch",
+        }
+    }
+}
+
+impl ReanchorMarker {
+    /// Why it is owed ([`ReanchorCause`]).
+    pub fn cause(&self) -> ReanchorCause {
+        if self.from_cursor > self.fence { ReanchorCause::PastFence } else { ReanchorCause::ReplayMismatch }
+    }
+}
+
+/// What a persistent replay mismatch of `filter` needs of GLOBAL: the frame
+/// it committed for the shard ([`committed_tip`]), the head session's
+/// generation (0 without one), and whether a re-anchor finds its anchor
+/// under that session ([`reanchor_applies`]).
+pub fn replay_mismatch_inputs(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<(Option<u64>, u64, bool)> {
+    let committed = committed_tip(global, filter)?;
+    let view = CommittedView::capture(global)?;
+    let generation = handoff::head(&view, filter)?.map_or(0, |head| head.generation);
+    Ok((committed, generation, reanchor_applies(global, filter)?))
 }
 
 /// The digest (`poseidon(output)`) of `filter`'s local frame `number`, if
@@ -2117,6 +2242,10 @@ mod successor_tests {
         assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), Some([0x33; 32]), "the sealed checkpoint");
         assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), None, "below the predecessor's tip");
         assert_eq!(committed_frame_digest(&global, &[0x08; 32], 3).unwrap(), None, "another shard");
+        handoff::record_session_tip(&state, 6, &source.id().unwrap(),
+            &Checkpoint { frame: 4, view: 6, digest: [0x55; 32], state_roots: [[1; 32]; 4], history_root: [0; 32] }).unwrap();
+        commit(&global, &state, 6);
+        assert_eq!(committed_frame_digest(&global, &filter, 4).unwrap(), None, "a predecessor's tip past its seal");
     }
 
     #[test]
@@ -3005,6 +3134,96 @@ mod successor_tests {
         assert_eq!(reanchor_gate(Some(marker), 6, Some([0x66; 32])), ReanchorGate::Stale(marker), "another frame there");
         let unheaded = ReanchorMarker { head: None, ..marker };
         assert_eq!(reanchor_gate(Some(unheaded), 6, Some([0x66; 32])), ReanchorGate::Owed(unheaded));
+    }
+
+    // An operator's joining worker held a lineage from an earlier tenure
+    // whose trees no longer matched it (2026-10-20): every archive frame
+    // past its head failed to replay with a pre-state mismatch, for hours,
+    // from every archive. Its session was never fenced. Once that persists
+    // it owes a re-anchor at the frame GLOBAL committed above its head: the
+    // rebase keeps the lineage through the head, drops the frames stored
+    // past it with their relay records, and moves the cursor below the
+    // anchor, which then replays as the session's executed tip. Without a
+    // committed frame above the head it owes none.
+    #[test]
+    fn a_lineage_whose_trees_diverged_is_reanchored_at_the_committed_frame_above_it() {
+        use quil_types::proto::global::FrameHeader;
+        use quil_types::store::ClockStore as _;
+        // A first session on its own chain, never fenced, executed through 9.
+        let (global, state) = global_state();
+        let filter = vec![0x06; 32];
+        let signers: Vec<_> = (0..3).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let session = Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members,
+        };
+        commit(&global, &state, 1);
+        handoff::initialize(&state, 2, &session).unwrap();
+        commit(&global, &state, 2);
+        let tip = quil_crypto::poseidon::hash_bytes_to_32(&[0x99; 32]).unwrap();
+        handoff::record_session_tip(&state, 3, &session.id().unwrap(), &Checkpoint {
+            frame: 9, view: 12, digest: tip, state_roots: [[3; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(&global, &state, 3);
+        assert_eq!(replay_mismatch_inputs(&global, &filter).unwrap(), (Some(9), 1, true));
+
+        // The worker's lineage through 5, materialized through 4.
+        let clock_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(clock_db.inner());
+        let shard = crdt();
+        shard.set_unified_tree(true);
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        for number in 1..=5u64 {
+            store_header(&clock, FrameHeader {
+                address: filter.clone(), frame_number: number, rank: number, output: vec![0x10 | number as u8; 32],
+                ..Default::default()
+            });
+            store_relay_records(&clock, &filter, number);
+        }
+        shard.commit_with_frame_cursor_and_records(4, &cursor_key, &outflow_records(&filter, 4)).unwrap();
+        let cursor = || shard.read_frame_cursor(&cursor_key).unwrap();
+        assert_eq!(cursor(), 4);
+
+        for (head, committed) in [(4, None), (9, Some(9)), (10, Some(9))] {
+            assert_eq!(replay_mismatch_reanchor(1, head, committed), None, "{head} {committed:?}");
+        }
+        let marker = replay_mismatch_reanchor(1, 4, Some(9)).unwrap().with_head(&clock, &filter);
+        assert_eq!(marker, ReanchorMarker { generation: 1, fence: 4, from_cursor: 4,
+            head: Some(quil_crypto::poseidon::hash_bytes_to_32(&[0x14; 32]).unwrap()) });
+        assert_eq!(marker.cause(), ReanchorCause::ReplayMismatch);
+        assert_eq!(ReanchorMarker { fence: 3, from_cursor: 6, ..marker }.cause(), ReanchorCause::PastFence);
+        write_reanchor_marker(&clock, &filter, &marker).unwrap();
+        let gate = || reanchor_gate_at(&shard, &clock, &filter, read_reanchor_marker(&clock, &filter).unwrap()).unwrap();
+        assert_eq!(gate(), ReanchorGate::Owed(marker));
+        assert!(reanchor_applies(&global, &filter).unwrap());
+        assert!(anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x99)).unwrap());
+        assert!(!anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x98)).unwrap());
+        assert!(!anchor_is_committed(&global, &filter, &header_frame(&filter, 5, 0x15)).unwrap(), "a lineage frame");
+
+        let rebased = rebase_for_reanchor(&shard, &clock, &filter, &marker, 9,
+            Some(&header_frame(&filter, 8, 0x88)), |kept| { assert_eq!(kept, 4); Ok(()) }).unwrap();
+        assert_eq!(rebased, Rebased { from: 5, to: 5 });
+        assert_eq!(cursor(), 8);
+        assert!(clock.get_shard_clock_frame(&filter, 5, false).is_err(), "the frame past the head is dropped");
+        assert_eq!(relay_records_of(&clock, &filter, 5), [false; 4]);
+        for number in 1..=4u64 {
+            assert_eq!(clock.get_shard_clock_frame(&filter, number, false).unwrap().header.unwrap().output,
+                vec![0x10 | number as u8; 32], "frame {number} stays");
+            assert_eq!(relay_records_of(&clock, &filter, number), [true; 4], "frame {number}'s records stay");
+        }
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap().header.unwrap().output, vec![0x88; 32]);
+        assert_eq!(gate(), ReanchorGate::Absent, "the rebase committed");
+
+        // The anchor replays: the head is the frame GLOBAL executed.
+        store_header(&clock, FrameHeader {
+            address: filter.clone(), frame_number: 9, rank: 12, output: vec![0x99; 32], ..Default::default()
+        });
+        shard.checkpoint_frame_cursor(9, &cursor_key).unwrap();
+        assert_eq!(local_frame_digest(&clock, &filter, cursor()), Some(tip));
+        assert_eq!(gate(), ReanchorGate::Absent);
     }
 
     // A rebase interrupted after its deletions, before the cursor moves (a

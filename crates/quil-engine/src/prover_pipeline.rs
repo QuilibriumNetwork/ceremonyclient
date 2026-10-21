@@ -9,7 +9,8 @@
 //! Mirrors Go's `publishProverMessage` at
 //! `node/consensus/global/global_consensus_engine.go:154-159`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::{debug, info, warn};
 
@@ -17,7 +18,7 @@ use quil_execution::global_intrinsic::{
     addressed_signature::AddressedSignature,
     prover_filter_ops::ProverLeave,
     prover_join::ProverJoin,
-    prover_ops::{ProverConfirm, ProverReject, ShardMerge, ShardSplit},
+    prover_ops::{ProverConfirm, ProverReject, ProverSeniorityMerge, ShardMerge, ShardSplit},
     sig_with_pop::SignatureWithPop,
 };
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -152,6 +153,151 @@ fn confirm_encoding_plan(
             (filter.clone(), targets)
         })
         .collect()
+}
+
+/// A seniority-merge target GLOBAL already consumed: a join or seniority
+/// merge stamped its spent marker, and GLOBAL refuses every later seniority
+/// merge naming it, whoever submits it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConsumedMergeTarget {
+    /// The target's Ed448 public key.
+    pubkey: Vec<u8>,
+    /// The merge that consumed it: `join merge` or `seniority merge`.
+    marker: &'static str,
+    /// The prover the marker credits, when it names one.
+    credited: Option<Vec<u8>>,
+}
+
+/// Read a spent marker from the node's committed GLOBAL state.
+fn spent_marker(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    address: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    let va_disc = quil_execution::hypergraph_state::vertex_adds_discriminator()?;
+    quil_execution::hypergraph_state::HypergraphState::new(crdt.clone()).get(
+        &quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS[..],
+        address,
+        &va_disc,
+    )
+}
+
+/// Build the `ProverSeniorityMerge` of `seeds` at `frame_number`, leaving out
+/// the targets whose join- or seniority-merge spent marker `lookup` finds:
+/// GLOBAL refuses those forever (`verify_prover_seniority_merge_spent_markers`).
+/// Each target signs the prover key on its own, so the others still form a
+/// valid merge; `None` when no target is left.
+fn seniority_merge<F>(
+    frame_number: u64,
+    seeds: &[[u8; 57]],
+    bls_pubkey: &[u8],
+    prover_address: &[u8; 32],
+    bls_signer: &dyn Signer,
+    mut lookup: F,
+) -> Result<(Option<ProverSeniorityMerge>, Vec<ConsumedMergeTarget>)>
+where
+    F: FnMut(&[u8; 32]) -> Result<Option<Vec<u8>>>,
+{
+    use quil_execution::global_intrinsic::materialize::{
+        spent_join_merge_address, spent_seniority_merge_address,
+    };
+    let merge_domain_tag: &[u8] = b"PROVER_SENIORITY_MERGE";
+
+    // Build one SeniorityMerge record per helper seed GLOBAL can still credit.
+    let mut merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> =
+        Vec::with_capacity(seeds.len());
+    let mut consumed = Vec::new();
+    'seeds: for seed in seeds {
+        let helper_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
+        for (marker, spent) in [
+            ("join merge", spent_join_merge_address(&helper_pubkey)?),
+            ("seniority merge", spent_seniority_merge_address(&helper_pubkey)?),
+        ] {
+            if let Some(blob) = lookup(&spent)? {
+                let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                let credited = quil_execution::global_schema::read_field(&tree, "merge:SpentMerge", "ProverAddress")
+                    .filter(|address| address.len() == 32);
+                consumed.push(ConsumedMergeTarget { pubkey: helper_pubkey, marker, credited });
+                continue 'seeds;
+            }
+        }
+        let helper_signer = quil_crypto::Ed448Signer::from_bytes(seed, &helper_pubkey)?;
+        let helper_sig = <quil_crypto::Ed448Signer as Signer>::sign_with_domain(
+            &helper_signer,
+            bls_pubkey,
+            merge_domain_tag,
+        )?;
+
+        merge_targets.push(quil_execution::global_intrinsic::SeniorityMerge {
+            signature: helper_sig,
+            key_type: quil_types::crypto::KeyType::Ed448 as u32,
+            prover_public_key: helper_pubkey,
+        });
+    }
+    if merge_targets.is_empty() {
+        return Ok((None, consumed));
+    }
+
+    // BLS-sign `frame_be || helper_pubkeys_concat` under the
+    // PROVER_SENIORITY_MERGE domain.
+    let mut message: Vec<u8> = Vec::with_capacity(8 + merge_targets.len() * 57);
+    message.extend_from_slice(&frame_number.to_be_bytes());
+    for mt in &merge_targets {
+        message.extend_from_slice(&mt.prover_public_key);
+    }
+    let domain = ProverPipeline::domain(merge_domain_tag)?;
+    let bls_sig = bls_signer.sign_with_domain(&message, &domain)?;
+
+    let merge = ProverSeniorityMerge {
+        frame_number,
+        public_key_signature_bls48581: Some(AddressedSignature {
+            signature: bls_sig,
+            address: prover_address.to_vec(),
+        }),
+        merge_targets,
+    };
+    Ok((Some(merge), consumed))
+}
+
+/// The last 6 characters of an identifier, as logs name peers and provers.
+fn tail(id: &str) -> &str {
+    &id[id.len().saturating_sub(6)..]
+}
+
+/// Whom a consumed target's seniority went to, and what the operator can do
+/// about it: nothing when it went to this prover.
+fn consumed_target_credit(target: &ConsumedMergeTarget, own: &[u8; 32]) -> (String, Option<&'static str>) {
+    match &target.credited {
+        Some(address) if address.as_slice() == own => ("this prover".into(), None),
+        Some(address) => (
+            format!("prover …{}", tail(&hex::encode(address))),
+            Some("its seniority counts for that prover; restore that prover's key to recover it"),
+        ),
+        None => ("no recorded prover".into(), Some("none: GLOBAL credits each target once")),
+    }
+}
+
+/// Consumed merge targets this node reported, with the epoch of the report:
+/// a target found consumed is reported at once and again at most once per
+/// epoch while the lifecycle keeps proposing merges. Holds only this node's
+/// own targets.
+#[derive(Default)]
+struct ConsumedTargetReports(Mutex<HashMap<ConsumedMergeTarget, u64>>);
+
+impl ConsumedTargetReports {
+    /// Whether `target` is due a report in `epoch`; records the report.
+    fn due(&self, target: &ConsumedMergeTarget, epoch: u64) -> bool {
+        let Ok(mut reported) = self.0.lock() else { return false };
+        if reported.get(target).is_some_and(|last| *last >= epoch) {
+            return false;
+        }
+        reported.insert(target.clone(), epoch);
+        true
+    }
+}
+
+fn consumed_target_reports() -> &'static ConsumedTargetReports {
+    static REPORTS: OnceLock<ConsumedTargetReports> = OnceLock::new();
+    REPORTS.get_or_init(ConsumedTargetReports::default)
 }
 
 impl ProverPipeline {
@@ -779,54 +925,63 @@ impl ProverPipeline {
             ));
         }
 
-        let merge_domain_tag: &[u8] = b"PROVER_SENIORITY_MERGE";
-
-        // Build one SeniorityMerge record per helper seed.
-        let mut merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> =
-            Vec::with_capacity(self.multisig_ed448_seeds.len());
-        for seed in &self.multisig_ed448_seeds {
-            let helper_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
-            let helper_signer = quil_crypto::Ed448Signer::from_bytes(seed, &helper_pubkey)?;
-            let helper_sig = <quil_crypto::Ed448Signer as Signer>::sign_with_domain(
-                &helper_signer,
-                &self.bls_pubkey,
-                merge_domain_tag,
-            )?;
-
-            merge_targets.push(quil_execution::global_intrinsic::SeniorityMerge {
-                signature: helper_sig,
-                key_type: quil_types::crypto::KeyType::Ed448 as u32,
-                prover_public_key: helper_pubkey,
-            });
-        }
-
-        // BLS-sign `frame_be || helper_pubkeys_concat` under the
-        // PROVER_SENIORITY_MERGE domain.
-        let mut message: Vec<u8> = Vec::with_capacity(8 + merge_targets.len() * 57);
-        message.extend_from_slice(&frame_number.to_be_bytes());
-        for mt in &merge_targets {
-            message.extend_from_slice(&mt.prover_public_key);
-        }
         let bls_signer = self.bls_signer()?;
-        let domain = Self::domain(merge_domain_tag)?;
-        let bls_sig = bls_signer.sign_with_domain(&message, &domain)?;
-
-        let merge = quil_execution::global_intrinsic::ProverSeniorityMerge {
+        let (merge, consumed) = seniority_merge(
             frame_number,
-            public_key_signature_bls48581: Some(AddressedSignature {
-                signature: bls_sig,
-                address: self.prover_address.to_vec(),
-            }),
-            merge_targets,
+            &self.multisig_ed448_seeds,
+            &self.bls_pubkey,
+            &self.prover_address,
+            bls_signer.as_ref(),
+            |address| self.hypergraph.as_ref().map_or(Ok(None), |crdt| spent_marker(crdt, address)),
+        )?;
+        self.report_consumed_merge_targets(&consumed, frame_number);
+        let Some(merge) = merge else {
+            // GLOBAL would refuse it: no target is left to credit.
+            self.lifecycle.hold_seniority_merge(frame_number);
+            return Ok(());
         };
         let bytes = merge.to_canonical_bytes()?;
 
         info!(
             frame = frame_number,
-            helpers = self.multisig_ed448_seeds.len(),
+            helpers = merge.merge_targets.len(),
+            consumed = consumed.len(),
             "submitting ProverSeniorityMerge"
         );
         self.publish_prover_message(bytes).await
+    }
+
+    /// Report each consumed merge target once, and at most once per epoch
+    /// while it stays out of the merges this node proposes: a warning when
+    /// its seniority went elsewhere, a note when it went to this prover.
+    fn report_consumed_merge_targets(&self, consumed: &[ConsumedMergeTarget], frame_number: u64) {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        for target in consumed.iter().filter(|target| consumed_target_reports().due(target, epoch)) {
+            let peer = bs58::encode(quil_p2p::peer_id_from_ed448_pubkey(&target.pubkey)).into_string();
+            let target_peer = format!("…{}", tail(&peer));
+            match consumed_target_credit(target, &self.prover_address) {
+                (credited_to, None) => info!(
+                    frame = frame_number,
+                    epoch,
+                    target_peer = %target_peer,
+                    marker = target.marker,
+                    credited_to = %credited_to,
+                    "seniority merge target already credited to this prover; \
+                     left out of its seniority merges"
+                ),
+                (credited_to, Some(action)) => warn!(
+                    frame = frame_number,
+                    epoch,
+                    target_peer = %target_peer,
+                    marker = target.marker,
+                    credited_to = %credited_to,
+                    scope = "committed GLOBAL state",
+                    action,
+                    "seniority merge target already consumed: GLOBAL refuses to merge it again, \
+                     so this node leaves it out of its seniority merges"
+                ),
+            }
+        }
     }
 
     async fn submit_leave(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -1024,5 +1179,136 @@ mod tests {
             "each split child from the parent's storage; a shared merge target once",
         );
         assert_eq!(confirm_encoding_plan(&[vec![1]], &changes, 9), vec![(vec![1], vec![])], "only a change applying next epoch");
+    }
+
+    const FRAME: u64 = 720;
+    const BLS_KEY: &[u8] = b"prover key";
+    const OWN: [u8; 32] = [7; 32];
+    const OTHER: [u8; 32] = [8; 32];
+    const SEEDS: [[u8; 57]; 2] = [[1; 57], [2; 57]];
+
+    fn pubkey(seed: &[u8; 57]) -> Vec<u8> {
+        quil_p2p::ed448_identity::derive_public_key(seed)
+    }
+
+    /// Stands in for the prover's BLS signer; Ed448 signs deterministically.
+    fn prover_signer() -> quil_crypto::Ed448Signer {
+        quil_crypto::Ed448Signer::from_bytes(&[9; 57], &pubkey(&[9; 57])).unwrap()
+    }
+
+    /// Committed GLOBAL state holding a spent marker at each address, as the
+    /// merge that consumed the target stamps it for the prover it credits.
+    fn global_with_markers(markers: &[([u8; 32], [u8; 32])]) -> std::sync::Arc<quil_hypergraph::HypergraphCrdt> {
+        use quil_execution::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+        use std::sync::Arc;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(crdt.clone());
+        let va_disc = vertex_adds_discriminator().unwrap();
+        for (address, credited) in markers {
+            let marker = quil_execution::global_intrinsic::materialize::create_spent_merge_tree(credited).unwrap();
+            let blob = quil_execution::prover_registry::vertex_tree_to_blob(&marker);
+            state
+                .set(&quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc, 1, blob)
+                .unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        crdt
+    }
+
+    fn merge_with(
+        global: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        seeds: &[[u8; 57]],
+    ) -> (Option<super::ProverSeniorityMerge>, Vec<super::ConsumedMergeTarget>) {
+        super::seniority_merge(FRAME, seeds, BLS_KEY, &OWN, &prover_signer(), |address| {
+            super::spent_marker(global, address)
+        })
+        .unwrap()
+    }
+
+    /// The merge of `seeds` as built before consumed targets were left out.
+    fn merge_of(seeds: &[[u8; 57]]) -> super::ProverSeniorityMerge {
+        use quil_types::crypto::Signer;
+        let merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> = seeds
+            .iter()
+            .map(|seed| quil_execution::global_intrinsic::SeniorityMerge {
+                signature: quil_crypto::Ed448Signer::from_bytes(seed, &pubkey(seed))
+                    .unwrap()
+                    .sign_with_domain(BLS_KEY, b"PROVER_SENIORITY_MERGE")
+                    .unwrap(),
+                key_type: quil_types::crypto::KeyType::Ed448 as u32,
+                prover_public_key: pubkey(seed),
+            })
+            .collect();
+        let mut message = FRAME.to_be_bytes().to_vec();
+        for target in &merge_targets {
+            message.extend_from_slice(&target.prover_public_key);
+        }
+        let domain = super::ProverPipeline::domain(b"PROVER_SENIORITY_MERGE").unwrap();
+        super::ProverSeniorityMerge {
+            frame_number: FRAME,
+            public_key_signature_bls48581: Some(super::AddressedSignature {
+                signature: prover_signer().sign_with_domain(&message, &domain).unwrap(),
+                address: OWN.to_vec(),
+            }),
+            merge_targets,
+        }
+    }
+
+    fn consumed_by(seed: &[u8; 57], marker: &'static str, credited: [u8; 32]) -> super::ConsumedMergeTarget {
+        super::ConsumedMergeTarget { pubkey: pubkey(seed), marker, credited: Some(credited.to_vec()) }
+    }
+
+    #[test]
+    fn a_merge_of_unconsumed_targets_is_unchanged() {
+        let (merge, consumed) = merge_with(&global_with_markers(&[]), &SEEDS);
+        assert_eq!(merge, Some(merge_of(&SEEDS)));
+        assert!(consumed.is_empty());
+    }
+
+    #[test]
+    fn a_target_another_prover_consumed_is_not_merged_and_names_that_prover() {
+        let spent = quil_execution::global_intrinsic::materialize::spent_join_merge_address(&pubkey(&SEEDS[0])).unwrap();
+        let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OTHER)]), &SEEDS[..1]);
+        assert_eq!(merge, None, "GLOBAL refuses a merge naming a consumed target");
+        assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "join merge", OTHER)]);
+        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN);
+        assert_eq!(credited_to, "prover …080808");
+        assert!(action.is_some_and(|action| action.contains("restore that prover's key")), "{action:?}");
+    }
+
+    #[test]
+    fn a_target_this_prover_consumed_is_not_merged_again() {
+        let spent = quil_execution::global_intrinsic::materialize::spent_seniority_merge_address(&pubkey(&SEEDS[0])).unwrap();
+        let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OWN)]), &SEEDS[..1]);
+        assert_eq!(merge, None);
+        assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "seniority merge", OWN)]);
+        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN);
+        assert_eq!(credited_to, "this prover");
+        assert_eq!(action, None, "nothing for the operator to do");
+    }
+
+    #[test]
+    fn a_merge_keeps_only_the_unconsumed_targets() {
+        let spent = quil_execution::global_intrinsic::materialize::spent_seniority_merge_address(&pubkey(&SEEDS[0])).unwrap();
+        let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OTHER)]), &SEEDS);
+        assert_eq!(merge, Some(merge_of(&SEEDS[1..])), "the prover signs the remaining target alone");
+        assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "seniority merge", OTHER)]);
+    }
+
+    #[test]
+    fn a_consumed_target_is_reported_once_per_epoch() {
+        let reports = super::ConsumedTargetReports::default();
+        let target = consumed_by(&SEEDS[0], "join merge", OTHER);
+        assert!(reports.due(&target, 5), "reported when found");
+        assert!(!reports.due(&target, 5), "not again within the epoch");
+        assert!(reports.due(&target, 6), "repeated the next epoch");
+        assert!(reports.due(&consumed_by(&SEEDS[0], "join merge", OWN), 6), "a changed marker is reported at once");
     }
 }
