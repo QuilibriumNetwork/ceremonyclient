@@ -3155,8 +3155,9 @@ impl AppConsensusEngine {
 
     /// Warn while this successor cannot start on its predecessor's state
     /// ([`PredecessorBlock::blocked`]), naming the predecessor and the shard
-    /// sync's last anchor refusal.
-    fn warn_predecessor_blocked(&mut self, now: std::time::Instant) {
+    /// sync's last anchor refusal, or, when `pending` is the wait for the
+    /// predecessor's outgoing history, that wait.
+    fn warn_predecessor_blocked(&mut self, now: std::time::Instant, pending: &QuilError) {
         // Its archive recoveries go first while it waits (thread_worker).
         self.execution.set_successor_blocked(true);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
@@ -3167,6 +3168,18 @@ impl AppConsensusEngine {
                 seal.predecessor_generation, if seal.fenced { "fenced" } else { "sealed" },
                 seal.through, seal.session_generation,
             ));
+        if predecessor_history_pending(pending) {
+            warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
+                local_frame = self.last_materialized_frame,
+                cause = "predecessor outgoing history recovery still in progress",
+                blocked_secs = blocked.as_secs(), scope = "this node",
+                action = "this worker cannot join the shard's consensus until it rebuilds the predecessor's \
+                    outgoing history from certified headers or an archive; it retries; a 'predecessor outgoing \
+                    history could not be recovered' warning names a failing source; report it with this line \
+                    if it persists",
+                "successor session blocked: predecessor outgoing history not recovered");
+            return;
+        }
         let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
         // A recovery that failed before reaching this engine (an archive
         // lacking the frame, a failed connection) is recorded only by the
@@ -3193,7 +3206,7 @@ impl AppConsensusEngine {
             local_frame = self.last_materialized_frame,
             anchor_frame = %or_none(refusal.and_then(|r| r.frame)),
             anchored_global_frame = %or_none(refusal.and_then(|r| r.global_frame)),
-            cause = refusal.map_or("no archive sync anchor refused yet", |r| r.cause),
+            cause = refusal.map_or("no recovery refusal recorded yet", |r| r.cause),
             last_error = %refusal.map_or("none", |r| r.error.as_str()),
             blocked_secs = blocked.as_secs(), scope = "this node", action = action,
             "successor session blocked: predecessor state not recovered through its seal");
@@ -3204,7 +3217,7 @@ impl AppConsensusEngine {
     fn note_predecessor_block(&mut self, refused: Option<&QuilError>, now: std::time::Instant) {
         match refused {
             None => self.end_predecessor_block("consensus started", now),
-            Some(error) if predecessor_recovery_pending(error) => self.warn_predecessor_blocked(now),
+            Some(error) if predecessor_recovery_pending(error) => self.warn_predecessor_blocked(now, error),
             Some(_) => self.end_predecessor_block("startup now waits on something else", now),
         }
     }
@@ -8353,9 +8366,14 @@ async fn storage_history_unavailable(
 /// Whether a start failed only because this successor has not yet recovered
 /// its predecessor's sealed state or outgoing history.
 fn predecessor_recovery_pending(error: &QuilError) -> bool {
-    crate::app_handoff::predecessor_unrecovered(error)
-        || matches!(error, QuilError::ExecutionUnavailable(reason)
-            if reason == "predecessor outgoing history recovery is still in progress")
+    crate::app_handoff::predecessor_unrecovered(error) || predecessor_history_pending(error)
+}
+
+/// Whether `error` is the successor's wait for its predecessor's outgoing
+/// history, which it rebuilds after (or without) recovering its state.
+fn predecessor_history_pending(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason)
+        if reason == "predecessor outgoing history recovery is still in progress")
 }
 
 /// How long a successor waits on its predecessor's state before it warns.
@@ -10178,14 +10196,20 @@ mod tests {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        let warned = |engine: &mut AppConsensusEngine, at| {
+        let unrecovered = QuilError::ExecutionUnavailable(
+            "app committee session: predecessor state has not been recovered through its seal".into());
+        let history = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
+        assert!(crate::app_handoff::predecessor_unrecovered(&unrecovered) && predecessor_history_pending(&history)
+            && !predecessor_history_pending(&unrecovered));
+        let warned_on = |engine: &mut AppConsensusEngine, at, pending: &QuilError| {
             let lines = Lines::default();
             let writer = lines.clone();
             let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
-            tracing::subscriber::with_default(subscriber, || engine.warn_predecessor_blocked(at));
+            tracing::subscriber::with_default(subscriber, || engine.warn_predecessor_blocked(at, pending));
             let bytes = lines.0.lock().unwrap().clone();
             String::from_utf8(bytes).unwrap()
         };
+        let warned = |engine: &mut AppConsensusEngine, at| warned_on(engine, at, &unrecovered);
         let fail = |engine: &AppConsensusEngine, error: &'static str| {
             let (execution, filter) = (engine.execution.clone(), engine.filter.clone());
             async move {
@@ -10222,6 +10246,17 @@ mod tests {
         // A replayed frame clears it.
         engine.note_replay_outcome(8, 7, &Ok(8));
         assert!(engine.predecessor_block.refusal.is_none());
+        // Waiting for the predecessor's outgoing history names that wait,
+        // not a refusal; with neither, none is claimed.
+        let line = warned_on(&mut engine, minutes(104), &history);
+        assert!(line.contains("successor session blocked: predecessor outgoing history not recovered")
+            && line.contains("cause=\"predecessor outgoing history recovery still in progress\"")
+            && !line.contains("last_error"), "{line}");
+        let (mut engine, _, _, _) = engine_with_session_based_at_seven(0x43);
+        assert_eq!(warned(&mut engine, start), "");
+        let line = warned(&mut engine, minutes(11));
+        assert!(line.contains("cause=\"no recovery refusal recorded yet\"") && line.contains("last_error=none"),
+            "{line}");
     }
 
     #[test]
