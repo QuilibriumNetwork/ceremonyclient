@@ -945,6 +945,56 @@ fn release_eligibility_seats_only_recorded_minimum_releases() {
     set_release_eligibility_for_thread(None).unwrap();
 }
 
+/// From the leaver currency frame the membership pass seats a leaving
+/// allocation only if it was current when it left. One whose leave landed
+/// epochs after its last re-confirm raised its committee's quorum beyond the
+/// members that vote; it is no longer seated, and a session that seated it
+/// gets a successor without it. A current leaver still serves its notice.
+#[test]
+fn the_membership_pass_seats_a_lapsed_leaver_only_before_the_leaver_currency_frame() {
+    use crate::prover_registry::set_leaver_currency_frame_for_thread;
+    use quil_types::consensus::ProverStatus;
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let filter = vec![7u8; 32];
+    let filters = vec![filter.clone()];
+    let provers = keys();
+    // Leaves proposed in epoch 5: the third prover re-confirmed for epoch 5,
+    // the fourth last for epoch 2.
+    let mut scan = scan_of(&[(&filter, &provers)]);
+    for (index, recorded) in [(2, 5), (3, 2)] {
+        let alloc = &mut scan.allocations[index].1;
+        alloc.status = ProverStatus::Leaving;
+        alloc.leave_frame_number = 5 * epoch + 10;
+        alloc.epoch = recorded;
+    }
+    // The epoch's first frame, where successor committees are seated.
+    let boundary = 6 * epoch;
+    let seated = |activation: Option<u64>| -> (quil_store::RocksDb, HypergraphState, Vec<Vec<u8>>) {
+        set_leaver_currency_frame_for_thread(activation);
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let (_, state) = make_state(&db);
+        commit(&state, 1);
+        assert_eq!(schedule::reconcile_membership(&state, boundary, &policy(), &filters, &scan).unwrap(), 1);
+        commit(&state, boundary);
+        let members = head(&state, &filter).unwrap().unwrap().members;
+        (db, state, members)
+    };
+    // Unset (assumes QUIL_LEAVER_CURRENCY_FRAME is unset): the old rule.
+    let (_db, old, seated_old) = seated(None);
+    assert_eq!(seated_old, members(&provers), "unset: every unexpired leaver is seated");
+    assert_eq!(seated(Some(boundary + 1)).2, members(&provers), "not before the frame");
+    assert_eq!(seated(Some(boundary)).2, members(&provers[..3]), "a lapsed leaver is not seated");
+    set_leaver_currency_frame_for_thread(None);
+    assert_eq!(schedule::reconcile_membership(&old, boundary + 1, &policy(), &filters, &scan).unwrap(), 0,
+        "unset: the seated committee stands");
+    set_leaver_currency_frame_for_thread(Some(boundary));
+    assert_eq!(schedule::desired_members(&scan, &filter, 7 * epoch - 1), members(&provers[..3]),
+        "a current leaver serves its notice");
+    assert_eq!(schedule::reconcile_membership(&old, boundary + 1, &policy(), &filters, &scan).unwrap(), 1,
+        "a session that seated a lapsed leaver gets a successor without it");
+    set_leaver_currency_frame_for_thread(None);
+}
+
 /// From `membership_boundary_frame` a changed eligible set replaces a session
 /// only at the first pass of an epoch; before it, at any pass.
 #[test]

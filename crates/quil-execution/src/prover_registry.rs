@@ -1318,6 +1318,69 @@ fn live_allocation_status(
     }
 }
 
+/// From this GLOBAL frame a `Leaving` allocation is a committee member only
+/// if it was current when its leave was proposed (`left_current`). A leave
+/// is accepted from any raw `Active` allocation, also one that stopped
+/// re-confirming epochs ago and reads `ExpiredEpoch`, and `effective_status`
+/// reads every unexpired leave as `Leaving` whatever its recorded epoch. So
+/// a leave made such a lapsed allocation committee-eligible again for its
+/// notice, and the next epoch's membership pass seated it in successor
+/// committees it never served, raising their quorum beyond their voters.
+/// The committee is evaluated at the frame it serves, so the rule changes
+/// committee seating, leader rotation and quorum alike: consensus-affecting,
+/// and every archive and prover must run a build with it before the frame.
+/// Not scheduled on mainnet; `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = None;
+
+static LEAVER_CURRENCY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static LEAVER_CURRENCY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn leaver_currency_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_LEAVER_CURRENCY_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's leaver currency frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_leaver_currency_frame(network: u8) -> u64 {
+    *LEAVER_CURRENCY_FRAME.get_or_init(|| {
+        leaver_currency_frame_for(network, std::env::var("QUIL_LEAVER_CURRENCY_FRAME").ok().as_deref())
+    })
+}
+
+pub fn leaver_currency_frame() -> u64 {
+    if let Some(frame) = LEAVER_CURRENCY_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *LEAVER_CURRENCY_FRAME.get_or_init(|| {
+        std::env::var("QUIL_LEAVER_CURRENCY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the leaver currency frame for the calling thread only (tests).
+pub fn set_leaver_currency_frame_for_thread(frame: Option<u64>) {
+    LEAVER_CURRENCY_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Was the leaving `alloc` current, re-confirmed for the epoch, when its
+/// leave was proposed? Only then does it keep serving its notice: `epoch`,
+/// the highest epoch it registered leaf roots for, reaches the leave's
+/// epoch, as `effective_status` requires of an `Active` allocation. The
+/// global filter carries no epoch obligation, and a leave without a frame
+/// (genesis and test fixtures) has no epoch to compare.
+fn left_current(alloc: &ProverAllocationInfo) -> bool {
+    alloc.confirmation_filter.is_empty()
+        || alloc.leave_frame_number == 0
+        || alloc.epoch >= quil_types::consensus::epoch_for_frame(alloc.leave_frame_number)
+}
+
 /// Is `alloc` a member of the epoch-aligned consensus committee at
 /// `frame_number`? SHARED predicate behind both `get_active_provers`
 /// (quorum membership) and `get_ordered_provers` (leader rotation) — they
@@ -1328,7 +1391,9 @@ fn live_allocation_status(
 ///
 /// Included: `Active`, and `Leaving`-within-grace (a departing prover
 /// keeps serving notice — still proving, still counted — and stays in the
-/// FROZEN committee until the E+2 boundary).
+/// FROZEN committee until the E+2 boundary). From
+/// [`leaver_currency_frame`] only a leaver that was current when it left
+/// serves that notice ([`left_current`]).
 ///
 /// Excluded: `Joining` — including a just-confirmed prover still inside
 /// its deferred-activation window (raw `Active` byte but pre-E+2; it is
@@ -1351,7 +1416,8 @@ fn live_allocation_status(
 /// exempts it), so GLOBAL consensus is completely unaffected either way.
 fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: bool) -> bool {
     match alloc.effective_status(frame_number) {
-        EffectiveStatus::Active | EffectiveStatus::Leaving => true,
+        EffectiveStatus::Active => true,
+        EffectiveStatus::Leaving => frame_number < leaver_currency_frame() || left_current(alloc),
         // Demoted-but-raw-Active: re-admitted only by the empty-committee floor.
         EffectiveStatus::Joining | EffectiveStatus::ExpiredEpoch => {
             lenient && alloc.status == ProverStatus::Active
@@ -4923,6 +4989,154 @@ mod tests {
 
         // The set changes EXACTLY at the boundary (719 → 720), nowhere else.
         assert_ne!(committee(e - 1), committee(e), "committee changes across the boundary");
+    }
+
+    fn leaving_alloc(filter: Vec<u8>, epoch: u64, leave: u64, leave_confirm: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            confirmation_filter: filter,
+            rejection_filter: Vec::new(),
+            join_frame_number: 0,
+            leave_frame_number: leave,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: leave_confirm,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            last_signed_frame_number: 0,
+            epoch,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    /// From the leaver currency frame a `Leaving` allocation is a committee
+    /// member only if it was current when its leave was proposed; before the
+    /// frame every unexpired leave is, as before. A leave that lands on an
+    /// allocation which stopped re-confirming epochs ago must not seat it in
+    /// committees for its notice.
+    #[test]
+    fn a_leaving_allocation_is_committee_eligible_only_if_current_when_it_left() {
+        let e = quil_types::consensus::epoch_length_frames();
+        let shard = vec![0x4Eu8; 64];
+        // Leaves proposed in epoch 5, unconfirmed or confirmed in epoch 6: by
+        // allocations re-confirmed for epoch 5 or 6, and by ones whose last
+        // re-confirm was for epoch 2 or 4.
+        let leave = 5 * e + 10;
+        let confirm = 6 * e + 3;
+        let current = [
+            leaving_alloc(shard.clone(), 5, leave, 0),
+            leaving_alloc(shard.clone(), 6, leave, 0),
+            leaving_alloc(shard.clone(), 5, leave, confirm),
+        ];
+        let lapsed = [leaving_alloc(shard.clone(), 2, leave, 0), leaving_alloc(shard.clone(), 4, leave, confirm)];
+        let notice = [leave, 6 * e, 7 * e - 1];
+        for frame in notice {
+            for alloc in current.iter().chain(&lapsed) {
+                assert_eq!(alloc.effective_status(frame), EffectiveStatus::Leaving, "{alloc:?} at {frame}");
+            }
+        }
+        // Unset (assumes QUIL_LEAVER_CURRENCY_FRAME is unset): every
+        // unexpired leave keeps its seat.
+        set_leaver_currency_frame_for_thread(None);
+        for frame in notice {
+            for alloc in current.iter().chain(&lapsed) {
+                assert!(committee_eligible(alloc, frame, false), "unset: {alloc:?} at {frame}");
+            }
+        }
+        // From the frame only current leavers; before it the old rule.
+        let activation = 6 * e;
+        set_leaver_currency_frame_for_thread(Some(activation));
+        for frame in notice {
+            for alloc in &current {
+                assert!(committee_eligible(alloc, frame, false), "current: {alloc:?} at {frame}");
+            }
+            for alloc in &lapsed {
+                assert_eq!(committee_eligible(alloc, frame, false), frame < activation, "lapsed: {alloc:?} at {frame}");
+                assert_eq!(committee_eligible(alloc, frame, true), frame < activation,
+                    "the empty-committee floor does not re-admit a lapsed leaver: {alloc:?} at {frame}");
+            }
+        }
+        // The global filter carries no epoch obligation, and a leave without
+        // a frame has no epoch to compare.
+        assert!(committee_eligible(&leaving_alloc(Vec::new(), 0, leave, 0), activation, false));
+        assert!(committee_eligible(&leaving_alloc(shard.clone(), 0, 0, 0), activation, false));
+        set_leaver_currency_frame_for_thread(None);
+    }
+
+    /// Quorum membership (`get_active_provers`) and leader rotation
+    /// (`get_ordered_provers`) drop a lapsed leaver together from the leaver
+    /// currency frame, and keep a current one through its notice.
+    #[test]
+    fn quorum_and_leader_rotation_drop_a_lapsed_leaver_from_the_leaver_currency_frame() {
+        let filter = vec![0x34u8; 64];
+        let e = quil_types::consensus::epoch_length_frames();
+        let leave = 5 * e + 10;
+        let (active, current, lapsed) = ([0xA0u8; 32], [0xB0u8; 32], [0xC0u8; 32]);
+        let mk_prover = |pk: u8| {
+            build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![pk; 57]),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ])
+        };
+        let mk_alloc = |prover: &[u8; 32], status: u8, epoch: u64, leave: u64| {
+            build_sub_tree(vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", prover.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+                field_leaf("allocation:ProverAllocation", "Epoch", epoch.to_be_bytes().to_vec()),
+                field_leaf("allocation:ProverAllocation", "LeaveFrameNumber", leave.to_be_bytes().to_vec()),
+            ])
+        };
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let rows = [(active, 1u8, 9999u64, 0u64), (current, 3, 5, leave), (lapsed, 3, 2, leave)];
+        for (address, status, epoch, leave) in rows {
+            let (key, alloc) = (address[0], mk_alloc(&address, status, epoch, leave));
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(key), &mk_prover(key | 0x0A)).unwrap();
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(key | 0x01), &alloc).unwrap();
+        }
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+        let committee = |frame: u64| -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+            let mut quorum: Vec<Vec<u8>> =
+                reg.get_active_provers(&filter, frame).iter().map(|p| p.address.clone()).collect();
+            quorum.sort();
+            let mut leaders = reg.get_ordered_provers(&[0x5Au8; 32], &filter, frame);
+            leaders.sort();
+            (quorum, leaders)
+        };
+        let all = vec![active.to_vec(), current.to_vec(), lapsed.to_vec()];
+        let served = vec![active.to_vec(), current.to_vec()];
+        // The first frame of the epoch after the leave, where the membership
+        // pass seats successor committees.
+        let boundary = 6 * e;
+        set_leaver_currency_frame_for_thread(None);
+        assert_eq!(committee(boundary), (all.clone(), all.clone()), "unset: the old rule");
+        set_leaver_currency_frame_for_thread(Some(boundary));
+        assert_eq!(committee(boundary - 1), (all.clone(), all), "not before the frame");
+        assert_eq!(committee(boundary), (served.clone(), served.clone()), "a lapsed leaver is no member");
+        assert_eq!(committee(7 * e - 1), (served.clone(), served), "a current leaver serves its notice");
+        assert_eq!(committee(7 * e).0, vec![active.to_vec()], "an unconfirmed leave expires after it");
+        set_leaver_currency_frame_for_thread(None);
+    }
+
+    /// Leaver currency is consensus and not scheduled on mainnet.
+    #[test]
+    fn leaver_currency_is_not_scheduled_by_default() {
+        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, None);
+        assert_eq!(leaver_currency_frame_for(0, None), u64::MAX);
+        assert_eq!(leaver_currency_frame_for(0, Some("7")), u64::MAX);
+        assert_eq!(leaver_currency_frame_for(1, Some("7")), 7);
+        assert_eq!(leaver_currency_frame_for(1, Some("soon")), u64::MAX);
+        assert_eq!(leaver_currency_frame_for(1, None), u64::MAX);
     }
 
     #[test]
