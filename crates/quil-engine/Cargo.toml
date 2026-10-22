@@ -52,6 +52,7 @@ bs58 = "0.5"
 
 [dev-dependencies]
 quil-store = { path = "../quil-store", features = ["test-utils"] }
+tokio = { version = "1", features = ["test-util"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }

@@ -95,6 +95,13 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     }
     /// An attempt of the owed re-anchor installed nothing, for `reason`.
     fn reanchor_failed(&self, _reason: String) {}
+    /// An attempt of the owed re-anchor handed its turn back at the hold
+    /// limit, its installed leaves kept: the next sync makes the attempt.
+    fn reanchor_yielded(&self) {}
+    /// Whether the worker's engine still runs, so its recovery goes on.
+    fn running(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -127,6 +134,10 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     fn reanchor_failed(&self, reason: String) {
         self.send(crate::app_engine::AppEngineMessage::ReanchorFailed { reason });
     }
+    fn reanchor_yielded(&self) {
+        self.execution_record().reanchor_yielded();
+    }
+    fn running(&self) -> bool { self.is_running() }
 }
 
 /// What a shard sync starting now does about a re-anchor at the fence.
@@ -165,6 +176,10 @@ pub(crate) enum ShardRecoveryProgress {
     /// recovery (a re-anchor at the fence has its own attempt): no counter,
     /// streak or archive state changes.
     Deferred(&'static str),
+    /// The tree install handed its turn back at the hold limit
+    /// ([`crate::recovery_turns::MAX_TURN_HOLD`]) after installing leaves,
+    /// which stay: the recovery queues again and resumes from them.
+    Yielded,
 }
 
 impl std::fmt::Display for ShardRecoveryProgress {
@@ -177,6 +192,7 @@ impl std::fmt::Display for ShardRecoveryProgress {
             Self::Inherited { pinned: true } => f.write_str("inherited the origins' sealed state"),
             Self::Inherited { pinned: false } => f.write_str("inherited the covered archive subtree, unpinned"),
             Self::NotReady(reason) | Self::Deferred(reason) => f.write_str(reason),
+            Self::Yielded => f.write_str(crate::worker_execution::RECOVERY_TURN_SPENT),
         }
     }
 }
@@ -188,22 +204,27 @@ impl std::fmt::Display for ShardRecoveryProgress {
 /// `blocked`: the successor-blocked flag of a worker holding a recovery turn
 /// (`None` without one). A turn replays one batch, and while the flag stays
 /// set further batches up to the replay target, within the turn budget
-/// ([`crate::recovery_turns::holds_turn`]).
+/// ([`crate::recovery_turns::holds_turn`]). `turn`: the turn held, released
+/// before the engine installs an anchor, which reads no archive tree; a tree
+/// install past the hold limit hands it back (`ShardRecoveryProgress::Yielded`).
 pub(crate) async fn recover_shard_from_latest(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: Option<AppShardFrame>,
     target: &dyn ShardRecoveryTarget,
     blocked: Option<&AtomicBool>,
+    turn: Option<crate::recovery_turns::Turn<'_>>,
 ) -> Result<ShardRecoveryProgress> {
     use crate::worker_execution::recovery_phase;
     // No archive extends a head the fence discarded: the local lineage is
     // not replayed, and the shard is anchored again.
     match target.reanchor_fence().await {
         ReanchorAttempt::Take(fence) => {
-            let result = reanchor_shard_at_fence(syncer, filter, fence, target).await;
+            crate::worker_execution::recovery_kind(crate::recovery_turns::RecoveryKind::Reanchor);
+            let result = yielded(reanchor_shard_at_fence(syncer, filter, fence, target, turn).await);
             match &result {
                 Ok(ShardRecoveryProgress::NotReady(reason)) => target.reanchor_failed((*reason).to_string()),
+                Ok(ShardRecoveryProgress::Yielded) => target.reanchor_yielded(),
                 Err(error) => target.reanchor_failed(error.to_string()),
                 Ok(_) => {}
             }
@@ -249,19 +270,72 @@ pub(crate) async fn recover_shard_from_latest(
     });
     let committed_tip = target.committed_tip().await;
     recovery_phase("fetching_checkpoint");
-    match sync_shard_from_latest_attested(
+    let synced = sync_shard_from_latest_attested(
         syncer, filter, None, &anchors, committed_tip,
         |anchor, predecessor| target.validate(anchor, predecessor),
         |frame| target.discarded_base_roots(frame),
-    ).await? {
-        ShardSyncResult::Anchored { anchor, predecessor } => {
+    ).await;
+    match synced {
+        Err(error) if crate::worker_execution::turn_spent(&error) => Ok(ShardRecoveryProgress::Yielded),
+        Err(error) => Err(error),
+        Ok(ShardSyncResult::Anchored { anchor, predecessor }) => {
             let frame = anchor.header.as_ref().map_or(0, |header| header.frame_number);
             recovery_phase("installing_checkpoint");
+            // The trees are in; the engine's installation reads none from an
+            // archive, and its own in-flight guard keeps another install out.
+            drop(turn);
             target.install(anchor, predecessor).await?;
             Ok(ShardRecoveryProgress::Anchored { frame })
         }
-        ShardSyncResult::Inherited { pinned } => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
-        ShardSyncResult::NotReady(reason) => Ok(ShardRecoveryProgress::NotReady(reason)),
+        Ok(ShardSyncResult::Inherited { pinned }) => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
+        Ok(ShardSyncResult::NotReady(reason)) => Ok(ShardRecoveryProgress::NotReady(reason)),
+    }
+}
+
+/// A tree sync that handed its turn back ([`crate::worker_execution::turn_spent`])
+/// as the outcome it is.
+fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgress> {
+    match result {
+        Err(error) if crate::worker_execution::turn_spent(&error) => Ok(ShardRecoveryProgress::Yielded),
+        other => other,
+    }
+}
+
+/// Recover `filter` for the worker on `core` whose record is `execution`,
+/// through `turns`, one attempt per turn: an attempt that handed its turn
+/// back at the hold limit ([`ShardRecoveryProgress::Yielded`]) queues again
+/// in its first arrival's place, taking at most every other turn while
+/// others wait (`recovery_turns::TurnQueue::next`), and resumes from the
+/// leaves it installed. `lineage` reads the worker's latest frame of the
+/// shard before each attempt. Returns the last attempt's outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recover_in_turns(
+    turns: &crate::recovery_turns::RecoveryTurns,
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    core: u32,
+    target: &dyn ShardRecoveryTarget,
+    execution: &crate::worker_execution::SharedWorkerExecution,
+    mut lineage: impl FnMut() -> Result<Option<AppShardFrame>>,
+) -> Result<ShardRecoveryProgress> {
+    use crate::recovery_turns::{Claim, RecoveryKind};
+    let mut ticket = None;
+    loop {
+        let local = lineage().inspect_err(|error| tracing::warn!(core, filter = %hex::encode(filter), %error,
+            "cannot determine local shard lineage for sync"))?;
+        let attempt = async {
+            crate::worker_execution::recovery_phase("waiting_for_permit");
+            let kind = if local.is_some() { RecoveryKind::Replay } else { RecoveryKind::Install };
+            let claim = Claim { core, filter: filter.to_vec(), kind, execution: execution.clone(), ticket };
+            let turn = turns.acquire(claim).await;
+            ticket.get_or_insert(turn.ticket());
+            let blocked = execution.successor_blocked_flag();
+            recover_shard_from_latest(syncer, filter, local, target, Some(&*blocked), Some(turn)).await
+        };
+        let result = execution.recovering(filter, attempt).await;
+        if !matches!(result, Ok(ShardRecoveryProgress::Yielded)) || !target.running() {
+            return result;
+        }
     }
 }
 
@@ -292,6 +366,7 @@ async fn reanchor_shard_at_fence(
     filter: &[u8],
     fence: u64,
     target: &dyn ShardRecoveryTarget,
+    turn: Option<crate::recovery_turns::Turn<'_>>,
 ) -> Result<ShardRecoveryProgress> {
     use crate::worker_execution::recovery_phase;
     recovery_phase("fetching_checkpoint");
@@ -314,6 +389,7 @@ async fn reanchor_shard_at_fence(
         return Ok(ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
     }
     recovery_phase("installing_checkpoint");
+    drop(turn);
     target.install(anchor, predecessor).await.map_err(on_this_node("installation"))?;
     Ok(ShardRecoveryProgress::Anchored { frame: committed })
 }
@@ -620,6 +696,7 @@ where
                 let failure = match syncer.sync_shard_tree(source, &pinned_roots).await {
                     Ok(true) => continue,
                     Ok(false) => "the archive does not hold it or the synced roots differ".to_string(),
+                    Err(error) if crate::worker_execution::turn_spent(&error) => return Err(error),
                     Err(error) => error.to_string(),
                 };
                 tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source),
@@ -740,7 +817,7 @@ mod tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let archive = Archive { latest:Some(frame(500)), calls:calls.clone() };
             let target = Target { calls:calls.clone(), cursor:0.into(), valid, install_ok, blocked:false.into(), unblock_at:0 };
-            let result = recover_shard_from_latest(&archive, &[5;32], None, &target, None).await;
+            let result = recover_shard_from_latest(&archive, &[5;32], None, &target, None, None).await;
             let mut expected = vec!["fetch 0", "fetch 499", "validate 500"];
             if valid { expected.extend(["sync 244", "install 500"]); }
             assert_eq!(*calls.lock().unwrap(), expected);
@@ -756,7 +833,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest:Some(frame(500)), calls:calls.clone() };
         let target = Target { calls:calls.clone(), cursor:129.into(), valid:false, install_ok:false, blocked:false.into(), unblock_at:0 };
-        let result = recover_shard_from_latest(&archive, &[5;32], Some(frame(130)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5;32], Some(frame(130)), &target, None, None).await.unwrap();
         let ShardRecoveryProgress::Replayed { materialized, archive_tip, committed_tip, turn } = result else { panic!("expected a replay") };
         assert_eq!((materialized, archive_tip, committed_tip, turn.frames, turn.batches), (161, Some(500), None, 32, 1));
         let calls = calls.lock().unwrap();
@@ -774,7 +851,7 @@ mod tests {
             let target = Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
                 blocked: blocked.unwrap_or(false).into(), unblock_at: 0 };
             let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target,
-                blocked.map(|_| &target.blocked)).await.unwrap();
+                blocked.map(|_| &target.blocked), None).await.unwrap();
             let ShardRecoveryProgress::Replayed { materialized, archive_tip, turn, .. } = result else { panic!("expected a replay") };
             assert_eq!((materialized, archive_tip, turn.frames, turn.batches), (expected, Some(200), expected - 129, batches), "{blocked:?}");
             let calls = calls.lock().unwrap();
@@ -792,7 +869,7 @@ mod tests {
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
         let target = Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
             blocked: true.into(), unblock_at: 170 };
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked)).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked), None).await.unwrap();
         let ShardRecoveryProgress::Replayed { materialized, turn, .. } = result else { panic!("expected a replay") };
         assert_eq!((materialized, turn.frames, turn.batches), (193, 64, 2));
     }
@@ -804,7 +881,7 @@ mod tests {
         let archive = ChainArchive { missing: Some(170), wrong_shard: false, unsigned_end: 0 };
         let target = Target { calls: Arc::new(Mutex::new(Vec::new())), cursor: 130.into(), valid: false, install_ok: false,
             blocked: true.into(), unblock_at: 0 };
-        let error = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked)).await.unwrap_err();
+        let error = recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, Some(&target.blocked), None).await.unwrap_err();
         assert!(error.to_string().contains("missing shard frame 170"), "{error}");
         assert_eq!(target.materialized(), 169);
     }
@@ -1310,7 +1387,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 505 });
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249", "install 505"]);
         assert!(target.failures.lock().unwrap().is_empty());
@@ -1318,7 +1395,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let target = Reanchoring::new(&calls, None, Some(505));
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert!(matches!(result, ShardRecoveryProgress::Replayed { .. }), "{result:?}");
         assert!(calls.lock().unwrap().iter().all(|call| call.starts_with("fetch 0")), "{:?}", calls.lock().unwrap());
     }
@@ -1331,7 +1408,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(500), Some(505));
-        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(500)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&archive, &[5; 32], Some(frame(500)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 505 });
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249", "install 505"]);
     }
@@ -1363,7 +1440,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let frameless = FramelessArchive { calls: Arc::new(Mutex::new(Vec::new())), refuse: None };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&frameless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&frameless, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
         assert!(frameless.calls.lock().unwrap().is_empty(), "no tree sync at all");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
@@ -1371,7 +1448,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let stateless = StatelessArchive { calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), Some(505));
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_UNAVAILABLE));
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505", "sync 249"], "never installed");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_UNAVAILABLE]);
@@ -1380,7 +1457,7 @@ mod tests {
         let stateless = StatelessArchive { calls: calls.clone() };
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.valid_through = 504;
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_REFUSED));
         assert_eq!(*calls.lock().unwrap(), ["fetch 505", "fetch 504", "validate 505"], "no tree write");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_REFUSED]);
@@ -1388,7 +1465,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let stateless = StatelessArchive { calls: calls.clone() };
         let target = Reanchoring::new(&calls, Some(505), None);
-        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None).await.unwrap();
+        let result = recover_shard_from_latest(&stateless, &[5; 32], Some(frame(507)), &target, None, None).await.unwrap();
         assert_eq!(result, ShardRecoveryProgress::NotReady(REANCHOR_NO_TIP));
         assert!(calls.lock().unwrap().is_empty(), "nothing asked of an archive");
         assert_eq!(*target.failures.lock().unwrap(), [REANCHOR_NO_TIP]);
@@ -1398,7 +1475,7 @@ mod tests {
         let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.install_fails = true;
-        assert!(recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None).await.is_err());
+        assert!(recover_shard_from_latest(&archive, &[5; 32], Some(frame(507)), &target, None, None).await.is_err());
         let failures = target.failures.lock().unwrap();
         assert!(failures.len() == 1 && failures[0].contains("re-anchor installation on this node: "), "{failures:?}");
         drop(failures);
@@ -1410,7 +1487,7 @@ mod tests {
         let mut target = Reanchoring::new(&calls, Some(505), Some(505));
         target.elsewhere = true;
         for local in [Some(frame(507)), None] {
-            let result = recover_shard_from_latest(&archive, &[5; 32], local, &target, None).await.unwrap();
+            let result = recover_shard_from_latest(&archive, &[5; 32], local, &target, None, None).await.unwrap();
             assert_eq!(result, ShardRecoveryProgress::Deferred(REANCHOR_ELSEWHERE));
         }
         assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
@@ -1438,5 +1515,201 @@ mod tests {
         assert!(sync_shard_from_latest(&archive, &[5; 32], None, &[], None,
             |_, _| async { panic!("malformed anchor reached validator") }).await.is_err());
         assert_eq!(calls.lock().unwrap().last().unwrap(), "fetch 0");
+    }
+
+    /// Serves frame 500 as a checkpoint whose tree takes `chunks` chunks of
+    /// `chunk` each to install, kept across attempts as the store keeps
+    /// them. Like `forest_sync`, a sync whose recovery spent its turn hands
+    /// it back between chunks.
+    struct ChunkedArchive {
+        chunks: u64,
+        chunk: std::time::Duration,
+        installed: Arc<AtomicU64>,
+        /// When each sync started, and the chunks it installed.
+        syncs: Arc<Mutex<Vec<(tokio::time::Instant, u64)>>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for ChunkedArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            Ok(Some(frame(if number == 0 { 500 } else { number })))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> {
+            let started = tokio::time::Instant::now();
+            let mut chunks = 0;
+            let result = loop {
+                let installed = self.installed.load(Ordering::SeqCst);
+                if installed == self.chunks {
+                    break Ok(true);
+                }
+                if crate::worker_execution::recovery_turn_spent() {
+                    break Err(crate::worker_execution::turn_spent_error());
+                }
+                tokio::time::sleep(self.chunk).await;
+                self.installed.store(installed + 1, Ordering::SeqCst);
+                chunks += 1;
+                crate::worker_execution::recovery_installed(1_024);
+                crate::worker_execution::recovery_leaves(0, (installed + 1) * 1_024, self.chunks * 1_024);
+            };
+            self.syncs.lock().unwrap().push((started, chunks));
+            result
+        }
+    }
+
+    /// A checkpoint install three hold limits long hands its turn back at
+    /// the limit, so a worker queued behind it is granted within the limit
+    /// and one chunk; it queues again and resumes from the chunks it
+    /// installed, none installed twice, until the engine installs its
+    /// anchor (an operator's node: two installs of 157,076 and
+    /// 23,348 leaves held both turns for hours while 89 to 143 waited).
+    #[tokio::test(start_paused = true)]
+    async fn a_long_install_hands_its_turn_back_and_resumes_from_its_installed_leaves() {
+        use crate::recovery_turns::RecoveryTurns;
+        let (limit, chunk) = (std::time::Duration::from_secs(600), std::time::Duration::from_secs(120));
+        assert_eq!(crate::recovery_turns::MAX_TURN_HOLD, limit);
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let start = tokio::time::Instant::now();
+        let run = |core: u32, chunks: u64| {
+            let syncs = Arc::new(Mutex::new(Vec::new()));
+            let archive = ChunkedArchive { chunks, chunk, installed: Arc::default(), syncs: syncs.clone() };
+            let task = tokio::spawn(async move {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let target = Target { calls: calls.clone(), cursor: 0.into(), valid: true, install_ok: true,
+                    blocked: false.into(), unblock_at: 0 };
+                let execution = crate::worker_execution::SharedWorkerExecution::default();
+                let result = recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None)).await;
+                let installed = archive.installed.load(Ordering::SeqCst);
+                let calls = calls.lock().unwrap().clone();
+                (result, calls, installed, execution.snapshot().recovery.unwrap())
+            });
+            (task, syncs)
+        };
+        let long_chunks = 3 * limit.as_secs() / chunk.as_secs();
+        let (long, long_syncs) = run(1, long_chunks);
+        tokio::task::yield_now().await;
+        let (short, short_syncs) = run(2, 1);
+        let (result, calls, installed, record) = long.await.unwrap();
+        assert_eq!(result.unwrap(), ShardRecoveryProgress::Anchored { frame: 500 });
+        assert_eq!(installed, long_chunks);
+        let syncs = long_syncs.lock().unwrap().clone();
+        assert_eq!(syncs.iter().map(|(_, chunks)| *chunks).collect::<Vec<_>>(), [5, 5, 5],
+            "each turn resumes where the last stopped; no chunk is installed twice");
+        assert_eq!(calls.iter().filter(|call| *call == "install 500").count(), 1);
+        assert_eq!((record.attempts, record.consecutive_failures), (3, 0));
+        assert!(record.last_outcome.contains("frame 500"), "{}", record.last_outcome);
+        let (short_result, ..) = short.await.unwrap();
+        assert_eq!(short_result.unwrap(), ShardRecoveryProgress::Anchored { frame: 500 });
+        let granted = short_syncs.lock().unwrap()[0].0.saturating_duration_since(start);
+        assert!(granted <= limit + chunk, "the waiter was granted after {granted:?}");
+    }
+
+    /// Two long installs and six short ones share two turns: each long
+    /// install, handing its turn back at the limit, is granted another
+    /// within two short installs' turns, and every short install starts
+    /// before the long installs are done.
+    #[tokio::test(start_paused = true)]
+    async fn long_installs_and_the_waiters_behind_them_all_progress() {
+        use crate::recovery_turns::RecoveryTurns;
+        let (limit, chunk) = (std::time::Duration::from_secs(600), std::time::Duration::from_secs(120));
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(2)));
+        let start = tokio::time::Instant::now();
+        let mut workers = Vec::new();
+        for (core, chunks) in [(1, 15), (2, 15), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)] {
+            let syncs = Arc::new(Mutex::new(Vec::new()));
+            let archive = ChunkedArchive { chunks, chunk, installed: Arc::default(), syncs: syncs.clone() };
+            let task = tokio::spawn(async move {
+                let target = Target { calls: Arc::default(), cursor: 0.into(), valid: true, install_ok: true,
+                    blocked: false.into(), unblock_at: 0 };
+                let execution = crate::worker_execution::SharedWorkerExecution::default();
+                recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None)).await
+            });
+            tokio::task::yield_now().await;
+            workers.push((chunks, task, syncs));
+        }
+        let mut finished = Vec::new();
+        let mut short_starts = Vec::new();
+        for (chunks, task, syncs) in workers {
+            assert_eq!(task.await.unwrap().unwrap(), ShardRecoveryProgress::Anchored { frame: 500 });
+            let syncs: Vec<_> = syncs.lock().unwrap().iter()
+                .map(|(at, installed)| (at.saturating_duration_since(start), *installed)).collect();
+            if chunks == 1 {
+                short_starts.push(syncs[0].0);
+                continue;
+            }
+            assert_eq!(syncs.iter().map(|(_, installed)| *installed).collect::<Vec<_>>(), [5, 5, 5], "{syncs:?}");
+            for pair in syncs.windows(2) {
+                let handed_back = pair[0].0 + limit;
+                assert!(pair[1].0 <= handed_back + chunk * 2, "a long install waited too long for its next turn: {syncs:?}");
+            }
+            let (last, installed) = *syncs.last().unwrap();
+            finished.push(last + chunk * installed as u32);
+        }
+        let done = finished.into_iter().max().unwrap();
+        assert!(short_starts.iter().all(|&at| at < done), "short installs started {short_starts:?}, long ones done {done:?}");
+    }
+
+    /// Never answers an installation: an engine busy or wedged.
+    struct Wedged(Target);
+
+    #[async_trait]
+    impl ShardRecoveryTarget for Wedged {
+        fn materialized(&self) -> u64 { self.0.materialized() }
+        async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
+            self.0.replay(frame, descendants).await
+        }
+        async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool> {
+            self.0.validate(anchor, predecessor).await
+        }
+        async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+            std::future::pending().await
+        }
+        fn inherited(&self) { panic!("a certified archive tip must never use unanchored inheritance") }
+    }
+
+    /// The engine installs an anchor after the turn is released: one that
+    /// never answers keeps no other worker from its turn.
+    #[tokio::test(start_paused = true)]
+    async fn an_installation_that_never_answers_holds_no_turn() {
+        use crate::recovery_turns::{Claim, RecoveryKind, RecoveryTurns};
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let claim = |core| Claim { core, filter: vec![5; 32], kind: RecoveryKind::Install, execution: Default::default(), ticket: None };
+        let turn = turns.acquire(claim(1)).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let installing = tokio::spawn(async move {
+            let archive = Archive { latest: Some(frame(500)), calls: seen.clone() };
+            let target = Wedged(Target { calls: seen, cursor: 0.into(), valid: true, install_ok: true,
+                blocked: false.into(), unblock_at: 0 });
+            recover_shard_from_latest(&archive, &[5; 32], None, &target, None, Some(turn)).await
+        });
+        let next = tokio::time::timeout(std::time::Duration::from_secs(60), turns.acquire(claim(2))).await;
+        assert!(next.is_ok(), "the turn was released before the engine's installation");
+        assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("sync 244"));
+        assert!(!installing.is_finished());
+        installing.abort();
+    }
+
+    /// A re-anchor whose tree sync handed its turn back is neither failed
+    /// nor done: its attempt goes to the next sync.
+    #[tokio::test]
+    async fn a_reanchor_that_hands_its_turn_back_is_not_a_failure() {
+        struct Spent;
+        #[async_trait]
+        impl ProverTreeSyncer for Spent {
+            async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+            async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+                Ok(Some(frame(number)))
+            }
+            async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> {
+                Err(crate::worker_execution::turn_spent_error())
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let target = Reanchoring::new(&calls, Some(505), Some(505));
+        let result = recover_shard_from_latest(&Spent, &[5; 32], Some(frame(507)), &target, None, None).await;
+        assert_eq!(result.unwrap(), ShardRecoveryProgress::Yielded);
+        assert!(target.failures.lock().unwrap().is_empty());
+        assert!(!calls.lock().unwrap().iter().any(|call| call.starts_with("install")));
     }
 }
