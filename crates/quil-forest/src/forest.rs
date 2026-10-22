@@ -2518,6 +2518,31 @@ mod tests {
         assert_eq!(forest.prune_tree(&tree, 2).unwrap(), 0);
     }
 
+    /// A prune deletes a backlog in batches of bounded size, so the first
+    /// pass over a store that was never pruned does not hold all of it in
+    /// memory at once; the result equals an unbatched prune.
+    #[test]
+    fn prune_deletes_its_backlog_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let shard = b"S".to_vec();
+        for v in 0..=3u64 {
+            forest
+                .commit_shard_phase(&shard, Phase::VertexAdds, v, leaves(20, v as u8))
+                .unwrap();
+        }
+        let tree = TreeId::shard_phase(&shard, Phase::VertexAdds);
+        let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
+        let mut batches = Vec::new();
+        let reclaimed = store.prune_in_batches(3, 4, |records| batches.push(records)).unwrap();
+        assert!(reclaimed > 8, "the backlog must span several batches, got {reclaimed}");
+        assert!(batches.iter().all(|&records| records <= 4), "batches {batches:?} exceed 4 records");
+        assert_eq!(batches.iter().sum::<usize>(), reclaimed);
+        let got = Sha256Jmt::new(&store).get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 3).unwrap();
+        assert_eq!(got, Some(vec![3u8 ^ 3u8; 40]), "head read survives pruning");
+        assert_eq!(forest.prune_tree(&tree, 3).unwrap(), 0, "nothing below the watermark is left");
+    }
+
     #[test]
     fn prune_keeps_nodes_still_readable_above_watermark() {
         let dir = tempfile::tempdir().unwrap();
