@@ -1253,6 +1253,7 @@ mod fee_relay_tests {
             mode: mode.clone(),
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
+            keeps: Default::default(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
