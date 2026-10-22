@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::ProposalContext;
-use quil_cw_consensus::handoff::automaton::{AuthorizedParent, ParentReader};
+use quil_cw_consensus::handoff::automaton::{AuthorizedParent, ClosingAbsence, ClosingProbe, ParentReader};
 use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
 use quil_execution::global_intrinsic::handoff::{
     self, schedule, CertificateSubmission, CommittedView, Status,
@@ -330,6 +330,58 @@ impl ParentSource {
     #[cfg(test)]
     fn read(&self, context: ProposalContext) -> Result<AuthorizedParent> {
         self.authorized(context, true)
+    }
+
+    /// Why this member's parent names no closing request, for a seal of its
+    /// session it is asked to vote on (`HandoffProposer::with_closing_probe`).
+    /// `anchors` holds the GLOBAL headers this node received. A request
+    /// absent from a committed view behind the GLOBAL head asks `refresh` for
+    /// an early pull of that view; the seal waits only if one can land soon,
+    /// which needs this process's sync task to honour requests.
+    pub fn closing_probe(
+        self: &Arc<Self>,
+        anchors: Arc<dyn ClockStore>,
+        refresh: Arc<crate::global_view_refresh::ViewRefresh>,
+    ) -> ClosingProbe {
+        let source = self.clone();
+        Arc::new(move || source.closing_absence(anchors.as_ref(), &refresh))
+    }
+
+    fn closing_absence(
+        &self,
+        anchors: &dyn ClockStore,
+        refresh: &crate::global_view_refresh::ViewRefresh,
+    ) -> ClosingAbsence {
+        let absent = |detail: String| ClosingAbsence { detail, refreshing: false };
+        let view = match CommittedView::capture(&self.global) {
+            Ok(view) => view,
+            Err(error) => return absent(format!("committed GLOBAL view unavailable: {error}")),
+        };
+        let at = view.frame();
+        match schedule::closing_request(&view, &self.session) {
+            Ok(Some(_)) => absent(format!(
+                "closing request in the committed GLOBAL view at frame {at}, but the checkpoint is not \
+                 sealable: its last {DRAIN_FRAMES} frames are not free of requests, or it is the base"
+            )),
+            Ok(None) => {
+                let head = anchors.get_latest_global_clock_frame().ok()
+                    .and_then(|frame| frame.header).map(|header| header.frame_number);
+                // A header's prover root binds the state before its frame, so
+                // a refresh now reaches the frame below the head.
+                let reach = head.map(|head| head.saturating_sub(1)).filter(|reach| *reach > at);
+                let refreshing = reach.is_some_and(|reach| refresh.request(
+                    crate::global_view_refresh::Reason::SealBeforeClosingRequest, reach, std::time::Instant::now(),
+                ));
+                ClosingAbsence {
+                    detail: format!(
+                        "no closing request in the committed GLOBAL view at frame {at}, GLOBAL head {}",
+                        head.map_or_else(|| "unknown".to_string(), |head| head.to_string()),
+                    ),
+                    refreshing,
+                }
+            }
+            Err(error) => absent(format!("closing request unreadable at committed GLOBAL frame {at}: {error}")),
+        }
     }
 
     /// The authorized checkpoint at the local materialized tip; when
@@ -4024,6 +4076,73 @@ mod successor_tests {
         let global = crdt();
         assert!(CommittedView::capture(&global).is_err(), "no GLOBAL cursor recorded");
         assert!(matches!(resolve(&global, &[0x03; 32], 100).unwrap(), SessionChoice::Legacy));
+    }
+
+    /// A seal this member cannot authorize names the missing input: a closing
+    /// request its committed GLOBAL view does not hold, refreshed early while
+    /// the GLOBAL head is ahead of that view and this process's sync task
+    /// honours requests, or a held request whose checkpoint is not sealable.
+    #[test]
+    fn a_seal_before_the_closing_request_asks_for_a_fresher_global_view() {
+        let (global, state) = global_state();
+        let filter = vec![0x05; 32];
+        let mut members: Vec<Vec<u8>> = (0..3)
+            .map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec()).collect();
+        members.sort();
+        let session = Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members: members.clone(),
+        };
+        commit(&global, &state, 1);
+        handoff::initialize(&state, 2, &session).unwrap();
+        commit(&global, &state, 2);
+        let anchors = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let head = |number: u64| anchors.seed_frame(quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: number, ..Default::default() }),
+            ..Default::default()
+        });
+        let source = ParentSource::new(
+            session.clone(), global.clone(), crdt(), anchors.clone() as Arc<dyn ClockStore>,
+            Arc::new(AtomicBool::new(false)),
+        ).unwrap();
+        use crate::global_view_refresh::{Reason, ViewRefresh};
+        let refresh = Arc::new(ViewRefresh::default());
+        let probe = source.closing_probe(anchors.clone() as Arc<dyn ClockStore>, refresh.clone());
+
+        // The head's root binds frame 2, which the view holds: nothing newer.
+        head(3);
+        let current = probe();
+        assert!(!current.refreshing);
+        assert_eq!(current.detail, "no closing request in the committed GLOBAL view at frame 2, GLOBAL head 3");
+
+        // GLOBAL moved on. A process whose sync task does not honour requests
+        // (an archive, a separate worker) refuses at once, naming its view.
+        head(10);
+        let unhonoured = probe();
+        assert!(!unhonoured.refreshing);
+        assert_eq!(unhonoured.detail, "no closing request in the committed GLOBAL view at frame 2, GLOBAL head 10");
+        assert_eq!(refresh.requested(Reason::SealBeforeClosingRequest), None);
+
+        // A regular node's in-process worker asks for frame 9 and waits.
+        refresh.enable(720);
+        assert!(probe().refreshing);
+        assert_eq!(refresh.requested(Reason::SealBeforeClosingRequest), Some(9));
+        // Not while a pull short of frame 9 runs: the next starts after it.
+        refresh.begin(5);
+        assert!(!probe().refreshing);
+        refresh.end(std::time::Instant::now());
+        refresh.settle(9);
+
+        // The refreshed view holds the request: what is missing is a sealable checkpoint.
+        handoff::schedule(&state, 3, vec![filter.clone()],
+            vec![DesiredCommittee { filter: filter.clone(), members }]).unwrap();
+        commit(&global, &state, 9);
+        let held = probe();
+        assert!(!held.refreshing);
+        assert!(held.detail.starts_with("closing request in the committed GLOBAL view at frame 9, but the checkpoint is not sealable"),
+            "{}", held.detail);
+        assert_eq!(refresh.requested(Reason::SealBeforeClosingRequest), None);
     }
 
     /// Generation zero continues a legacy chain: its base is the registered

@@ -5502,6 +5502,17 @@ impl AppConsensusEngine {
         if let Some(session) = session.as_ref() {
             let session_id = session.id()?;
             if self.sealed_session.as_ref().is_some_and(|(id, _)| *id == session_id) {
+                // The successor activates when GLOBAL applies the seal; this
+                // node sees it only in a refreshed committed view. Start
+                // retries ask often; the refresh takes one a minute.
+                if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                    .and_then(|frame| frame.header).map(|header| header.frame_number)
+                {
+                    crate::global_view_refresh::shared().request(
+                        crate::global_view_refresh::Reason::SealedSessionAwaitsSuccessor,
+                        head.saturating_sub(1), std::time::Instant::now(),
+                    );
+                }
                 return Err(QuilError::Consensus("app committee session is sealed; awaiting its successor".into()));
             }
             // The execution manager's CRDT is where state, cursor and outgoing
@@ -6035,6 +6046,9 @@ impl AppConsensusEngine {
                 );
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
+                    closing_probe: Some(source.closing_probe(
+                        self.global_anchor_store.clone(), crate::global_view_refresh::shared(),
+                    )),
                     read_parent: source.reader(),
                     read_tip: source.tip_reader(),
                     read_private_parent,
