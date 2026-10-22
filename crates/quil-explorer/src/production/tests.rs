@@ -114,7 +114,7 @@ fn report_of(view: &IndexView, head: u64, w: &World) -> ProductionReport {
         &Inputs {
             head_frame: head,
             grid: &w.grid,
-            active: &w.active,
+            active: Some((head, &w.active)),
             halted: &w.halted,
             committed: &w.committed,
             quil: crate::handlers::quil_str,
@@ -216,13 +216,17 @@ fn outcome_less_frames_wait_then_count_unknown() {
     let s = &v.shards[&filter(1)];
     assert_eq!((s.window.unknown, s.window.applied), (1, 238));
     let r = report(&idx, &w);
-    assert_eq!(entry(&r, 1).class, Class::NoData, "unknown outcomes are no data, never a stall");
-    assert_eq!((r.summary.classes.no_data, r.summary.classes.staffed_not_producing), (1, 0));
+    assert_eq!(entry(&r, 1).class, Class::Producing, "applied app frames are positive evidence in an incomplete window");
+    let c = &r.summary.classes;
+    assert_eq!((c.producing, c.no_data, c.staffed_not_producing), (1, 0, 0));
+    assert_eq!(entry(&report(&idx, &world(&[(2, 4)])), 2).class, Class::NoData, "no claim without one, never a stall");
 }
 
 #[test]
 fn classes_apply_in_order() {
-    assert_eq!(classify(false, 3, 0, 9), Class::NoData);
+    assert_eq!(classify(false, 3, 0, 9), Class::Producing, "an applied app frame needs no complete window");
+    assert_eq!(classify(false, 0, 0, 9), Class::NoData);
+    assert_eq!(classify(false, 0, 0, 0), Class::NoData);
     assert_eq!(classify(true, 1, 5, 0), Class::Producing, "an applied app frame outranks unknown headers");
     assert_eq!(classify(true, 0, 1, 9), Class::NoData);
     assert_eq!(classify(true, 0, 0, 3), Class::BelowQuorum);
@@ -377,9 +381,236 @@ fn the_response_selects_shards_and_keeps_its_shape() {
     );
     let body = serde_json::to_string(&r.response(Some(Class::Producing), None)).unwrap();
     assert!(
-        body.starts_with(r#"{"head_frame":240,"indexed_through":240,"window_frames":240,"window_complete":true,"index_waiting_frame":null,"median_frame_interval_ms":15500,"summary":{"live_shards":3,"classes":{"no_data":0,"producing":1,"below_quorum":1,"staffed_not_producing":1},"#),
+        body.starts_with(r#"{"head_frame":240,"indexed_through":240,"window_frames":240,"window_complete":true,"index_waiting_frame":null,"median_frame_interval_ms":15500,"stored_head_frame":null,"stored_head_timestamp_ms":null,"as_of_frame":240,"as_of_timestamp_ms":3720000,"lag_frames":0,"stale":false,"stale_reason":null,"values_known":true,"built_at_ms":0,"summary":{"live_shards":3,"classes":{"no_data":0,"producing":1,"below_quorum":1,"staffed_not_producing":1},"#),
         "{body}"
     );
+}
+
+#[test]
+fn a_lagging_index_keeps_its_classes_flagged_stale() {
+    // Stored and materialized frames end at 300; the received head is 340,
+    // past frame 301 by more than the grace.
+    let mut src = MemSource::default();
+    for n in 1..=300u64 {
+        let requests = if n % 10 == 0 { vec![shard(header(1, n))] } else { Vec::new() };
+        let outcomes = ok(requests.len());
+        src.frames.insert(n, (frame(n, requests), outcomes));
+    }
+    let mut idx = index(1);
+    let a = idx.advance(&src, 340, u64::MAX, &mut || Some(300));
+    assert_eq!((idx.indexed_through(), a.waiting), (Some(300), Some(301)));
+    let mut stall = StallTracker::default();
+    assert_eq!(stall.observe(a.waiting, 340, Instant::now()), Some(StallEvent::Started { frame: 301 }));
+    let mut view = idx.view();
+    view.waiting_frame = stall.waiting_frame();
+
+    let r = report_of(&view, 340, &world(&[(1, 4), (2, 4), (3, 2)]));
+    let classes: Vec<Class> = [1, 2, 3].iter().map(|t| entry(&r, *t).class).collect();
+    assert_eq!(classes, vec![Class::Producing, Class::StaffedNotProducing, Class::BelowQuorum]);
+    let c = &r.summary.classes;
+    assert_eq!((r.summary.live_shards, c.no_data, c.producing, c.below_quorum, c.staffed_not_producing), (3, 0, 1, 1, 1));
+    assert_eq!(r.summary.applied_in_window, 24);
+    let w = &r.window;
+    assert!(!w.window_complete, "the window still reads incomplete while the index waits");
+    assert_eq!((w.index_waiting_frame, w.as_of_frame, w.lag_frames), (Some(301), Some(300), Some(40)));
+    assert!(w.stale && w.values_known);
+    assert_eq!(
+        serde_json::to_string(w).unwrap(),
+        r#"{"head_frame":340,"indexed_through":300,"window_frames":240,"window_complete":false,"index_waiting_frame":301,"median_frame_interval_ms":15500,"stored_head_frame":null,"stored_head_timestamp_ms":null,"as_of_frame":300,"as_of_timestamp_ms":4650000,"lag_frames":40,"stale":true,"stale_reason":"the index waits for GLOBAL frame 301, not stored or not materialized although the head passed it by the grace; indexed through frame 300","values_known":true,"built_at_ms":0}"#
+    );
+    let stats = serde_json::to_value(r.stats()).unwrap();
+    assert_eq!((stats["stale"].as_bool(), stats["as_of_frame"].as_u64(), stats["classes"]["producing"].as_u64()), (Some(true), Some(300), Some(1)));
+
+    // Within the grace nothing is stale.
+    let fresh = report_of(&idx.view(), 310, &world(&[(1, 4)]));
+    assert_eq!((fresh.window.stale, fresh.window.lag_frames, fresh.window.window_complete), (false, Some(10), true));
+}
+
+#[test]
+fn stale_flags_a_catch_up_an_early_wait_and_an_old_census() {
+    let mut idx = index(1);
+    empty_through(&mut idx, 239);
+    idx.apply(&frame(240, vec![shard(header(1, 1))]), Some(ok(1).as_slice()));
+    let w = world(&[(1, 4), (2, 4)]);
+    let at = |head| report_of(&idx.view(), head, &w).window;
+    assert!(!at(240 + OUTCOME_GRACE).stale, "within the grace");
+    let jump = at(241 + OUTCOME_GRACE);
+    assert_eq!((jump.stale, jump.lag_frames, jump.stale_reason.as_deref()), (true, Some(33), Some("the index trails the head by 33 frames: catching up")));
+
+    let early = report_of(&IndexView { waiting_frame: Some(5), ..Default::default() }, 40, &w).window;
+    assert!(early.stale && early.stale_reason.unwrap().ends_with("; nothing indexed yet"), "a wait before any frame is indexed");
+
+    let view = idx.view();
+    let inputs = |active| Inputs {
+        head_frame: 240,
+        grid: &w.grid,
+        active,
+        halted: &w.halted,
+        committed: &w.committed,
+        quil: crate::handlers::quil_str,
+    };
+    let old = assemble(&view, &inputs(Some((238, &w.active))));
+    assert_eq!(
+        (old.window.stale, old.window.values_known, old.window.stale_reason.as_deref()),
+        (true, true, Some("the prover census is from frame 238: the prover snapshot could not be rebuilt since"))
+    );
+}
+
+#[test]
+fn without_a_census_only_producing_classifies_and_the_values_are_unknown() {
+    let mut idx = index(1);
+    empty_through(&mut idx, 239);
+    idx.apply(&frame(240, vec![shard(header(1, 1))]), Some(ok(1).as_slice()));
+    let w = world(&[(1, 4), (2, 4), (3, 0)]);
+    let r = assemble(
+        &idx.view(),
+        &Inputs { head_frame: 240, grid: &w.grid, active: None, halted: &w.halted, committed: &w.committed, quil: crate::handlers::quil_str },
+    );
+    let classes: Vec<Class> = [1, 2, 3].iter().map(|t| entry(&r, *t).class).collect();
+    assert_eq!(classes, vec![Class::Producing, Class::NoData, Class::NoData], "no census: no below_quorum claim");
+    assert!(!r.window.values_known && r.window.stale);
+    assert_eq!(r.unknown_reason.as_deref(), Some(NO_PROVERS));
+
+    // The registry unreadable on the first read: no live set, values unknown.
+    let none = World {
+        grid: GridView { unavailable: Some(NO_REGISTRY), ..Default::default() },
+        active: HashMap::new(),
+        halted: BTreeSet::new(),
+        committed: HashMap::new(),
+    };
+    let r = report_of(&idx.view(), 240, &none);
+    assert_eq!((r.window.values_known, r.unknown_reason.as_deref(), r.summary.grid_unavailable), (false, Some(NO_REGISTRY), Some(NO_REGISTRY)));
+}
+
+/// A grid cache answer listing shards 1 and 2 with data (and one empty QUIL
+/// grid shard, so the grid is the cache's).
+fn cache_with_two_shards() -> HashMap<Vec<u8>, (u64, u64)> {
+    HashMap::from([(filter(1), (100, 1)), (filter(2), (100, 1)), (quil_filter(&[0, 7, 9]), (0, 0))])
+}
+
+/// An explorer over an in-memory store holding GLOBAL frames 0..=`stored`
+/// (shard 1 applies an app frame in every tenth), received head `head`,
+/// its grid from the archive-cache answer in `grid` and an empty registry.
+fn memory_state(stored: u64, head: u64, grid: Arc<parking_lot::Mutex<Option<HashMap<Vec<u8>, (u64, u64)>>>>) -> crate::ExplorerState {
+    let db = quil_store::RocksDb::open_in_memory().expect("an in-memory store");
+    let raw = db.inner();
+    let clock = quil_store::RocksClockStore::new(raw.clone());
+    for n in 0..=stored {
+        let requests = if n > 0 && n % 10 == 0 { vec![shard(header(1, n))] } else { Vec::new() };
+        let outcomes = ok(requests.len());
+        clock.put_global_frame(&frame(n, requests), None).expect("store a frame");
+        if !outcomes.is_empty() {
+            clock.put_global_clock_frame_outcomes(n, &outcomes).expect("store its outcomes");
+        }
+    }
+    let hg = Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        hg as Arc<dyn quil_types::store::HypergraphStore>,
+        Arc::new(quil_tries::ShaInclusionProver),
+    ));
+    crate::ExplorerState::new(
+        Arc::new(clock),
+        crdt,
+        Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
+        Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
+        Arc::new(quil_store::RocksShardsStore::new(raw)),
+        None,
+        None,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(crate::RecentMessageRing::new(16)),
+        Arc::new(std::sync::atomic::AtomicU64::new(head)),
+    )
+    .with_archive_grid(Arc::new(move || grid.lock().clone()))
+}
+
+fn served(state: &crate::ExplorerState) -> Arc<Snapshot> {
+    state.production_snapshot.read().clone().expect("a snapshot")
+}
+
+#[test]
+fn an_indexer_tick_behind_the_head_keeps_classifying_flagged_stale() {
+    // Frames stored through 300, the received head at 340: the index waits
+    // for 301 beyond the grace.
+    let grid = Arc::new(parking_lot::Mutex::new(Some(cache_with_two_shards())));
+    let state = memory_state(300, 340, grid.clone());
+    let mut indexer = Indexer::default();
+    let tick = indexer.tick(&state, 340);
+    assert_eq!((tick.through, tick.advance.waiting, tick.stall), (Some(300), Some(301), Some(StallEvent::Started { frame: 301 })));
+    assert_eq!(tick.unknown, None);
+    let snapshot = served(&state);
+    let r = &snapshot.report;
+    // The registry is empty: shard 2, without an applied frame, is below
+    // quorum over the window through 300, not no_data.
+    assert_eq!((entry(r, 1).class, entry(r, 2).class), (Class::Producing, Class::BelowQuorum));
+    let w = &r.window;
+    assert_eq!((w.window_complete, w.index_waiting_frame, w.as_of_frame, w.lag_frames), (false, Some(301), Some(300), Some(40)));
+    assert!(w.stale && w.values_known);
+    assert_eq!((w.stored_head_frame, w.stored_head_timestamp_ms), (Some(300), Some(300 * 15_500)));
+    assert!(w.built_at_ms > 0);
+    let body: serde_json::Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!((body["stale"].as_bool(), body["summary"]["classes"]["below_quorum"].as_u64()), (Some(true), Some(1)));
+
+    // The task restarts (a fresh indexer) while the grid cannot be read:
+    // the previous snapshot's values serve on, flagged stale as of 300.
+    *grid.lock() = None;
+    let tick = Indexer::default().tick(&state, 345);
+    let reason = tick.unknown.expect("the census inputs are unreadable");
+    assert!(reason.starts_with("no archive shard-info refresh"), "{reason}");
+    assert!(!reason.contains("waits for GLOBAL frame"), "the log reason carries no index wait");
+    let carried = served(&state);
+    let (w, s) = (&carried.report.window, &carried.report.summary);
+    assert_eq!((w.head_frame, w.as_of_frame, w.lag_frames, w.values_known, w.stale), (345, Some(300), Some(45), true, true));
+    assert_eq!((s.live_shards, s.classes.producing, s.classes.below_quorum), (2, 1, 1));
+    assert!(w.stale_reason.as_deref().unwrap().ends_with("serving the last known values, as of frame 300"));
+}
+
+#[test]
+fn an_applied_app_frame_is_producing_in_a_short_window() {
+    let mut idx = index(1);
+    empty_through(&mut idx, 9);
+    idx.apply(&frame(10, vec![shard(header(1, 1))]), Some(ok(1).as_slice()));
+    assert!(!idx.window_complete());
+    let r = report(&idx, &world(&[(1, 4), (2, 4), (3, 0)]));
+    let classes: Vec<Class> = [1, 2, 3].iter().map(|t| entry(&r, *t).class).collect();
+    assert_eq!(classes, vec![Class::Producing, Class::NoData, Class::NoData]);
+}
+
+#[test]
+fn an_unknown_live_set_serves_the_last_known_values_flagged_stale() {
+    // Registry filters off the grid and no grid shard holding data: an
+    // empty live set, a failed read, never a network without shards.
+    let off = grid_from_cache(&[filter(1)], Some(HashMap::from([(quil_filter(&[0, 7, 9]), (0, 0))])));
+    assert_eq!((off.live.len(), off.unavailable), (0, Some(NO_LIVE)));
+
+    let mut idx = index(1);
+    empty_through(&mut idx, 239);
+    idx.apply(&frame(240, vec![shard(header(1, 1))]), Some(ok(1).as_slice()));
+    let known = report(&idx, &world(&[(1, 4), (2, 3)]));
+    assert!(known.window.values_known && !known.window.stale);
+
+    empty_through(&mut idx, 250);
+    let lost = World { grid: off, active: HashMap::new(), halted: BTreeSet::new(), committed: HashMap::new() };
+    let unknown = report_of(&idx.view(), 252, &lost);
+    assert!(!unknown.window.values_known && unknown.window.stale);
+    let reason = format!("values unknown: {NO_LIVE}");
+    assert_eq!(unknown.window.stale_reason.as_deref(), Some(reason.as_str()));
+    let first = unknown.clone().or_last_known(None);
+    assert!(!first.window.values_known && first.window.stale, "never known: placeholders, flagged");
+
+    let served = unknown.or_last_known(Some(&known));
+    let (w, s) = (&served.window, &served.summary);
+    assert_eq!((w.head_frame, w.indexed_through, w.as_of_frame, w.lag_frames), (252, Some(250), Some(240), Some(12)));
+    assert!(w.stale && w.values_known);
+    let carried = format!("{reason}; serving the last known values, as of frame 240");
+    assert_eq!(w.stale_reason.as_deref(), Some(carried.as_str()));
+    assert_eq!((s.live_shards, s.classes.producing, s.classes.below_quorum, served.shards.len()), (2, 1, 1, 2));
+
+    // A later failed build carries the same values on; a build that reads
+    // the live set serves its own again.
+    let again = report_of(&idx.view(), 260, &lost).or_last_known(Some(&served));
+    assert_eq!((again.window.as_of_frame, again.window.lag_frames, again.summary.live_shards), (Some(240), Some(20), 2));
+    let back = report_of(&idx.view(), 260, &world(&[(1, 4)])).or_last_known(Some(&served));
+    assert_eq!((back.window.as_of_frame, back.window.stale, back.summary.live_shards), (Some(250), false, 1));
 }
 
 #[test]
@@ -424,7 +655,7 @@ fn an_outcome_less_frame_blanks_only_its_shards() {
 }
 
 #[test]
-fn a_missing_frame_blanks_every_shard_until_it_leaves_the_window() {
+fn a_missing_frame_blanks_shards_without_an_applied_frame_until_it_leaves_the_window() {
     let mut idx = index(1);
     empty_through(&mut idx, 239);
     idx.apply(&frame(240, vec![shard(header(1, 1))]), Some(ok(1).as_slice()));
@@ -433,7 +664,8 @@ fn a_missing_frame_blanks_every_shard_until_it_leaves_the_window() {
     let r = report(&idx, &w);
     assert!(!r.window.window_complete);
     assert_eq!(r.summary.missing_frames_in_window, 1);
-    assert_eq!((entry(&r, 1).class, entry(&r, 2).class), (Class::NoData, Class::NoData));
+    assert_eq!((entry(&r, 1).class, entry(&r, 2).class), (Class::Producing, Class::NoData));
+    assert!(!r.window.stale, "a missing frame is no lag");
     empty_through(&mut idx, 241 + WINDOW_FRAMES);
     assert_eq!(entry(&report(&idx, &w), 2).class, Class::StaffedNotProducing);
 }
