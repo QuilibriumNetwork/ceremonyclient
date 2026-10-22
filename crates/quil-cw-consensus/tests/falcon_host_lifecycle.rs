@@ -3,7 +3,7 @@
 //! this does not test crash atomicity of application execution.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -303,4 +303,94 @@ fn production_host_drains_after_voter_panics_on_corrupt_journal() {
         .block_on(join_hosts(vec![host.thread]));
     assert!(host.inbound.iter().all(|sender| sender.is_closed()));
     assert_eq!(std::fs::read(path).unwrap(), corrupt);
+}
+
+/// A present member of a committee that cannot reach quorum still votes:
+/// with two of four members running, no view gets a certificate, so the
+/// view times out (30 s at the production leader timeout) whether or not its
+/// leader runs, and each running member sends its nullify vote on the vote
+/// channel, which `quil-engine` counts as this member's votes. A node lets
+/// the seat of a member that sends none lapse, so a stalled committee's
+/// present members must not look silent. Each member's votes are counted
+/// before the timeout and after it: the timeout must bring a vote of its
+/// own, besides any notarize vote a running leader's proposal drew.
+#[test]
+fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
+    let directory = Directory::new();
+    let committee = Committee::new(4);
+    let store = BlockStore::new();
+    let running = [0usize, 1];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, _finalized) = mpsc::unbounded_channel();
+        let mut inbound = HashMap::new();
+        let mut outbound = Vec::new();
+        let mut threads = Vec::new();
+        for member in running {
+            let GlobalHostHandle {
+                inbound: inputs,
+                outbound: outputs,
+                thread,
+            } = spawn_global_host(
+                committee.schemes[member].clone(),
+                committee.peers.clone(),
+                Arc::new(Proposer),
+                Arc::new(Sink),
+                Arc::new(Finalizer {
+                    member,
+                    tx: tx.clone(),
+                }),
+                store.clone(),
+                GlobalEngineParams::new("journal", 17, Digest([0; 32])),
+                Some(directory.0.join(member.to_string())),
+                Some(shutdown.clone()),
+            );
+            inbound.insert(committee.peers[member].clone(), inputs);
+            outbound.push((member, committee.peers[member].clone(), outputs));
+            threads.push(thread);
+        }
+        let inbound = Arc::new(inbound);
+        let votes: Arc<Vec<AtomicU64>> = Arc::new(running.iter().map(|_| AtomicU64::new(0)).collect());
+        let routers: Vec<_> = outbound
+            .into_iter()
+            .map(|(member, sender, mut rx)| {
+                let inbound = inbound.clone();
+                let votes = votes.clone();
+                tokio::spawn(async move {
+                    while let Some(message) = rx.recv().await {
+                        if message.channel == 0 {
+                            votes[member].fetch_add(1, Ordering::Relaxed);
+                        }
+                        for recipient in message.recipients {
+                            if recipient != sender {
+                                if let Some(inputs) = inbound.get(&recipient) {
+                                    let _ = inputs[message.channel as usize]
+                                        .send(inbound_message(sender.clone(), message.bytes.clone()));
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let counts = || votes.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<u64>>();
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        let before_timeout = counts();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let sent = counts();
+        shutdown.store(true, Ordering::Release);
+        join_hosts(threads).await;
+        for router in routers {
+            router.await.unwrap();
+        }
+        assert!(
+            sent.iter().zip(&before_timeout).all(|(after, before)| after > before),
+            "each running member sends a vote when the view times out, within 45 s: \
+             {before_timeout:?} after 25 s, {sent:?} after 45 s"
+        );
+    });
 }

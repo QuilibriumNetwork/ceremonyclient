@@ -130,6 +130,21 @@ impl SharedWorkerExecution {
 
     pub fn observe(&self) { self.record.lock().unwrap().observed_unix_ms = now_ms(); }
 
+    /// The votes of the running session host (`WorkerExecution.own_votes`
+    /// and its companions).
+    pub(crate) fn votes(&self, votes: crate::own_votes::VotesReport) {
+        let mut s = self.record.lock().unwrap();
+        s.own_votes = votes.own;
+        s.peer_votes = votes.peer;
+        s.last_peer_vote_unix_ms = votes.last_peer_vote_unix_ms;
+        s.host_started_unix_ms = votes.host_started_unix_ms;
+        s.silent_ms = votes.silent_ms;
+    }
+
+    /// The engine this record belongs to started now
+    /// (`WorkerExecution.engine_started_unix_ms`).
+    pub fn engine_started(&self) { self.record.lock().unwrap().engine_started_unix_ms = now_ms(); }
+
     /// This member saw its session's terminal seal finalized.
     pub fn sealed(&self, generation: u64, checkpoint: u64, view: u64) {
         let mut s = self.record.lock().unwrap();

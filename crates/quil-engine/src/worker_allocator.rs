@@ -461,6 +461,9 @@ pub struct WorkerAllocator {
     interrupted_seats: std::sync::Mutex<Option<std::collections::HashSet<Vec<u8>>>>,
     /// The lifecycle has decided renewals since this process started.
     renewals_offered: std::sync::atomic::AtomicBool,
+    /// Workers the lifecycle holds back from new seats for sending no vote
+    /// ([`Self::set_held_back`]).
+    held_back: std::sync::Mutex<std::collections::HashSet<u32>>,
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
@@ -600,6 +603,7 @@ impl WorkerAllocator {
             submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             interrupted_seats: std::sync::Mutex::new(None),
             renewals_offered: std::sync::atomic::AtomicBool::new(false),
+            held_back: Default::default(),
             worker_manager,
             prover_registry,
             local_prover_address,
@@ -622,6 +626,13 @@ impl WorkerAllocator {
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The workers held back from new seats for sending no vote in their
+    /// last one: the bind pass gives them an unbound seat only after every
+    /// other idle worker.
+    pub(crate) fn set_held_back(&self, cores: std::collections::HashSet<u32>) {
+        *self.held_back.lock().unwrap_or_else(|e| e.into_inner()) = cores;
     }
 
     pub fn set_pending_shard_changes(&self, changes: PendingShardChanges) {
@@ -1375,6 +1386,11 @@ impl WorkerAllocator {
         // bindings landed on 2..15, core 1's join reported missing).
         idle_workers.sort();
         idle_workers.reverse();
+        // A worker held back for sending no vote in its last seat is bound
+        // last, so a healthy idle worker takes an unbound seat first
+        // (`provers::session_hosting`).
+        let held_back = self.held_back.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        idle_workers.sort_by_key(|core_id| !held_back.contains(core_id));
 
         // Manually-managed-but-unbound workers — the operator picked
         // these via the TUI's worker-selector at join time. We
@@ -2216,6 +2232,29 @@ mod tests {
         let assigned: Vec<Vec<u8>> = workers.iter().map(|w| w.filter.clone()).collect();
         assert!(assigned.contains(&vec![0x01; 32]));
         assert!(assigned.contains(&vec![0x02; 32]));
+    }
+
+    /// A worker held back for sending no vote in its last seat is bound to
+    /// an unbound seat only after every other idle worker; held back alone,
+    /// it is still bound (binding is not a join).
+    #[test]
+    fn held_back_workers_are_bound_last() {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.set_held_back(std::collections::HashSet::from([1]));
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_cores(&wm), vec![2], "the healthy idle worker takes the seat");
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.set_held_back(std::collections::HashSet::from([1]));
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_cores(&wm), vec![1], "with no other idle worker it is bound");
     }
 
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {

@@ -131,6 +131,29 @@ message WorkerExecution {
   // by which the awaited event happens (e.g. the epoch boundary whose
   // session pass seats this worker). Absent otherwise and on older nodes.
   optional uint64 awaited_frame = 8;
+  // Votes in the running committee session's consensus host, since that
+  // host started: the votes this member signed and handed to the shard
+  // transport (`own_votes`, retransmissions included), and those received
+  // from the session's other members (`peer_votes`, retransmissions
+  // included; `last_peer_vote_unix_ms` 0 until one arrives). A present
+  // member casts at least a nullify vote each time a view times out. A vote
+  // counts once handed to the node to publish, whether or not the network
+  // carries it. `own_votes` is absent while no session host runs and on
+  // older builds, which says nothing about voting.
+  optional uint64 own_votes = 9;
+  uint64 peer_votes = 10;
+  uint64 last_peer_vote_unix_ms = 11;
+  // When the running session host started, and when the engine started
+  // (`engine_started_unix_ms`), on the worker's own clock. They name the
+  // host and the engine: a reader compares them with earlier reports of the
+  // same worker and never moves them onto its own clock. 0 on older builds,
+  // and for the host while none runs.
+  uint64 host_started_unix_ms = 12;
+  // How long the running host has sent no vote while another member's vote
+  // had arrived within the last two minutes; time while none arrive is not
+  // counted.
+  uint64 silent_ms = 13;
+  uint64 engine_started_unix_ms = 14;
 }
 
 // A finalized terminal seal and its submission to GLOBAL. GLOBAL accepts a
