@@ -238,6 +238,12 @@ const TAG_SIZE: u8 = b'z';
 /// per-batch WAL write across many nodes, small enough to bound peak memory.
 const SEED_BATCH: usize = 65_536;
 
+/// Stale records a prune deletes per write batch. A prune used to collect
+/// every record below its watermark and delete them in one batch, so the
+/// first pass over a store that had never been pruned held its whole
+/// backlog in memory at once.
+const PRUNE_BATCH: usize = 16_384;
+
 /// A store that can memoize per-node subtree size sums (the [`TAG_SIZE`]
 /// side column). Split from [`TreeReader`] so the generic
 /// [`crate::subtree_size`] / [`crate::node_size_sum`] walkers work over both
@@ -723,6 +729,86 @@ impl RocksTreeStore {
         *hi.last_mut().unwrap() = TAG_STALE + 1;
         (lo, hi)
     }
+
+    /// [`ForestStore::prune`], deleting at most `batch_records` stale
+    /// records per write batch and telling `flushed` each batch's size.
+    /// A record's node, size memo and stale entry go in the same batch, so
+    /// an interrupted prune leaves only whole records for the next pass.
+    pub fn prune_in_batches(
+        &self,
+        min_readable_version: Version,
+        batch_records: usize,
+        mut flushed: impl FnMut(usize),
+    ) -> Result<usize> {
+        let batch_records = batch_records.max(1);
+        let (lo, hi) = self.stale_scan_bounds();
+        let vstart = self.prefix.len() + 1; // after prefix + TAG_STALE
+        let mut from = lo.clone();
+        let mut pruned = 0usize;
+        loop {
+            // Collect one batch of stale records with stale_since_version
+            // <= min, and release the iterator before writing.
+            let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(batch_records);
+            let mut more = false;
+            {
+                let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+                it.seek(&from)?;
+                while it.valid() {
+                    let k = match it.key() {
+                        Some(k) if k < hi.as_slice() => k,
+                        _ => break,
+                    };
+                    // Parse the 8-byte stale_since_version prefix.
+                    if k.len() < vstart + 8 {
+                        it.next()?;
+                        continue;
+                    }
+                    let mut vb = [0u8; 8];
+                    vb.copy_from_slice(&k[vstart..vstart + 8]);
+                    if Version::from_be_bytes(vb) > min_readable_version {
+                        // Records are version-ordered; nothing beyond is prunable.
+                        break;
+                    }
+                    if doomed.len() == batch_records {
+                        more = true;
+                        break;
+                    }
+                    doomed.push(k.to_vec());
+                    it.next()?;
+                }
+            }
+            if doomed.is_empty() {
+                return Ok(pruned);
+            }
+            let mut wb = self.db.batch();
+            for stale_k in &doomed {
+                // Reconstruct the node key: prefix ++ 'n' ++ borsh(node_key).
+                // The borsh(node_key) bytes are exactly the tail after the
+                // 8-byte version. The parallel size-index memo (TAG_SIZE) for
+                // the same NodeKey goes in lockstep so the side column can't
+                // outgrow the node column.
+                let nk_borsh = &stale_k[vstart + 8..];
+                let mut node_k = self.prefix.clone();
+                node_k.push(TAG_NODE);
+                node_k.extend_from_slice(nk_borsh);
+                let mut size_k = self.prefix.clone();
+                size_k.push(TAG_SIZE);
+                size_k.extend_from_slice(nk_borsh);
+                wb.delete(&node_k);
+                wb.delete(&size_k);
+                wb.delete(stale_k);
+            }
+            self.db.write(wb)?;
+            flushed(doomed.len());
+            pruned += doomed.len();
+            if !more {
+                return Ok(pruned);
+            }
+            // Resume after the last record deleted, not over its tombstones.
+            from = doomed.pop().unwrap_or_default();
+            from.push(0);
+        }
+    }
 }
 
 impl SizeIndex for RocksTreeStore {
@@ -1055,62 +1141,6 @@ impl ForestStore for RocksTreeStore {
     }
 
     fn prune(&self, min_readable_version: Version) -> Result<usize> {
-        let (lo, hi) = self.stale_scan_bounds();
-        // Collect stale records with stale_since_version <= min first.
-        let mut doomed_nodes: Vec<Vec<u8>> = Vec::new();
-        let mut doomed_sizes: Vec<Vec<u8>> = Vec::new();
-        let mut doomed_stale: Vec<Vec<u8>> = Vec::new();
-        {
-            let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
-            it.seek(&lo)?;
-            let vstart = self.prefix.len() + 1; // after prefix + TAG_STALE
-            while it.valid() {
-                let k = match it.key() {
-                    Some(k) if k < hi.as_slice() => k,
-                    _ => break,
-                };
-                // Parse the 8-byte stale_since_version prefix.
-                if k.len() < vstart + 8 {
-                    it.next()?;
-                    continue;
-                }
-                let mut vb = [0u8; 8];
-                vb.copy_from_slice(&k[vstart..vstart + 8]);
-                let stale_since = Version::from_be_bytes(vb);
-                if stale_since > min_readable_version {
-                    // Records are version-ordered; nothing beyond is prunable.
-                    break;
-                }
-                // Reconstruct the node key: prefix ++ 'n' ++ borsh(node_key).
-                // The borsh(node_key) bytes are exactly the tail after the
-                // 8-byte version.
-                let nk_borsh = &k[vstart + 8..];
-                let mut node_k = self.prefix.clone();
-                node_k.push(TAG_NODE);
-                node_k.extend_from_slice(nk_borsh);
-                doomed_nodes.push(node_k);
-                // The parallel size-index memo (TAG_SIZE) for the same NodeKey
-                // is pruned in lockstep so the side column can't outgrow the
-                // node column.
-                let mut size_k = self.prefix.clone();
-                size_k.push(TAG_SIZE);
-                size_k.extend_from_slice(nk_borsh);
-                doomed_sizes.push(size_k);
-                doomed_stale.push(k.to_vec());
-                it.next()?;
-            }
-        }
-        let mut wb = self.db.batch();
-        for nk in &doomed_nodes {
-            wb.delete(nk);
-        }
-        for sk in &doomed_sizes {
-            wb.delete(sk);
-        }
-        for sk in &doomed_stale {
-            wb.delete(sk);
-        }
-        self.db.write(wb)?;
-        Ok(doomed_nodes.len())
+        self.prune_in_batches(min_readable_version, PRUNE_BATCH, |_| {})
     }
 }
