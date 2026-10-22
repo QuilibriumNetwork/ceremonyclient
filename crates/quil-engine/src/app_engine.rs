@@ -4802,6 +4802,7 @@ impl AppConsensusEngine {
         self.session_liveness_logged = Some(std::time::Instant::now());
         let seen = liveness.snapshot();
         let decided = liveness.decisions();
+        let best_signers = liveness.view_signers(seen.best.view);
         let members = session.members.len();
         let quorum = members - members.saturating_sub(1) / 3;
         let tally = |t: quil_cw_consensus::adapters::ViewTally| format!(
@@ -4824,7 +4825,7 @@ impl AppConsensusEngine {
             inbound_by_channel = ?self.cw_inbound, inbound_unattributed = self.cw_unresolved,
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
-        self.log_silent_members(seen.voters, quorum);
+        self.log_silent_members(&seen, best_signers, quorum);
     }
 
     /// While the running session's committed tip stands still, carry the
@@ -4929,23 +4930,60 @@ impl AppConsensusEngine {
         }
     }
 
-    /// While the running session lacks a voting quorum, the members never
-    /// heard on the vote channel ([`SilentMembers`]), each with its prover
-    /// registry allocation on this shard: an Active prover that never takes
-    /// part, or a Leaving one still counted, is a remote problem only its
-    /// prover or the protocol can fix (public issue #748).
-    fn log_silent_members(&mut self, voters: usize, quorum: usize) {
+    /// While the running session forms no certificate, why: the members
+    /// never heard on the vote channel while too few vote ([`SilentMembers`]),
+    /// each with its prover registry allocation on this shard (an Active
+    /// prover that never takes part, or a Leaving one still counted), or,
+    /// once enough members vote across views, the members missing from the
+    /// view closest to a quorum. Either is a remote problem only its provers
+    /// or the protocol can fix (public issue #748). Its end is logged once a
+    /// view is notarized or finalized.
+    fn log_silent_members(
+        &mut self,
+        seen: &quil_cw_consensus::adapters::LivenessSnapshot,
+        best: Option<quil_cw_consensus::adapters::ViewSigners>,
+        quorum: usize,
+    ) {
         let now = std::time::Instant::now();
-        let report = self.session_silent.report(voters >= quorum, now);
+        let certified = seen.notarized.max(seen.finalized);
+        let look = QuorumLook {
+            voters: seen.voters, quorum, certified, nullify_quorum: seen.most_nullified.nullify >= quorum,
+        };
+        let report = self.session_silent.report(look, now);
         let (Some(report), Some(session)) = (report, self.cw_session.as_ref()) else {
             return;
         };
         let observed_secs = self.session_silent.observed(now).as_secs();
+        let voters = seen.voters;
         let never_voted = match report {
-            SilentReport::Cleared => {
+            SilentReport::Cleared { stalled } => {
                 info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
-                    members = session.members.len(), quorum, voters, observed_secs,
-                    "app session no longer below quorum with members that never voted");
+                    members = session.members.len(), quorum, voters, certified_view = certified,
+                    stalled_secs = stalled.as_secs(), observed_secs,
+                    "app session no longer below voting quorum: a view was notarized or finalized");
+                return;
+            }
+            SilentReport::NoQuorumView { stalled, never_voted } => {
+                let me = self.session_silent.me;
+                let missing = missing_from_view(best.as_ref(), session.members.len());
+                let listed = missing.iter().take(SILENT_LISTED).map(|&(member, voted)| {
+                    use quil_execution::global_intrinsic::materialize::prover_address_from_pubkey;
+                    let address = session.members.get(member)
+                        .and_then(|key| prover_address_from_pubkey(key).ok())
+                        .map_or_else(|| "unknown".to_string(), |address| hex::encode(&address[..8]));
+                    format!("{member} {address} {voted}{}", if Some(member) == me { ", this node" } else { "" })
+                }).collect::<Vec<_>>().join("; ");
+                let tally = best.as_ref().map_or((0, 0, 0), |b| (b.view, b.notarize.len(), b.nullify.len()));
+                warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+                    members = session.members.len(), quorum, voters, never_voted, stalled_secs = stalled.as_secs(),
+                    observed_secs, view = seen.view, certified_view = certified, best_view = tally.0,
+                    best_view_notarize = tally.1, best_view_nullify = tally.2,
+                    missing_members = %listed, unlisted = missing.len().saturating_sub(SILENT_LISTED), scope = "peer",
+                    action = "nothing to fix on this node unless it is listed as missing; members that vote in some \
+                        views but not others are a remote participation problem only those provers or the protocol \
+                        (public issue #748) can fix; ends when a view is notarized or finalized (logged), or when the \
+                        GLOBAL fence retires a closing session; report it with this line if it persists",
+                    "app session below voting quorum in every view: members vote in some views but not others");
                 return;
             }
             SilentReport::NeverVoted(never_voted) => never_voted,
@@ -9712,9 +9750,25 @@ const SILENT_REPEAT: Duration = Duration::from_secs(30 * 60);
 /// Non-voting members named in one line; the rest are counted.
 const SILENT_LISTED: usize = 32;
 
+/// What the running session's consensus showed at one look
+/// ([`SilentMembers::report`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct QuorumLook {
+    /// Distinct members that voted in the recent views.
+    voters: usize,
+    quorum: usize,
+    /// The highest view a notarization or finalization certificate named;
+    /// it rises only when a view gathers a quorum for one proposal.
+    certified: u64,
+    /// Whether a recent view gathered a quorum of nullify votes here: the
+    /// members vote together, and only their proposals fail (the liveness
+    /// line's declined and refused counts say why).
+    nullify_quorum: bool,
+}
+
 /// Which members of one session's host this node heard from, and on the vote
-/// channel, so the members that never voted can be named while the session
-/// lacks a quorum.
+/// channel, and when a view of the session last gathered a quorum, so a
+/// session that forms no certificate can be reported with its cause.
 #[derive(Default)]
 struct SilentMembers {
     /// When the host started; `None` before any session ran.
@@ -9723,26 +9777,43 @@ struct SilentMembers {
     me: Option<usize>,
     /// Per member: heard at all, and heard on the vote channel.
     heard: Vec<(bool, bool)>,
+    /// The highest certified view seen, and when it last rose (or the host
+    /// started).
+    certified: u64,
+    progressed: Option<std::time::Instant>,
     /// The non-voters last named, and when.
     named: Option<(Vec<(usize, bool)>, std::time::Instant)>,
-    /// Named since the session last had a quorum.
+    /// When the session was last reported without a quorum in any view.
+    no_quorum_view: Option<std::time::Instant>,
+    /// Reported since a view last gathered a quorum.
     open: bool,
 }
 
 /// What [`SilentMembers::report`] names.
 #[derive(Debug, PartialEq, Eq)]
 enum SilentReport {
-    /// Members never heard on the vote channel, each with whether it was
-    /// heard at all.
+    /// Too few members vote, and these were never heard on the vote channel,
+    /// each with whether it was heard at all.
     NeverVoted(Vec<(usize, bool)>),
-    /// Named non-voters no longer keep the session below quorum: it has one,
-    /// or every member voted.
-    Cleared,
+    /// Enough members vote across the recent views (or every member voted at
+    /// some point), but no view gathered a quorum for `stalled`: members vote
+    /// in some views but not others. `never_voted` members were never heard
+    /// on the vote channel.
+    NoQuorumView { stalled: Duration, never_voted: usize },
+    /// A view gathered a quorum after a report, ending a condition that
+    /// lasted `stalled`.
+    Cleared { stalled: Duration },
 }
 
 impl SilentMembers {
     fn restart(&mut self, members: usize, me: Option<usize>, now: std::time::Instant) {
-        *self = Self { since: Some(now), me, heard: vec![(false, false); members], ..Self::default() };
+        *self = Self {
+            since: Some(now),
+            me,
+            heard: vec![(false, false); members],
+            progressed: Some(now),
+            ..Self::default()
+        };
     }
 
     fn record(&mut self, member: usize, channel: u64) {
@@ -9756,19 +9827,43 @@ impl SilentMembers {
         self.since.map_or(Duration::ZERO, |since| now.duration_since(since))
     }
 
-    /// What to log at `now`: nothing until the session was observed for
-    /// [`SILENT_AFTER`] (nothing heard yet is not silence) or while it has a
-    /// quorum; the non-voters when first known, when they change, and every
-    /// [`SILENT_REPEAT`] while they persist; and once that they cleared.
-    fn report(&mut self, quorate: bool, now: std::time::Instant) -> Option<SilentReport> {
-        if self.since.is_none() || self.observed(now) < SILENT_AFTER {
+    /// What to log at `now`: nothing until no view gathered a quorum for
+    /// [`SILENT_AFTER`] (nothing heard yet is not silence); then, while too
+    /// few members vote, the non-voters when first known, when they change
+    /// and every [`SILENT_REPEAT`] while they persist; once enough members
+    /// vote across views, or every member voted, that no view gathers a
+    /// quorum, every [`SILENT_REPEAT`] (not while a view gathers a quorum of
+    /// nullify votes: then the members vote together); and once either cleared, when a view
+    /// is notarized or finalized. Members heard voting at some point are not
+    /// a quorum: a session whose members vote in turns forms no certificate.
+    fn report(&mut self, look: QuorumLook, now: std::time::Instant) -> Option<SilentReport> {
+        let since = self.since?;
+        let progressed = self.progressed.unwrap_or(since);
+        if look.certified > self.certified {
+            self.certified = look.certified;
+            self.progressed = Some(now);
+            let stalled = now.duration_since(progressed);
+            return std::mem::take(&mut self.open).then_some(SilentReport::Cleared { stalled });
+        }
+        let stalled = now.duration_since(progressed);
+        if stalled < SILENT_AFTER {
             return None;
         }
         let never_voted: Vec<_> = self.heard.iter().enumerate()
             .filter_map(|(member, &(any, votes))| (Some(member) != self.me && !votes).then_some((member, any)))
             .collect();
-        if quorate || never_voted.is_empty() {
-            return std::mem::take(&mut self.open).then_some(SilentReport::Cleared);
+        if look.voters >= look.quorum || never_voted.is_empty() {
+            if look.nullify_quorum {
+                return None;
+            }
+            // Which members miss a view changes with every view; repeated at
+            // a fixed interval, not on change.
+            if self.no_quorum_view.is_some_and(|at| now.duration_since(at) < SILENT_REPEAT) {
+                return None;
+            }
+            self.open = true;
+            self.no_quorum_view = Some(now);
+            return Some(SilentReport::NoQuorumView { stalled, never_voted: never_voted.len() });
         }
         // A quorum that comes and goes does not name the same members sooner.
         let unchanged = self.named.as_ref()
@@ -9782,31 +9877,64 @@ impl SilentMembers {
     }
 }
 
+/// The members of a session of `members` missing from `view`'s
+/// best-supported proposal, each with what it voted in that view instead:
+/// `nullified`, `finalized` or `no vote`. Without a view, every member.
+fn missing_from_view(
+    view: Option<&quil_cw_consensus::adapters::ViewSigners>,
+    members: usize,
+) -> Vec<(usize, &'static str)> {
+    (0..members)
+        .filter_map(|member| {
+            let Some(view) = view else { return Some((member, "no vote")) };
+            let signer = u32::try_from(member).ok()?;
+            if view.notarize.contains(&signer) {
+                return None;
+            }
+            Some((member, if view.nullify.contains(&signer) {
+                "nullified"
+            } else if view.finalize.contains(&signer) {
+                "finalized"
+            } else {
+                "no vote"
+            }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod silent_member_tests {
     use super::*;
 
     const MINUTE: Duration = Duration::from_secs(60);
 
+    /// `voters` of a quorum of 3, nothing certified past `certified`, no
+    /// view with a quorum of nullify votes.
+    fn look(voters: usize, certified: u64) -> QuorumLook {
+        QuorumLook { voters, quorum: 3, certified, nullify_quorum: false }
+    }
+
     /// Nothing heard is not silence until the session was observed for a
-    /// while; this member and a quorate session are never reported.
+    /// while; this member and a session that certifies views are never
+    /// reported.
     #[test]
     fn non_voters_are_named_only_once_the_session_was_observed() {
         let start = std::time::Instant::now();
         let mut silent = SilentMembers::default();
-        assert_eq!(silent.report(false, start + MINUTE * 60), None, "no session ran");
+        assert_eq!(silent.report(look(0, 0), start + MINUTE * 60), None, "no session ran");
         silent.restart(3, Some(0), start);
-        assert_eq!(silent.report(false, start + MINUTE * 4), None, "not yet observed");
-        assert_eq!(silent.report(true, start + MINUTE * 5), None, "quorate");
+        assert_eq!(silent.report(look(1, 0), start + MINUTE * 4), None, "not yet observed");
+        assert_eq!(silent.report(look(3, 4), start + MINUTE * 5), None, "a view was certified");
+        assert_eq!(silent.report(look(1, 4), start + MINUTE * 9), None, "certified four minutes ago");
         assert_eq!(
-            silent.report(false, start + MINUTE * 5),
+            silent.report(look(1, 4), start + MINUTE * 10),
             Some(SilentReport::NeverVoted(vec![(1, false), (2, false)])),
         );
     }
 
     /// Unchanged non-voters are named again only half an hour later, a
-    /// change at once; their end is named once, and a quorum that comes and
-    /// goes does not repeat them sooner.
+    /// change at once; their end is named once, when a view is certified,
+    /// and a quorum that comes and goes does not repeat them sooner.
     #[test]
     fn non_voters_are_named_on_change_and_every_half_hour() {
         let start = std::time::Instant::now();
@@ -9815,20 +9943,78 @@ mod silent_member_tests {
         silent.restart(4, Some(0), start);
         silent.record(1, VOTE_CHANNEL);
         silent.record(2, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL);
-        assert_eq!(silent.report(false, at(5)), Some(SilentReport::NeverVoted(vec![(2, true), (3, false)])));
-        assert_eq!(silent.report(false, at(6)), None);
+        assert_eq!(silent.report(look(2, 0), at(5)), Some(SilentReport::NeverVoted(vec![(2, true), (3, false)])));
+        assert_eq!(silent.report(look(2, 0), at(6)), None);
         silent.record(3, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL);
         let heard = || Some(SilentReport::NeverVoted(vec![(2, true), (3, true)]));
-        assert_eq!(silent.report(false, at(7)), heard());
-        assert_eq!(silent.report(false, at(36)), None);
-        assert_eq!(silent.report(false, at(37)), heard());
-        assert_eq!(silent.report(true, at(38)), Some(SilentReport::Cleared));
-        assert_eq!(silent.report(true, at(39)), None);
-        assert_eq!(silent.report(false, at(40)), None, "named three minutes ago");
-        assert_eq!(silent.report(false, at(67)), heard());
+        assert_eq!(silent.report(look(2, 0), at(7)), heard());
+        assert_eq!(silent.report(look(2, 0), at(36)), None);
+        assert_eq!(silent.report(look(2, 0), at(37)), heard());
+        assert_eq!(silent.report(look(3, 9), at(38)), Some(SilentReport::Cleared { stalled: MINUTE * 38 }));
+        assert_eq!(silent.report(look(3, 9), at(39)), None);
+        assert_eq!(silent.report(look(2, 9), at(42)), None, "certified four minutes ago");
+        assert_eq!(silent.report(look(2, 9), at(44)), None, "named seven minutes ago");
+        assert_eq!(silent.report(look(2, 9), at(67)), heard());
+    }
+
+    /// Members that each voted at some point, or enough of them across the
+    /// recent views, are no quorum while no view gathers one: participation
+    /// that rotates between views is reported, every half hour, and never
+    /// as cleared; only a certified view ends it.
+    #[test]
+    fn rotating_voters_are_no_quorum_until_a_view_is_certified() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut silent = SilentMembers::default();
+        silent.restart(4, Some(0), start);
+        silent.record(1, VOTE_CHANNEL);
+        assert_eq!(silent.report(look(2, 0), at(5)), Some(SilentReport::NeverVoted(vec![(2, false), (3, false)])));
+        // Enough members vote across views, the certified view does not move.
+        assert_eq!(
+            silent.report(look(3, 0), at(6)),
+            Some(SilentReport::NoQuorumView { stalled: MINUTE * 6, never_voted: 2 }),
+            "not cleared: no view was certified",
+        );
         silent.record(2, VOTE_CHANNEL);
         silent.record(3, VOTE_CHANNEL);
-        assert_eq!(silent.report(false, at(68)), Some(SilentReport::Cleared), "every member voted");
+        assert_eq!(silent.report(look(4, 0), at(7)), None, "every member voted, still none: reported");
+        assert_eq!(silent.report(look(2, 0), at(20)), None, "every member voted at some point");
+        assert_eq!(
+            silent.report(look(4, 0), at(36)),
+            Some(SilentReport::NoQuorumView { stalled: MINUTE * 36, never_voted: 0 }),
+        );
+        assert_eq!(silent.report(look(4, 5), at(40)), Some(SilentReport::Cleared { stalled: MINUTE * 40 }));
+        assert_eq!(silent.report(look(4, 6), at(41)), None, "already cleared");
+    }
+
+    /// A view with a quorum of nullify votes shows the members voting
+    /// together: a stall of their proposals is no participation problem.
+    #[test]
+    fn a_nullify_quorum_is_no_rotating_participation() {
+        let start = std::time::Instant::now();
+        let mut silent = SilentMembers::default();
+        silent.restart(4, Some(0), start);
+        for member in 1..4 {
+            silent.record(member, VOTE_CHANNEL);
+        }
+        let together = QuorumLook { nullify_quorum: true, ..look(4, 0) };
+        assert_eq!(silent.report(together, start + MINUTE * 6), None);
+        assert_eq!(
+            silent.report(look(4, 0), start + MINUTE * 7),
+            Some(SilentReport::NoQuorumView { stalled: MINUTE * 7, never_voted: 0 }),
+        );
+    }
+
+    /// The members missing from a view's best-supported proposal are named
+    /// with what they voted instead.
+    #[test]
+    fn members_missing_from_the_best_view_say_what_they_voted() {
+        let set = |signers: &[u32]| signers.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let view = quil_cw_consensus::adapters::ViewSigners {
+            view: 756, notarize: set(&[0, 1, 3]), nullify: set(&[1, 2]), finalize: set(&[]),
+        };
+        assert_eq!(missing_from_view(Some(&view), 5), vec![(2, "nullified"), (4, "no vote")]);
+        assert_eq!(missing_from_view(None, 2), vec![(0, "no vote"), (1, "no vote")]);
     }
 }
 
