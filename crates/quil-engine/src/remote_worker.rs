@@ -86,7 +86,14 @@ pub struct RemoteWorkerManager {
     /// latest report request, as its filter and the reason
     /// (`refresh_executions`).
     unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    /// Standalone workers whose build lacks `EvictPayload`, each logged once
+    /// until it answers the call.
+    evict_unsupported: std::sync::Arc<Mutex<std::collections::HashSet<u32>>>,
 }
+
+/// How long a payload eviction request may take: the worker answers before
+/// it runs the removal.
+const EVICT_PAYLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why a standalone worker running consensus gave no report.
 const NO_ANSWER: &str = "worker does not answer";
@@ -184,6 +191,7 @@ impl RemoteWorkerManager {
             client_tls,
             executions: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
+            evict_unsupported: Default::default(),
         }
     }
 
@@ -560,6 +568,51 @@ impl RemoteWorkerManager {
 }
 
 impl WorkerManager for RemoteWorkerManager {
+    /// Hand the request to the standalone worker over `EvictPayload` without
+    /// waiting: the allocator calls this under its locks and repeats it at
+    /// its interval, so a worker that is not connected, fails or times out
+    /// is asked again then.
+    fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        let channel = {
+            let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+            let worker = workers
+                .get(&core_id)
+                .ok_or_else(|| QuilError::InvalidArgument("eviction worker missing".into()))?;
+            worker.channel.clone()
+        };
+        let Some(channel) = channel else {
+            debug!(core_id, "remote worker not connected; payload eviction waits for the next interval");
+            return Ok(());
+        };
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| QuilError::ExecutionUnavailable("payload eviction needs a runtime".into()))?;
+        let unsupported = self.evict_unsupported.clone();
+        runtime.spawn(async move {
+            let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+                .max_decoding_message_size(64 << 10);
+            let request = quil_types::proto::node::EvictPayloadRequest { keep };
+            match tokio::time::timeout(EVICT_PAYLOAD_TIMEOUT, client.evict_payload(request)).await {
+                Ok(Ok(response)) => {
+                    if let Ok(mut unsupported) = unsupported.lock() {
+                        unsupported.remove(&core_id);
+                    }
+                    let response = response.into_inner();
+                    debug!(core_id, started = response.started, deferred = %response.deferred, "remote worker answered payload eviction");
+                }
+                Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                    if unsupported.lock().is_ok_and(|mut unsupported| unsupported.insert(core_id)) {
+                        info!(core_id, "remote worker keeps the payload of shards it left until it is upgraded");
+                    }
+                }
+                Ok(Err(status)) => warn!(core_id, code = ?status.code(), message = status.message(),
+                    "remote worker payload eviction request failed; asking again next interval"),
+                Err(_) => warn!(core_id, timeout_s = EVICT_PAYLOAD_TIMEOUT.as_secs(),
+                    "remote worker payload eviction request timed out; asking again next interval"),
+            }
+        });
+        Ok(())
+    }
+
     fn set_worker_filter(
         &self,
         core_id: u32,
@@ -917,6 +970,8 @@ mod fee_relay_tests {
 
     struct SnapshotServer {
         mode: Arc<AtomicU8>, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+        /// The keep sets of eviction requests received.
+        keeps: Arc<std::sync::Mutex<Vec<Vec<Vec<u8>>>>>,
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for SnapshotServer {
@@ -945,6 +1000,15 @@ mod fee_relay_tests {
         }
         async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("not used by fee relay"))
+        }
+        /// Mode 5 is an older build without the call.
+        async fn evict_payload(&self, request: tonic::Request<node::EvictPayloadRequest>)
+            -> std::result::Result<tonic::Response<node::EvictPayloadResponse>, tonic::Status> {
+            if self.mode.load(Ordering::SeqCst) == 5 {
+                return Err(tonic::Status::unimplemented("older worker"));
+            }
+            self.keeps.lock().unwrap().push(request.into_inner().keep);
+            Ok(tonic::Response::new(node::EvictPayloadResponse { started: true, deferred: String::new() }))
         }
         /// Mode 5 is an older build without the call, mode 6 never answers
         /// and mode 7 answers unavailable; otherwise the engine runs
@@ -979,6 +1043,7 @@ mod fee_relay_tests {
             mode: mode.clone(),
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
+            keeps: Default::default(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
@@ -1026,6 +1091,7 @@ mod fee_relay_tests {
             mode: mode.clone(),
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
+            keeps: Default::default(),
         };
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -1064,6 +1130,57 @@ mod fee_relay_tests {
         serving.abort();
     }
 
+    /// An eviction request reaches the standalone worker with its keep set
+    /// and returns at once; a build without the call is noted once and asked
+    /// again, and an unknown worker is an error.
+    #[tokio::test]
+    async fn payload_eviction_reaches_the_standalone_worker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(0));
+        let keeps: Arc<std::sync::Mutex<Vec<Vec<Vec<u8>>>>> = Default::default();
+        let server = SnapshotServer {
+            mode: mode.clone(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            keeps: keeps.clone(),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+        });
+        let manager = RemoteWorkerManager::new(vec![(1, endpoint), (2, "http://no such host".into())], String::new(), None);
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        async fn until(done: impl Fn() -> bool) {
+            let started = std::time::Instant::now();
+            while !done() && started.elapsed() < std::time::Duration::from_secs(5) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let keep = vec![vec![7; 32], vec![7; 33]];
+        manager.evict_payload(1, keep.clone()).unwrap();
+        until(|| !keeps.lock().unwrap().is_empty()).await;
+        assert_eq!(*keeps.lock().unwrap(), vec![keep.clone()], "the worker receives the keep set");
+
+        mode.store(5, Ordering::SeqCst);
+        manager.evict_payload(1, keep.clone()).unwrap();
+        until(|| manager.evict_unsupported.lock().unwrap().contains(&1)).await;
+        assert!(manager.evict_unsupported.lock().unwrap().contains(&1), "an older build is noted");
+        mode.store(0, Ordering::SeqCst);
+        manager.evict_payload(1, keep.clone()).unwrap();
+        until(|| !manager.evict_unsupported.lock().unwrap().contains(&1)).await;
+        assert!(!manager.evict_unsupported.lock().unwrap().contains(&1), "an upgraded worker is asked again");
+        assert_eq!(keeps.lock().unwrap().len(), 2);
+
+        manager.evict_payload(2, keep.clone()).unwrap();
+        assert!(manager.evict_payload(9, keep).is_err(), "an unknown worker");
+        stop.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+    }
+
     /// A shard a worker runs consensus for is served, and a direct message
     /// for it reaches that worker; a worker build without the delivery RPC is
     /// told apart, so the master stops taking direct messages for it.
@@ -1075,6 +1192,7 @@ mod fee_relay_tests {
             mode: Arc::new(AtomicU8::new(0)),
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
+            keeps: Default::default(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
@@ -1109,7 +1227,7 @@ mod fee_relay_tests {
         let mode = Arc::new(AtomicU8::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let server = SnapshotServer { mode: mode.clone(), entered: entered.clone(), release: release.clone() };
+        let server = SnapshotServer { mode: mode.clone(), entered: entered.clone(), release: release.clone(), keeps: Default::default() };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let mut serving = tokio::spawn(async move {
             tonic::transport::Server::builder()

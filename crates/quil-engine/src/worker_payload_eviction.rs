@@ -270,6 +270,79 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
     Ok(outcome)
 }
 
+/// Forest node records a confinement sweep examines per hold of the worker's
+/// forest and commit locks, keeping each pause of its frame commits short.
+const FOREST_SCAN_BUDGET: usize = 250_000;
+
+/// Why a worker defers a request to evict outside `keep`, or `None` to run
+/// it: the scope it is bound to must be protected, served by a running
+/// engine, and settled.
+pub(crate) fn deferral(bound: &[u8], keep: &[Vec<u8>], serving: bool, bound_for: std::time::Duration) -> Option<&'static str> {
+    if bound.is_empty() || !keep.iter().any(|filter| filter.as_slice() == bound) {
+        Some("binding is not protected")
+    } else if !serving {
+        Some("engine is not serving the binding")
+    } else if bound_for < crate::worker_allocator::PAYLOAD_EVICTION_SETTLE {
+        Some("binding has not settled")
+    } else {
+        None
+    }
+}
+
+/// A worker's eviction passes for `keep`, in a thread or a standalone
+/// process: the payload outside its served scopes, the forest of the shards
+/// it left, then, under `storage`'s base directory, the consensus storage of
+/// shards it left unless the predicate says it still owes that shard's
+/// committee a vote or seal. `filter` names the binding in the logs.
+pub(crate) async fn run_passes<R>(
+    core_id: u32,
+    filter: String,
+    crdt: std::sync::Arc<HypergraphCrdt>,
+    keep: Vec<Vec<u8>>,
+    storage: Option<(std::path::PathBuf, R)>,
+) where
+    R: Fn(&[u8]) -> bool + Send + 'static,
+{
+    use tracing::{debug, info, warn};
+    let (forest_crdt, forest_keep, storage_keep) = (crdt.clone(), keep.clone(), keep.clone());
+    let started = std::time::Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || evict_outside(&crdt, &keep)).await;
+    match outcome {
+        Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
+            removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
+            compacted_ranges = o.compacted_ranges, reclaimable_bytes = o.reclaimable_bytes,
+            secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
+        Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
+        Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
+        Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
+    }
+    // The forest subtrees of the shards this worker left.
+    let started = std::time::Instant::now();
+    let outcome = tokio::task::spawn_blocking(move ||
+        forest_crdt.confine_forest(&forest_keep, FOREST_SCAN_BUDGET)).await;
+    match outcome {
+        Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(core_id, filter, commits = o.commits,
+            nodes = o.nodes, stale_records = o.stale_records, key_ranges = o.key_ranges,
+            secs = started.elapsed().as_secs(), "worker forest outside served scopes removed"),
+        Ok(Ok(_)) => debug!(core_id, "no worker forest outside served scopes"),
+        Ok(Err(error)) => warn!(core_id, filter, %error, "worker forest confinement refused"),
+        Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
+    }
+    // Consensus storage of shards this worker left, unless it still owes
+    // that shard's committee a vote or seal.
+    if let Some((base, retained)) = storage {
+        let outcome = tokio::task::spawn_blocking(move ||
+            crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)).await;
+        match outcome {
+            Ok(Ok(o)) if o.entries > 0 => info!(core_id, filter, entries = o.entries, bytes = o.bytes,
+                "worker consensus storage outside served scopes removed"),
+            Ok(Ok(_)) => debug!(core_id, "no worker consensus storage outside served scopes"),
+            Ok(Err(error)) => warn!(core_id, filter, %error, "worker consensus storage removal failed"),
+            Err(error) => warn!(core_id, filter, %error, "worker consensus storage removal task failed"),
+        }
+    }
+}
+
 /// Compact gap ranges that still contain SST files lying wholly inside them:
 /// with no visible keys left there, those files hold only deleted records.
 /// A file ends at `upper` when it carries the range tombstone, whose bound
@@ -536,6 +609,49 @@ mod tests {
         refuses(&|| inner.put(&root_index, [0; 16]).unwrap(), &|| inner.delete(&root_index).unwrap());
         refuses(&|| crdt.set_unified_tree(false), &|| crdt.set_unified_tree(true));
         assert_eq!(evict_outside(&crdt, &lower_half()).unwrap().removed_records, 1, "each refusal was the only obstacle");
+    }
+
+    /// A request runs only for a protected, served and settled binding.
+    #[test]
+    fn eviction_waits_for_a_protected_served_and_settled_binding() {
+        let settled = crate::worker_allocator::PAYLOAD_EVICTION_SETTLE;
+        let keep = lower_half();
+        assert_eq!(deferral(&[], &keep, true, settled), Some("binding is not protected"));
+        assert_eq!(deferral(&[1; 32], &keep, true, settled), Some("binding is not protected"));
+        assert_eq!(deferral(&keep[0], &keep, false, settled), Some("engine is not serving the binding"));
+        assert_eq!(deferral(&keep[0], &keep, true, settled / 2), Some("binding has not settled"));
+        assert_eq!(deferral(&keep[0], &keep, true, settled), None);
+    }
+
+    /// The passes a standalone worker runs remove the payload outside the
+    /// kept scope and the consensus storage of a shard it left, and keep the
+    /// storage of the kept shard and of a shard whose committee it still owes.
+    #[tokio::test]
+    async fn the_passes_remove_payload_and_consensus_storage_outside_keep() {
+        let (db, _, crdt) = open();
+        let inner = db.inner();
+        let key = |address: u8| {
+            let mut id = APP.to_vec();
+            id.extend([address; 32]);
+            quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0)
+        };
+        inner.put(key(1), b"kept").unwrap();
+        inner.put(key(129), b"left").unwrap();
+        let base = std::env::temp_dir().join(format!("quil-worker-passes-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let keep = lower_half();
+        let (owed, left) = (vec![0x22; 32], vec![0x23; 32]);
+        let entry = |filter: &[u8]| base.join("cw-app-consensus").join(format!("app-{}", hex::encode(filter)));
+        for filter in [&keep[0], &owed, &left] {
+            std::fs::create_dir_all(entry(filter)).unwrap();
+        }
+        let retained = { let owed = owed.clone(); move |filter: &[u8]| filter == owed.as_slice() };
+        run_passes(1, "test".into(), Arc::new(crdt), keep.clone(), Some((base.clone(), retained))).await;
+        assert_eq!(inner.get(key(1)).unwrap().as_deref(), Some(&b"kept"[..]));
+        assert!(inner.get(key(129)).unwrap().is_none(), "payload outside the kept scope is evicted");
+        assert!(entry(&keep[0]).exists() && entry(&owed).exists());
+        assert!(!entry(&left).exists(), "a left shard's consensus storage is removed");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// A snapshot older than the deletion keeps the deleted records on disk;

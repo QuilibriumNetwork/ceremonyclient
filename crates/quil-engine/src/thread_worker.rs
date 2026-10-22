@@ -17,10 +17,6 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
-/// Forest node records a confinement sweep examines per hold of the worker's
-/// forest and commit locks, keeping each pause of its frame commits short.
-const FOREST_SCAN_BUDGET: usize = 250_000;
-
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
@@ -901,16 +897,8 @@ impl ThreadWorkerManager {
                                         let Some(owned) = worker_owned.clone() else { continue };
                                         let serving = execution_slot.lock().unwrap().as_ref()
                                             .is_some_and(|h| h.filter == current_filter && h.is_running());
-                                        let refusal = if current_filter.is_empty() || !keep.contains(&current_filter) {
-                                            Some("binding is not protected")
-                                        } else if !serving {
-                                            Some("engine is not serving the binding")
-                                        } else if bound_since.elapsed() < crate::worker_allocator::PAYLOAD_EVICTION_SETTLE {
-                                            Some("binding has not settled")
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(reason) = refusal {
+                                        if let Some(reason) = crate::worker_payload_eviction::deferral(
+                                            &current_filter, &keep, serving, bound_since.elapsed()) {
                                             info!(core_id, reason, "worker payload eviction deferred");
                                             continue;
                                         }
@@ -921,50 +909,11 @@ impl ThreadWorkerManager {
                                         let crdt = owned.hypergraph.clone();
                                         let filter = hex::encode(&current_filter);
                                         let storage = consensus_deps.clone().and_then(|deps|
-                                            crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base, deps)));
-                                        let storage_keep = keep.clone();
-                                        let (forest_crdt, forest_keep) = (crdt.clone(), keep.clone());
+                                            crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base,
+                                                move |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
+                                                    crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey)))));
                                         tokio::spawn(async move {
-                                            let started = std::time::Instant::now();
-                                            let outcome = tokio::task::spawn_blocking(move ||
-                                                crate::worker_payload_eviction::evict_outside(&crdt, &keep)).await;
-                                            match outcome {
-                                                Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
-                                                    removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
-                                                    compacted_ranges = o.compacted_ranges, reclaimable_bytes = o.reclaimable_bytes,
-                                                    secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
-                                                Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
-                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
-                                                Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
-                                            }
-                                            // The forest subtrees of the shards this worker left.
-                                            let started = std::time::Instant::now();
-                                            let outcome = tokio::task::spawn_blocking(move ||
-                                                forest_crdt.confine_forest(&forest_keep, FOREST_SCAN_BUDGET)).await;
-                                            match outcome {
-                                                Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(core_id, filter, commits = o.commits,
-                                                    nodes = o.nodes, stale_records = o.stale_records, key_ranges = o.key_ranges,
-                                                    secs = started.elapsed().as_secs(), "worker forest outside served scopes removed"),
-                                                Ok(Ok(_)) => debug!(core_id, "no worker forest outside served scopes"),
-                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker forest confinement refused"),
-                                                Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
-                                            }
-                                            // Consensus storage of shards this worker left, unless it
-                                            // still owes that shard's committee a vote or seal.
-                                            if let Some((base, deps)) = storage {
-                                                let outcome = tokio::task::spawn_blocking(move || {
-                                                    let retained = |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
-                                                        crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey));
-                                                    crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)
-                                                }).await;
-                                                match outcome {
-                                                    Ok(Ok(o)) if o.entries > 0 => info!(core_id, filter, entries = o.entries, bytes = o.bytes,
-                                                        "worker consensus storage outside served scopes removed"),
-                                                    Ok(Ok(_)) => debug!(core_id, "no worker consensus storage outside served scopes"),
-                                                    Ok(Err(error)) => warn!(core_id, filter, %error, "worker consensus storage removal failed"),
-                                                    Err(error) => warn!(core_id, filter, %error, "worker consensus storage removal task failed"),
-                                                }
-                                            }
+                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage).await;
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                         });
                                     }
