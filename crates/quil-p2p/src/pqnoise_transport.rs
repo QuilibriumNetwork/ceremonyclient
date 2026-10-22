@@ -44,6 +44,12 @@ pub const PROTOCOL_ID: &str = "/quilibrium/pqnoise/sntrup761/1.0.0";
 /// Domain separation for the identity signature over the handshake hash.
 const ID_SIG_PREFIX: &[u8] = b"quilibrium-pqnoise-static-key:";
 
+/// Signing attempts for our identity signature before the handshake fails.
+/// Falcon signing runs on floating point while verification is integer-only,
+/// so a core that miscomputes floating point signs invalid signatures it can
+/// still detect itself; a fresh signature draws fresh randomness.
+const ID_SIG_ATTEMPTS: u32 = 3;
+
 /// AEAD tag length (ChaCha20-Poly1305).
 const TAG_LEN: usize = 16;
 /// Max plaintext per transport frame (leaves room for the tag under clatter's
@@ -62,6 +68,16 @@ pub enum PqNoiseError {
     Handshake(String),
     #[error("identity: {0}")]
     Identity(String),
+    #[error(
+        "identity: our own {key_type} signature failed self-verification on thread {thread} \
+         {attempts} times in a row; this CPU core likely computes floating point incorrectly \
+         (hardware fault, unstable overclock/undervolt, or a changed FPU rounding mode)"
+    )]
+    SelfVerification {
+        key_type: String,
+        thread: String,
+        attempts: u32,
+    },
 }
 
 /// libp2p security-transport configuration for PQNoise. Constructed from the
@@ -184,15 +200,78 @@ fn build_identity_payload(keypair: &Keypair, hash: &[u8]) -> Result<Vec<u8>, PqN
     let mut to_sign = Vec::with_capacity(ID_SIG_PREFIX.len() + hash.len());
     to_sign.extend_from_slice(ID_SIG_PREFIX);
     to_sign.extend_from_slice(hash);
-    let sig = keypair
-        .sign(&to_sign)
-        .map_err(|e| PqNoiseError::Identity(format!("sign: {}", e)))?;
+    let public = keypair.public();
+    let sig = sign_self_verified(
+        &to_sign,
+        &keypair.key_type().to_string(),
+        |m| {
+            keypair
+                .sign(m)
+                .map_err(|e| PqNoiseError::Identity(format!("sign: {}", e)))
+        },
+        |m, sig| public.verify(m, sig),
+    )?;
     let mut out = Vec::with_capacity(8 + pk.len() + sig.len());
     out.extend_from_slice(&(pk.len() as u32).to_be_bytes());
     out.extend_from_slice(&pk);
     out.extend_from_slice(&(sig.len() as u32).to_be_bytes());
     out.extend_from_slice(&sig);
     Ok(out)
+}
+
+/// Sign `msg` and check the signature against our own public key before it
+/// leaves the node, re-signing up to [`ID_SIG_ATTEMPTS`] times. A peer drops
+/// a handshake carrying an invalid identity signature without saying why, so
+/// the dialer would only see the connection close; failing here names the
+/// cause instead. Costs one verification per handshake.
+fn sign_self_verified(
+    msg: &[u8],
+    key_type: &str,
+    mut sign: impl FnMut(&[u8]) -> Result<Vec<u8>, PqNoiseError>,
+    verify: impl Fn(&[u8], &[u8]) -> bool,
+) -> Result<Vec<u8>, PqNoiseError> {
+    let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+    for attempt in 1..=ID_SIG_ATTEMPTS {
+        let sig = sign(msg)?;
+        if verify(msg, &sig) {
+            if attempt > 1 {
+                note_rescued_signature(&thread, key_type, attempt);
+            }
+            return Ok(sig);
+        }
+    }
+    Err(PqNoiseError::SelfVerification {
+        key_type: key_type.to_string(),
+        thread,
+        attempts: ID_SIG_ATTEMPTS,
+    })
+}
+
+thread_local! {
+    /// Identity signatures a re-sign rescued on this thread.
+    static RESCUED_SIGNATURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Warn that a re-sign rescued an invalid identity signature. Logs the 1st,
+/// 2nd, 4th, 8th, ... rescue per thread, so a faulty core stays visible
+/// without a line per handshake.
+fn note_rescued_signature(thread: &str, key_type: &str, attempts: u32) {
+    let rescued = RESCUED_SIGNATURES.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    if rescued.is_power_of_two() {
+        tracing::warn!(
+            thread,
+            key_type,
+            attempts,
+            rescued_on_thread = rescued,
+            "own identity signature failed self-verification and a re-sign rescued it: \
+             this CPU core computes floating point incorrectly at times (hardware fault, \
+             unstable overclock/undervolt, or a changed FPU rounding mode), so signatures \
+             it makes for consensus may be invalid too"
+        );
+    }
 }
 
 fn verify_identity_payload(payload: &[u8], hash: &[u8]) -> Result<PeerId, PqNoiseError> {
@@ -464,5 +543,66 @@ mod tests {
         let mut got = [0u8; 8];
         resp_io.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"pq-hello");
+    }
+
+    fn falcon_keypair() -> Keypair {
+        Keypair::falcon_from_bytes(&crate::generate_falcon_signing_key()).unwrap()
+    }
+
+    /// Signs with `kp`, corrupting the signatures whose 1-based call number
+    /// `corrupt` selects; returns the signer and its call counter.
+    fn signer<'a>(
+        kp: &'a Keypair,
+        calls: &'a std::cell::Cell<u32>,
+        corrupt: impl Fn(u32) -> bool + 'a,
+    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, PqNoiseError> + 'a {
+        move |m| {
+            calls.set(calls.get() + 1);
+            let mut sig = kp.sign(m).unwrap();
+            if corrupt(calls.get()) {
+                sig[100] ^= 0x01;
+            }
+            Ok(sig)
+        }
+    }
+
+    #[test]
+    fn self_verified_signature_passes_on_first_attempt() {
+        let kp = falcon_keypair();
+        let public = kp.public();
+        let calls = std::cell::Cell::new(0);
+        let sig = sign_self_verified(b"msg", "Falcon", signer(&kp, &calls, |_| false), |m, s| {
+            public.verify(m, s)
+        })
+        .unwrap();
+        assert!(public.verify(b"msg", &sig));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn self_verified_signature_resigns_after_a_corrupt_one() {
+        let kp = falcon_keypair();
+        let public = kp.public();
+        let calls = std::cell::Cell::new(0);
+        let sig = sign_self_verified(b"msg", "Falcon", signer(&kp, &calls, |n| n == 1), |m, s| {
+            public.verify(m, s)
+        })
+        .unwrap();
+        assert!(public.verify(b"msg", &sig), "the rescued signature must verify");
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn self_verified_signature_fails_after_three_corrupt_ones() {
+        let kp = falcon_keypair();
+        let public = kp.public();
+        let calls = std::cell::Cell::new(0);
+        let err = sign_self_verified(b"msg", "Falcon", signer(&kp, &calls, |_| true), |m, s| {
+            public.verify(m, s)
+        })
+        .unwrap_err();
+        assert!(matches!(err, PqNoiseError::SelfVerification { attempts: 3, .. }), "{err}");
+        assert!(err.to_string().contains("our own Falcon signature failed self-verification"));
+        assert_eq!(calls.get(), ID_SIG_ATTEMPTS);
     }
 }
