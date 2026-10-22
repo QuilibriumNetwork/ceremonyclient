@@ -76,6 +76,11 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
         Ok(Vec::new())
     }
+    /// The base-state roots a refused archive tip attests: the certified
+    /// first frame of a session GLOBAL ended at the current session's base.
+    async fn discarded_base_roots(&self, _frame: AppShardFrame) -> Result<Option<Vec<Vec<u8>>>> {
+        Ok(None)
+    }
     /// The frame GLOBAL has executed the shard's current session through
     /// (`app_handoff::committed_tip`): replay targets at least this, and an
     /// archive below it is behind, not a sign the worker is up to date.
@@ -109,6 +114,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     }
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
         crate::app_engine::AppEngineHandle::origin_anchors(self).await
+    }
+    async fn discarded_base_roots(&self, frame: AppShardFrame) -> Result<Option<Vec<Vec<u8>>>> {
+        crate::app_engine::AppEngineHandle::discarded_base_roots(self, frame).await
     }
     async fn committed_tip(&self) -> Option<u64> {
         crate::app_engine::AppEngineHandle::committed_tip(self).await
@@ -241,7 +249,11 @@ pub(crate) async fn recover_shard_from_latest(
     });
     let committed_tip = target.committed_tip().await;
     recovery_phase("fetching_checkpoint");
-    match sync_shard_from_latest(syncer, filter, None, &anchors, committed_tip, |anchor, predecessor| target.validate(anchor, predecessor)).await? {
+    match sync_shard_from_latest_attested(
+        syncer, filter, None, &anchors, committed_tip,
+        |anchor, predecessor| target.validate(anchor, predecessor),
+        |frame| target.discarded_base_roots(frame),
+    ).await? {
         ShardSyncResult::Anchored { anchor, predecessor } => {
             let frame = anchor.header.as_ref().map_or(0, |header| header.frame_number);
             recovery_phase("installing_checkpoint");
@@ -463,6 +475,58 @@ where
     Ok(ShardReplay { materialized, archive_tip, target })
 }
 
+/// The base state of a session based at frame 0 of which GLOBAL executed no
+/// frame, when the archive's latest frame (`refused`) failed validation: it
+/// belongs to a session GLOBAL ended without executing it, and the archive's
+/// current subtree may include its writes. Sync only state something
+/// certifies: the origins' sealed roots, else the pre-state roots `refused`
+/// attests as the certified first frame of a session ended at this base
+/// (`attest_base`). Otherwise refuse; never inherit the subtree unpinned. A
+/// shard whose sessions all ended at frame 0 kept every member unstaged and
+/// its committee nullifying every view (…a1a80, generation 13, 2026-10-22).
+async fn sync_unexecuted_base<A, AFut>(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    origin_anchors: &[(Vec<u8>, [[u8; 32]; 4])],
+    refused: AppShardFrame,
+    attest_base: &mut A,
+) -> Result<ShardSyncResult>
+where
+    A: FnMut(AppShardFrame) -> AFut,
+    AFut: std::future::Future<Output = Result<Option<Vec<Vec<u8>>>>>,
+{
+    use crate::worker_execution::recovery_phase;
+    let number = refused.header.as_ref().map_or(0, |header| header.frame_number);
+    if !origin_anchors.is_empty() {
+        recovery_phase("installing_leaves");
+        for (source, roots) in origin_anchors {
+            let pinned: Vec<Vec<u8>> = roots.iter().map(|root| root.to_vec()).collect();
+            if !syncer.sync_shard_tree(source, &pinned).await? {
+                return Ok(ShardSyncResult::NotReady(
+                    "the archive does not hold the session's certified base state, or its roots differ",
+                ));
+            }
+        }
+        tracing::info!(filter = %hex::encode(filter), refused_frame = number, origins = origin_anchors.len(),
+            "archive's latest shard frame refused; bootstrapped from the origins' sealed state at the session base");
+        return Ok(ShardSyncResult::Inherited { pinned: true });
+    }
+    let Some(roots) = attest_base(refused).await? else {
+        return Ok(ShardSyncResult::NotReady(
+            "the archive checkpoint failed validation, and nothing certifies the session's base state",
+        ));
+    };
+    recovery_phase("installing_leaves");
+    if !syncer.sync_shard_tree(filter, &roots).await? {
+        return Ok(ShardSyncResult::NotReady(
+            "the archive does not hold the session's attested base state, or its roots differ",
+        ));
+    }
+    tracing::info!(filter = %hex::encode(filter), refused_frame = number,
+        "archive's latest shard frame refused; bootstrapped from the base state its certified first frame attests");
+    Ok(ShardSyncResult::Inherited { pinned: true })
+}
+
 /// An anchor and its predecessor, both accepted by `validate`; `None` when
 /// refused. A malformed or wrong-shard anchor, or one that is not frame
 /// `expected`, is an error.
@@ -490,24 +554,49 @@ where
     Ok(validate(anchor.clone(), predecessor.clone()).await?.then_some((anchor, predecessor)))
 }
 
-/// A stale worker must discover the archive tip even when it has a local
-/// clock head. Authenticate the selected chain before installing any leaves.
-/// The validator runs on the engine that owns the worker's committee view.
-///
-/// `committed`: the frame GLOBAL has executed the shard's current session
-/// through, or its base (`app_handoff::committed_tip`). When the archive's
-/// latest frame is refused, the anchor falls back to that frame.
+/// [`sync_shard_from_latest_attested`] for a session whose base needs no
+/// attestation.
+#[cfg(test)]
 pub(crate) async fn sync_shard_from_latest<F, Fut>(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: Option<AppShardFrame>,
     origin_anchors: &[(Vec<u8>, [[u8; 32]; 4])],
     committed: Option<u64>,
-    mut validate: F,
+    validate: F,
 ) -> Result<ShardSyncResult>
 where
     F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
+{
+    sync_shard_from_latest_attested(
+        syncer, filter, local, origin_anchors, committed, validate, |_| async { Ok(None) },
+    ).await
+}
+
+/// A stale worker must discover the archive tip even when it has a local
+/// clock head. Authenticate the selected chain before installing any leaves.
+/// The validator runs on the engine that owns the worker's committee view.
+///
+/// `committed`: the frame GLOBAL has executed the shard's current session
+/// through, or its base (`app_handoff::committed_tip`). When the archive's
+/// latest frame is refused, the anchor falls back to that frame, and
+/// `attest_base` gives the base-state
+/// roots a refused archive tip attests (see [`sync_unexecuted_base`]).
+pub(crate) async fn sync_shard_from_latest_attested<F, Fut, A, AFut>(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    local: Option<AppShardFrame>,
+    origin_anchors: &[(Vec<u8>, [[u8; 32]; 4])],
+    committed: Option<u64>,
+    mut validate: F,
+    mut attest_base: A,
+) -> Result<ShardSyncResult>
+where
+    F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+    A: FnMut(AppShardFrame) -> AFut,
+    AFut: std::future::Future<Output = Result<Option<Vec<Vec<u8>>>>>,
 {
     use crate::worker_execution::recovery_phase;
     let remote = syncer.get_app_shard_frame(filter, 0).await?;
@@ -565,6 +654,7 @@ where
         } else { ShardSyncResult::NotReady("the archive could not supply the covered subtree") });
     };
     let latest = height(&anchor);
+    let refused = (committed == Some(0)).then(|| anchor.clone());
     let (anchor, predecessor) = match authenticated_anchor(syncer, filter, anchor, None, &mut validate).await? {
         Some(pair) => pair,
         // The latest frame an archive holds can lie above the checkpoint GLOBAL
@@ -576,6 +666,11 @@ where
         // that needed such members for quorum never produced (2026-10-13). The
         // frame GLOBAL committed is the successor's base and authenticated.
         None => {
+            // GLOBAL executed no frame of a session based at frame 0, which
+            // has no frame to anchor at.
+            if let Some(refused) = refused {
+                return sync_unexecuted_base(syncer, filter, origin_anchors, refused, &mut attest_base).await;
+            }
             let Some(committed) = committed.filter(|&number| number > 0 && number < latest) else {
                 return Ok(ShardSyncResult::NotReady("the archive checkpoint failed validation"));
             };
@@ -908,6 +1003,89 @@ mod tests {
             assert!(matches!(result, ShardSyncResult::NotReady(_)));
             assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 506"]);
         }
+    }
+
+    /// A session based at 0 of which GLOBAL executed nothing; the archive's
+    /// latest frame (1) is refused. Certified origins pin the base state;
+    /// otherwise the refused frame's attested pre-state roots do; with
+    /// neither the sync refuses and never takes the archive's subtree
+    /// unpinned (the mock panics on an unpinned sync).
+    #[tokio::test]
+    async fn a_refused_tip_over_an_unexecuted_base_syncs_only_certified_state() {
+        let refuse = |_: AppShardFrame, _: Option<AppShardFrame>| async { Ok(false) };
+
+        let anchors = vec![(vec![1; 32], [[0x51; 32]; 4])];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(1)), calls: calls.clone() };
+        let result = sync_shard_from_latest(&archive, &[5; 32], None, &anchors, Some(0), refuse).await.unwrap();
+        assert!(matches!(result, ShardSyncResult::Inherited { pinned: true }));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0", "sync 81"], "pinned to the origin's sealed roots");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(1)), calls: calls.clone() };
+        let attested = |refused: AppShardFrame| async move {
+            assert_eq!(refused.header.unwrap().frame_number, 1);
+            Ok(Some(vec![vec![0x22; 32]; 4]))
+        };
+        let result = sync_shard_from_latest_attested(&archive, &[5; 32], None, &[], Some(0), refuse, attested)
+            .await.unwrap();
+        assert!(matches!(result, ShardSyncResult::Inherited { pinned: true }));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0", "sync 34"], "pinned to the attested pre-state");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(1)), calls: calls.clone() };
+        let result = sync_shard_from_latest_attested(&archive, &[5; 32], None, &[], Some(0), refuse,
+            |_| async { Ok(None) }).await.unwrap();
+        assert!(matches!(result, ShardSyncResult::NotReady(reason) if reason.contains("nothing certifies")));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0"], "no unpinned sync");
+
+        // A committed frame above 0 keeps its own fallback; nothing is attested.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(507)), calls: calls.clone() };
+        let never = |_: AppShardFrame| async { panic!("attested only over an unexecuted base 0") };
+        let result = sync_shard_from_latest_attested(&archive, &[5; 32], None, &[], Some(507), refuse, never)
+            .await.unwrap();
+        assert!(matches!(result, ShardSyncResult::NotReady(_)));
+    }
+
+    /// Serves frame 1 as its latest; every pinned tree sync fails (the
+    /// archive does not retain that state); an unpinned one panics.
+    struct UnretainedArchive {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for UnretainedArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            self.calls.lock().unwrap().push(format!("fetch {number}"));
+            Ok(Some(frame(1)))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], roots: &[Vec<u8>]) -> Result<bool> {
+            self.calls.lock().unwrap().push(format!("sync {}", roots[0][0]));
+            Ok(false)
+        }
+    }
+
+    /// Over an unexecuted base 0, an archive that cannot serve the certified
+    /// base state leaves the sync not ready; it never falls back to the
+    /// archive's current subtree.
+    #[tokio::test]
+    async fn an_unretained_base_state_is_never_replaced_by_unpinned_state() {
+        let refuse = |_: AppShardFrame, _: Option<AppShardFrame>| async { Ok(false) };
+        let anchors = vec![(vec![1; 32], [[0x51; 32]; 4])];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = UnretainedArchive { calls: calls.clone() };
+        let result = sync_shard_from_latest(&archive, &[5; 32], None, &anchors, Some(0), refuse).await.unwrap();
+        assert!(matches!(result, ShardSyncResult::NotReady(reason) if reason.contains("certified base state")));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0", "sync 81"], "pinned only");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = UnretainedArchive { calls: calls.clone() };
+        let result = sync_shard_from_latest_attested(&archive, &[5; 32], None, &[], Some(0), refuse,
+            |_| async { Ok(Some(vec![vec![0x22; 32]; 4])) }).await.unwrap();
+        assert!(matches!(result, ShardSyncResult::NotReady(reason) if reason.contains("attested base state")));
+        assert_eq!(*calls.lock().unwrap(), ["fetch 0", "sync 34"], "pinned only");
     }
 
     /// Holds no frame of the shard; records each tree sync as
