@@ -7,6 +7,9 @@ on:
     # base so regressions are attributed to the push that introduced them.
     branches: [develop, 'develop-*', 'v[0-9]*']
   pull_request:
+  # A merge queue tests each queued PR on the base plus the PRs ahead of
+  # it, so changes that pass alone but conflict together never land.
+  merge_group:
 
 concurrency:
   group: rust-ci-${{ github.ref }}
