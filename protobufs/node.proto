@@ -566,6 +566,11 @@ message RespawnRequest {
 }
 
 message RespawnResponse {
+  // The worker is starting: it applies the Respawn once its initial
+  // prover-tree sync completes.
+  bool deferred = 1;
+  // The worker already ran the filter and kept its engine.
+  bool kept = 2;
 }
 
 message CreateJoinProofRequest {
@@ -640,7 +645,8 @@ message EvictPayloadResponse {
 message GetWorkerExecutionRequest {}
 
 message GetWorkerExecutionResponse {
-  // The filter of the engine this worker runs; empty when it runs none.
+  // The filter of the engine this worker runs, or of the Respawn it is
+  // applying; empty when it runs none or its engine has exited.
   bytes filter = 1;
   WorkerExecution execution = 2;
   // The worker's clock when it answered, so the master can rebase the
