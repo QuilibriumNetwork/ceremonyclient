@@ -218,6 +218,8 @@ impl ProverRegistry for TestProverRegistry {
 /// plumbing.
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
+    /// Configured worker count; `None` uses the number of workers.
+    capacity: Mutex<Option<usize>>,
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
     unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
@@ -233,10 +235,17 @@ impl TestWorkerManager {
     pub fn new() -> Self {
         Self {
             workers: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(None),
             evictions: Mutex::new(Vec::new()),
             executions: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure fewer workers than there are records, as after an operator
+    /// lowers the worker count.
+    pub fn set_allocation_capacity(&self, capacity: usize) {
+        *self.capacity.lock().unwrap() = Some(capacity);
     }
 
     /// The execution report `core_id`'s engine gives for `filter`.
@@ -279,6 +288,11 @@ impl TestWorkerManager {
 }
 
 impl WorkerManager for TestWorkerManager {
+    fn allocation_capacity(&self) -> Result<usize> {
+        let configured = *self.capacity.lock().unwrap();
+        Ok(configured.unwrap_or_else(|| self.workers.lock().unwrap().len()))
+    }
+
     /// Reports set with `set_execution`, for workers still bound to their filter.
     fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
         let workers = self.workers.lock().unwrap();
