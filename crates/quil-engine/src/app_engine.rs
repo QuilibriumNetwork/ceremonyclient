@@ -10749,12 +10749,12 @@ mod tests {
             AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
         let turns: &'static crate::recovery_turns::RecoveryTurns =
             Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
-        let held = turns.acquire(Arc::new(AtomicBool::new(false))).await;
+        let held = turns.acquire(Arc::new(AtomicBool::new(false)), false).await;
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let run = |name: &'static str, blocked: Arc<AtomicBool>| {
             let order = order.clone();
             tokio::spawn(async move {
-                let _turn = turns.acquire(blocked).await;
+                let _turn = turns.acquire(blocked, false).await;
                 order.lock().unwrap().push(name);
             })
         };
