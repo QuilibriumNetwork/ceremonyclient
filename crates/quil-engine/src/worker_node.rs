@@ -138,6 +138,11 @@ pub struct WorkerOnlyNode {
     /// Stop the old engine and its transport wait before rebinding this worker.
     engine_cancel: std::sync::Mutex<Option<CancellationToken>>,
     respawn_lock: tokio::sync::Mutex<()>,
+    /// When the engine generation last changed: a payload eviction waits
+    /// for the previous engine's detached tasks to finish with its scope.
+    bound_since: std::sync::Mutex<std::time::Instant>,
+    /// Set while this worker's payload eviction passes run.
+    evicting: Arc<std::sync::atomic::AtomicBool>,
     /// Channel for engine events back to the master stream.
     engine_event_tx: mpsc::UnboundedSender<crate::app_engine::AppEngineEvent>,
     /// Optional receiver for engine events — consumed by the
@@ -460,6 +465,8 @@ impl WorkerOnlyNode {
             engine_handle: std::sync::Mutex::new(None),
             engine_cancel: std::sync::Mutex::new(None),
             respawn_lock: tokio::sync::Mutex::new(()),
+            bound_since: std::sync::Mutex::new(std::time::Instant::now()),
+            evicting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
@@ -943,6 +950,7 @@ impl WorkerOnlyNode {
     pub async fn respawn(&self, filter: Vec<u8>) -> Result<()> {
         let _respawn = self.respawn_lock.lock().await;
         let core_id = self.config.core_id;
+        *self.bound_since.lock().unwrap() = std::time::Instant::now();
 
         // Stop existing engine and drop subscriptions for the
         // outgoing filter.
@@ -1042,15 +1050,7 @@ impl WorkerOnlyNode {
             // worker's own (unique) data dir AND clear the prefix/paths so
             // `cw_app_storage_base` resolves to that unique `db.path`
             // (`<data_dir>/cw-app-consensus/app-<addr>`), never the shared prefix.
-            db_config: {
-                let mut d = quil_config::DbConfig::default();
-                if let Some(dir) = self.config.data_dir.as_ref() {
-                    d.path = dir.to_string_lossy().into_owned();
-                }
-                d.worker_path_prefix = String::new();
-                d.worker_paths = Vec::new();
-                d
-            },
+            db_config: self.consensus_db_config(),
             // Multi-process worker: consolidation hook not wired here yet (the
             // thread-mode path is the mainnet path); the flip still occurs.
             unified_cutover_hook: None,
@@ -1098,6 +1098,18 @@ impl WorkerOnlyNode {
         self.subscribe_to_shard_bitmasks(&filter, transport_handle, engine_cancel).await;
 
         Ok(())
+    }
+
+    /// The DB config whose `cw_app_storage_base` is this worker's own data
+    /// dir (see `respawn`).
+    fn consensus_db_config(&self) -> quil_config::DbConfig {
+        let mut d = quil_config::DbConfig::default();
+        if let Some(dir) = self.config.data_dir.as_ref() {
+            d.path = dir.to_string_lossy().into_owned();
+        }
+        d.worker_path_prefix = String::new();
+        d.worker_paths = Vec::new();
+        d
     }
 
     /// Subscribe to all per-shard bitmasks for `filter` on the
@@ -1523,6 +1535,37 @@ fn deliver_to_engine(
     true
 }
 
+/// Start the eviction passes for `keep` unless the binding of `handle`
+/// defers them or a run is in progress. Returns why they did not start.
+fn start_payload_eviction<R>(
+    core_id: u32,
+    handle: Option<&AppEngineHandle>,
+    bound_for: Duration,
+    evicting: &Arc<std::sync::atomic::AtomicBool>,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    keep: Vec<Vec<u8>>,
+    storage: Option<(std::path::PathBuf, R)>,
+) -> Option<&'static str>
+where
+    R: Fn(&[u8]) -> bool + Send + 'static,
+{
+    let bound = handle.map(|handle| handle.filter.clone()).unwrap_or_default();
+    let serving = handle.is_some_and(|handle| handle.is_running());
+    if let Some(reason) = crate::worker_payload_eviction::deferral(&bound, &keep, serving, bound_for) {
+        info!(core_id, reason, "worker payload eviction deferred");
+        return Some(reason);
+    }
+    if evicting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Some("an eviction is running");
+    }
+    let flag = evicting.clone();
+    tokio::spawn(async move {
+        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage).await;
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    None
+}
+
 #[tonic::async_trait]
 impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     for DataIpcServiceImpl
@@ -1646,6 +1689,50 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         Ok(tonic::Response::new(
             quil_types::proto::node::SetHaltedResponse {},
         ))
+    }
+
+    /// The master's request to remove what this worker's store keeps
+    /// outside `keep`, computed as for its thread workers. The worker runs
+    /// the thread workers' passes once its own binding is protected, served
+    /// and settled; they continue after the answer.
+    async fn evict_payload(
+        &self,
+        request: tonic::Request<quil_types::proto::node::EvictPayloadRequest>,
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::node::EvictPayloadResponse>,
+        tonic::Status,
+    > {
+        let keep = request.into_inner().keep;
+        let worker = &self.worker;
+        let Some(crdt) = worker.hypergraph.clone() else {
+            return Err(tonic::Status::unavailable("worker has no shard storage"));
+        };
+        let handle = worker
+            .engine_handle
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
+            .clone();
+        let bound_for = worker
+            .bound_since
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker binding unavailable"))?
+            .elapsed();
+        // As in `respawn`: on a network with committee sessions this
+        // worker's own store holds the authorization records.
+        let storage = crate::app_engine::cw_app_storage_base(&worker.consensus_db_config(), worker.config.core_id)
+            .map(|base| {
+                let global = quil_types::consensus::committee_handoff_policy().and(worker.hypergraph.clone());
+                let member = worker.local_bls_pubkey.clone();
+                (base, move |shard: &[u8]| global.as_ref().is_none_or(|global|
+                    crate::app_handoff::retains_worker(global, shard, &member)))
+            });
+        let deferred = start_payload_eviction(
+            worker.config.core_id, handle.as_ref(), bound_for, &worker.evicting, crdt, keep, storage,
+        );
+        Ok(tonic::Response::new(quil_types::proto::node::EvictPayloadResponse {
+            started: deferred.is_none(),
+            deferred: deferred.unwrap_or_default().to_string(),
+        }))
     }
 
     async fn prepare_storage_confirm(
@@ -2101,6 +2188,40 @@ mod tests {
             cancel.cancel();
             assert!(!tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap().unwrap());
         }
+    }
+
+    /// A standalone worker starts the passes only for a protected, served
+    /// and settled binding, one run at a time, and clears the run when
+    /// they finish.
+    #[tokio::test]
+    async fn a_standalone_worker_starts_eviction_only_for_a_settled_protected_binding() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        let bound = vec![7u8; 32];
+        let (handle, _receiver) = AppEngineHandle::for_test(bound.clone());
+        let settled = crate::worker_allocator::PAYLOAD_EVICTION_SETTLE;
+        let evicting = Arc::new(AtomicBool::new(false));
+        let start = |handle: Option<&AppEngineHandle>, bound_for: Duration, keep: Vec<Vec<u8>>| {
+            let no_storage: Option<(std::path::PathBuf, fn(&[u8]) -> bool)> = None;
+            start_payload_eviction(1, handle, bound_for, &evicting, crdt.clone(), keep, no_storage)
+        };
+        assert_eq!(start(None, settled, vec![bound.clone()]), Some("binding is not protected"));
+        assert_eq!(start(Some(&handle), settled, vec![vec![8; 32]]), Some("binding is not protected"));
+        assert_eq!(start(Some(&handle), Duration::from_secs(1), vec![bound.clone()]), Some("binding has not settled"));
+        evicting.store(true, Ordering::SeqCst);
+        assert_eq!(start(Some(&handle), settled, vec![bound.clone()]), Some("an eviction is running"));
+        evicting.store(false, Ordering::SeqCst);
+        assert_eq!(start(Some(&handle), settled, vec![bound.clone()]), None);
+        for _ in 0..200 {
+            if !evicting.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!evicting.load(Ordering::SeqCst), "the finished run is cleared");
     }
 
     #[test]

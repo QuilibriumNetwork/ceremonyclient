@@ -617,6 +617,24 @@ service DataIPCService {
   // renews a seat only while its worker hosts the committee session that
   // counts it, and shows the report to operators.
   rpc GetWorkerExecution(GetWorkerExecutionRequest) returns (GetWorkerExecutionResponse);
+  // EvictPayload asks a standalone worker to remove the payload, forest and
+  // consensus storage its own store keeps outside the shard filters in
+  // `keep`, as a thread worker does. The worker revalidates its binding and
+  // runs the removal after answering.
+  rpc EvictPayload(EvictPayloadRequest) returns (EvictPayloadResponse);
+}
+
+message EvictPayloadRequest {
+  // The worker's binding and the shards a staged split or merge of its
+  // application creates.
+  repeated bytes keep = 1;
+}
+
+message EvictPayloadResponse {
+  // The worker started its removal passes.
+  bool started = 1;
+  // Why it did not, when it did not.
+  string deferred = 2;
 }
 
 message GetWorkerExecutionRequest {}
