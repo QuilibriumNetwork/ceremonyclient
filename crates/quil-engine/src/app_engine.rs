@@ -3274,10 +3274,17 @@ impl AppConsensusEngine {
         let terminal = descendants.last().ok_or_else(|| QuilError::InvalidSignature(
             "archive replay frame has no certified descendant".into()))?;
         let terminal_retained = storage_history_retained(&validator, terminal).await;
+        let terminal_valid = validate_certified_frame(&validator, terminal, terminal_retained)?
+            && self.body_matches_requests_root(terminal);
+        // The linked frames' outputs are checked against GLOBAL anchors from
+        // this node's clock: fetch the missing ones first, once the
+        // certificate checks out, as their storage history is fetched below.
+        if terminal_valid {
+            crate::frame_validator::prepare_archive_replay_anchors(&validator, &frame, &descendants).await?;
+        }
         crate::frame_validator::validate_archive_replay_chain(
             &frame, &descendants,
-            |terminal| Ok(validate_certified_frame(&validator, terminal, terminal_retained)?
-                && self.body_matches_requests_root(terminal)),
+            |_| Ok(terminal_valid),
             |linked| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
                 Ok(validator.validate_linked_without_storage(linked)?
                     && self.body_matches_requests_root(linked)))) {
@@ -3313,8 +3320,15 @@ impl AppConsensusEngine {
     ) -> Result<u64> {
         let number = frame.header.as_ref().map_or(0, |header| header.frame_number);
         let materialized = self.last_materialized_frame;
+        let anchors: Vec<(u64, u64)> = std::iter::once(&frame).chain(&descendants)
+            .filter_map(|frame| frame.header.as_ref().map(|header| (header.frame_number, header.global_frame_number)))
+            .collect();
         let result = self.replay_archive_frame(frame, descendants).await;
-        self.note_replay_outcome(number, materialized, &result);
+        // The first frame of the chain whose GLOBAL anchor this node still lacks.
+        let unanchored = result.is_err().then(|| anchors.into_iter().find(|&(_, global)| {
+            global > 0 && self.global_anchor_store.get_global_clock_frame(global).is_err()
+        })).flatten();
+        self.note_replay_outcome(number, materialized, unanchored, &result);
         result
     }
 
@@ -3322,12 +3336,15 @@ impl AppConsensusEngine {
     /// successor-blocked warning, as an anchor refusal is kept, and clear it
     /// once a frame replays. A frame already materialized (at or below
     /// `materialized` before the attempt) replays nothing and changes neither.
-    fn note_replay_outcome(&mut self, number: u64, materialized: u64, result: &Result<u64>) {
+    /// `unanchored` names the chain's first frame whose GLOBAL anchor this
+    /// node lacks, with that anchor.
+    fn note_replay_outcome(&mut self, number: u64, materialized: u64, unanchored: Option<(u64, u64)>, result: &Result<u64>) {
         if number <= materialized {
             return;
         }
         self.predecessor_block.refusal = result.as_ref().err().map(|error| AnchorRefusal {
-            frame: Some(number), global_frame: None, at_unix_ms: crate::worker_execution::now_ms(),
+            frame: Some(unanchored.map_or(number, |(frame, _)| frame)), global_frame: unanchored.map(|(_, global)| global),
+            at_unix_ms: crate::worker_execution::now_ms(),
             cause: "archive replay frame refused", error: error.to_string(),
         });
     }
@@ -12294,7 +12311,7 @@ mod tests {
             && line.contains("last_error=invalid signature: archive replay frame has no certified descendant"),
             "{line}");
         // A frame already materialized replays nothing and keeps it.
-        engine.note_replay_outcome(7, 7, &Ok(7));
+        engine.note_replay_outcome(7, 7, None, &Ok(7));
         assert!(engine.predecessor_block.refusal.is_some());
         // A later failure of another kind replaces it.
         engine.predecessor_block.refusal.as_mut().unwrap().at_unix_ms -= 2 * REFUSAL_ATTEMPT_MS;
@@ -12303,7 +12320,7 @@ mod tests {
         assert!(line.contains("anchor_frame=none ")
             && line.contains("last_error=execution unavailable: archive connect refused (3 consecutive"), "{line}");
         // A replayed frame clears it.
-        engine.note_replay_outcome(8, 7, &Ok(8));
+        engine.note_replay_outcome(8, 7, None, &Ok(8));
         assert!(engine.predecessor_block.refusal.is_none());
         // Waiting for the predecessor's outgoing history names that wait,
         // not a refusal; with neither, none is claimed.
@@ -12651,6 +12668,97 @@ mod tests {
         .unwrap();
         assert_eq!(materialized.processed, 0);
         assert_eq!(materialized.skipped, 0);
+    }
+
+    /// A frame final only through its certified child is checked against its
+    /// own GLOBAL anchor, which may lie in a hole of this node's GLOBAL
+    /// chain. The replay fetches it from the node's own master before
+    /// validating the chain; it validated first, so it was refused for the
+    /// missing anchor on every retry. A failed fetch is the refusal, naming
+    /// the anchor and the master's reason.
+    #[tokio::test]
+    async fn an_uncertified_replay_fetches_its_missing_global_anchor_before_validating() {
+        use quil_types::consensus::{ProverInfo, ProverStatus};
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::global::{AppShardFrame, FrameHeader, GlobalFrame, GlobalFrameHeader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        quil_crypto::init();
+        // Frame 95 is anchored in the hole; its certified child to the next
+        // GLOBAL frame, which this node holds below its GLOBAL head.
+        let hole = quil_types::consensus::epoch_length_frames() * 11 + 3;
+        let global = |number, output: u8| GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: number, output: vec![output; 516], ..Default::default() }),
+            requests: vec![],
+        };
+        let anchors = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        anchors.seed_frame(global(hole + 1, 10));
+        anchors.seed_frame(global(hole + 20, 11));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: crate::global_anchor::GlobalAnchorSource = {
+            let calls = calls.clone();
+            Arc::new(move |number| {
+                assert_eq!(number, hole);
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    if first {
+                        return Err(QuilError::ExecutionUnavailable("GLOBAL frame not retained by the master".into()));
+                    }
+                    Ok(global(number, 9))
+                })
+            })
+        };
+        let signer = quil_crypto::FalconSigner::generate();
+        let filter = vec![8; 32];
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            global_anchor_store: Some(anchors.clone()), global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::with_prover(ProverInfo {
+                public_key: signer.public_key().to_vec(), address: vec![7; 32], status: ProverStatus::Active,
+                kick_frame_number: 0, allocations: vec![], available_storage: 0, seniority: 0,
+                delegate_address: vec![],
+            })),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (engine, _handle) = AppConsensusEngine::new(1, filter.clone(), deps, events);
+        let mut engine = engine.with_global_anchor_source(Some(source));
+        let shard_frame = |number: u64, global_frame_number, parent_selector| AppShardFrame {
+            header: Some(FrameHeader {
+                address: filter.clone(), frame_number: number, rank: number, global_frame_number,
+                timestamp: number as i64, state_roots: vec![vec![0; 32]; 4], prover: vec![7; 32], parent_selector,
+                ..Default::default()
+            }),
+            requests: vec![],
+            storage_attestation: None,
+        };
+        let mut frame = shard_frame(95, hole, vec![]);
+        crate::frame_validator::history_tests::certify(&mut frame, &signer, &[9; 516]);
+        frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+        let parent = quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap();
+        let mut child = shard_frame(96, hole + 1, parent.to_vec());
+        crate::frame_validator::history_tests::certify(&mut child, &signer, &[10; 516]);
+
+        let refused = engine.replay_archive_frame_for_sync(frame.clone(), vec![child.clone()]).await.unwrap_err();
+        assert!(refused.to_string().contains("GLOBAL frame not retained by the master"), "{refused}");
+        let refusal = engine.predecessor_block.refusal.clone().unwrap();
+        assert_eq!((refusal.frame, refusal.global_frame), (Some(95), Some(hole)), "the warning names the anchor");
+        // Fetched, the chain validates; this engine then lacks frames 1-94.
+        let replayed = engine.replay_archive_frame_for_sync(frame, vec![child]).await.unwrap_err();
+        assert!(replayed.to_string().contains("archive replay would skip a materialization gap"), "{replayed}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(anchors.get_global_clock_frame(hole).is_ok());
+        assert_eq!(engine.predecessor_block.refusal.as_ref().unwrap().global_frame, None);
     }
 
     #[tokio::test]
