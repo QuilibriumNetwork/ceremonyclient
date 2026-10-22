@@ -66,6 +66,8 @@ where
     epoch: Epoch,
     // QUILIBRIUM: discarded peer messages awaiting their summary line.
     discards: super::discards::Discards<S::PublicKey>,
+    // QUILIBRIUM: repeated and conflicting votes per signer (repeats.rs).
+    repeats: super::repeats::Repeats<S::PublicKey>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
 
@@ -133,6 +135,7 @@ where
                 forwarding: cfg.forwarding,
                 epoch: cfg.epoch,
                 discards: Default::default(),
+                repeats: Default::default(),
 
                 mailbox_receiver: receiver,
 
@@ -150,9 +153,11 @@ where
     }
 
     /// QUILIBRIUM: name the engine's journal partition in discard summaries
-    /// (discards.rs), so a line identifies its session.
+    /// (discards.rs) and repeated-vote summaries (repeats.rs), so a line
+    /// identifies its session.
     pub fn name_discards(&mut self, partition: &str) {
         self.discards.partition = partition.to_string();
+        self.repeats.partition = partition.to_string();
     }
 
     fn new_round(&self, view: View) -> Round<S, B, D, Re> {
@@ -559,12 +564,29 @@ where
                 }
                 self.record_activity(&sender, view);
 
-                // Add the vote to the verifier
-                if work
+                // QUILIBRIUM: end the episodes of signers whose repeated or
+                // conflicting votes stopped, then summarize this vote's
+                // (repeats.rs).
+                let now = self.context.as_ref().current();
+                for line in self.repeats.expire(now) {
+                    line.log(&self.repeats.partition, self.epoch.get());
+                }
+                let added = match work
                     .entry(view)
                     .or_insert_with(|| self.new_round(view))
                     .add_network(sender.clone(), message)
                 {
+                    Ok(added) => added,
+                    Err((repeat, index)) => {
+                        for line in self.repeats.record(now, &sender, index, repeat, view.get()) {
+                            line.log(&self.repeats.partition, self.epoch.get());
+                        }
+                        false
+                    }
+                };
+
+                // Add the vote to the verifier
+                if added {
                     self.added.inc();
 
                     // Update per-peer latest vote metric (only if higher than current)

@@ -1,4 +1,4 @@
-use super::{verifier::offload, Verifier};
+use super::{repeats::Repeat, verifier::offload, Verifier};
 use crate::{
     simplex::{
         actors::span::ViewSpan,
@@ -132,11 +132,21 @@ impl<
     }
 
     /// Adds a vote from the network to this round's verifier.
-    pub fn add_network(&mut self, sender: S::PublicKey, message: Vote<S, D>) -> bool {
+    ///
+    /// QUILIBRIUM: a further vote of a member in this view that is repeated
+    /// (re-signed) or conflicting returns `Err` with its kind and the
+    /// signer's index, which the batcher summarizes per signer (repeats.rs)
+    /// instead of upstream's warning per message. The sender is blocked and
+    /// the evidence reported as upstream.
+    pub fn add_network(
+        &mut self,
+        sender: S::PublicKey,
+        message: Vote<S, D>,
+    ) -> Result<bool, (Repeat, Participant)> {
         // Check if sender is a participant
         let Some(index) = self.verifier.participants().index(&sender) else {
             commonware_p2p::block!(self.blocker, sender, "unknown participant");
-            return false;
+            return Ok(false);
         };
 
         // Attempt to reserve
@@ -145,27 +155,32 @@ impl<
                 // Verify sender is signer
                 if index != notarize.signer() {
                     commonware_p2p::block!(self.blocker, sender, "notarize signer mismatch");
-                    return false;
+                    return Ok(false);
                 }
 
                 // Try to reserve
                 match self.votes.notarize(index) {
                     Some(previous) => {
-                        if previous.proposal != notarize.proposal {
+                        // QUILIBRIUM: summarized per signer (repeats.rs).
+                        let repeat = if previous.proposal != notarize.proposal {
                             let activity = ConflictingNotarize::new(previous.clone(), notarize);
                             self.reporter
                                 .report(Activity::ConflictingNotarize(activity));
-                            commonware_p2p::block!(self.blocker, sender, "conflicting notarize");
+                            Repeat::Conflicting
                         } else if previous != &notarize {
-                            commonware_p2p::block!(self.blocker, sender, "invalid signature");
-                        }
-                        false
+                            Repeat::Resigned
+                        } else {
+                            return Ok(false);
+                        };
+                        #[allow(clippy::disallowed_methods)]
+                        self.blocker.block(sender);
+                        Err((repeat, index))
                     }
                     None => {
                         self.reporter.report(Activity::Notarize(notarize.clone()));
                         self.votes.insert_notarize(notarize.clone());
                         self.verifier.add(Vote::Notarize(notarize), false);
-                        true
+                        Ok(true)
                     }
                 }
             }
@@ -173,30 +188,37 @@ impl<
                 // Verify sender is signer
                 if index != nullify.signer() {
                     commonware_p2p::block!(self.blocker, sender, "nullify signer mismatch");
-                    return false;
+                    return Ok(false);
                 }
 
                 // Check if finalized
                 if let Some(previous) = self.votes.finalize(index) {
                     let activity = NullifyFinalize::new(nullify, previous.clone());
                     self.reporter.report(Activity::NullifyFinalize(activity));
-                    commonware_p2p::block!(self.blocker, sender, "nullify after finalize");
-                    return false;
+                    // QUILIBRIUM: summarized per signer (repeats.rs).
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
+                    return Err((Repeat::NullifyFinalize, index));
                 }
 
                 // Try to reserve
                 match self.votes.nullify(index) {
                     Some(previous) => {
-                        if previous != &nullify {
-                            commonware_p2p::block!(self.blocker, sender, "conflicting nullify");
+                        if previous == &nullify {
+                            return Ok(false);
                         }
-                        false
+                        // QUILIBRIUM: a nullify names only its round, so a
+                        // differing one is re-signed; summarized per signer
+                        // (repeats.rs).
+                        #[allow(clippy::disallowed_methods)]
+                        self.blocker.block(sender);
+                        Err((Repeat::Resigned, index))
                     }
                     None => {
                         self.reporter.report(Activity::Nullify(nullify.clone()));
                         self.votes.insert_nullify(nullify.clone());
                         self.verifier.add(Vote::Nullify(nullify), false);
-                        true
+                        Ok(true)
                     }
                 }
             }
@@ -204,35 +226,42 @@ impl<
                 // Verify sender is signer
                 if index != finalize.signer() {
                     commonware_p2p::block!(self.blocker, sender, "finalize signer mismatch");
-                    return false;
+                    return Ok(false);
                 }
 
                 // Check if nullified
                 if let Some(previous) = self.votes.nullify(index) {
                     let activity = NullifyFinalize::new(previous.clone(), finalize);
                     self.reporter.report(Activity::NullifyFinalize(activity));
-                    commonware_p2p::block!(self.blocker, sender, "finalize after nullify");
-                    return false;
+                    // QUILIBRIUM: summarized per signer (repeats.rs).
+                    #[allow(clippy::disallowed_methods)]
+                    self.blocker.block(sender);
+                    return Err((Repeat::NullifyFinalize, index));
                 }
 
                 // Try to reserve
                 match self.votes.finalize(index) {
                     Some(previous) => {
-                        if previous.proposal != finalize.proposal {
+                        // QUILIBRIUM: summarized per signer (repeats.rs).
+                        let repeat = if previous.proposal != finalize.proposal {
                             let activity = ConflictingFinalize::new(previous.clone(), finalize);
                             self.reporter
                                 .report(Activity::ConflictingFinalize(activity));
-                            commonware_p2p::block!(self.blocker, sender, "conflicting finalize");
+                            Repeat::Conflicting
                         } else if previous != &finalize {
-                            commonware_p2p::block!(self.blocker, sender, "invalid signature");
-                        }
-                        false
+                            Repeat::Resigned
+                        } else {
+                            return Ok(false);
+                        };
+                        #[allow(clippy::disallowed_methods)]
+                        self.blocker.block(sender);
+                        Err((repeat, index))
                     }
                     None => {
                         self.reporter.report(Activity::Finalize(finalize.clone()));
                         self.votes.insert_finalize(finalize.clone());
                         self.verifier.add(Vote::Finalize(finalize), false);
-                        true
+                        Ok(true)
                     }
                 }
             }

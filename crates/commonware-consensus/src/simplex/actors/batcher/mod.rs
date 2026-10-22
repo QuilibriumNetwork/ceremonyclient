@@ -1,6 +1,7 @@
 mod actor;
 mod discards;
 mod ingress;
+mod repeats;
 mod round;
 mod verifier;
 
@@ -302,7 +303,10 @@ mod tests {
         round.set_leader(Participant::from_usize(0));
         for (i, scheme) in schemes.iter().enumerate() {
             let notarize = Notarize::sign(scheme, proposal.clone()).unwrap();
-            assert!(round.add_network(participants[i].clone(), Vote::Notarize(notarize)));
+            assert_eq!(
+                round.add_network(participants[i].clone(), Vote::Notarize(notarize)),
+                Ok(true)
+            );
         }
 
         // Batch verify the pending votes on the strategy's pool.
@@ -341,6 +345,80 @@ mod tests {
             verify_and_construct(ed25519::fixture, strategy.clone()).await;
             verify_and_construct(secp256r1::fixture, strategy).await;
         });
+    }
+
+    /// QUILIBRIUM: a member's further vote in a view returns its kind for the
+    /// per-signer summary (repeats.rs) and still blocks its sender; an
+    /// identical copy is ignored silently, as upstream.
+    #[test]
+    fn repeated_and_conflicting_votes_are_returned_and_still_blocked() {
+        #[derive(Clone)]
+        struct Blocked(Arc<Mutex<Vec<PublicKey>>>);
+
+        impl commonware_p2p::Blocker for Blocked {
+            type PublicKey = PublicKey;
+
+            fn block(&mut self, peer: Self::PublicKey) -> Feedback {
+                self.0.lock().push(peer);
+                Feedback::Ok
+            }
+        }
+
+        let mut rng = test_rng();
+        let Fixture {
+            participants,
+            schemes,
+            ..
+        } = ed25519::fixture(&mut rng, b"batcher_test", 5);
+        let blocked = Blocked(Arc::new(Mutex::new(Vec::new())));
+        let round_id = Round::new(Epoch::new(0), View::new(1));
+        let mut round = super::Round::new(
+            round_id,
+            Arc::new(schemes[0].clone()),
+            blocked.clone(),
+            NoopReporter(PhantomData),
+        );
+        let a = Proposal::new(round_id, View::new(0), Sha256::hash(b"a"));
+        let b = Proposal::new(round_id, View::new(0), Sha256::hash(b"b"));
+        let notarize = |i: usize, proposal: &Proposal<Sha256Digest>| {
+            Notarize::sign(&schemes[i], proposal.clone()).unwrap()
+        };
+        let repeat = |kind, index| -> Result<bool, (super::repeats::Repeat, Participant)> {
+            Err((kind, Participant::new(index)))
+        };
+
+        // Signer 1: its vote, an identical copy, the same vote with other
+        // signature bytes, and a vote for another proposal.
+        let first = notarize(1, &a);
+        let mut resigned = first.clone();
+        resigned.attestation.signature = notarize(1, &b).attestation.signature;
+        let one = participants[1].clone();
+        assert_eq!(round.add_network(one.clone(), Vote::Notarize(first.clone())), Ok(true));
+        assert_eq!(round.add_network(one.clone(), Vote::Notarize(first)), Ok(false));
+        assert_eq!(
+            round.add_network(one.clone(), Vote::Notarize(resigned)),
+            repeat(super::repeats::Repeat::Resigned, 1)
+        );
+        assert_eq!(
+            round.add_network(one.clone(), Vote::Notarize(notarize(1, &b))),
+            repeat(super::repeats::Repeat::Conflicting, 1)
+        );
+
+        // Signer 2: a finalize, then a nullify of the same view.
+        let two = participants[2].clone();
+        let finalize = Finalize::sign(&schemes[2], a).unwrap();
+        assert_eq!(round.add_network(two.clone(), Vote::Finalize(finalize)), Ok(true));
+        let nullify = Nullify::sign::<Sha256Digest>(&schemes[2], round_id).unwrap();
+        assert_eq!(
+            round.add_network(two.clone(), Vote::Nullify(nullify)),
+            repeat(super::repeats::Repeat::NullifyFinalize, 2)
+        );
+
+        assert_eq!(
+            *blocked.0.lock(),
+            vec![one.clone(), one, two],
+            "every repeat still blocks its sender"
+        );
     }
 
     fn certificate_forwarding_from_network<S, F>(mut fixture: F)
