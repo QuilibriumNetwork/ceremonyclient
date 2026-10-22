@@ -1611,7 +1611,9 @@ impl ProverLifecycle {
         let worker_bound_filters: std::collections::HashSet<Vec<u8>> =
             worker_view.filter_set().map(|w| w.filter.clone()).collect();
         // Whether each bound seat's worker hosts the committee session that
-        // counts this prover, for the renewal below.
+        // counts this prover, for the renewal below. Seats whose worker is
+        // seen unable to host now are kept for the leave decision too.
+        let mut unable_seats: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         if let Some(prover) = prover_info.as_ref() {
             let bound: Vec<(u32, Vec<u8>)> = worker_view.filter_set()
                 .map(|w| (w.core_id, w.filter.clone())).collect();
@@ -1639,6 +1641,9 @@ impl ProverLifecycle {
                         .map_or(Hosting::Unknown, |(_, _, reason)| super::session_hosting::unanswered(reason)),
                     observed => observed,
                 };
+                if observed.seen_unable(seat) {
+                    unable_seats.insert(filter.clone());
+                }
                 let hosts = observed == Hosting::Hosting;
                 if let Some(run) = hosting.observe(frame_number, epoch_frames, filter, *core_id, seat, observed) {
                     tracing::info!(frame = frame_number, filter = hex::encode(filter), core_id,
@@ -2702,9 +2707,10 @@ impl ProverLifecycle {
                 .map(|w| w.filter.clone())
                 .collect();
 
-            // Three-way partition: manual-pinned, orphan (no worker
-            // bound, or a split-away parent), and auto-bound. Manual + orphan
-            // always confirm; auto-bound goes through score-driven decide.
+            // Four-way partition: manual-pinned, orphan (no worker
+            // bound, or a split-away parent), lapsed, and auto-bound. Manual,
+            // orphan and lapsed always confirm; auto-bound goes through
+            // score-driven decide.
             //
             // A split-away parent no longer exists as a shard, so its score
             // means nothing. Scoring it rejected the very leave the lifecycle
@@ -2713,6 +2719,29 @@ impl ProverLifecycle {
             // them and staged a second root split, and every session retired.
             let mut manual_ready: Vec<Vec<u8>> = Vec::new();
             let mut orphan_ready: Vec<Vec<u8>> = Vec::new();
+            // A seat that had lapsed (missed its epoch renewal) before its
+            // leave was proposed: the orphan sweep left it because no worker
+            // served it. A worker the allocator binds to it afterwards does
+            // not make it current, and the score rule would reject the leave
+            // when no better destination exists: the seat then reads raw
+            // Active at its stale epoch, its renewal fails when the worker
+            // cannot host, the worker is released and the sweep leaves it
+            // again, every two epochs, while the leaving seat keeps a
+            // committee place it never votes in. Let the leave stand when the
+            // bound worker is seen unable to host, by `session_hosting`'s
+            // test: one that hosts, or passed its shard state checks and is
+            // refused only for its seat, is able and would renew the seat, so
+            // the score rule decides as before; an unknown report (stale, or
+            // a build without the call) is never held against the seat. A
+            // worker still syncing or recovering the shard is unable: a
+            // lapsed seat stays lapsed until its worker passes those checks,
+            // so its leave stands too. Same lapse test as the registry's
+            // `left_current`.
+            let lapsed_when_left = |f: &Vec<u8>| prover_info.as_ref().is_some_and(|p| p.allocations.iter().any(|a|
+                &a.confirmation_filter == f && a.status == quil_types::consensus::ProverStatus::Leaving
+                    && a.leave_frame_number > 0
+                    && a.epoch < quil_types::consensus::epoch_for_frame(a.leave_frame_number)));
+            let mut lapsed_ready: Vec<Vec<u8>> = Vec::new();
             let mut auto_ready: Vec<Vec<u8>> = Vec::new();
             let mut retained_rejections = Vec::new();
             for f in &ready_leave_filters {
@@ -2725,6 +2754,8 @@ impl ProverLifecycle {
                 } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f)
                     || shard_sizes_snapshot.get(f) == Some(&0) {
                     orphan_ready.push(f.clone());
+                } else if lapsed_when_left(f) && unable_seats.contains(f) {
+                    lapsed_ready.push(f.clone());
                 } else if !held_descriptors.iter().any(|d| &d.filter == f) {
                     // Unknown current rank cannot justify an economic departure.
                     // Keep its worker and reject rather than confirm at score zero.
@@ -2792,16 +2823,23 @@ impl ProverLifecycle {
             auto_reject.extend(retained_rejections);
             info!(frame = frame_number, score = auto_confirm.len(),
                 halt_risk_swap = swap_confirm.len(), orphan = orphan_ready.len(),
-                manual = manual_ready.len(), reject = auto_reject.len(),
+                lapsed = lapsed_ready.len(), manual = manual_ready.len(), reject = auto_reject.len(),
                 confirmed_departure_workers = confirmed_departure_workers.len(),
                 "lifecycle leave decision causes");
+            if !lapsed_ready.is_empty() {
+                info!(frame = frame_number, lapsed = lapsed_ready.len(), scope = "local",
+                    reason = "seat had missed its epoch renewal when its leave was proposed, and its rebound worker is seen unable to host its session",
+                    "confirming leaves of lapsed seats rather than rejecting them for their score");
+            }
 
-            // Manual + orphan: always confirm at window, no auto-reject.
-            // Order: auto confirms, then swaps, then orphans, then
-            // manuals — stable per-frame ordering for the log.
+            // Manual, orphan and lapsed: always confirm at window, no
+            // auto-reject. Order: auto confirms, then swaps, then orphans,
+            // then lapsed, then manuals — stable per-frame ordering for the
+            // log.
             let mut combined_confirm = auto_confirm;
             combined_confirm.extend(swap_confirm);
             combined_confirm.extend(orphan_ready);
+            combined_confirm.extend(lapsed_ready);
             combined_confirm.extend(manual_ready);
 
             // Per-message cap: each LifecycleAction maps 1:1 to a
@@ -4211,6 +4249,62 @@ mod proposal_loop_tests {
         lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (available, (100_000_000, 1))]));
         let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
+    }
+
+    /// A seat the orphan sweep left after it missed its epoch renewal can
+    /// have a free worker bound to it before its leave's confirm window. The
+    /// score rule must not reject that leave for want of a better
+    /// destination: rejection restores a stale seat whose renewal the
+    /// worker cannot make. Only a worker seen unable to host lets the leave
+    /// stand: a seat that was current when it left is still kept for its
+    /// score, and so is one whose worker is able to host (refused only for
+    /// its seat) or not observed.
+    #[test]
+    fn a_lapsed_seats_leave_is_confirmed_though_a_worker_rebinds() {
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let better_held = filter_bytes(0xA2);
+        let available = filter_bytes(0xA3);
+        // A worker's answer: its report, made `age_ms` ago, or why it gave none.
+        let reported = |state: &str, blocker: &str, age_ms: u64| Ok::<_, &'static str>(Some(WorkerExecution {
+            state: state.into(), blocker: blocker.into(),
+            observed_unix_ms: crate::worker_execution::now_ms() - age_ms, ..Default::default()
+        }));
+        // (leaving seat's registered epoch, its worker's answer, confirmed)
+        // The leave was proposed at frame 730, in epoch 1.
+        for (epoch, answer, confirmed) in [(u64::MAX, Ok(None), false), (1, Ok(None), false),
+            (0, Err("worker does not answer"), true), (0, reported("blocked", "state unavailable", 0), true),
+            (0, reported("syncing", "staging shard data", 0), true),
+            (0, reported("blocked", "committee admission unavailable", 0), false),
+            (0, Ok(None), false), (0, reported("blocked", "state unavailable", 10 * 60 * 1000), false)]
+        {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, better_held.clone()));
+            match &answer {
+                Err(reason) => wm.set_unanswered(1, &held, *reason),
+                Ok(Some(execution)) => wm.set_execution(1, &held, execution.clone()),
+                Ok(None) => {}
+            }
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.ring = 1;
+            leaving.leave_frame_number = 730;
+            leaving.epoch = epoch;
+            reg.set_prover(prover(address.clone(), vec![leaving, alloc(better_held.clone(), ProverStatus::Active, 10)]));
+            reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(better_held.clone(), 59), shard_summary(available.clone(), 8)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (better_held.clone(), (100_000_000, 1)), (available.clone(), (100_000, 1))]));
+            lc.set_prover_root_verified_frame(1440);
+            let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            let rejects = actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held)));
+            let confirms = actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held)));
+            assert_eq!((confirms, rejects), (confirmed, !confirmed),
+                "epoch {epoch}, answer {answer:?}: actions={actions:?}");
+        }
     }
 
     #[test]
