@@ -1281,6 +1281,22 @@ pub fn committed_tip(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Opti
     Ok(Some(handoff::session_tip(&view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
 }
 
+/// Whether `ended`, a session of `filter`, is one the current session was
+/// looked through to ([`effective_origins`]: same filter, ended at its base,
+/// none of its frames executed) at the current session's base, while GLOBAL
+/// has executed no frame of the current session. Its base state is then the
+/// current session's.
+pub fn shares_unexecuted_base(global: &Arc<HypergraphCrdt>, filter: &[u8], ended: &Session) -> Result<bool> {
+    let view = CommittedView::capture(global)?;
+    let Some(head) = handoff::head(&view, filter)? else { return Ok(false) };
+    if handoff::session_tip(&view, &head.id()?)?.is_some() {
+        return Ok(false);
+    }
+    let id = ended.id()?;
+    Ok(effective_origins(&view, &head)?.looked_through.iter()
+        .any(|through| through.base_frame == head.base_frame && through.id().is_ok_and(|other| other == id)))
+}
+
 /// The certified state a member of `filter` with no frame of its own can
 /// authenticate an archive's copy against: `(source filter, sealed roots)` for
 /// each origin of the shard's current session. The sources partition the
@@ -2392,6 +2408,29 @@ mod successor_tests {
             &Checkpoint { frame: 4, view: 6, digest: [0x55; 32], state_roots: [[1; 32]; 4], history_root: [0; 32] }).unwrap();
         commit(&global, &state, 6);
         assert_eq!(committed_frame_digest(&global, &filter, 4).unwrap(), None, "a predecessor's tip past its seal");
+    }
+
+    /// A session fenced at its base without an executed frame is looked
+    /// through by its successor based at the same frame: its base state is
+    /// the successor's until GLOBAL executes a frame of the successor.
+    #[test]
+    fn a_session_fenced_at_its_base_shares_its_successors_unexecuted_base() {
+        let (global, state) = global_state();
+        let filter = vec![0x0c; 32];
+        let (source, _, _) = closing_session(&global, &state, &filter);
+        assert!(!shares_unexecuted_base(&global, &filter, &source).unwrap(), "still the head");
+        let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        commit(&global, &state, due);
+        let successor = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.base_frame, source.base_frame);
+        assert!(shares_unexecuted_base(&global, &filter, &source).unwrap());
+        assert!(!shares_unexecuted_base(&global, &filter, &successor).unwrap(), "the head is not looked through");
+        handoff::record_session_tip(&state, due + 1, &successor.id().unwrap(), &Checkpoint {
+            frame: 1, view: 1, digest: [0x55; 32], state_roots: [[1; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(&global, &state, due + 1);
+        assert!(!shares_unexecuted_base(&global, &filter, &source).unwrap(), "GLOBAL executed a successor frame");
     }
 
     #[test]

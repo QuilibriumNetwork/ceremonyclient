@@ -58,6 +58,46 @@ pub fn verify_history(
     verify_with(state, claim, bytes, true)
 }
 
+/// The first data frame of a session GLOBAL ended at its base (sealed or
+/// fenced there, none of its frames executed): certified by that session's
+/// committee, frame `base_frame + 1` over its genesis, and past its terminal
+/// checkpoint, so [`verify_history`] refuses it. A header's state roots are
+/// its pre-state, which each voter checked against its own state before it
+/// voted, so this frame attests the session's base state as its certifying
+/// quorum held it. The frame itself stays discarded.
+pub fn verify_discarded_base_frame(
+    state: &impl Records,
+    claim: &FrameClaim<'_>,
+    bytes: &[u8],
+) -> Result<Session> {
+    let generation =
+        unverified_finalization_epoch(bytes).ok_or_else(|| invalid("malformed proposal prefix"))?;
+    if generation == 0 {
+        return Err(invalid("a legacy frame attests no session base"));
+    }
+    let session = session_at_generation(state, claim.filter, generation)?
+        .ok_or_else(|| invalid("generation has no authorization"))?;
+    let certificate = quil_cw_consensus::app_cert::check_finalization(
+        bytes, &session.members, &session.namespace()?, claim.digest,
+    )
+    .map_err(|reason| invalid(&format!("generation {generation}: {reason}")))?;
+    let proposal = &certificate.finalization.proposal;
+    if proposal.round.epoch().get() != session.generation
+        || proposal.round.view().get() != claim.view
+        || claim.frame != session.base_frame + 1
+        || !proposal.parent.is_zero()
+        || claim.parent != session.genesis
+    {
+        return Err(invalid("frame is not the certified first frame of its session"));
+    }
+    let ended_at_base = submitted_checkpoint(state, &session.id()?)?
+        .is_some_and(|end| end.frame == session.base_frame && end.digest == session.genesis);
+    if !ended_at_base {
+        return Err(invalid("session did not end at its base"));
+    }
+    Ok(session)
+}
+
 fn verify_with(
     state: &impl Records,
     claim: &FrameClaim<'_>,

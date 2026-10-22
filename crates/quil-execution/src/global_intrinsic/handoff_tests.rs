@@ -1637,6 +1637,48 @@ fn a_re_sealed_checkpoint_keeps_its_data_frame_verifiable_as_history() {
     }
 }
 
+/// A session GLOBAL fenced at its base finalized frame 1 that GLOBAL never
+/// executed. As history it is refused (past the terminal checkpoint); as the
+/// attestation of the session's base state it is accepted. It is not while
+/// the session is open, nor for a session that ended past its base, nor for
+/// any later frame.
+#[test]
+fn the_first_frame_of_a_session_ended_at_its_base_attests_its_base_state() {
+    use super::frames::{verify_discarded_base_frame, verify_history, FrameClaim};
+    let keys = keys();
+    let filter = vec![0x6c; 32];
+    let first = initial(filter.clone(), &keys);
+    let claim = FrameClaim {
+        filter: &filter, frame: first.base_frame + 1, view: 1, parent: &first.genesis, digest: [0x51; 32],
+    };
+    let certificate = sign_certificate(&first, &keys, 1, 0, claim.digest);
+    let second = FrameClaim { frame: first.base_frame + 2, view: 2, parent: &[0x52; 32], digest: [0x53; 32], ..claim };
+    let second_certificate = sign_certificate(&first, &keys, 2, 1, second.digest);
+
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    initialize(&state, 1, &first).unwrap();
+    let open = verify_discarded_base_frame(&state, &claim, &certificate).unwrap_err();
+    assert!(open.to_string().contains("did not end at its base"), "{open}");
+    schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    assert_eq!(schedule::fence_stalled_sources(&state, 2 + fence_timeout(), &[filter.clone()], None).unwrap(), 1);
+    let refused = verify_history(&state, &claim, &certificate).err().unwrap();
+    assert!(refused.to_string().contains("outside the terminal checkpoint"), "{refused}");
+    assert_eq!(verify_discarded_base_frame(&state, &claim, &certificate).unwrap(), first);
+    let later = verify_discarded_base_frame(&state, &second, &second_certificate).unwrap_err();
+    assert!(later.to_string().contains("not the certified first frame"), "{later}");
+
+    // Sealed past its base at frame 4: frame 1 is executed history.
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    initialize(&state, 1, &first).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    assert!(apply_submission(&state, 3, &submission(&request, 0, &keys, 4)).unwrap());
+    assert!(verify_history(&state, &claim, &certificate).unwrap().is_some());
+    let ran = verify_discarded_base_frame(&state, &claim, &certificate).unwrap_err();
+    assert!(ran.to_string().contains("did not end at its base"), "{ran}");
+}
+
 /// A session asked to close before its first frame seals at its base; when
 /// that seal is notarized but never finalized, its re-seal names the genesis
 /// at the notarized seal's view. GLOBAL refuses it before the seal recovery

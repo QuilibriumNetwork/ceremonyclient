@@ -85,6 +85,12 @@ pub enum AppEngineMessage {
         predecessor: Option<quil_types::proto::global::AppShardFrame>,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// The base-state roots a refused archive tip attests
+    /// ([`AppConsensusEngine::discarded_base_roots`]).
+    DiscardedBaseRoots {
+        frame: quil_types::proto::global::AppShardFrame,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<Vec<u8>>>>,
+    },
     /// The certified origin state a shard with no frame of its own syncs
     /// against (`app_handoff::origin_anchors`).
     OriginAnchors {
@@ -351,6 +357,18 @@ impl AppEngineHandle {
                 .await.map_err(|_| QuilError::ExecutionUnavailable("shard engine stopped before sync validation".into()))?;
             receive.await.map_err(|_| QuilError::ExecutionUnavailable("shard sync validation was cancelled".into()))
         }).await.map_err(|_| QuilError::ExecutionUnavailable("shard sync validation timed out".into()))?
+    }
+
+    pub(crate) async fn discarded_base_roots(
+        &self,
+        frame: quil_types::proto::global::AppShardFrame,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::DiscardedBaseRoots { frame, reply })
+                .await.map_err(|_| QuilError::ExecutionUnavailable("shard engine stopped before base attestation".into()))?;
+            receive.await.map_err(|_| QuilError::ExecutionUnavailable("base attestation was cancelled".into()))
+        }).await.map_err(|_| QuilError::ExecutionUnavailable("base attestation timed out".into()))?
     }
 
     pub(crate) async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
@@ -3498,6 +3516,61 @@ impl AppConsensusEngine {
         )
     }
 
+    /// The base-state roots a refused archive tip attests while GLOBAL has
+    /// executed no frame of this shard's session: the tip must be the
+    /// certified first frame of a same-filter session the current one was
+    /// looked through to, ended at the same base
+    /// ([`quil_execution::global_intrinsic::handoff::frames::verify_discarded_base_frame`],
+    /// [`crate::app_handoff::shares_unexecuted_base`]). Its structure and
+    /// deterministic output, which bind its roots to the certified digest,
+    /// are checked as for any frame. All-zero roots attest nothing: a quorum
+    /// that had staged no data would have certified those. `None` when the
+    /// tip attests nothing.
+    fn discarded_base_roots(
+        &mut self,
+        frame: &quil_types::proto::global::AppShardFrame,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        use quil_execution::global_intrinsic::handoff::frames;
+        let (Some(global), Some(header)) = (self.global_hypergraph.clone(), frame.header.as_ref()) else {
+            return Ok(None);
+        };
+        if header.address != self.filter || header.state_roots.len() != 4
+            || header.state_roots.iter().any(|root| root.len() != 32)
+            || header.state_roots.iter().all(|root| root.iter().all(|byte| *byte == 0))
+        {
+            return Ok(None);
+        }
+        let Some(certificate) = header.public_key_signature_bls48581.as_ref()
+            .and_then(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature))
+        else {
+            return Ok(None);
+        };
+        let Some(view) = crate::app_handoff::committed_view(&global)? else { return Ok(None) };
+        let claim = frames::FrameClaim {
+            filter: &header.address,
+            frame: header.frame_number,
+            view: header.rank,
+            parent: &header.parent_selector,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&header.output)?,
+        };
+        let ended = frames::verify_discarded_base_frame(&view, &claim, certificate)?;
+        if !crate::app_handoff::shares_unexecuted_base(&global, &self.filter, &ended)? {
+            return Ok(None);
+        }
+        // The certificate is verified above; the rest without it.
+        let mut bare = frame.clone();
+        if let Some(header) = bare.header.as_mut() {
+            header.public_key_signature_bls48581 = None;
+        }
+        let validator = self.frame_validator();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_linked_without_storage(&bare))) {
+            Ok(Ok(true)) => Ok(Some(header.state_roots.clone())),
+            Ok(Ok(false)) => Ok(None),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(QuilError::Internal("base attestation validation panicked".into())),
+        }
+    }
+
     /// Keep why the shard sync's archive anchor was refused, for the warning
     /// a successor blocked on its predecessor's state gives: the first of
     /// the two frames whose GLOBAL anchor this node lacks, else the anchor.
@@ -4214,6 +4287,13 @@ impl AppConsensusEngine {
                                 let result = self.replay_archive_frame_for_sync(frame, descendants).await;
                                 let _ = reply.send(result);
                             }
+                        }
+                        Some(AppEngineMessage::DiscardedBaseRoots { frame, reply }) => {
+                            let roots = self.discarded_base_roots(&frame).unwrap_or_else(|error| {
+                                debug!(core_id = self.core_id, %error, "refused archive tip attests no base state");
+                                None
+                            });
+                            let _ = reply.send(roots);
                         }
                         Some(AppEngineMessage::OriginAnchors { reply }) => {
                             let anchors = match self.global_hypergraph.as_ref() {
@@ -11670,6 +11750,109 @@ mod tests {
         let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor), None).await.unwrap_err().to_string();
         assert!(error.starts_with("invalid argument: archive sync anchor frame 8: ")
             && !error.contains("has no certificate"), "{error}");
+    }
+
+    /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without
+    /// executing a frame, and based generation 2 there. Generation 1's
+    /// certified frame 1 attests that base state by its pre-state roots. It
+    /// attests nothing with zero roots, without its certificate, or once
+    /// GLOBAL executed a frame of generation 2; roots that differ from those
+    /// its certified output binds are refused.
+    #[tokio::test]
+    async fn a_discarded_first_frame_attests_the_unexecuted_base_state() {
+        use quil_execution::global_intrinsic::handoff::{self, DesiredCommittee};
+        use quil_types::crypto::Signer as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let signers: Vec<_> = (0..3).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let first = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(), base_frame: 0,
+            authorization: [0; 32], members: members.clone(),
+        };
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let commit = |frame| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        commit(1);
+        handoff::initialize(&state, 2, &first).unwrap();
+        commit(2);
+        handoff::schedule(&state, 3, vec![filter.clone()],
+            vec![DesiredCommittee { filter: filter.clone(), members }]).unwrap();
+        commit(3);
+        let due = handoff::schedule::fence_due_frame(3);
+        assert_eq!(handoff::schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
+        commit(due);
+        let head = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!((head.generation, head.base_frame), (2, 0));
+
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            global_anchor_store: None, global_hypergraph: Some(global.clone()),
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, _handle) = AppConsensusEngine::new(1, filter.clone(), deps, events);
+
+        // Generation 1's frame 1 over its genesis, with pre-state roots
+        // `roots`, its deterministic output and its certificate.
+        let frame_one = |roots: u8| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(), frame_number: 1, rank: 1,
+                parent_selector: first.genesis.to_vec(), state_roots: vec![vec![roots; 32]; 4],
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector, &header.requests_root, &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(0, &[]), header.frame_number, header.rank,
+                &header.prover, header.difficulty, header.fee_multiplier_vote, header.timestamp,
+                &header.storage_attestation_root,
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                &header.settlements, &header.accumulator, &header.spends,
+            ).to_vec();
+            let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
+            let certificate = crate::test_support::certify_proposal(&first, &signers, 1, 0, digest);
+            header.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: quil_cw_consensus::app_cert::wrap_cert_for_header(&certificate), ..Default::default()
+            });
+            quil_types::proto::global::AppShardFrame { header: Some(header), ..Default::default() }
+        };
+        assert_eq!(engine.discarded_base_roots(&frame_one(0x22)).unwrap(), Some(vec![vec![0x22; 32]; 4]));
+        assert_eq!(engine.discarded_base_roots(&frame_one(0)).unwrap(), None, "zero roots attest nothing");
+        let mut uncertified = frame_one(0x22);
+        uncertified.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+        assert_eq!(engine.discarded_base_roots(&uncertified).unwrap(), None);
+        let mut other_roots = frame_one(0x22);
+        other_roots.header.as_mut().unwrap().state_roots = vec![vec![0x23; 32]; 4];
+        assert!(engine.discarded_base_roots(&other_roots).is_err(), "the certified output binds the roots");
+
+        handoff::record_session_tip(&state, due + 1, &head.id().unwrap(), &quil_cw_consensus::handoff::Checkpoint {
+            frame: 1, view: 1, digest: [0x55; 32], state_roots: [[1; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        commit(due + 1);
+        assert_eq!(engine.discarded_base_roots(&frame_one(0x22)).unwrap(), None,
+            "GLOBAL executed a frame of generation 2");
     }
 
     /// The warning of a successor blocked on its predecessor's state names

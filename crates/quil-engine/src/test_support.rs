@@ -691,6 +691,18 @@ pub fn certify_seal(
     signers: &[quil_crypto::FalconSigner],
     seal: &quil_cw_consensus::handoff::Seal,
 ) -> Vec<u8> {
+    certify_proposal(session, signers, seal.view, seal.checkpoint.view, seal.digest())
+}
+
+/// A real Simplex finalization by every member of `session` of the proposal
+/// of `digest` at `view` over `parent` (0: the session's genesis).
+pub fn certify_proposal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+) -> Vec<u8> {
     use quil_cw_consensus::{
         _consensus::{
             simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
@@ -708,9 +720,9 @@ pub fn certify_seal(
         .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
         .collect();
     let proposal = Proposal::new(
-        Round::new(Epoch::new(session.generation), View::new(seal.view)),
-        View::new(seal.checkpoint.view),
-        Digest(seal.digest()),
+        Round::new(Epoch::new(session.generation), View::new(view)),
+        View::new(parent),
+        Digest(digest),
     );
     let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
     let schemes: Vec<Generic<Namespace>> = keys.iter().cloned()
