@@ -371,28 +371,86 @@ pub(crate) async fn start(
     //     master live on different hosts.
     if config.engine.enable_master_proxy {
         let master_addr = quil_engine::worker_node::master_grpc_endpoint(&config);
-        // `master_addr` is already `http://host:port`.
+        // `master_addr` is already `http://host:port`. A worker started
+        // before its master keeps connecting in the background instead of
+        // running receive-only until restarted; its publishes are dropped
+        // until the proxy connects.
+        let proxy: Arc<std::sync::OnceLock<Arc<quil_rpc::proxy_pubsub::ProxyPubSub>>> = Arc::default();
+        let master_addr_for_publish = master_addr.clone();
+        let mut outage = quil_engine::outage::Outage::default();
         match quil_rpc::proxy_pubsub::ProxyPubSub::connect(master_addr.clone(), None).await {
-            Ok(proxy) => {
-                let proxy = Arc::new(proxy);
+            Ok(connected) => {
+                let _ = proxy.set(Arc::new(connected));
                 info!(master = %master_addr, "worker connected to master PubSubProxy");
-                let proxy_for_publish = proxy.clone();
-                let publish_fn: quil_engine::worker_node::PublishFn =
-                    Arc::new(move |bitmask, data| {
-                        let p = proxy_for_publish.clone();
-                        Box::pin(async move {
-                            if let Err(e) = p.publish(bitmask, data).await {
-                                warn!(error = %e, "proxy publish failed");
-                            }
-                        })
-                    });
-                worker_node = worker_node.with_publish_fn(publish_fn);
             }
             Err(e) => {
-                warn!(error = ?e, master = %master_addr,
-                    "worker proxy connect failed — running receive-only");
+                let _ = outage.observe(std::time::Instant::now(), false);
+                warn!(error = ?e, master = %master_addr, scope = "local", action = "check",
+                    "worker proxy connect failed — retrying in the background; this worker's publishes are \
+                     dropped until it connects; check that the master runs and listens on that address");
+                let proxy = proxy.clone();
+                let master_addr = master_addr.clone();
+                sup.spawn_startup_task("worker-proxy-connect", move |token| async move {
+                    let mut backoff = std::time::Duration::from_secs(1);
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                        let connected = quil_rpc::proxy_pubsub::ProxyPubSub::connect(master_addr.clone(), None).await;
+                        let now = std::time::Instant::now();
+                        match connected {
+                            Ok(connected) => {
+                                let _ = proxy.set(Arc::new(connected));
+                                if let Some(quil_engine::outage::OutageEvent::Ended { secs, failures }) = outage.observe(now, true) {
+                                    info!(master = %master_addr, secs, failures,
+                                        "worker connected to master PubSubProxy after {} failed attempts over {}s", failures, secs);
+                                }
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                if let Some(quil_engine::outage::OutageEvent::Continues { secs, failures }) = outage.observe(now, false) {
+                                    warn!(error = ?e, master = %master_addr, secs, failures, scope = "local", action = "check",
+                                        "worker still cannot connect to master PubSubProxy; its publishes are dropped");
+                                }
+                            }
+                        }
+                    }
+                });
             }
         }
+        let proxy_for_publish = proxy.clone();
+        // A committee handoff seal dropped before the proxy connects warns,
+        // at most once a minute with the count dropped since; other
+        // publishes are routine and dropped quietly.
+        let dropped_seals: Arc<std::sync::Mutex<(Option<std::time::Instant>, u64)>> = Arc::default();
+        let publish_fn: quil_engine::worker_node::PublishFn =
+            Arc::new(move |bitmask, data| {
+                let p = proxy_for_publish.get().cloned();
+                if p.is_none() && bitmask.as_slice() == quil_engine::bitmasks::GLOBAL_PROVER {
+                    if let Ok(mut dropped) = dropped_seals.lock() {
+                        dropped.1 += 1;
+                        let now = std::time::Instant::now();
+                        if dropped.0.is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(60)) {
+                            warn!(master = %master_addr_for_publish, dropped = dropped.1, scope = "local", action = "check",
+                                "committee handoff seal not published: the master PubSubProxy is not connected yet; \
+                                 check that the master runs and listens on that address");
+                            *dropped = (Some(now), 0);
+                        }
+                    }
+                }
+                Box::pin(async move {
+                    let Some(p) = p else {
+                        tracing::debug!("proxy publish dropped: master PubSubProxy not connected yet");
+                        return;
+                    };
+                    if let Err(e) = p.publish(bitmask, data).await {
+                        warn!(error = %e, "proxy publish failed");
+                    }
+                })
+            });
+        worker_node = worker_node.with_publish_fn(publish_fn);
     }
 
     // Worker-owned p2p when proxy is off. Carry the receiver out of

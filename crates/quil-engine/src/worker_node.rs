@@ -137,7 +137,7 @@ pub struct WorkerOnlyNode {
     /// `kv_db` (see `encode_worker_storage_confirm`).
     replicas_retired_below: Arc<std::sync::atomic::AtomicU64>,
     /// Current engine handle (set after Respawn).
-    engine_handle: std::sync::Mutex<Option<AppEngineHandle>>,
+    engine_handle: Arc<std::sync::Mutex<Option<AppEngineHandle>>>,
     /// Stop the old engine and its transport wait before rebinding this worker.
     engine_cancel: std::sync::Mutex<Option<CancellationToken>>,
     respawn_lock: tokio::sync::Mutex<()>,
@@ -146,6 +146,12 @@ pub struct WorkerOnlyNode {
     bound_since: std::sync::Mutex<std::time::Instant>,
     /// Set while this worker's payload eviction passes run.
     evicting: Arc<std::sync::atomic::AtomicBool>,
+    /// The master's Respawn requests, and whether the worker has finished
+    /// starting (its initial prover-tree sync). The listener binds before
+    /// the sync; until then the calls that depend on its state answer
+    /// `Unavailable` with [`WORKER_STARTING`], and a Respawn is kept for
+    /// the ready point.
+    respawns: Arc<RespawnQueue>,
     /// Channel for engine events back to the master stream.
     engine_event_tx: mpsc::UnboundedSender<crate::app_engine::AppEngineEvent>,
     /// Optional receiver for engine events — consumed by the
@@ -466,11 +472,12 @@ impl WorkerOnlyNode {
             inclusion_prover: None,
             kv_db: None,
             replicas_retired_below: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            engine_handle: std::sync::Mutex::new(None),
+            engine_handle: Arc::new(std::sync::Mutex::new(None)),
             engine_cancel: std::sync::Mutex::new(None),
             respawn_lock: tokio::sync::Mutex::new(()),
             bound_since: std::sync::Mutex::new(std::time::Instant::now()),
             evicting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            respawns: Arc::new(RespawnQueue::default()),
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
@@ -597,6 +604,30 @@ impl WorkerOnlyNode {
             "worker node starting"
         );
 
+        // The DataIPC listener binds first, so a bind failure shows at once
+        // and the master's channel comes up while the sync below runs; the
+        // calls that need the synced state answer `Unavailable` until the
+        // worker is ready, and a Respawn waits for it (see `respawns`).
+        let listen_addr: std::net::SocketAddr = self.config.listen_addr.parse()
+            .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
+        // mTLS the master↔worker (DataIpc) channel when the node layer supplied
+        // cert materials (cluster mode). The server then REQUIRES a client cert
+        // chaining to our CA — only a master holding the node's Falcon key can
+        // connect. `None` (tests / not wired) keeps the old plaintext behavior.
+        let channel_tls: Option<tonic::transport::ServerTlsConfig> = match (
+            self.config.channel_tls_ca_pem.clone(),
+            self.config.channel_tls_leaf_pem.clone(),
+            self.config.channel_tls_key_pem.clone(),
+        ) {
+            (Some(ca), Some(leaf), Some(key)) => Some(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(leaf, key))
+                    .client_ca_root(tonic::transport::Certificate::from_pem(ca)),
+            ),
+            _ => None,
+        };
+        let server_handle = tokio::spawn(serve_data_ipc(self.clone(), listen_addr, channel_tls, self.cancel.clone()));
+
         // 0. Initial prover-tree sync from archive. Remote workers
         // start with an empty CRDT; without this sync the prover
         // registry is empty and the worker can't resolve leader
@@ -692,59 +723,11 @@ impl WorkerOnlyNode {
             });
         }
 
-        // 2. Start gRPC server for DataIPCService
-        let ipc_service = DataIpcServiceImpl {
-            worker: self.clone(),
-        };
-        let listen_addr = self.config.listen_addr.parse()
-            .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
-
-        let server_cancel = self.cancel.clone();
-        // mTLS the master↔worker (DataIpc) channel when the node layer supplied
-        // cert materials (cluster mode). The server then REQUIRES a client cert
-        // chaining to our CA — only a master holding the node's Falcon key can
-        // connect. `None` (tests / not wired) keeps the old plaintext behavior.
-        let channel_tls: Option<tonic::transport::ServerTlsConfig> = match (
-            self.config.channel_tls_ca_pem.clone(),
-            self.config.channel_tls_leaf_pem.clone(),
-            self.config.channel_tls_key_pem.clone(),
-        ) {
-            (Some(ca), Some(leaf), Some(key)) => Some(
-                tonic::transport::ServerTlsConfig::new()
-                    .identity(tonic::transport::Identity::from_pem(leaf, key))
-                    .client_ca_root(tonic::transport::Certificate::from_pem(ca)),
-            ),
-            _ => None,
-        };
-        let server_handle = tokio::spawn(async move {
-            info!("DataIPC gRPC server starting on {} (mtls={})", listen_addr, channel_tls.is_some());
-            let mut builder = Server::builder()
-                // Reap dead master connections (h2 PING) so a master that
-                // dies without FIN doesn't leave the stream fd behind.
-                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
-                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
-                .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
-            if let Some(tls) = channel_tls {
-                match builder.tls_config(tls) {
-                    Ok(b) => builder = b,
-                    Err(e) => {
-                        error!(error = %e, "DataIPC gRPC TLS config invalid — server not started");
-                        return;
-                    }
-                }
-            }
-            if let Err(e) = builder
-                .add_service(
-                    quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
-                        ipc_service,
-                    ),
-                )
-                .serve_with_shutdown(listen_addr, server_cancel.cancelled())
-                .await
-            {
-                error!(error = %e, "DataIPC gRPC server failed");
-            }
-        });
+        // 2. Serve the DataIPC calls that need the synced state, and apply
+        // a Respawn received while starting; the listener has been up since
+        // the start of `run`.
+        info!(core_id, listen = %listen_addr, "worker ready for DataIPC commands");
+        self.respawns.set_ready(respawn_apply(self.clone()), core_id);
 
         // 3. Connect to master for message streaming. Skipped when no
         // factory is supplied (single-process tests, etc.).
@@ -950,10 +933,16 @@ impl WorkerOnlyNode {
     }
 
     /// Handle a Respawn command: tear down existing engine, start new
-    /// one with the given filter.
-    pub async fn respawn(&self, filter: Vec<u8>) -> Result<()> {
+    /// one with the given filter. An engine that already runs `filter`
+    /// is kept, so a master that restarts or sends the same assignment
+    /// again does not restart it.
+    pub async fn respawn(&self, filter: Vec<u8>) -> Result<Respawned> {
         let _respawn = self.respawn_lock.lock().await;
         let core_id = self.config.core_id;
+        if !filter.is_empty() && self.running_engine().is_some_and(|handle| handle.filter == filter) {
+            info!(core_id, filter = hex::encode(&filter), "worker already runs this filter; Respawn keeps its engine");
+            return Ok(Respawned::Kept);
+        }
         *self.bound_since.lock().unwrap() = std::time::Instant::now();
 
         // Stop existing engine and drop subscriptions for the
@@ -969,7 +958,7 @@ impl WorkerOnlyNode {
 
         if filter.is_empty() {
             info!(core_id, "worker set to idle (no filter)");
-            return Ok(());
+            return Ok(Respawned::Applied);
         }
 
         info!(
@@ -1088,10 +1077,26 @@ impl WorkerOnlyNode {
         // committee is buildable.
         let signer_factory = self.bls_signer_factory.clone();
         let run_cancel = engine_cancel.clone();
+        let engine_slot = self.engine_handle.clone();
+        let filter_hex = hex::encode(&filter);
         tokio::spawn(async move {
             tokio::select! {
                 _ = run_cancel.cancelled() => {},
-                _ = engine.run(signer_factory) => {},
+                _ = engine.run(signer_factory) => {
+                    // The engine ended on its own: drop its handle, so the
+                    // worker reports running no filter and its master sends
+                    // the Respawn again.
+                    if let Ok(mut handle) = engine_slot.lock() {
+                        if handle.as_ref().is_some_and(|handle| !handle.is_running()) {
+                            *handle = None;
+                        }
+                    }
+                    if !run_cancel.is_cancelled() {
+                        warn!(core_id, filter = %filter_hex, scope = "local", action = "report",
+                            "app consensus engine exited on its own; the worker runs no filter until its master \
+                             sends the Respawn again; the lines before this one say why");
+                    }
+                },
             }
             run_cancel.cancel();
         });
@@ -1101,7 +1106,17 @@ impl WorkerOnlyNode {
         // proxy mode (worker_p2p is None there).
         self.subscribe_to_shard_bitmasks(&filter, transport_handle, engine_cancel).await;
 
-        Ok(())
+        Ok(Respawned::Applied)
+    }
+
+    /// The handle of the engine this worker runs: `None` when it runs
+    /// none, or its engine was stopped or has exited.
+    fn running_engine(&self) -> Option<AppEngineHandle> {
+        let stopped = self.engine_cancel.lock().ok()?.as_ref().is_none_or(|cancel| cancel.is_cancelled());
+        if stopped {
+            return None;
+        }
+        self.engine_handle.lock().ok()?.clone().filter(|handle| handle.is_running())
     }
 
     /// The DB config whose `cw_app_storage_base` is this worker's own data
@@ -1509,12 +1524,346 @@ where
     }
 }
 
+/// What a starting worker answers the DataIPC calls that need its synced
+/// state; the master waits for it instead of counting it as a failure.
+pub(crate) const WORKER_STARTING: &str = "worker starting: initial prover-tree sync in progress";
+
+/// What a Respawn did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Respawned {
+    /// The engine for the filter was started, or the worker set idle.
+    Applied,
+    /// The worker already ran the filter and kept its engine.
+    Kept,
+    /// The worker is starting: it applies the Respawn once its initial
+    /// prover-tree sync completes.
+    AtReady,
+}
+
+/// Applies one Respawn: the worker's `respawn`, or a test's stand-in.
+type RespawnApply = Arc<
+    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<Respawned, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A call waiting for a Respawn's outcome.
+type RespawnWaiter = tokio::sync::oneshot::Sender<std::result::Result<Respawned, String>>;
+
+/// The worker's `respawn` as a [`RespawnApply`].
+fn respawn_apply(worker: Arc<WorkerOnlyNode>) -> RespawnApply {
+    Arc::new(move |filter| {
+        let worker = worker.clone();
+        Box::pin(async move { worker.respawn(filter).await.map_err(|e| e.to_string()) })
+    })
+}
+
+/// What a Respawn that a newer one replaced before it ran answers.
+const RESPAWN_SUPERSEDED: &str = "superseded by a newer Respawn";
+
+/// The master's Respawn requests, applied one at a time in a task of their
+/// own, so a master that stops waiting (its call timed out, or the
+/// connection reset) cannot cancel a respawn half-way, leaving an engine
+/// that reads as running but never started consensus. A request that
+/// arrives while one runs waits for it; a newer one replaces a waiting one,
+/// and one for the filter being applied waits for that application instead
+/// of repeating it. Until a request is applied, the worker reports its
+/// filter as the one it runs, so its master does not send it again
+/// meanwhile. While the worker starts, the latest request is accepted and
+/// kept (an empty filter clears it) and applied once the worker is ready,
+/// so a master's single Respawn is not lost.
+#[derive(Default)]
+struct RespawnQueue {
+    state: std::sync::Mutex<RespawnQueueState>,
+}
+
+#[derive(Default)]
+struct RespawnQueueState {
+    ready: bool,
+    /// A task is applying requests.
+    running: bool,
+    queued: Option<QueuedRespawn>,
+    /// The request being applied.
+    applying: Option<QueuedRespawn>,
+}
+
+struct QueuedRespawn {
+    filter: Vec<u8>,
+    /// The calls waiting for this request's outcome.
+    waiters: Vec<RespawnWaiter>,
+}
+
+/// Clears `running` if the task applying requests unwinds, so the next
+/// request starts another.
+struct RespawnDrain(Arc<RespawnQueue>);
+
+impl Drop for RespawnDrain {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Ok(mut state) = self.0.state.lock() {
+                state.running = false;
+                state.applying = None;
+            }
+        }
+    }
+}
+
+impl RespawnQueue {
+    fn is_ready(&self) -> bool {
+        self.state.lock().map(|state| state.ready).unwrap_or(false)
+    }
+
+    /// Respawn on `filter`. Answers once it is applied (or replaced by a
+    /// newer request before it ran); while the worker starts, at once,
+    /// with [`Respawned::AtReady`].
+    async fn respawn(
+        self: &Arc<Self>,
+        filter: Vec<u8>,
+        apply: RespawnApply,
+        core_id: u32,
+    ) -> std::result::Result<Respawned, tonic::Status> {
+        let Some(outcome) = self.enqueue(filter, apply, core_id)? else { return Ok(Respawned::AtReady) };
+        match outcome.await {
+            Ok(Ok(respawned)) => Ok(respawned),
+            Ok(Err(error)) if error == RESPAWN_SUPERSEDED => Err(tonic::Status::aborted(error)),
+            Ok(Err(error)) => Err(tonic::Status::internal(format!("respawn failed: {}", error))),
+            Err(_) => Err(tonic::Status::internal("respawn ended without an outcome")),
+        }
+    }
+
+    /// Queue a Respawn on `filter` and start applying requests; `None` when
+    /// the worker is starting and keeps it for the ready point.
+    fn enqueue(
+        self: &Arc<Self>,
+        filter: Vec<u8>,
+        apply: RespawnApply,
+        core_id: u32,
+    ) -> std::result::Result<Option<tokio::sync::oneshot::Receiver<std::result::Result<Respawned, String>>>, tonic::Status> {
+        let mut state = self.state.lock().map_err(|_| tonic::Status::internal("respawn queue poisoned"))?;
+        let state = &mut *state;
+        if !state.ready {
+            info!(core_id, filter = hex::encode(&filter),
+                "Respawn received while starting; applied once the initial prover-tree sync completes");
+            state.queued = (!filter.is_empty()).then(|| QueuedRespawn { filter, waiters: Vec::new() });
+            return Ok(None);
+        }
+        let (answer, outcome) = tokio::sync::oneshot::channel();
+        if let Some(applying) = state.applying.as_mut().filter(|applying| applying.filter == filter) {
+            // Being applied already: answer with that outcome rather than
+            // apply it twice, and drop an older request still waiting.
+            info!(core_id, filter = hex::encode(&filter), "Respawn received for the filter being applied; answered when it completes");
+            applying.waiters.push(answer);
+            for waiter in state.queued.take().into_iter().flat_map(|queued| queued.waiters) {
+                let _ = waiter.send(Err(RESPAWN_SUPERSEDED.to_string()));
+            }
+            return Ok(Some(outcome));
+        }
+        match state.queued.take() {
+            Some(mut queued) if queued.filter == filter => {
+                queued.waiters.push(answer);
+                state.queued = Some(queued);
+            }
+            replaced => {
+                for waiter in replaced.into_iter().flat_map(|queued| queued.waiters) {
+                    let _ = waiter.send(Err(RESPAWN_SUPERSEDED.to_string()));
+                }
+                state.queued = Some(QueuedRespawn { filter, waiters: vec![answer] });
+            }
+        }
+        if !state.running {
+            state.running = true;
+            tokio::spawn(self.clone().drain(apply));
+        }
+        Ok(Some(outcome))
+    }
+
+    /// Mark the worker ready, and apply the Respawn it accepted while
+    /// starting, if any.
+    fn set_ready(self: &Arc<Self>, apply: RespawnApply, core_id: u32) {
+        let Ok(mut state) = self.state.lock() else { return };
+        state.ready = true;
+        if let Some(queued) = state.queued.as_ref() {
+            info!(core_id, filter = hex::encode(&queued.filter), "applying the Respawn received while starting");
+            if !state.running {
+                state.running = true;
+                tokio::spawn(self.clone().drain(apply));
+            }
+        }
+    }
+
+    /// Apply queued requests, one at a time, until none is left.
+    async fn drain(self: Arc<Self>, apply: RespawnApply) {
+        let _drain = RespawnDrain(self.clone());
+        while let Some(filter) = self.next_queued() {
+            let outcome = apply(filter).await;
+            for waiter in self.applied() {
+                let _ = waiter.send(outcome.clone());
+            }
+        }
+    }
+
+    /// Mark the next request as being applied and return its filter;
+    /// `None` ends the applying task.
+    fn next_queued(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().ok()?;
+        let next = state.queued.take();
+        if next.is_none() {
+            state.running = false;
+        }
+        let filter = next.as_ref().map(|next| next.filter.clone());
+        state.applying = next;
+        filter
+    }
+
+    /// The calls waiting for the request just applied.
+    fn applied(&self) -> Vec<RespawnWaiter> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.applying.take())
+            .map(|applied| applied.waiters)
+            .unwrap_or_default()
+    }
+
+    /// The filter of the latest Respawn waiting or being applied, if any.
+    fn pending(&self) -> Option<Vec<u8>> {
+        let state = self.state.lock().ok()?;
+        state.queued.as_ref().or(state.applying.as_ref()).map(|request| request.filter.clone())
+    }
+}
+
+/// First and longest wait between attempts to bind the DataIPC listener.
+const DATA_IPC_BIND_RETRY_FIRST: Duration = Duration::from_secs(1);
+const DATA_IPC_BIND_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// `error` with its chain of sources, as one line.
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut line = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        line.push_str(": ");
+        line.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    line
+}
+
+/// Serve the DataIPC service on `listen_addr` until `cancel`. A listener
+/// that cannot bind, or a server that stops on an error, is bound again
+/// with backoff rather than leaving the worker unreachable for good.
+async fn serve_data_ipc(
+    worker: Arc<WorkerOnlyNode>,
+    listen_addr: std::net::SocketAddr,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    cancel: CancellationToken,
+) {
+    let core_id = worker.config.core_id;
+    let mut pause = DATA_IPC_BIND_RETRY_FIRST;
+    loop {
+        let Some(incoming) = bind_data_ipc(core_id, listen_addr, &cancel).await else { return };
+        let started = std::time::Instant::now();
+        info!("DataIPC gRPC server starting on {} (mtls={})", listen_addr, tls.is_some());
+        let mut builder = Server::builder()
+            // Reap dead master connections (h2 PING) so a master that
+            // dies without FIN doesn't leave the stream fd behind. TCP
+            // keepalive is set on the bound listener.
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
+        if let Some(tls) = tls.clone() {
+            match builder.tls_config(tls) {
+                Ok(b) => builder = b,
+                Err(e) => {
+                    error!(error = %e, "DataIPC gRPC TLS config invalid — server not started");
+                    return;
+                }
+            }
+        }
+        let served = builder
+            .add_service(
+                quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
+                    DataIpcServiceImpl { worker: worker.clone() },
+                ),
+            )
+            .serve_with_incoming_shutdown(incoming, cancel.cancelled())
+            .await;
+        let Err(e) = served else { return };
+        // A server that keeps failing at once is bound again at most twice
+        // a minute; one that served for a while starts over from a second.
+        if started.elapsed() >= 2 * DATA_IPC_BIND_RETRY_MAX {
+            pause = DATA_IPC_BIND_RETRY_FIRST;
+        }
+        error!(core_id, listen = %listen_addr, error = %error_chain(&e), retry_secs = pause.as_secs(),
+            "DataIPC gRPC server failed; binding its listener again");
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(pause) => {}
+        }
+        pause = (pause * 2).min(DATA_IPC_BIND_RETRY_MAX);
+    }
+}
+
+/// Bind the DataIPC listener on `listen_addr`, retrying from
+/// [`DATA_IPC_BIND_RETRY_FIRST`], doubling to [`DATA_IPC_BIND_RETRY_MAX`],
+/// until it binds; `None` once `cancel` fires. A failing bind warns when it
+/// begins and at a bounded interval, and logs its end.
+async fn bind_data_ipc(
+    core_id: u32,
+    listen_addr: std::net::SocketAddr,
+    cancel: &CancellationToken,
+) -> Option<tonic::transport::server::TcpIncoming> {
+    use crate::outage::OutageEvent;
+    let mut outage = crate::outage::Outage::default();
+    let mut backoff = DATA_IPC_BIND_RETRY_FIRST;
+    loop {
+        let bound = tonic::transport::server::TcpIncoming::new(listen_addr, true, Some(Duration::from_secs(60)));
+        let now = std::time::Instant::now();
+        match bound {
+            Ok(incoming) => {
+                if let Some(OutageEvent::Ended { secs, failures }) = outage.observe(now, true) {
+                    info!(core_id, listen = %listen_addr, secs, failures,
+                        "DataIPC listener bound after {} failed attempts over {}s", failures, secs);
+                }
+                return Some(incoming);
+            }
+            Err(error) => {
+                let error = error_chain(&*error);
+                match outage.observe(now, false) {
+                    Some(OutageEvent::Began) => warn!(core_id, listen = %listen_addr, error = %error,
+                        scope = "local", action = "check",
+                        "DataIPC listener cannot bind; the master cannot reach this worker until it does; \
+                         check that the address belongs to this host and that no old worker process holds the port"),
+                    Some(OutageEvent::Continues { secs, failures }) => warn!(core_id, listen = %listen_addr,
+                        error = %error, secs, failures, scope = "local", action = "check",
+                        "DataIPC listener still cannot bind"),
+                    _ => {}
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(DATA_IPC_BIND_RETRY_MAX);
+    }
+}
+
 // =====================================================================
 // DataIPCService — gRPC server on the worker for master commands
 // =====================================================================
 
 struct DataIpcServiceImpl {
     worker: Arc<WorkerOnlyNode>,
+}
+
+impl DataIpcServiceImpl {
+    /// Refuse a call that needs the synced state while the worker starts.
+    fn ready(&self) -> std::result::Result<(), tonic::Status> {
+        if self.worker.respawns.is_ready() {
+            Ok(())
+        } else {
+            Err(tonic::Status::unavailable(WORKER_STARTING))
+        }
+    }
 }
 
 /// Hand a directly received shard consensus message to `handle` when it is
@@ -1581,6 +1930,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         &self,
         request: tonic::Request<quil_types::proto::node::DeliverShardConsensusRequest>,
     ) -> std::result::Result<tonic::Response<quil_types::proto::node::DeliverShardConsensusResponse>, tonic::Status> {
+        self.ready()?;
         let handle = self
             .worker
             .engine_handle
@@ -1592,20 +1942,22 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     }
 
     /// The engine this worker runs and its latest execution report, for the
-    /// master's renewal decisions and operator views.
+    /// master's renewal decisions and operator views. An engine that was
+    /// stopped or has exited runs nothing; a Respawn waiting or being
+    /// applied counts as run, so the master does not send it again.
     async fn get_worker_execution(
         &self,
         _request: tonic::Request<quil_types::proto::node::GetWorkerExecutionRequest>,
     ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetWorkerExecutionResponse>, tonic::Status> {
-        let handle = self
-            .worker
-            .engine_handle
-            .lock()
-            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
-            .clone();
-        let (filter, execution) = match handle {
-            Some(handle) => (handle.filter.clone(), Some(handle.execution())),
-            None => (Vec::new(), None),
+        self.ready()?;
+        let handle = self.worker.running_engine();
+        let (filter, execution) = match (self.worker.respawns.pending(), handle) {
+            (Some(pending), handle) => {
+                let execution = handle.filter(|handle| handle.filter == pending).map(|handle| handle.execution());
+                (pending, execution)
+            }
+            (None, Some(handle)) => (handle.filter.clone(), Some(handle.execution())),
+            (None, None) => (Vec::new(), None),
         };
         Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
             filter,
@@ -1640,13 +1992,16 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         tonic::Response<quil_types::proto::node::RespawnResponse>,
         tonic::Status,
     > {
+        // Accepted while starting too: an older master sends its Respawn
+        // only once. The respawn itself runs in a task of its own, so a
+        // master that stops waiting cannot cancel it half-way.
         let filter = request.into_inner().filter;
-        match self.worker.respawn(filter).await {
-            Ok(()) => Ok(tonic::Response::new(
-                quil_types::proto::node::RespawnResponse {},
-            )),
-            Err(e) => Err(tonic::Status::internal(format!("respawn failed: {}", e))),
-        }
+        let core_id = self.worker.config.core_id;
+        let respawned = self.worker.respawns.respawn(filter, respawn_apply(self.worker.clone()), core_id).await?;
+        Ok(tonic::Response::new(quil_types::proto::node::RespawnResponse {
+            deferred: respawned == Respawned::AtReady,
+            kept: respawned == Respawned::Kept,
+        }))
     }
 
     async fn create_join_proof(
@@ -1698,7 +2053,8 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     /// The master's request to remove what this worker's store keeps
     /// outside `keep`, computed as for its thread workers. The worker runs
     /// the thread workers' passes once its own binding is protected, served
-    /// and settled; they continue after the answer.
+    /// and settled; they continue after the answer. While the worker starts
+    /// it answers `Unavailable`, and the allocator's repeat asks again.
     async fn evict_payload(
         &self,
         request: tonic::Request<quil_types::proto::node::EvictPayloadRequest>,
@@ -1706,6 +2062,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         tonic::Response<quil_types::proto::node::EvictPayloadResponse>,
         tonic::Status,
     > {
+        self.ready()?;
         let keep = request.into_inner().keep;
         let worker = &self.worker;
         let Some(crdt) = worker.hypergraph.clone() else {
@@ -1746,6 +2103,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         tonic::Response<quil_types::proto::node::PrepareStorageConfirmResponse>,
         tonic::Status,
     > {
+        self.ready()?;
         let req = request.into_inner();
         // Only the worker executing this shard holds its data. The master's
         // own store does not, so its confirm registered leaves this worker
@@ -2427,6 +2785,275 @@ mod tests {
         // the misconfig in logs.
         let c = config_with_stream("not-a-multiaddr");
         assert_eq!(master_grpc_endpoint(&c), "http://127.0.0.1:8340");
+    }
+}
+
+#[cfg(test)]
+mod data_ipc_bind_tests {
+    use super::*;
+    use crate::outage::test_logs::CapturedLogs;
+
+    /// A DataIPC port another process holds is bound once it is released,
+    /// with one warning naming the worker, its address and the error, and
+    /// one line for the recovery.
+    #[tokio::test]
+    async fn a_held_data_ipc_port_is_bound_once_released() {
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_addr = holder.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let binding = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { bind_data_ipc(3, listen_addr, &cancel).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!binding.is_finished(), "the port is held");
+        drop(holder);
+        let bound = tokio::time::timeout(Duration::from_secs(5), binding).await.expect("bound after release").unwrap();
+        assert!(bound.is_some());
+        let warns = logs.lines_with("DataIPC listener cannot bind");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("core_id=3") && warns[0].contains(&listen_addr.to_string()), "{}", warns[0]);
+        assert!(warns[0].contains("in use"), "names the error: {}", warns[0]);
+        let bound_lines = logs.lines_with("DataIPC listener bound after");
+        assert_eq!(bound_lines.len(), 1, "{bound_lines:?}");
+        assert!(bound_lines[0].contains("failures="), "{}", bound_lines[0]);
+        cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod respawn_queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Records each filter it applies; the first waits for `release` when
+    /// set, after `entered`.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        applied: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        done: Arc<AtomicBool>,
+        hold_first: Arc<AtomicBool>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Recorder {
+        fn apply(&self) -> RespawnApply {
+            let recorder = self.clone();
+            Arc::new(move |filter| {
+                let recorder = recorder.clone();
+                Box::pin(async move {
+                    recorder.applied.lock().unwrap().push(filter);
+                    if recorder.hold_first.swap(false, Ordering::SeqCst) {
+                        recorder.entered.notify_one();
+                        recorder.release.notified().await;
+                    }
+                    recorder.done.store(true, Ordering::SeqCst);
+                    Ok(Respawned::Applied)
+                })
+            })
+        }
+
+        fn applied(&self) -> Vec<Vec<u8>> {
+            self.applied.lock().unwrap().clone()
+        }
+    }
+
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    /// A Respawn received while the worker starts is accepted and applied
+    /// once it is ready, the latest one winning; an empty one clears it.
+    #[tokio::test]
+    async fn a_respawn_received_while_starting_is_applied_once_ready() {
+        let recorder = Recorder::default();
+        let queue = Arc::new(RespawnQueue::default());
+        assert!(queue.respawn(vec![1; 32], recorder.apply(), 1).await.is_ok(), "accepted while starting");
+        assert!(queue.respawn(vec![2; 32], recorder.apply(), 1).await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(recorder.applied().is_empty(), "nothing is applied before the worker is ready");
+        queue.set_ready(recorder.apply(), 1);
+        assert!(eventually(|| recorder.applied().len() == 1).await);
+        assert_eq!(recorder.applied(), vec![vec![2u8; 32]], "the latest request wins");
+
+        let cleared = Recorder::default();
+        let queue = Arc::new(RespawnQueue::default());
+        assert!(queue.respawn(vec![1; 32], cleared.apply(), 1).await.is_ok());
+        assert!(queue.respawn(Vec::new(), cleared.apply(), 1).await.is_ok());
+        queue.set_ready(cleared.apply(), 1);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(cleared.applied().is_empty(), "an empty filter clears the request");
+    }
+
+    /// A respawn runs to its end when the master stops waiting for it.
+    #[tokio::test]
+    async fn a_respawn_completes_when_its_caller_stops_waiting() {
+        let recorder = Recorder::default();
+        recorder.hold_first.store(true, Ordering::SeqCst);
+        let queue = Arc::new(RespawnQueue::default());
+        queue.set_ready(recorder.apply(), 1);
+        let call = {
+            let (queue, apply) = (queue.clone(), recorder.apply());
+            tokio::spawn(async move { queue.respawn(vec![1; 32], apply, 1).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
+        call.abort();
+        let _ = call.await;
+        recorder.release.notify_one();
+        assert!(eventually(|| recorder.done.load(Ordering::SeqCst)).await, "the respawn ran to its end");
+    }
+
+    /// Requests run one at a time; a newer one replaces one still waiting.
+    #[tokio::test]
+    async fn a_newer_respawn_replaces_a_waiting_one() {
+        let recorder = Recorder::default();
+        recorder.hold_first.store(true, Ordering::SeqCst);
+        let queue = Arc::new(RespawnQueue::default());
+        queue.set_ready(recorder.apply(), 1);
+        let call = |filter: Vec<u8>| {
+            let (queue, apply) = (queue.clone(), recorder.apply());
+            tokio::spawn(async move { queue.respawn(filter, apply, 1).await })
+        };
+        let first = call(vec![1; 32]);
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
+        let second = call(vec![2; 32]);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let third = call(vec![3; 32]);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorder.applied(), vec![vec![1u8; 32]], "one at a time");
+        recorder.release.notify_one();
+        assert!(first.await.unwrap().is_ok());
+        assert_eq!(second.await.unwrap().unwrap_err().code(), tonic::Code::Aborted);
+        assert!(third.await.unwrap().is_ok());
+        assert_eq!(recorder.applied(), vec![vec![1u8; 32], vec![3u8; 32]]);
+    }
+
+    /// A Respawn for the filter being applied waits for that application
+    /// instead of repeating it; meanwhile the filter is reported as run.
+    #[tokio::test]
+    async fn a_respawn_for_the_filter_being_applied_runs_once() {
+        let recorder = Recorder::default();
+        recorder.hold_first.store(true, Ordering::SeqCst);
+        let queue = Arc::new(RespawnQueue::default());
+        queue.set_ready(recorder.apply(), 1);
+        let call = |filter: Vec<u8>| {
+            let (queue, apply) = (queue.clone(), recorder.apply());
+            tokio::spawn(async move { queue.respawn(filter, apply, 1).await })
+        };
+        let first = call(vec![1; 32]);
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
+        assert_eq!(queue.pending(), Some(vec![1u8; 32]), "the filter being applied is reported");
+        let second = call(vec![1; 32]);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        recorder.release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), Respawned::Applied);
+        assert_eq!(second.await.unwrap().unwrap(), Respawned::Applied, "answered by the same application");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorder.applied(), vec![vec![1u8; 32]], "applied once");
+        assert_eq!(queue.pending(), None);
+    }
+
+    /// A worker with no master, store or engine.
+    fn idle_worker() -> Arc<WorkerOnlyNode> {
+        let config = WorkerNodeConfig {
+            core_id: 1,
+            master_endpoint: String::new(),
+            listen_addr: "127.0.0.1:0".into(),
+            channel_tls_ca_pem: None,
+            channel_tls_leaf_pem: None,
+            channel_tls_key_pem: None,
+            parent_pid: None,
+            app_consensus_cw: false,
+            data_dir: None,
+            channel_factory: None,
+        };
+        let signer: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
+            Arc::new(|| -> Box<dyn quil_types::crypto::Signer> { unreachable!("no engine starts in this test") });
+        Arc::new(WorkerOnlyNode::new(
+            config,
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(crate::test_support::TestProverRegistry::new()),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            Arc::new(MessageCollector::new()),
+            Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            vec![1; 32],
+            vec![2; 32],
+            signer,
+            false,
+            1,
+        ))
+    }
+
+    /// The filter `service`'s worker reports running.
+    async fn reported_filter(service: &DataIpcServiceImpl) -> Vec<u8> {
+        use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
+        let request = tonic::Request::new(quil_types::proto::node::GetWorkerExecutionRequest {});
+        service.get_worker_execution(request).await.unwrap().into_inner().filter
+    }
+
+    /// A Respawn of the filter the running engine runs keeps that engine:
+    /// it is neither stopped nor replaced.
+    #[tokio::test]
+    async fn a_respawn_of_the_running_filter_keeps_the_engine() {
+        let worker = idle_worker();
+        let (handle, _engine) = AppEngineHandle::for_test(vec![7; 32]);
+        let cancel = CancellationToken::new();
+        *worker.engine_handle.lock().unwrap() = Some(handle);
+        *worker.engine_cancel.lock().unwrap() = Some(cancel.clone());
+        let respawned = tokio::time::timeout(Duration::from_secs(5), worker.respawn(vec![7; 32])).await;
+        assert!(matches!(respawned, Ok(Ok(Respawned::Kept))), "a running engine is kept");
+        assert!(!cancel.is_cancelled(), "the engine is not stopped");
+        assert!(worker.running_engine().is_some_and(|handle| handle.filter == vec![7u8; 32]));
+    }
+
+    /// An engine that has exited runs nothing, so the worker reports no
+    /// filter and its master sends the Respawn again; a Respawn being
+    /// applied while no engine runs is reported as run.
+    #[tokio::test]
+    async fn an_exited_engine_reports_no_filter() {
+        let worker = idle_worker();
+        worker.respawns.state.lock().unwrap().ready = true;
+        let service = DataIpcServiceImpl { worker: worker.clone() };
+        let (handle, engine) = AppEngineHandle::for_test(vec![7; 32]);
+        *worker.engine_handle.lock().unwrap() = Some(handle);
+        *worker.engine_cancel.lock().unwrap() = Some(CancellationToken::new());
+        assert_eq!(reported_filter(&service).await, vec![7u8; 32], "a running engine is reported");
+        drop(engine);
+        assert!(reported_filter(&service).await.is_empty(), "an exited engine runs nothing");
+        assert!(worker.running_engine().is_none());
+        worker.respawns.state.lock().unwrap().applying = Some(QueuedRespawn { filter: vec![8; 32], waiters: Vec::new() });
+        assert_eq!(reported_filter(&service).await, vec![8u8; 32], "a Respawn being applied is reported");
+    }
+
+    /// While the worker starts, a payload eviction is refused as starting,
+    /// and the master asks again at its next interval.
+    #[tokio::test]
+    async fn a_payload_eviction_while_starting_answers_starting() {
+        use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
+        let service = DataIpcServiceImpl { worker: idle_worker() };
+        let request = tonic::Request::new(quil_types::proto::node::EvictPayloadRequest { keep: Vec::new() });
+        let status = service.evict_payload(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), WORKER_STARTING);
     }
 }
 

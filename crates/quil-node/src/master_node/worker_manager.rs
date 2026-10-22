@@ -504,6 +504,10 @@ pub(crate) fn init(
                         // The lifecycle renews a seat only while its worker
                         // hosts its committee session (decided 2026-10-18).
                         cm.refresh_executions().await;
+                        // Re-send a Respawn a worker did not take, or lost
+                        // when it restarted, so it does not stay idle while
+                        // its allocation counts as served.
+                        cm.reconcile_respawns().await;
                     }
                 });
             }
