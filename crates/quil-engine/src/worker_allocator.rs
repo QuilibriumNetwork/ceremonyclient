@@ -810,6 +810,68 @@ impl WorkerAllocator {
             && self.registry_synced_from_frame.load(std::sync::atomic::Ordering::SeqCst) <= pending_frame + 1
     }
 
+    /// Clear the pending-join marker of a worker still idle after the bind
+    /// pass once its join is past `PROPOSAL_TIMEOUT_FRAMES` (and any registry
+    /// sync hold). `submit_join` sets the marker BEFORE the allocation lands
+    /// in the registry, so the lifecycle's `free_auto()` won't re-pick the
+    /// worker mid-flight; a marker that outlived a lost join would exclude
+    /// the worker from `free_auto()` for good and wedge the lifecycle (no
+    /// free workers, no new ProposeJoin).
+    ///
+    /// Runs after the bind pass: a join whose first registry sync arrives
+    /// past the timeout binds its worker in the same pass and keeps the
+    /// marker until it is confirmed. A worker left idle although the
+    /// registry holds an allocation joined at or after its proposal frame
+    /// lost the binding to another worker (or the join was decided
+    /// already); its reservation is released without claiming the join was
+    /// dropped.
+    fn expire_unlanded_join_markers(
+        &self,
+        frame_number: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+    ) -> Result<()> {
+        for worker in self.worker_manager.range_workers()? {
+            let pending = worker.pending_filter_frame;
+            if !worker.filter.is_empty()
+                || pending == 0
+                || frame_number <= pending + PROPOSAL_TIMEOUT_FRAMES
+                || self.join_awaits_registry_sync(pending, frame_number)
+            {
+                continue;
+            }
+            let landed = allocations.iter().find(|a| a.join_frame_number >= pending);
+            match landed {
+                Some(alloc) => info!(
+                    core_id = worker.core_id,
+                    pending_since = pending,
+                    join_frame = alloc.join_frame_number,
+                    status = ?alloc.status,
+                    filter = hex::encode(&alloc.confirmation_filter),
+                    "join landed in the registry but not on this worker; releasing \
+                     the worker's join reservation"
+                ),
+                // Warn, not info: submit_join returned Ok (no transport
+                // error visible) but no allocation joined in the proposal
+                // window reached the registry, which usually means an archive
+                // accepted the bundle and then dropped it during
+                // materialization (stale frame_number on archive-side
+                // materialize, BLS / VDF rejection, prover-state gate). The
+                // operator can spot a string of these before the lifecycle's
+                // retry burns more attempts.
+                None => warn!(
+                    core_id = worker.core_id,
+                    frame = frame_number,
+                    pending_since = pending,
+                    frames_elapsed = frame_number - pending,
+                    "join submitted but no alloc landed in registry within 10 frames \
+                     — archive likely dropped the bundle silently"
+                ),
+            }
+            let _ = self.worker_manager.set_pending_filter_frame(worker.core_id, 0);
+        }
+        Ok(())
+    }
+
     /// Publish the lifecycle's per-filter ranking for `frame_number`.
     ///
     /// Called once per lifecycle evaluation, after shard-info has
@@ -1040,49 +1102,10 @@ impl WorkerAllocator {
                 _ => false,
             };
             if worker.filter.is_empty() {
-                // Idle worker — but check for an expired pending-join
-                // marker. `submit_join` sets `pending_filter_frame`
-                // BEFORE the alloc lands in the registry (so the
-                // lifecycle's `free_auto()` won't re-pick the same
-                // worker mid-flight). If the join never lands
-                // (archive silently rejected the bundle, network
-                // drop, or the alloc-binding pass below didn't see
-                // a matching alloc within the 10-frame window), the
-                // marker would otherwise persist indefinitely and
-                // the worker stays excluded from `free_auto()` —
-                // wedging the entire lifecycle (no free workers →
-                // `allow_proposals = false` → no new ProposeJoin).
-                // Mirror the 10-frame `PROPOSAL_TIMEOUT_FRAMES`
-                // ceiling used below for filter-pinned-but-
-                // unallocated workers.
-                if worker.pending_filter_frame > 0
-                    && frame_number
-                        > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
-                    && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
-                {
-                    // Warn, not info — silent failures are exactly the
-                    // class of bug this telemetry needs to surface. A
-                    // submit_join returned Ok (no transport error
-                    // visible) but the alloc never showed up in the
-                    // registry within 10 frames, which means an
-                    // archive accepted the bundle and then dropped
-                    // it during materialization (typical causes:
-                    // stale frame_number on archive-side materialize,
-                    // BLS / VDF rejection, prover-state gate). The
-                    // operator can spot a string of these in the log
-                    // and dig in before the lifecycle's retry burns
-                    // more attempts.
-                    warn!(
-                        core_id = worker.core_id,
-                        pending_since = worker.pending_filter_frame,
-                        frames_elapsed = frame_number - worker.pending_filter_frame,
-                        "join submitted but no alloc landed in registry within 10 frames \
-                         — archive likely dropped the bundle silently"
-                    );
-                    let _ = self
-                        .worker_manager
-                        .set_pending_filter_frame(worker.core_id, 0);
-                }
+                // Idle worker: an expired pending-join marker is swept after
+                // the bind pass below (`expire_unlanded_join_markers`), so a
+                // join the registry shows for the first time in this pass is
+                // bound before its marker is judged.
                 continue;
             }
 
@@ -1494,6 +1517,11 @@ impl WorkerAllocator {
                 orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
         }
+
+        self.expire_unlanded_join_markers(
+            frame_number,
+            prover_info.as_ref().map(|p| p.allocations.as_slice()).unwrap_or(&[]),
+        )?;
 
         if !orphan_filters.is_empty() {
             let count = orphan_filters.len();
@@ -2021,6 +2049,100 @@ mod tests {
         let workers = wm.range_workers().unwrap();
         assert_eq!(workers[0].filter, filter);
         assert_eq!(workers[0].pending_filter_frame, 0, "a landed join must not stay pending");
+    }
+
+    /// Runs one reconcile and returns what it logged.
+    fn reconcile_logged(alloc: &WorkerAllocator, frame: u64) -> String {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || alloc.on_new_frame(frame).unwrap());
+        let bytes = lines.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn idle_worker(core_id: u32, pending_filter_frame: u64) -> crate::worker::WorkerInfo {
+        crate::worker::WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame,
+            allocated: false,
+        }
+    }
+
+    fn joining_alloc(filter: Vec<u8>, join_frame: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Joining,
+            join_frame_number: join_frame,
+            join_confirm_frame_number: 0,
+            ..make_alloc(filter)
+        }
+    }
+
+    const DROPPED: &str = "join submitted but no alloc landed in registry";
+
+    /// A join whose first registry sync arrives past the proposal timeout
+    /// binds its worker in that pass, keeps the marker and is not reported
+    /// as dropped (observed: every worker of a 27-shard join warned in the
+    /// pass that bound it).
+    #[test]
+    fn a_join_first_seen_past_the_timeout_binds_without_a_dropped_warning() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(idle_worker(1, 100));
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining_alloc(filter.clone(), 102)]))),
+            vec![0xAAu8; 32],
+        );
+        let logged = reconcile_logged(&alloc, 129);
+        assert!(!logged.contains(DROPPED), "{logged}");
+        let worker = &wm.range_workers().unwrap()[0];
+        assert_eq!(worker.filter, filter);
+        assert_eq!(worker.pending_filter_frame, 100, "the landed join stays pending until confirmed");
+    }
+
+    /// A join that landed on another worker releases this worker's
+    /// reservation without reporting a dropped join; a join absent from the
+    /// registry past the timeout still warns and frees its worker.
+    #[test]
+    fn an_expired_join_marker_warns_only_when_no_join_landed() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(idle_worker(1, 0));
+        wm.add(idle_worker(2, 100));
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining_alloc(filter.clone(), 102)]))),
+            vec![0xAAu8; 32],
+        );
+        let logged = reconcile_logged(&alloc, 129);
+        assert!(!logged.contains(DROPPED) && logged.contains("not on this worker"), "{logged}");
+        let workers = wm.range_workers().unwrap();
+        assert_eq!((workers[0].filter.clone(), workers[1].pending_filter_frame), (filter, 0));
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(idle_worker(1, 100));
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with(Vec::new()))),
+            vec![0xAAu8; 32],
+        );
+        let logged = reconcile_logged(&alloc, 100 + PROPOSAL_TIMEOUT_FRAMES);
+        assert!(!logged.contains(DROPPED), "within the timeout: {logged}");
+        let logged = reconcile_logged(&alloc, 129);
+        assert!(logged.contains(DROPPED), "{logged}");
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers[0].pending_filter_frame, 0);
     }
 
     #[test]
