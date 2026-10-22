@@ -290,6 +290,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut committee_peer_timer = tokio::time::interval(std::time::Duration::from_secs(5));
         committee_peer_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let committee_peer_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut peer_policy_unavailable = super::committee_peer_policy::Unavailability::default();
         let mut committee_builds = super::committee_builds::CommitteeBuilds::default();
         let mut committee_builds_checked = std::time::Instant::now();
         let mut last_committee_peers = std::collections::HashSet::new();
@@ -372,6 +373,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         super::committee_peer_policy::collect(&filters, |filter| handoff::head(&view, filter)));
                     match desired {
                         Ok(peers) if peers != last_committee_peers => {
+                            peer_policy_unavailable.recovered(std::time::Instant::now());
                             if committee_peer_busy.compare_exchange(false, true,
                                 std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
                             {
@@ -397,8 +399,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 pending_committee_policy = Some((expected, applied));
                             }
                         }
-                        Ok(_) => {}
-                        Err(error) => warn!(%error, "committed committee peer policy unavailable"),
+                        Ok(_) => {
+                            peer_policy_unavailable.recovered(std::time::Instant::now());
+                        }
+                        Err(error) => {
+                            peer_policy_unavailable.failed(&error, std::time::Instant::now());
+                        }
                     }
                     // Which build each member of a served committee runs, by its
                     // verified PeerInfo (committee_builds.rs).
