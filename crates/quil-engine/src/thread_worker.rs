@@ -818,12 +818,13 @@ impl ThreadWorkerManager {
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
                                                                         // time rather than all failing busy together. A
-                                                                        // blocked successor session goes first and keeps
-                                                                        // its turn for further replay batches.
+                                                                        // replay onto held frames goes before checkpoint
+                                                                        // installs; a blocked successor session goes first
+                                                                        // and keeps its turn for further replay batches.
                                                                         let attempt = async {
                                                                             crate::worker_execution::recovery_phase("waiting_for_permit");
                                                                             let blocked = lb.execution_record().successor_blocked_flag();
-                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked.clone()).await;
+                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked.clone(), local.is_some()).await;
                                                                             crate::prover_tree_syncer::recover_shard_from_latest(
                                                                                 syncer.as_ref(), &filter, local, &lb, Some(&*blocked),
                                                                             ).await
