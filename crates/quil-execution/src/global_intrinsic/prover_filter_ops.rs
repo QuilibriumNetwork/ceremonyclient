@@ -38,10 +38,10 @@ pub const TYPE_PROVER_RESUME: u32 = 0x0304;
 
 /// Upper bound on the number of filters in a `ProverLeave`. Go:
 /// `filtersCount > 100` is rejected at decode time.
-pub const MAX_PROVER_FILTERS_COUNT: u32 = 100;
+pub const MAX_PROVER_FILTERS_COUNT: u32 = super::prover_ops::MAX_FILTERS_PER_OP as u32;
 /// Upper bound on any single filter's length. Go: `filterLen > 64`
 /// is rejected for all three filter ops.
-pub const MAX_PROVER_FILTER_LEN: u32 = 64;
+pub const MAX_PROVER_FILTER_LEN: u32 = super::prover_ops::MAX_FILTER_LEN as u32;
 /// Upper bound on the inner canonical-bytes payload for the
 /// `BLS48581AddressedSignature` — with Falcon-512 the single-signer
 /// envelope is 710 bytes and the one-extra-signer aggregate is 1226.

@@ -15,6 +15,9 @@ use quil_types::proto::global::{
     ProverPause, ProverReject, ProverResume, ProverUpdate,
 };
 
+use quil_types::proto::node::node_service_client::NodeServiceClient;
+use tonic::transport::Channel;
+
 use super::{sign, ProverCtx};
 
 /// All-0xFF 32-byte filter — the "all shards" default.
@@ -40,29 +43,87 @@ fn parse_single_filter(arg: Option<&str>) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Sign and send a multi-filter op as several ops when `filters` exceed what
+/// one carries (see [`sign::op_chunks`]), each built by `build` over its own
+/// filters at the same frame. Every op is signed before the first is sent, so
+/// a filter no node decodes stops the command before anything goes out; a
+/// failed send stops the rest and says how many filters went out.
+async fn send_split(
+    pc: &ProverCtx,
+    client: &mut NodeServiceClient<Channel>,
+    op: &str,
+    filters: &[Vec<u8>],
+    build: impl Fn(&[Vec<u8>]) -> anyhow::Result<Request>,
+) -> anyhow::Result<()> {
+    let chunks: Vec<&[Vec<u8>]> = sign::op_chunks(filters).collect();
+    let requests = chunks.iter().map(|chunk| build(*chunk)).collect::<anyhow::Result<Vec<_>>>()?;
+    let count = requests.len();
+    let mut sent = 0;
+    for (index, (request, chunk)) in requests.into_iter().zip(&chunks).enumerate() {
+        pc.send_global(client, wrap(request))
+            .await
+            .map_err(|e| split_send_error(op, index, count, filters, sent, e))?;
+        sent += chunk.len();
+    }
+    if count > 1 {
+        println!("Prover {op} sent successfully as {count} messages for {} filters", filters.len());
+    } else {
+        println!("Prover {op} sent successfully");
+    }
+    Ok(())
+}
+
+/// The error of a split op whose message `index` (from 0) of `count` was not
+/// sent after the first `sent` filters went out. After a partial send it
+/// lists the unsent filters as the arguments of a follow-up command, so a
+/// re-run does not resend the published ones.
+fn split_send_error(
+    op: &str,
+    index: usize,
+    count: usize,
+    filters: &[Vec<u8>],
+    sent: usize,
+    err: impl std::fmt::Display,
+) -> anyhow::Error {
+    let mut message = format!(
+        "prover {op} message {}/{count} not sent ({sent}/{} filters sent): {err}",
+        index + 1,
+        filters.len()
+    );
+    if sent > 0 {
+        let unsent: Vec<String> = filters[sent..].iter().map(hex::encode).collect();
+        message.push_str(&format!(
+            "\nsend the {} unsent filters with: qclient node prover {op} {}",
+            unsent.len(),
+            unsent.join(" ")
+        ));
+    }
+    anyhow::anyhow!(message)
+}
+
 pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let sig = sign::leave_sig(&pc.key_manager, &filters, frame)?;
-    let op = ProverLeave {
-        filters,
-        frame_number: frame,
-        public_key_signature_bls48581: Some(sig),
-    };
-    pc.send_global(&mut client, wrap(Request::Leave(op))).await?;
-    println!("Prover leave sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "leave", &filters, |chunk| {
+        let sig = sign::leave_sig(&pc.key_manager, chunk, frame)?;
+        Ok(Request::Leave(ProverLeave {
+            filters: chunk.to_vec(),
+            frame_number: frame,
+            public_key_signature_bls48581: Some(sig),
+        }))
+    })
+    .await
 }
 
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let op = sign::confirm_op(&pc.key_manager, &filters, frame)?;
-    pc.send_global(&mut client, wrap(Request::Confirm(op))).await?;
-    println!("Prover confirm sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "confirm", &filters, |chunk| {
+        Ok(Request::Confirm(sign::confirm_op(&pc.key_manager, chunk, frame)?))
+    })
+    .await
 }
 
 // `filter` is deprecated in global.proto in favour of the repeated `filters`,
@@ -74,16 +135,16 @@ pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let sig = sign::reject_sig(&pc.key_manager, &filters, frame)?;
-    let op = ProverReject {
-        filter: Vec::new(), // deprecated field
-        frame_number: frame,
-        public_key_signature_bls48581: Some(sig),
-        filters,
-    };
-    pc.send_global(&mut client, wrap(Request::Reject(op))).await?;
-    println!("Prover reject sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "reject", &filters, |chunk| {
+        let sig = sign::reject_sig(&pc.key_manager, chunk, frame)?;
+        Ok(Request::Reject(ProverReject {
+            filter: Vec::new(), // deprecated field
+            frame_number: frame,
+            public_key_signature_bls48581: Some(sig),
+            filters: chunk.to_vec(),
+        }))
+    })
+    .await
 }
 
 pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<()> {
@@ -198,5 +259,30 @@ fn wrap(request: Request) -> MessageRequest {
     MessageRequest {
         request: Some(request),
         timestamp: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A partial send names the unsent filters as follow-up arguments, so a
+    /// re-run does not resend the published messages; a first failure has
+    /// nothing to leave out.
+    #[test]
+    fn a_partial_split_send_lists_the_unsent_filters() {
+        let filters: Vec<Vec<u8>> = (0..250u16).map(|n| n.to_be_bytes().to_vec()).collect();
+        let error = split_send_error("leave", 1, 3, &filters, 100, "boom").to_string();
+        let (head, follow_up) = error.split_once('\n').expect("a follow-up line");
+        assert_eq!(head, "prover leave message 2/3 not sent (100/250 filters sent): boom");
+        let args: Vec<&str> = follow_up
+            .strip_prefix("send the 150 unsent filters with: qclient node prover leave ")
+            .expect("the follow-up command")
+            .split(' ')
+            .collect();
+        assert_eq!(args.len(), 150);
+        assert_eq!((args[0], args[149]), ("0064", "00f9"));
+        let first = split_send_error("leave", 0, 3, &filters, 0, "boom").to_string();
+        assert_eq!(first, "prover leave message 1/3 not sent (0/250 filters sent): boom");
     }
 }

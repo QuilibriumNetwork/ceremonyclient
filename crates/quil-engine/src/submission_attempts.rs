@@ -13,12 +13,26 @@ pub(crate) struct SubmissionAttempts(Mutex<HashMap<Key, Attempt>>);
 struct Attempt {
     frame: u64,
     in_flight: bool,
+    /// Fenced until its epoch ends rather than for the retry fence.
+    for_epoch: bool,
+}
+
+impl Attempt {
+    /// Whether this attempt of `attempt_epoch` still owns its filter at
+    /// `frame` of `epoch`: in flight, or inside its fence.
+    fn owns(&self, attempt_epoch: u64, epoch: u64, frame: u64) -> bool {
+        self.in_flight
+            || (attempt_epoch == epoch
+                && (self.for_epoch || frame.saturating_sub(self.frame) < RETRY_FRAMES))
+    }
 }
 
 pub(crate) struct SubmissionAttempt {
     owner: Arc<SubmissionAttempts>,
     keys: Vec<Key>,
     published_frames: HashMap<Vec<u8>, u64>,
+    /// Filters fenced until the epoch ends (`fence_for_epoch`).
+    epoch_fenced: Vec<Vec<u8>>,
 }
 
 impl SubmissionAttempts {
@@ -27,8 +41,7 @@ impl SubmissionAttempts {
     pub(crate) fn owned(&self, filter: &[u8], frame: u64) -> bool {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
         self.0.lock().is_ok_and(|attempts| attempts.iter().any(|((e, owned), a)| {
-            owned.as_slice() == filter
-                && (a.in_flight || (*e == epoch && frame.saturating_sub(a.frame) < RETRY_FRAMES))
+            owned.as_slice() == filter && a.owns(*e, epoch, frame)
         }))
     }
 
@@ -42,9 +55,7 @@ impl SubmissionAttempts {
         }
         let epoch = quil_types::consensus::epoch_for_frame(frame);
         let mut attempts = self.0.lock().ok()?;
-        attempts.retain(|(e, _), a| {
-            a.in_flight || (*e == epoch && frame.saturating_sub(a.frame) < RETRY_FRAMES)
-        });
+        attempts.retain(|(e, _), a| a.owns(*e, epoch, frame));
         if filters.iter().any(|f| {
             attempts
                 .iter()
@@ -59,6 +70,7 @@ impl SubmissionAttempts {
                 Attempt {
                     frame,
                     in_flight: true,
+                    for_epoch: false,
                 },
             );
         }
@@ -66,11 +78,15 @@ impl SubmissionAttempts {
             owner: self.clone(),
             keys,
             published_frames: HashMap::new(),
+            epoch_fenced: Vec::new(),
         })
     }
 }
 
 impl SubmissionAttempt {
+    /// Every filter published at `frame`; senders record each message's
+    /// filters with `published_subset` as it goes out.
+    #[cfg(test)]
     pub(crate) fn published(mut self, frame: u64) {
         for (_, filter) in &self.keys {
             self.published_frames.insert(filter.clone(), frame);
@@ -95,9 +111,29 @@ impl SubmissionAttempt {
     /// A later chunk failure cannot erase ownership of an already published
     /// subset. Unpublished filters are released when this guard is dropped.
     pub(crate) fn published_subset(&mut self, filters: &[Vec<u8>], frame: u64) {
+        self.fence(filters, frame);
+    }
+
+    /// Keep `filters` owned for the retry fence from `frame`, as if
+    /// published: the attempt refused them for a reason retrying them on the
+    /// next cycle would not change (an op no node decodes).
+    pub(crate) fn fence(&mut self, filters: &[Vec<u8>], frame: u64) {
         for filter in filters {
             if self.keys.iter().any(|(_, owned)| owned == filter) {
                 self.published_frames.insert(filter.clone(), frame);
+            }
+        }
+    }
+
+    /// Keep `filters` owned until the attempt's epoch ends: the attempt left
+    /// them out for a reason that holds for the whole epoch (a seat over the
+    /// decode limits), so preparing them again within it would only leave
+    /// them out again. The next epoch's attempt retries them.
+    pub(crate) fn fence_for_epoch(&mut self, filters: &[Vec<u8>], frame: u64) {
+        self.fence(filters, frame);
+        for filter in filters {
+            if self.published_frames.contains_key(filter) {
+                self.epoch_fenced.push(filter.clone());
             }
         }
     }
@@ -111,6 +147,7 @@ impl Drop for SubmissionAttempt {
                     if let Some(a) = attempts.get_mut(key) {
                         a.in_flight = false;
                         a.frame = a.frame.max(frame);
+                        a.for_epoch |= self.epoch_fenced.contains(&key.1);
                     }
                 } else {
                     attempts.remove(key);
@@ -168,6 +205,20 @@ mod tests {
         guard.published(12);
         assert!(attempts.begin(&[vec![1]], 13).is_none(), "published: fenced");
         assert!(attempts.begin(&[vec![2]], 13).is_some(), "released: not fenced");
+    }
+
+    #[test]
+    fn an_epoch_fence_lasts_until_the_epoch_ends() {
+        let attempts = Arc::new(SubmissionAttempts::default());
+        let mut guard = attempts.begin(&[vec![1], vec![2]], 10).unwrap();
+        guard.fence_for_epoch(&[vec![1]], 12);
+        guard.fence(&[vec![2]], 12);
+        drop(guard);
+        assert!(attempts.begin(&[vec![2]], 42).is_some(), "the retry fence lapses");
+        assert!(attempts.owned(&[1], 719), "the epoch fence holds to the epoch's last frame");
+        assert!(attempts.begin(&[vec![1]], 719).is_none());
+        assert!(!attempts.owned(&[1], 720), "and lapses with it");
+        assert!(attempts.begin(&[vec![1]], 720).is_some(), "the next epoch retries it");
     }
 
     #[test]

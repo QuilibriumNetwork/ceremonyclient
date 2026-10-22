@@ -43,8 +43,30 @@ fn addressed_sig(
     Ok(Bls48581AddressedSignature { signature, address })
 }
 
+/// Split `filters` into the lists one lifecycle op carries, at most
+/// `MAX_FILTERS_PER_OP` each: callers sign and send one op per list, so a
+/// longer selection still goes out as ops every node decodes.
+pub fn op_chunks(filters: &[Vec<u8>]) -> std::slice::Chunks<'_, Vec<u8>> {
+    filters.chunks(quil_execution::global_intrinsic::prover_ops::MAX_FILTERS_PER_OP)
+}
+
+/// Refuse to sign one op over the filters no node decodes: every node drops
+/// such a message, so the command would report success while nothing
+/// changes. A filter over the length limit cannot be split off; callers
+/// split longer lists with [`op_chunks`].
+fn check_filters(op: &str, filters: &[Vec<u8>]) -> anyhow::Result<()> {
+    quil_execution::global_intrinsic::prover_ops::check_filters(filters).map_err(|e| {
+        anyhow::anyhow!(
+            "{op}: {e}; no node decodes such a message: one op carries at most {} filters of at most {} bytes",
+            quil_execution::global_intrinsic::prover_ops::MAX_FILTERS_PER_OP,
+            quil_execution::global_intrinsic::prover_ops::MAX_FILTER_LEN
+        )
+    })
+}
+
 /// ProverPause signature (single filter).
 pub fn pause_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+    check_filters("pause", &[filter.to_vec()])?;
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_pause_domain().map_err(|e| anyhow::anyhow!("pause domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -52,6 +74,7 @@ pub fn pause_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Resu
 
 /// ProverResume signature (single filter).
 pub fn resume_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+    check_filters("resume", &[filter.to_vec()])?;
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_resume_domain().map_err(|e| anyhow::anyhow!("resume domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -59,6 +82,7 @@ pub fn resume_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Res
 
 /// ProverLeave signature (multi filter).
 pub fn leave_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+    check_filters("leave", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_leave_domain().map_err(|e| anyhow::anyhow!("leave domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -86,6 +110,7 @@ pub fn confirm_op(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyho
 /// ProverConfirm signature (multi filter; CLI registers no leaf roots, so
 /// the confirm message is byte-identical to the multi-filter message).
 pub fn confirm_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+    check_filters("confirm", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_confirm_domain().map_err(|e| anyhow::anyhow!("confirm domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -93,6 +118,7 @@ pub fn confirm_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyh
 
 /// ProverReject signature (multi filter).
 pub fn reject_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+    check_filters("reject", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_reject_domain().map_err(|e| anyhow::anyhow!("reject domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -190,6 +216,26 @@ mod tests {
             legacy.extend_from_slice(filter);
         }
         assert_eq!(conversions::prover_confirm_from_proto(&op).to_canonical_bytes().unwrap(), legacy);
+    }
+
+    /// qclient refuses to sign an op no node decodes instead of reporting
+    /// a send that changes nothing.
+    #[test]
+    fn an_op_over_the_decode_limits_is_refused() {
+        let (km, _d) = km_with_prover_key();
+        let filters = |n: usize| vec![vec![0xFFu8; 32]; n];
+        assert!(leave_sig(&km, &filters(100), 7).is_ok());
+        for refused in [
+            leave_sig(&km, &filters(101), 7).map(drop),
+            reject_sig(&km, &filters(101), 7).map(drop),
+            confirm_op(&km, &filters(101), 7).map(drop),
+            pause_sig(&km, &[1; 65], 7).map(drop),
+        ] {
+            let error = refused.unwrap_err().to_string();
+            assert!(error.contains("one op carries at most 100 filters of at most 64 bytes"), "{error}");
+        }
+        let chunks: Vec<usize> = op_chunks(&filters(250)).map(<[Vec<u8>]>::len).collect();
+        assert_eq!(chunks, vec![100, 100, 50], "a longer selection is signed as several ops");
     }
 
     #[test]

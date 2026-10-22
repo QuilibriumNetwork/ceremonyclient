@@ -23,8 +23,8 @@ use super::seniority_merge::SeniorityMerge;
 
 pub const TYPE_PROVER_JOIN: u32 = 0x0301;
 
-const MAX_FILTERS: u32 = 100;
-const MAX_FILTER_LEN: u32 = 64;
+const MAX_FILTERS: u32 = super::prover_ops::MAX_FILTERS_PER_OP as u32;
+const MAX_FILTER_LEN: u32 = super::prover_ops::MAX_FILTER_LEN as u32;
 const MAX_SIG_LEN: u32 = 2249; // Falcon SignatureWithPop: 4+(4+666)+(4+901)+(4+666)
 const MAX_DELEGATE_ADDR_LEN: u32 = 32;
 const MAX_MERGE_TARGET_LEN: u32 = 675;

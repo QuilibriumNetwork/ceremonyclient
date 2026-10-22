@@ -21,11 +21,33 @@ fn write_opt_addr_sig(out: &mut Vec<u8>, sig: Option<&AddressedSignature>) -> Re
     match sig { Some(s) => { let b = s.to_canonical_bytes()?; put_u32(out, b.len() as u32); out.extend_from_slice(&b); } None => put_u32(out, 0), }
     Ok(())
 }
+/// The most filters one prover op carries: every node refuses to decode a
+/// join, leave, confirm or reject naming more, so a sender splits a longer
+/// list into several ops. Consensus-affecting: every node must agree on
+/// what decodes.
+pub const MAX_FILTERS_PER_OP: usize = 100;
+/// The longest filter a prover op carries; a longer one does not decode.
+pub const MAX_FILTER_LEN: usize = 64;
+
+/// Whether `filters` fit one prover op: the decoders' filter count and
+/// filter length limits, as an error naming the one exceeded.
+pub fn check_filters(filters: &[Vec<u8>]) -> Result<()> {
+    if filters.len() > MAX_FILTERS_PER_OP {
+        return Err(QuilError::InvalidArgument(format!(
+            "too many filters: {} (at most {} per op)", filters.len(), MAX_FILTERS_PER_OP)));
+    }
+    if let Some(filter) = filters.iter().find(|f| f.len() > MAX_FILTER_LEN) {
+        return Err(QuilError::InvalidArgument(format!(
+            "filter too long: {} bytes (at most {})", filter.len(), MAX_FILTER_LEN)));
+    }
+    Ok(())
+}
+
 fn read_filters(buf: &[u8], c: &mut usize) -> Result<Vec<Vec<u8>>> {
     let n = read_u32(buf, c)?;
-    if n > 100 { return Err(QuilError::InvalidArgument(format!("too many filters: {}", n))); }
+    if n > MAX_FILTERS_PER_OP as u32 { return Err(QuilError::InvalidArgument(format!("too many filters: {}", n))); }
     let mut out = Vec::with_capacity(n as usize);
-    for _ in 0..n { let l = read_u32(buf, c)?; if l > 64 { return Err(QuilError::InvalidArgument(format!("filter too long: {}", l))); } out.push(read_bytes(buf, c, l as usize)?); }
+    for _ in 0..n { let l = read_u32(buf, c)?; if l > MAX_FILTER_LEN as u32 { return Err(QuilError::InvalidArgument(format!("filter too long: {}", l))); } out.push(read_bytes(buf, c, l as usize)?); }
     Ok(out)
 }
 fn write_filters(out: &mut Vec<u8>, filters: &[Vec<u8>]) {
@@ -354,6 +376,34 @@ mod tests {
 
     fn merge_target() -> SeniorityMerge {
         SeniorityMerge { signature: vec![0x11u8; 74], key_type: 2, prover_public_key: vec![0x22u8; 57] }
+    }
+
+    /// `check_filters` admits exactly the filter lists every filter op
+    /// decodes: senders split by these limits, so they must not drift apart.
+    #[test]
+    fn every_filter_op_decodes_exactly_what_check_filters_admits() {
+        use super::super::{prover_filter_ops::ProverLeave, prover_join::ProverJoin};
+        let decodes = |filters: Vec<Vec<u8>>| -> [bool; 4] {
+            [
+                ProverConfirm::from_canonical_bytes(&ProverConfirm { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverReject::from_canonical_bytes(&ProverReject { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverLeave::from_canonical_bytes(&ProverLeave { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverJoin::from_canonical_bytes(&ProverJoin { filters, ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+            ]
+        };
+        let at_limit = vec![vec![7u8; MAX_FILTER_LEN]; MAX_FILTERS_PER_OP];
+        assert!(check_filters(&at_limit).is_ok());
+        assert_eq!(decodes(at_limit), [true; 4]);
+        let too_many = vec![vec![7u8; 32]; MAX_FILTERS_PER_OP + 1];
+        assert!(check_filters(&too_many).is_err());
+        assert_eq!(decodes(too_many), [false; 4]);
+        let too_long = vec![vec![7u8; MAX_FILTER_LEN + 1]];
+        assert!(check_filters(&too_long).is_err());
+        assert_eq!(decodes(too_long), [false; 4]);
     }
 
     // -- ProverConfirm --
