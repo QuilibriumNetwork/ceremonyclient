@@ -932,14 +932,14 @@ pub(crate) async fn start(
         remote_storage_confirm: Some({
             let cell = remote_worker_manager_for_halt.clone();
             let runtime = tokio::runtime::Handle::current();
-            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64| {
+            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration| {
                 let Some(manager) = cell.get().cloned() else {
                     return Ok(None);
                 };
                 if !manager.serves_filter(filter) {
                     return Ok(None);
                 }
-                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number))
+                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout))
             })
         }),
         pending_shard_changes: Some({

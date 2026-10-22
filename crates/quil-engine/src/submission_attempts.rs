@@ -77,6 +77,21 @@ impl SubmissionAttempt {
         }
     }
 
+    /// Release `filters` before the rest of the attempt finishes: the attempt
+    /// left them out and neither prepares nor submits them any more, so the
+    /// next cycle may retry them while the others are still published.
+    pub(crate) fn release(&mut self, filters: &[Vec<u8>]) {
+        let (released, kept): (Vec<Key>, Vec<Key>) = std::mem::take(&mut self.keys)
+            .into_iter()
+            .partition(|(_, owned)| filters.contains(owned));
+        self.keys = kept;
+        if let Ok(mut attempts) = self.owner.0.lock() {
+            for key in &released {
+                attempts.remove(key);
+            }
+        }
+    }
+
     /// A later chunk failure cannot erase ownership of an already published
     /// subset. Unpublished filters are released when this guard is dropped.
     pub(crate) fn published_subset(&mut self, filters: &[Vec<u8>], frame: u64) {
@@ -141,6 +156,18 @@ mod tests {
         assert!(attempts.begin(&[vec![1]], 13).is_none());
         assert!(attempts.begin(&[vec![2]], 13).is_some());
         assert!(attempts.begin(&[vec![1]], 42).is_some());
+    }
+
+    #[test]
+    fn a_released_filter_is_free_while_the_rest_stays_reserved() {
+        let attempts = Arc::new(SubmissionAttempts::default());
+        let mut guard = attempts.begin(&[vec![1], vec![2]], 10).unwrap();
+        guard.release(&[vec![2]]);
+        assert!(attempts.begin(&[vec![2]], 11).is_some(), "released at once");
+        assert!(attempts.begin(&[vec![1]], 11).is_none(), "still in flight");
+        guard.published(12);
+        assert!(attempts.begin(&[vec![1]], 13).is_none(), "published: fenced");
+        assert!(attempts.begin(&[vec![2]], 13).is_some(), "released: not fenced");
     }
 
     #[test]
