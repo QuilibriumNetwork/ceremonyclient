@@ -37,6 +37,7 @@ use crate::worker::WorkerManager;
 use crate::prover_message_transport::ProverMessageTransport;
 use crate::message_collector::{MessageCollector, SubmitOutcome};
 use crate::current_frame::CurrentFrame;
+use crate::submission_attempts::OpKind;
 
 /// End-to-end submission pipeline for prover lifecycle actions.
 ///
@@ -203,6 +204,8 @@ enum LeftOutCause {
     MergeTarget,
     /// Its filter or leaf roots exceed what every node decodes in a confirm.
     OverLimit,
+    /// Its committed allocation no longer accepts the confirm (`confirm_refusal`).
+    Refused,
 }
 
 impl LeftOutCause {
@@ -214,6 +217,7 @@ impl LeftOutCause {
             Self::Incomplete => "incomplete",
             Self::MergeTarget => "merge target",
             Self::OverLimit => "over decode limit",
+            Self::Refused => "refused",
         }
     }
 }
@@ -244,14 +248,16 @@ impl PreparedConfirm {
     /// prepare is released, so the next cycle retries it; a seat over the
     /// decode limits is fenced from `frame` until the epoch ends, as
     /// preparing it again (a full storage encode) within the epoch would only
-    /// leave it out again; the next epoch's renewal retries it. The submitted
-    /// seats stay reserved until published.
+    /// leave it out again; the next epoch's renewal retries it. A refused
+    /// seat is fenced for the retry fence. The submitted seats stay reserved
+    /// until published.
     fn settle_left_out(&self, attempt: &mut crate::submission_attempts::SubmissionAttempt, frame: u64) {
-        let (over_limit, unprepared): (Vec<&LeftOutSeat>, Vec<&LeftOutSeat>) =
-            self.left_out.iter().partition(|seat| seat.cause == LeftOutCause::OverLimit);
-        let filters = |seats: Vec<&LeftOutSeat>| seats.into_iter().map(|seat| seat.filter.clone()).collect::<Vec<_>>();
-        attempt.fence_for_epoch(&filters(over_limit), frame);
-        attempt.release(&filters(unprepared));
+        let filters = |settled: fn(LeftOutCause) -> bool| {
+            self.left_out.iter().filter(|seat| settled(seat.cause)).map(|seat| seat.filter.clone()).collect::<Vec<_>>()
+        };
+        attempt.fence_for_epoch(&filters(|cause| cause == LeftOutCause::OverLimit), frame);
+        attempt.fence(&filters(|cause| cause == LeftOutCause::Refused), frame);
+        attempt.release(&filters(|cause| !matches!(cause, LeftOutCause::OverLimit | LeftOutCause::Refused)));
     }
 }
 
@@ -269,17 +275,21 @@ fn seat_over_limit(filter: &[u8], roots: &LeafRoots) -> Option<QuilError> {
 /// (a shared merge target) is left out with it, so every submitted seat
 /// registers the shards a change creates from it, as a full confirm does.
 /// A seat whose filter or leaf roots exceed what every node decodes is left
-/// out too (`seat_over_limit`), so it does not take its message-mates down.
-/// When no seat is left and none is over those limits, the first worker
-/// error aborts the confirm, as does any other preparation error.
-fn prepare_confirm<F>(
+/// out too (`seat_over_limit`), so it does not take its message-mates down,
+/// as is one `refused` finds GLOBAL would no longer accept a confirm for,
+/// once every seat is prepared. When no seat is left and none is over those
+/// limits or refused, the first worker error aborts the confirm, as does any
+/// other preparation error.
+fn prepare_confirm<F, R>(
     filters: &[Vec<u8>],
     changes: &[quil_types::store::PendingShardChange],
     epoch: u64,
     mut prepare: F,
+    mut refused: R,
 ) -> Result<PreparedConfirm>
 where
     F: FnMut(&[u8], &[Vec<u8>]) -> Result<Prepared>,
+    R: FnMut(&[u8]) -> Option<QuilError>,
 {
     let mut prepared: Vec<(Vec<u8>, Vec<Vec<u8>>, LeafRoots)> = Vec::with_capacity(filters.len());
     let mut left_out: Vec<LeftOutSeat> = Vec::new();
@@ -290,6 +300,18 @@ where
                 Some(error) => left_out.push(LeftOutSeat { filter, targets, cause: LeftOutCause::OverLimit, error }),
             },
             Prepared::Unanswered(cause, error) => left_out.push(LeftOutSeat { filter, targets, cause, error }),
+        }
+    }
+    // A seat whose allocation changed while it was prepared (a leave of it
+    // landed) would sink every seat of its message.
+    let mut index = 0;
+    while index < prepared.len() {
+        match refused(&prepared[index].0) {
+            Some(error) => {
+                let (filter, targets, _) = prepared.remove(index);
+                left_out.push(LeftOutSeat { filter, targets, cause: LeftOutCause::Refused, error });
+            }
+            None => index += 1,
         }
     }
     // A shard claimed by a left-out seat is encoded by no submitted seat.
@@ -316,11 +338,11 @@ where
             ),
         });
     }
-    // A seat over the decode limits is settled rather than failed, so it is
-    // not prepared again every frame.
+    // A seat over the decode limits or refused is settled rather than
+    // failed, so it is not prepared again every frame.
     if prepared.is_empty()
         && !left_out.is_empty()
-        && left_out.iter().all(|seat| seat.cause != LeftOutCause::OverLimit)
+        && left_out.iter().all(|seat| !matches!(seat.cause, LeftOutCause::OverLimit | LeftOutCause::Refused))
     {
         return Err(left_out.remove(0).error);
     }
@@ -770,8 +792,9 @@ struct ConsumedMergeTarget {
     credited: Option<Vec<u8>>,
 }
 
-/// Read a spent marker from the node's committed GLOBAL state.
-fn spent_marker(
+/// Read a vertex (a spent marker, an allocation) from the node's committed
+/// GLOBAL state.
+fn global_vertex(
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     address: &[u8; 32],
 ) -> Result<Option<Vec<u8>>> {
@@ -781,6 +804,42 @@ fn spent_marker(
         address,
         &va_disc,
     )
+}
+
+/// Seats left out of a confirm as refused that were reported, by epoch.
+fn refused_seat_reports() -> &'static EpochReports<Vec<u8>> {
+    static REPORTS: OnceLock<EpochReports<Vec<u8>>> = OnceLock::new();
+    REPORTS.get_or_init(EpochReports::default)
+}
+
+/// Why every node would refuse a confirm naming `filter` at `frame_number`,
+/// if it would: `validate_confirm_timing` on the committed allocation of the
+/// prover `pubkey`, as GLOBAL checks each filter of a confirm, where one
+/// refused filter sinks the whole message. The allocation can change while
+/// the confirm is prepared (a leave of the seat lands). The rule reads only
+/// the frame's epoch, which inclusion shares (`validate_confirm_epoch`).
+/// Nothing for an absent or unreadable allocation, which GLOBAL skips too.
+/// Reported at info once per seat per epoch.
+fn confirm_refusal(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    pubkey: &[u8],
+    filter: &[u8],
+    frame_number: u64,
+) -> Option<QuilError> {
+    let address = quil_execution::global_intrinsic::materialize::allocation_address(pubkey, filter).ok()?;
+    let blob = global_vertex(crdt, &address).ok().flatten().filter(|blob| !blob.is_empty())?;
+    let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+    let error = quil_execution::global_intrinsic::verify::validate_confirm_timing(frame_number, &tree).err()?;
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    if refused_seat_reports().due(&filter.to_vec(), epoch) {
+        let status = quil_execution::global_schema::read_field(&tree, "allocation:ProverAllocation", "Status")
+            .and_then(|status| status.first().copied())
+            .map(quil_execution::prover_registry::map_allocation_status);
+        info!(frame = frame_number, epoch, filter = hex::encode(filter), status = ?status, %error, scope = "local",
+            "confirmation leaves out a seat whose committed allocation no longer accepts it (a leave of it landed, \
+             or it is already confirmed); submitting the others (reported once per seat per epoch)");
+    }
+    Some(error)
 }
 
 /// Build the `ProverSeniorityMerge` of `seeds` at `frame_number`, leaving out
@@ -895,8 +954,10 @@ impl ProverPipeline {
         needs_storage: bool, prune_replicas: bool,
     ) {
         // A seat whose message failed is retried without resending the seats
-        // already published (see `reserve_filters`).
-        let Some(attempt) = self.reserve_filters("confirm", &mut filters, None, frame_number) else {
+        // already published (see `reserve_filters`). A confirm of leaves is
+        // part of leaving: a renewal's fence must not hold it off.
+        let kind = if needs_storage { OpKind::Confirm } else { OpKind::Leave };
+        let Some(attempt) = self.reserve_filters("confirm", kind, &mut filters, None, frame_number) else {
             return;
         };
         tracing::info!(frame = frame_number, filters = filters.len(), needs_storage, prune_replicas,
@@ -941,6 +1002,12 @@ impl ProverPipeline {
                     }
                 }
             } else {
+                let mut attempt = attempt;
+                let refused: Vec<Vec<u8>> = me.hypergraph.as_ref().map_or_else(Vec::new, |crdt| filters.iter()
+                    .filter(|filter| confirm_refusal(crdt, &me.bls_pubkey, filter, frame_number).is_some())
+                    .cloned().collect());
+                attempt.fence(&refused, me.frame_now(frame_number));
+                let filters: Vec<Vec<u8>> = filters.into_iter().filter(|filter| !refused.contains(filter)).collect();
                 let seat_groups = vec![0; filters.len()];
                 (filters, Vec::new(), seat_groups, attempt)
             };
@@ -977,8 +1044,10 @@ impl ProverPipeline {
     /// `report_over_limit`).
     fn report_left_out_seats(&self, frame_number: u64, prepared: &PreparedConfirm) {
         const LISTED: usize = 16;
-        let (over_limit, unprepared): (Vec<&LeftOutSeat>, Vec<&LeftOutSeat>) =
-            prepared.left_out.iter().partition(|seat| seat.cause == LeftOutCause::OverLimit);
+        // Refused seats are reported as they are found (`confirm_refusal`).
+        let (over_limit, unprepared): (Vec<&LeftOutSeat>, Vec<&LeftOutSeat>) = prepared.left_out.iter()
+            .filter(|seat| seat.cause != LeftOutCause::Refused)
+            .partition(|seat| seat.cause == LeftOutCause::OverLimit);
         if !over_limit.is_empty() {
             let seats: Vec<(Vec<u8>, String)> =
                 over_limit.iter().map(|seat| (seat.filter.clone(), seat.error.to_string())).collect();
@@ -1021,14 +1090,14 @@ impl ProverPipeline {
         // operations reserve before spawning so another evaluation cannot race.
         let reserved = match &mut action {
             LifecycleAction::ProposeJoin { filters, worker_ids, frame_number } => {
-                Some(self.reserve_filters("join", filters, Some(worker_ids), *frame_number))
+                Some(self.reserve_filters("join", OpKind::Join, filters, Some(worker_ids), *frame_number))
             }
             LifecycleAction::RejectJoins { filters, frame_number }
             | LifecycleAction::RejectLeaves { filters, frame_number } => {
-                Some(self.reserve_filters("reject", filters, None, *frame_number))
+                Some(self.reserve_filters("reject", OpKind::Reject, filters, None, *frame_number))
             }
             LifecycleAction::ProposeLeave { filters, frame_number } => {
-                Some(self.reserve_filters("leave", filters, None, *frame_number))
+                Some(self.reserve_filters("leave", OpKind::Leave, filters, None, *frame_number))
             }
             _ => None,
         };
@@ -1201,19 +1270,20 @@ impl ProverPipeline {
     /// operation fails, the next cycle sends that message's filters, not the
     /// published ones again. A filter longer than every node decodes is
     /// fenced and reported instead of sent, so its message-mates still go
-    /// out; it stays fenced until the epoch ends. `None` when nothing is
-    /// left to send.
+    /// out; it stays fenced from ops of its `kind` until the epoch ends.
+    /// `None` when nothing is left to send.
     fn reserve_filters(
         &self,
         op: &'static str,
+        kind: OpKind,
         filters: &mut Vec<Vec<u8>>,
         mut worker_ids: Option<&mut Vec<u32>>,
         frame_number: u64,
     ) -> Option<crate::submission_attempts::SubmissionAttempt> {
         let requested = filters.len();
         let attempts = &self.lifecycle.submission_attempts;
-        retain_paired(filters, worker_ids.as_deref_mut(), |filter| !attempts.owned(filter, frame_number));
-        let Some(mut attempt) = attempts.begin(filters, frame_number) else {
+        retain_paired(filters, worker_ids.as_deref_mut(), |filter| !attempts.owned(filter, frame_number, kind));
+        let Some(mut attempt) = attempts.begin(filters, frame_number, kind) else {
             info!(op, frame = frame_number, filters = requested,
                 "shard submission deferred: another operation owns its filters");
             return None;
@@ -1502,7 +1572,7 @@ impl ProverPipeline {
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 &quil_crypto::sdr::SdrParams::default(),
             )?))
-        })
+        }, |filter| confirm_refusal(crdt, &self.bls_pubkey, filter, frame_number))
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -1621,7 +1691,7 @@ impl ProverPipeline {
             &self.bls_pubkey,
             &self.prover_address,
             bls_signer.as_ref(),
-            |address| self.hypergraph.as_ref().map_or(Ok(None), |crdt| spent_marker(crdt, address)),
+            |address| self.hypergraph.as_ref().map_or(Ok(None), |crdt| global_vertex(crdt, address)),
         )?;
         self.report_consumed_merge_targets(&consumed, frame_number);
         let Some(merge) = merge else {
@@ -1779,6 +1849,7 @@ fn prune_confirmation_replicas(
 #[cfg(test)]
 mod tests {
     use super::confirm_encoding_plan;
+    use crate::submission_attempts::OpKind;
     use quil_types::store::{PendingShardChange, ShardChangeKind};
 
     #[test]
@@ -1861,24 +1932,24 @@ mod tests {
         use std::sync::Arc;
         let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
         let filters = vec![vec![1], vec![2]];
-        let mut attempt = attempts.begin(&filters, FRAME).unwrap();
+        let mut attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
         let prepared = super::prepare_confirm(&filters, &[], 2, |filter, _| {
             Ok(match filter {
                 [2] => super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()),
                 _ => super::Prepared::Roots(vec![roots_of(filter)]),
             })
-        })
+        }, |_| None)
         .expect("the seat whose worker answers is confirmed");
         assert_eq!(prepared.filters, vec![vec![1]], "the confirm names only the prepared seat");
         assert_eq!(prepared.roots, vec![roots_of(&[1])]);
         assert_eq!(left_out_filters(&prepared), vec![vec![2]]);
         assert_eq!(super::left_out_errors(&prepared.left_out), "execution unavailable: worker storage confirm: tcp connect error (1)");
         prepared.settle_left_out(&mut attempt, FRAME);
-        assert!(attempts.begin(&[vec![2]], FRAME).is_some(), "the left-out seat is free for the next cycle");
-        assert!(attempts.begin(&[vec![1]], FRAME).is_none(), "the submitted seat stays reserved");
+        assert!(attempts.begin(&[vec![2]], FRAME, OpKind::Confirm).is_some(), "the left-out seat is free for the next cycle");
+        assert!(attempts.begin(&[vec![1]], FRAME, OpKind::Confirm).is_none(), "the submitted seat stays reserved");
         attempt.published(FRAME);
-        assert!(attempts.begin(&[vec![1]], FRAME + 1).is_none(), "only the submitted seat is fenced as published");
-        assert!(attempts.begin(&[vec![2]], FRAME + 1).is_some());
+        assert!(attempts.begin(&[vec![1]], FRAME + 1, OpKind::Confirm).is_none(), "only the submitted seat is fenced as published");
+        assert!(attempts.begin(&[vec![2]], FRAME + 1, OpKind::Confirm).is_some());
     }
 
     #[test]
@@ -1886,12 +1957,12 @@ mod tests {
         use std::sync::Arc;
         let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
         let filters = vec![vec![1], vec![2]];
-        let attempt = attempts.begin(&filters, FRAME).unwrap();
-        let result = super::prepare_confirm(&filters, &[], 2, |_, _| Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered())));
+        let attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
+        let result = super::prepare_confirm(&filters, &[], 2, |_, _| Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered())), |_| None);
         let error = result.err().expect("nothing to submit");
         assert_eq!(error.to_string(), unanswered().to_string(), "fails as before, with the first worker error");
         drop(attempt);
-        assert!(attempts.begin(&filters, FRAME).is_some(), "every seat is retried on the next cycle");
+        assert!(attempts.begin(&filters, FRAME, OpKind::Confirm).is_some(), "every seat is retried on the next cycle");
     }
 
     #[test]
@@ -1920,7 +1991,7 @@ mod tests {
         assert!(overlapped.load(Ordering::SeqCst), "the answering worker is asked while the other is waited for");
         let prepared = super::prepare_confirm(&[vec![2], vec![1]], &[], 2, |filter, targets| {
             Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
-        })
+        }, |_| None)
         .expect("the answering worker's seat is confirmed");
         assert_eq!(prepared.filters, vec![vec![1]]);
         assert_eq!(prepared.roots, vec![roots_of(&[1])]);
@@ -2011,7 +2082,7 @@ mod tests {
                 .collect();
             let prepared = super::prepare_confirm(&filters, &changes, 8, |filter, targets| {
                 Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
-            })
+            }, |_| None)
             .unwrap();
             assert_eq!(prepared.filters, submitted, "worker of 20 answered {groups:?}");
             assert_eq!(left_out_filters(&prepared), left_out, "worker of 20 answered {groups:?}");
@@ -2031,7 +2102,7 @@ mod tests {
                     std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect(),
                 ),
             })
-        })
+        }, |_| None)
         .unwrap();
         assert_eq!(prepared.filters, vec![vec![5]], "21 would confirm without registering the merge target 20 claimed");
         assert_eq!(prepared.roots, vec![roots_of(&[5])]);
@@ -2043,7 +2114,7 @@ mod tests {
         let result = super::prepare_confirm(&[vec![1], vec![2]], &[], 2, |filter, _| match filter {
             [1] => Err(quil_types::error::QuilError::Internal("store".into())),
             _ => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
-        });
+        }, |_| None);
         assert!(result.is_err());
     }
 
@@ -2089,7 +2160,7 @@ mod tests {
             } else {
                 std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect()
             }))
-        })
+        }, |_| None)
         .unwrap()
     }
 
@@ -2209,7 +2280,7 @@ mod tests {
                 return Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()));
             }
             Ok(super::Prepared::Roots(std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect()))
-        }).unwrap();
+        }, |_| None).unwrap();
         assert_eq!(prepared.filters, vec![vec![1], vec![2]]);
         assert_eq!(prepared.seat_groups, vec![3, 1], "the split parent registers its two children too");
         assert_eq!(prepared.roots.len(), 4);
@@ -2235,27 +2306,99 @@ mod tests {
         };
         let filters: Vec<Vec<u8>> = (0..103).map(seat).collect();
         let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
-        let mut attempt = attempts.begin(&filters, FRAME).unwrap();
-        let prepared = super::prepare_confirm(&filters, &[], 8, prepare).unwrap();
+        let mut attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 8, prepare, |_| None).unwrap();
         assert_eq!(left_out_filters(&prepared), vec![seat(5), seat(7), seat(9)]);
         assert_eq!(super::left_out_causes(&prepared.left_out), "failed 1, over decode limit 2");
         let errors = super::left_out_errors(&prepared.left_out);
         assert!(errors.contains("257 entries (at most 256)") && errors.contains("257 leaf-root groups"), "{errors}");
         prepared.settle_left_out(&mut attempt, FRAME);
-        assert!(attempts.begin(&[seat(9)], FRAME + 1).is_some(), "a worker failure is retried on the next cycle");
+        assert!(attempts.begin(&[seat(9)], FRAME + 1, OpKind::Confirm).is_some(), "a worker failure is retried on the next cycle");
         let messages = split_and_decode(prepared, &[]);
         assert_eq!(sizes(&messages), vec![100], "the others fill one message");
         drop(attempt); // Nothing was published.
-        assert!(!attempts.owned(&seat(0), FRAME + 1), "an unpublished seat is retried on the next cycle");
+        assert!(!attempts.owned(&seat(0), FRAME + 1, OpKind::Confirm), "an unpublished seat is retried on the next cycle");
         let next_epoch = FRAME + quil_types::consensus::epoch_length_frames();
         for over in [seat(5), seat(7)] {
-            assert!(attempts.owned(&over, FRAME + 30), "not prepared again after the retry fence");
-            assert!(attempts.owned(&over, next_epoch - 1), "nor until the epoch ends");
-            assert!(!attempts.owned(&over, next_epoch), "retried in the next epoch");
+            assert!(attempts.owned(&over, FRAME + 30, OpKind::Confirm), "not prepared again after the retry fence");
+            assert!(attempts.owned(&over, next_epoch - 1, OpKind::Confirm), "nor until the epoch ends");
+            assert!(!attempts.owned(&over, next_epoch, OpKind::Confirm), "retried in the next epoch");
+            assert!(!attempts.owned(&over, FRAME + 30, OpKind::Leave), "the fence does not hold off a leave");
+        }
+        let left = attempts.begin(&[seat(5)], FRAME + 30, OpKind::Leave);
+        assert!(left.is_some(), "a seat over the decode limits can still be left");
+        drop(left);
+        for over in [seat(5), seat(7)] {
+            assert!(attempts.owned(&over, FRAME + 31, OpKind::Confirm), "an unpublished leave leaves the renewal fenced");
         }
         // With every seat over a limit the confirm is settled, not failed.
-        let prepared = super::prepare_confirm(&[seat(5)], &[], 8, prepare).expect("settled, not failed");
+        let prepared = super::prepare_confirm(&[seat(5)], &[], 8, prepare, |_| None).expect("settled, not failed");
         assert!(prepared.filters.is_empty());
+        assert!(super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups).is_empty());
+    }
+
+    /// Committed GLOBAL state holding this prover's allocation of each
+    /// filter: joined at frame 10, confirmed in epoch 1 (so registered for
+    /// epoch 2), and left at the given frame.
+    fn global_with_allocations(seats: &[(Vec<u8>, Option<u64>)]) -> std::sync::Arc<quil_hypergraph::HypergraphCrdt> {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+        use std::sync::Arc;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(crdt.clone());
+        let va_disc = vertex_adds_discriminator().unwrap();
+        for (filter, left) in seats {
+            let (address, mut tree) = materialize::materialize_prover_join(BLS_KEY, std::slice::from_ref(filter), 10, 0)
+                .unwrap().allocations.remove(0);
+            materialize::materialize_prover_confirm(&mut tree, 730, None).unwrap();
+            if let Some(frame) = left {
+                materialize::materialize_prover_leave(&mut tree, *frame).unwrap();
+            }
+            let blob = quil_execution::prover_registry::vertex_tree_to_blob(&tree);
+            state
+                .set(&quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc, 1, blob)
+                .unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        crdt
+    }
+
+    /// A seat whose leave landed while its renewal was prepared is left out
+    /// of the confirm and the others still go out: every node refuses a
+    /// confirm naming a seat Leaving since this epoch, and with it every seat
+    /// of the message (2026-10-22). It is fenced, not prepared again at once,
+    /// and with every seat refused nothing is submitted.
+    #[test]
+    fn a_seat_turned_leaving_while_prepared_is_left_out_of_its_confirm() {
+        const RENEWAL: u64 = 1460; // Epoch 2: renews the seats for epoch 3.
+        let (kept, left) = (seat(1), seat(2));
+        let global = global_with_allocations(&[(kept.clone(), None), (left.clone(), Some(1450))]);
+        let refused = |filter: &[u8]| super::confirm_refusal(&global, BLS_KEY, filter, RENEWAL);
+        assert!(refused(&kept).is_none(), "a seat registered for this epoch renews");
+        assert!(refused(&seat(3)).is_none(), "an absent allocation is left to GLOBAL");
+        let prepare = |filter: &[u8], _: &[Vec<u8>]| -> quil_types::error::Result<super::Prepared> {
+            Ok(super::Prepared::Roots(vec![roots_of(filter)]))
+        };
+        let attempts = std::sync::Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let filters = vec![kept.clone(), left.clone()];
+        let mut attempt = attempts.begin(&filters, RENEWAL, OpKind::Confirm).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 3, prepare, refused).unwrap();
+        assert_eq!(prepared.filters, vec![kept.clone()], "the Leaving seat is left out");
+        assert_eq!(super::left_out_causes(&prepared.left_out), "refused 1");
+        prepared.settle_left_out(&mut attempt, RENEWAL);
+        let messages = super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups);
+        assert_eq!(messages, vec![(vec![kept.clone()], vec![roots_of(&kept)])], "the other seat still goes out");
+        drop(attempt);
+        assert!(attempts.owned(&left, RENEWAL + 29, OpKind::Confirm), "fenced, not prepared again at once");
+        assert!(!attempts.owned(&left, RENEWAL + 30, OpKind::Confirm));
+        let prepared = super::prepare_confirm(&[left.clone()], &[], 3, prepare, refused).expect("settled, not failed");
         assert!(super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups).is_empty());
     }
 
@@ -2379,7 +2522,7 @@ mod tests {
         seeds: &[[u8; 57]],
     ) -> (Option<super::ProverSeniorityMerge>, Vec<super::ConsumedMergeTarget>) {
         super::seniority_merge(FRAME, seeds, BLS_KEY, &OWN, &prover_signer(), |address| {
-            super::spent_marker(global, address)
+            super::global_vertex(global, address)
         })
         .unwrap()
     }
