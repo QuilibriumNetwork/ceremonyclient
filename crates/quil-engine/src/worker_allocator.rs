@@ -50,6 +50,29 @@ pub(crate) fn rejected_leave_recovery_pending(
         && epoch_for_frame(frame) == epoch_for_frame(allocation.leave_reject_frame_number)
 }
 
+/// Why the allocator released a manual worker's seat, and whether a leave
+/// ended it.
+fn manual_release_reason(
+    alloc: Option<&quil_types::consensus::ProverAllocationInfo>,
+    frame_number: u64,
+) -> (&'static str, bool) {
+    use quil_types::consensus::EffectiveStatus;
+    let Some(alloc) = alloc else {
+        return ("join_never_landed", false);
+    };
+    match alloc.effective_status(frame_number) {
+        EffectiveStatus::Kicked if alloc.leave_confirm_frame_number > 0 => ("leave_confirmed", true),
+        EffectiveStatus::ExpiredLeaving => ("leave_departed", true),
+        EffectiveStatus::Kicked => ("kicked", false),
+        EffectiveStatus::Rejected => ("join_rejected", false),
+        EffectiveStatus::ExpiredJoining => ("join_expired", false),
+        EffectiveStatus::ExpiredEpoch => ("missed_epoch_renewal", false),
+        EffectiveStatus::Historic => ("reassigned", false),
+        // Still live: freed for an unbound allocation, a split child.
+        _ => ("freed_for_split_child", false),
+    }
+}
+
 /// A recently expired storage registration gets one epoch to recover its
 /// worker and publish renewal. This reserves local capacity only; it never
 /// changes protocol membership, proof eligibility or the stored epoch.
@@ -557,6 +580,43 @@ impl WorkerAllocator {
     /// [`Self::awaits_renewal_offer`].
     pub(crate) fn note_renewals_offered(&self) {
         self.renewals_offered.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Tell the operator about each manual worker this pass released and
+    /// left idle. Releases are mode-agnostic: a seat that expired, was
+    /// rejected or evicted, or was vacated for a split child frees a manual
+    /// worker like any other. The lifecycle plans joins for auto workers
+    /// only, so an idle manual worker serves nothing until the operator
+    /// joins it to a shard, or until an allocation of this prover lands
+    /// unbound, which the bind pass gives to manual workers first (the
+    /// TUI's join relies on that). Logged once, on the transition; a leave
+    /// the operator asked for idles it as intended, so that is info only.
+    fn log_idled_manual_workers(
+        &self,
+        frame_number: u64,
+        manual_seats: &[(u32, Vec<u8>)],
+        alloc_by_filter: &HashMap<Vec<u8>, &quil_types::consensus::ProverAllocationInfo>,
+    ) -> Result<()> {
+        if manual_seats.is_empty() {
+            return Ok(());
+        }
+        let workers = self.worker_manager.range_workers()?;
+        for (core_id, filter) in manual_seats {
+            if !workers.iter().any(|w| w.core_id == *core_id && w.manually_managed && w.filter.is_empty()) {
+                continue;
+            }
+            let (reason, left) = manual_release_reason(alloc_by_filter.get(filter).copied(), frame_number);
+            if left {
+                info!(core_id, filter = %hex::encode(filter), frame = frame_number, reason,
+                    "manual worker idle after leaving its shard; the lifecycle does not join manual \
+                     workers: join it to a shard or switch it to auto");
+            } else {
+                warn!(core_id, filter = %hex::encode(filter), frame = frame_number, reason,
+                    "manual worker lost its seat and is idle; the lifecycle does not join manual \
+                     workers: join it to a shard or switch it to auto");
+            }
+        }
+        Ok(())
     }
 
     /// Free a worker, unless its committee session is still closing.
@@ -1090,6 +1150,13 @@ impl WorkerAllocator {
                     && !bound_filters.contains(&a.confirmation_filter)
             });
 
+        // Seats of manual workers at the start of this pass; see
+        // `log_idled_manual_workers`.
+        let manual_seats: Vec<(u32, Vec<u8>)> = workers.iter()
+            .filter(|w| w.manually_managed && !w.filter.is_empty())
+            .map(|w| (w.core_id, w.filter.clone()))
+            .collect();
+
         let session_authority = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone();
         let local_public_key = prover_info.as_ref().map(|p| p.public_key.clone());
         for worker in &workers {
@@ -1536,6 +1603,8 @@ impl WorkerAllocator {
                 orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
         }
+
+        self.log_idled_manual_workers(frame_number, &manual_seats, &alloc_by_filter)?;
 
         self.expire_unlanded_join_markers(
             frame_number,
@@ -2649,6 +2718,53 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].filter, live_filter,
             "the stale epoch binding must yield its only worker to the live allocation");
+    }
+
+    /// Releases are mode-agnostic, and the lifecycle joins auto workers
+    /// only, so a manual worker whose seat lapsed sat idle with no signal.
+    /// The pass that idles it says so once; one rebound in the same pass,
+    /// or one whose leave departed, is not reported as a lost seat.
+    #[test]
+    fn a_manual_worker_idled_by_a_release_is_reported_once() {
+        const LOST: &str = "manual worker lost its seat and is idle";
+        const LEFT: &str = "manual worker idle after leaving its shard";
+        let frame = 10_000;
+        let stale_filter = vec![0x01; 32];
+        let live_filter = vec![0x02; 32];
+        let setup = |allocations: Vec<ProverAllocationInfo>| {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &stale_filter).unwrap();
+            wm.set_manually_managed(1, true).unwrap();
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(allocations)));
+            let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            alloc.note_renewals_offered();
+            (wm, alloc)
+        };
+        let mut stale = make_alloc(stale_filter.clone());
+        stale.epoch = 0;
+
+        let (wm, alloc) = setup(vec![stale.clone()]);
+        let logged = reconcile_logged(&alloc, frame);
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "the lapsed seat frees its worker");
+        assert_eq!(logged.matches(LOST).count(), 1, "{logged}");
+        assert!(logged.contains("missed_epoch_renewal") && logged.contains("core_id=1"), "{logged}");
+        let logged = reconcile_logged(&alloc, frame + 1);
+        assert!(!logged.contains(LOST), "an idle worker is reported on the transition only: {logged}");
+
+        let mut live = make_alloc(live_filter.clone());
+        live.epoch = quil_types::consensus::epoch_for_frame(frame);
+        let (wm, alloc) = setup(vec![stale.clone(), live]);
+        let logged = reconcile_logged(&alloc, frame);
+        assert_eq!(wm.range_workers().unwrap()[0].filter, live_filter);
+        assert!(!logged.contains(LOST), "a worker rebound in the same pass is not idle: {logged}");
+
+        let mut departed = make_alloc(stale_filter.clone());
+        departed.status = ProverStatus::Kicked;
+        departed.leave_frame_number = 100;
+        departed.leave_confirm_frame_number = 800;
+        let (_, alloc) = setup(vec![departed]);
+        let logged = reconcile_logged(&alloc, frame);
+        assert!(!logged.contains(LOST) && logged.contains(LEFT) && logged.contains("leave_confirmed"), "{logged}");
     }
 
     // -----------------------------------------------------------------
