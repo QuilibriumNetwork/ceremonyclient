@@ -86,9 +86,10 @@ pub struct ProverPipeline {
     >>,
     /// Leaf roots prepared by the standalone (cluster-mode) worker serving a
     /// filter, from its own store: `Ok(None)` when no such worker serves it.
-    /// Called from a blocking task. Without it the master encoded from its
-    /// own store, which lacks the shard's data, and the worker's attestations
-    /// were rejected for leaves it could never prove.
+    /// Called from a blocking task, with the time the worker may take.
+    /// Without it the master encoded from its own store, which lacks the
+    /// shard's data, and the worker's attestations were rejected for leaves
+    /// it could never prove.
     pub remote_storage_confirm: Option<RemoteStorageConfirm>,
     /// Splits and merges this node has recorded but not applied. A confirm in
     /// the epoch before one applies also registers the shards it creates from
@@ -111,7 +112,7 @@ pub struct ProverPipeline {
 }
 
 pub type RemoteStorageConfirm = std::sync::Arc<
-    dyn Fn(&[u8], &[Vec<u8>], u64) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
+    dyn Fn(&[u8], &[Vec<u8>], u64, std::time::Duration) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
         + Send + Sync,
 >;
 
@@ -153,6 +154,303 @@ fn confirm_encoding_plan(
             (filter.clone(), targets)
         })
         .collect()
+}
+
+type LeafRoots = Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>;
+
+/// One filter's confirm preparation: its leaf roots, or why the standalone
+/// worker that serves it did not prepare them, with its error.
+enum Prepared {
+    Roots(LeafRoots),
+    Unanswered(LeftOutCause, QuilError),
+}
+
+/// Why a confirm leaves a seat out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LeftOutCause {
+    /// Its worker failed: unreachable, refused, or another error.
+    Failed,
+    /// Its worker was asked and had not answered by the round's deadline.
+    Late,
+    /// The round's deadline passed before its worker was asked.
+    Unasked,
+    /// Its worker's answer omitted or repeated a shard it was asked for.
+    Incomplete,
+    /// It pre-registers a shard a left-out seat was to encode.
+    MergeTarget,
+}
+
+impl LeftOutCause {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Late => "late",
+            Self::Unasked => "unasked",
+            Self::Incomplete => "incomplete",
+            Self::MergeTarget => "merge target",
+        }
+    }
+}
+
+/// A seat a confirm leaves out, with why; retried on the next cycle.
+struct LeftOutSeat {
+    filter: Vec<u8>,
+    /// Shards this seat was to pre-register for the confirm.
+    targets: Vec<Vec<u8>>,
+    cause: LeftOutCause,
+    error: QuilError,
+}
+
+/// What a confirm submits: the filters whose storage was prepared and their
+/// leaf roots, in the order requested, and the seats it leaves out.
+struct PreparedConfirm {
+    filters: Vec<Vec<u8>>,
+    roots: LeafRoots,
+    left_out: Vec<LeftOutSeat>,
+}
+
+impl PreparedConfirm {
+    /// Release the left-out seats' reservations so the next cycle retries
+    /// them; the submitted seats stay reserved until published.
+    fn release_left_out(&self, attempt: &mut crate::submission_attempts::SubmissionAttempt) {
+        let left_out: Vec<Vec<u8>> = self.left_out.iter().map(|seat| seat.filter.clone()).collect();
+        attempt.release(&left_out);
+    }
+}
+
+/// Prepare a confirm of `filters` along `confirm_encoding_plan`. A seat whose
+/// standalone worker does not answer is left out, so the seats whose workers
+/// answer are confirmed instead of all failing together; it is retried on the
+/// next cycle. A seat that was to encode a shard a left-out seat had claimed
+/// (a shared merge target) is left out with it, so every submitted seat
+/// registers the shards a change creates from it, as a full confirm does.
+/// When no seat is left, the first worker error aborts the confirm, as does
+/// any other preparation error.
+fn prepare_confirm<F>(
+    filters: &[Vec<u8>],
+    changes: &[quil_types::store::PendingShardChange],
+    epoch: u64,
+    mut prepare: F,
+) -> Result<PreparedConfirm>
+where
+    F: FnMut(&[u8], &[Vec<u8>]) -> Result<Prepared>,
+{
+    let mut prepared: Vec<(Vec<u8>, Vec<Vec<u8>>, LeafRoots)> = Vec::with_capacity(filters.len());
+    let mut left_out: Vec<LeftOutSeat> = Vec::new();
+    for (filter, targets) in confirm_encoding_plan(filters, changes, epoch) {
+        match prepare(&filter, &targets)? {
+            Prepared::Roots(roots) => prepared.push((filter, targets, roots)),
+            Prepared::Unanswered(cause, error) => left_out.push(LeftOutSeat { filter, targets, cause, error }),
+        }
+    }
+    // A shard claimed by a left-out seat is encoded by no submitted seat.
+    loop {
+        let orphaned: Vec<&Vec<u8>> = left_out.iter().flat_map(|seat| seat.targets.iter()).collect();
+        let Some(position) = prepared.iter().position(|(filter, targets, _)| {
+            quil_execution::global_intrinsic::leaf_root_registration::pre_registration_targets(
+                changes,
+                std::slice::from_ref(filter),
+                epoch,
+            )
+            .iter()
+            .any(|target| orphaned.contains(&target) && !targets.contains(target))
+        }) else {
+            break;
+        };
+        let (filter, targets, _) = prepared.remove(position);
+        left_out.push(LeftOutSeat {
+            filter,
+            targets,
+            cause: LeftOutCause::MergeTarget,
+            error: QuilError::ExecutionUnavailable(
+                "a shard it pre-registers was to be encoded by a left-out seat".into(),
+            ),
+        });
+    }
+    if prepared.is_empty() && !left_out.is_empty() {
+        return Err(left_out.remove(0).error);
+    }
+    let mut confirm = PreparedConfirm { filters: Vec::with_capacity(prepared.len()), roots: Vec::new(), left_out };
+    for (filter, _, roots) in prepared {
+        confirm.filters.push(filter);
+        confirm.roots.extend(roots);
+    }
+    Ok(confirm)
+}
+
+/// Standalone workers asked at once for their seats' leaf roots.
+const REMOTE_PREPARATIONS: usize = 8;
+
+/// How long one standalone worker may take to encode its seat's replicas and
+/// answer: encoding a large shard is slow.
+const REMOTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The share of an epoch one confirm's round of standalone-worker
+/// preparations may take. A seat's renewal is due from its epoch's first
+/// frame and lapses at the next boundary. Without a deadline each worker that
+/// never answers held the round for its whole timeout, eight at a time, while
+/// the round kept an encoder permit: 40 such workers held it for 50 minutes
+/// of a two-hour mainnet epoch (720 frames of `IDEAL_FRAME_TIME`). A sixth of
+/// an epoch, 20 minutes on mainnet, still gives a worker asked in the round's
+/// first half its full timeout, and leaves five more rounds in the epoch for
+/// the seats a round leaves out.
+const REMOTE_ROUND_EPOCH_SHARE: u64 = 6;
+
+/// When a round of standalone-worker preparations starting now must end.
+fn remote_round_deadline() -> std::time::Instant {
+    let epoch_ms = quil_types::consensus::epoch_length_frames()
+        .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME as u64);
+    std::time::Instant::now() + std::time::Duration::from_millis(epoch_ms / REMOTE_ROUND_EPOCH_SHARE)
+}
+
+/// A standalone worker's answer for a seat: its leaf roots, `None` when no
+/// standalone worker runs the seat, or why it gave none.
+type RemoteAnswer = std::result::Result<Option<LeafRoots>, (LeftOutCause, QuilError)>;
+
+/// Ask the standalone workers for their seats' leaf roots, `parallel` at a
+/// time, keyed by filter, until `deadline`. Each answer may take up to the
+/// worker's timeout, and a worker that does not answer must not hold up those
+/// that do. Each worker encodes only its own shard, so the queries are
+/// independent. A worker is given at most the time left before `deadline`:
+/// one that has not answered by then is late, and a seat whose turn comes
+/// after the deadline is not asked, so the round ends by it.
+fn query_remote_workers<F>(
+    requests: &[(Vec<u8>, Vec<Vec<u8>>)],
+    parallel: usize,
+    deadline: std::time::Instant,
+    query: F,
+) -> HashMap<Vec<u8>, RemoteAnswer>
+where
+    F: Fn(&[u8], &[Vec<u8>], std::time::Duration) -> Result<Option<LeafRoots>> + Sync,
+{
+    if requests.is_empty() {
+        return HashMap::new();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let answers = Mutex::new(HashMap::with_capacity(requests.len()));
+    let threads = parallel.max(1).min(requests.len());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((filter, targets)) = requests.get(index) else { break };
+                let timeout = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(REMOTE_PREPARATION_TIMEOUT);
+                let answer = if timeout.is_zero() {
+                    Err((
+                        LeftOutCause::Unasked,
+                        QuilError::ExecutionUnavailable("not asked before the confirm round's deadline".into()),
+                    ))
+                } else {
+                    let asked = std::time::Instant::now();
+                    query(filter, targets, timeout).map_err(|error| {
+                        let cause = if asked.elapsed() >= timeout { LeftOutCause::Late } else { LeftOutCause::Failed };
+                        (cause, error)
+                    })
+                };
+                answers.lock().unwrap_or_else(|e| e.into_inner()).insert(filter.clone(), answer);
+            });
+        }
+    });
+    answers.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Seats whose standalone workers were asked and had not answered by their
+/// round's deadline. The next round asks them after the others, so workers
+/// that never answer cannot fill every slot of each round while the seats
+/// planned after them go unasked. Holds only this node's own seats.
+#[derive(Default)]
+struct LateSeats(Mutex<std::collections::HashSet<Vec<u8>>>);
+
+impl LateSeats {
+    /// Order `requests` with the late seats last, otherwise as planned.
+    fn ask_last(&self, requests: &mut [(Vec<u8>, Vec<Vec<u8>>)]) {
+        let late = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        requests.sort_by_key(|(filter, _)| late.contains(filter));
+    }
+
+    /// Record the round's `answers`: a seat asked and late is late, one that
+    /// answered or failed in time is not; an unasked seat keeps its place.
+    fn record(&self, answers: &HashMap<Vec<u8>, RemoteAnswer>) {
+        let mut late = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (filter, answer) in answers {
+            match answer {
+                Err((LeftOutCause::Late, _)) => {
+                    late.insert(filter.clone());
+                }
+                Err((LeftOutCause::Unasked, _)) => {}
+                _ => {
+                    late.remove(filter);
+                }
+            }
+        }
+    }
+}
+
+fn late_seats() -> &'static LateSeats {
+    static LATE: OnceLock<LateSeats> = OnceLock::new();
+    LATE.get_or_init(LateSeats::default)
+}
+
+/// Whether `roots` hold exactly one group for `filter` and one for each of
+/// `targets`, and none for another shard: the worker encoded every shard the
+/// seat registers, so the confirm registers the shards a pending change
+/// creates from it.
+fn answers_every_requested_shard(filter: &[u8], targets: &[Vec<u8>], roots: &LeafRoots) -> bool {
+    roots.len() == 1 + targets.len()
+        && std::iter::once(filter)
+            .chain(targets.iter().map(Vec::as_slice))
+            .all(|shard| roots.iter().filter(|group| group.filter == shard).count() == 1)
+}
+
+/// A standalone worker's answer as the preparation of the seat `filter`,
+/// asked to encode `targets` too: its leaf roots when they cover every shard
+/// asked for, or why the seat is left out; `None` when no standalone worker
+/// runs the seat, which the master then encodes from its own store.
+fn remote_answer(filter: &[u8], targets: &[Vec<u8>], answer: RemoteAnswer) -> Option<Prepared> {
+    match answer {
+        Ok(Some(roots)) if answers_every_requested_shard(filter, targets, &roots) => Some(Prepared::Roots(roots)),
+        Ok(Some(roots)) => Some(Prepared::Unanswered(
+            LeftOutCause::Incomplete,
+            QuilError::ExecutionUnavailable(format!(
+                "worker answered {} leaf-root groups, not one for its shard and each of its {} targets",
+                roots.len(),
+                targets.len(),
+            )),
+        )),
+        Ok(None) => None,
+        Err((cause, error)) => Some(Prepared::Unanswered(cause, error)),
+    }
+}
+
+/// How many left-out seats each cause accounts for, e.g. `failed 2, late 1`.
+fn left_out_causes(left_out: &[LeftOutSeat]) -> String {
+    let mut counts: std::collections::BTreeMap<LeftOutCause, usize> = Default::default();
+    for seat in left_out {
+        *counts.entry(seat.cause).or_default() += 1;
+    }
+    counts.into_iter().map(|(cause, count)| format!("{} {count}", cause.name())).collect::<Vec<_>>().join(", ")
+}
+
+/// The distinct errors of left-out seats with their counts, most frequent
+/// first, at most three.
+fn left_out_errors(left_out: &[LeftOutSeat]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for seat in left_out {
+        let error = seat.error.to_string();
+        match counts.iter_mut().find(|(seen, _)| *seen == error) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((error, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let more = counts.len().saturating_sub(3);
+    let mut summary: Vec<String> = counts.into_iter().take(3).map(|(error, count)| format!("{error} ({count})")).collect();
+    if more > 0 {
+        summary.push(format!("{more} more"));
+    }
+    summary.join("; ")
 }
 
 /// A seniority-merge target GLOBAL already consumed: a join or seniority
@@ -317,7 +615,7 @@ impl ProverPipeline {
             // Limit expensive preparation independently from network timeouts.
             // Keep the reservation inside the blocking task: cancelling its
             // waiter cannot start a second encoder while the first still runs.
-            let (roots, attempt) = if needs_storage {
+            let (filters, roots, attempt) = if needs_storage {
                 static ENCODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
                 let Ok(permit) = ENCODERS.acquire().await else { return; };
                 let encoder = me.clone();
@@ -331,11 +629,17 @@ impl ProverPipeline {
                             &encoded_filters, current_epoch,
                         );
                     }
-                    let roots = encoder.storage_confirm_leaf_roots(&encoded_filters, frame_number);
-                    (roots, attempt)
+                    let confirm = encoder.storage_confirm_leaf_roots(&encoded_filters, frame_number);
+                    (confirm, attempt)
                 }).await;
                 match prepared {
-                    Ok((Ok(roots), attempt)) => (roots, attempt),
+                    Ok((Ok(prepared), mut attempt)) => {
+                        if !prepared.left_out.is_empty() {
+                            prepared.release_left_out(&mut attempt);
+                            me.report_left_out_seats(frame_number, &prepared);
+                        }
+                        (prepared.filters, prepared.roots, attempt)
+                    }
                     Ok((Err(e), _attempt)) => {
                         warn!(frame = frame_number, %e, "confirmation preparation failed; retrying on next cycle");
                         return;
@@ -346,7 +650,7 @@ impl ProverPipeline {
                     }
                 }
             } else {
-                (Vec::new(), attempt)
+                (filters, Vec::new(), attempt)
             };
             match tokio::time::timeout(
                 NON_VDF_SUBMIT_TIMEOUT,
@@ -359,6 +663,38 @@ impl ProverPipeline {
                 Err(_) => warn!(frame = frame_number, "confirmation submission timed out"),
             }
         });
+    }
+
+    /// Warn, once per confirm, of the seats it leaves out because their
+    /// workers did not prepare their storage, or not by the round's deadline:
+    /// the confirm goes ahead for the others, and these are retried on the
+    /// next cycle.
+    fn report_left_out_seats(&self, frame_number: u64, prepared: &PreparedConfirm) {
+        const LISTED: usize = 16;
+        let workers = self.worker_manager.range_workers().unwrap_or_default();
+        let mut core_ids: Vec<u32> = prepared
+            .left_out
+            .iter()
+            .filter_map(|seat| workers.iter().find(|w| w.filter == seat.filter).map(|w| w.core_id))
+            .collect();
+        core_ids.sort_unstable();
+        core_ids.dedup();
+        let listed = core_ids.iter().take(LISTED).map(u32::to_string).collect::<Vec<_>>().join(",");
+        warn!(
+            frame = frame_number,
+            epoch = quil_types::consensus::epoch_for_frame(frame_number),
+            left_out = prepared.left_out.len(),
+            requested = prepared.left_out.len() + prepared.filters.len(),
+            submitted = prepared.filters.len(),
+            causes = %left_out_causes(&prepared.left_out),
+            core_ids = %listed,
+            more_core_ids = core_ids.len().saturating_sub(LISTED),
+            errors = %left_out_errors(&prepared.left_out),
+            scope = "local workers",
+            action = "check that these workers run, the master can reach them and they answer within the round",
+            "confirmation leaves out seats whose workers did not prepare their storage in time; \
+             submitting the others, retrying these on next cycle"
+        );
     }
 
     /// Dispatch a lifecycle action. Non-blocking: spawns a tokio task
@@ -753,17 +1089,21 @@ impl ProverPipeline {
 
     /// Partition committed shard data into PoRep leaves, encode and persist the
     /// next epoch's replicas, and return their roots. Preparation errors abort
-    /// submission so the lifecycle can retry. Global confirms need no replicas.
+    /// submission so the lifecycle can retry, except a standalone worker's: its
+    /// seat is left out of this confirm (see `prepare_confirm`). Standalone
+    /// workers are asked concurrently, within a round deadline, and their
+    /// answers must cover every shard asked for. Global confirms need no
+    /// replicas.
     fn storage_confirm_leaf_roots(
         &self,
         filters: &[Vec<u8>],
         frame_number: u64,
-    ) -> Result<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>> {
+    ) -> Result<PreparedConfirm> {
         let (Some(crdt), Some(replica_store)) =
             (self.hypergraph.as_ref(), self.replica_store.as_ref())
         else {
             if filters.iter().all(Vec::is_empty) {
-                return Ok(Vec::new());
+                return Ok(PreparedConfirm { filters: filters.to_vec(), roots: Vec::new(), left_out: Vec::new() });
             }
             return Err(QuilError::Internal("storage confirmation requires hypergraph and replica store".into()));
         };
@@ -781,28 +1121,42 @@ impl ProverPipeline {
             Some(pending) if frame_number >= quil_execution::global_intrinsic::leaf_root_registration::pre_registration_frame() => pending(),
             _ => Vec::new(),
         };
-        let mut roots = Vec::with_capacity(filters.len());
-        for (filter, targets) in confirm_encoding_plan(filters, &changes, epoch) {
-            let filter = &filter;
-            let worker = if filter.is_empty() {
-                None
-            } else {
-                self.storage_for_filter.as_ref().and_then(|resolve| resolve(filter))
-            };
-            if worker.is_none() && !filter.is_empty() {
-                if let Some(remote) = self.remote_storage_confirm.as_ref() {
-                    if let Some(prepared) = remote(filter, &targets, frame_number)? {
-                        roots.extend(prepared);
-                        continue;
-                    }
-                }
+        // The thread worker holding each shard, if any. A shard none holds is
+        // prepared by the standalone worker running it, else by the master.
+        let local: HashMap<_, _> = filters
+            .iter()
+            .filter(|filter| !filter.is_empty())
+            .map(|filter| (filter.clone(), self.storage_for_filter.as_ref().and_then(|resolve| resolve(filter))))
+            .collect();
+        let mut answers = match self.remote_storage_confirm.as_ref() {
+            Some(remote) => {
+                let mut requests: Vec<(Vec<u8>, Vec<Vec<u8>>)> = confirm_encoding_plan(filters, &changes, epoch)
+                    .into_iter()
+                    .filter(|(filter, _)| matches!(local.get(filter), Some(None)))
+                    .collect();
+                late_seats().ask_last(&mut requests);
+                let answers = query_remote_workers(
+                    &requests,
+                    REMOTE_PREPARATIONS,
+                    remote_round_deadline(),
+                    |filter, targets, timeout| remote(filter, targets, frame_number, timeout),
+                );
+                late_seats().record(&answers);
+                answers
             }
+            None => HashMap::new(),
+        };
+        prepare_confirm(filters, &changes, epoch, |filter, targets| {
+            if let Some(prepared) = answers.remove(filter).and_then(|answer| remote_answer(filter, targets, answer)) {
+                return Ok(prepared);
+            }
+            let worker = local.get(filter).cloned().flatten();
             let (filter_crdt, filter_replicas) = match worker.as_ref() {
                 Some((worker_crdt, worker_replicas)) => (worker_crdt.as_ref(), worker_replicas),
                 None => (crdt.as_ref(), replica_store),
             };
-            let encoded: Vec<Vec<u8>> = std::iter::once(filter.clone()).chain(targets).collect();
-            roots.extend(crate::app_shard_metadata::compute_storage_confirm(
+            let encoded: Vec<Vec<u8>> = std::iter::once(filter.to_vec()).chain(targets.iter().cloned()).collect();
+            Ok(Prepared::Roots(crate::app_shard_metadata::compute_storage_confirm(
                 filter_crdt,
                 filter_replicas,
                 &encoded,
@@ -810,10 +1164,8 @@ impl ProverPipeline {
                 epoch,
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 &quil_crypto::sdr::SdrParams::default(),
-            )?);
-        }
-        Ok(roots)
-
+            )?))
+        })
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -1163,6 +1515,212 @@ mod tests {
             effective_epoch: 8,
             proposed_frame: 0,
         }
+    }
+
+    fn roots_of(filter: &[u8]) -> quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots {
+        quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots {
+            filter: filter.to_vec(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn unanswered() -> quil_types::error::QuilError {
+        quil_types::error::QuilError::ExecutionUnavailable("worker storage confirm: tcp connect error".into())
+    }
+
+    fn left_out_filters(prepared: &super::PreparedConfirm) -> Vec<Vec<u8>> {
+        prepared.left_out.iter().map(|seat| seat.filter.clone()).collect()
+    }
+
+    #[test]
+    fn a_confirm_skips_a_filter_whose_worker_does_not_answer() {
+        use std::sync::Arc;
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let filters = vec![vec![1], vec![2]];
+        let mut attempt = attempts.begin(&filters, FRAME).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 2, |filter, _| {
+            Ok(match filter {
+                [2] => super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()),
+                _ => super::Prepared::Roots(vec![roots_of(filter)]),
+            })
+        })
+        .expect("the seat whose worker answers is confirmed");
+        assert_eq!(prepared.filters, vec![vec![1]], "the confirm names only the prepared seat");
+        assert_eq!(prepared.roots, vec![roots_of(&[1])]);
+        assert_eq!(left_out_filters(&prepared), vec![vec![2]]);
+        assert_eq!(super::left_out_errors(&prepared.left_out), "execution unavailable: worker storage confirm: tcp connect error (1)");
+        prepared.release_left_out(&mut attempt);
+        assert!(attempts.begin(&[vec![2]], FRAME).is_some(), "the left-out seat is free for the next cycle");
+        assert!(attempts.begin(&[vec![1]], FRAME).is_none(), "the submitted seat stays reserved");
+        attempt.published(FRAME);
+        assert!(attempts.begin(&[vec![1]], FRAME + 1).is_none(), "only the submitted seat is fenced as published");
+        assert!(attempts.begin(&[vec![2]], FRAME + 1).is_some());
+    }
+
+    #[test]
+    fn a_confirm_whose_workers_all_fail_is_not_submitted() {
+        use std::sync::Arc;
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let filters = vec![vec![1], vec![2]];
+        let attempt = attempts.begin(&filters, FRAME).unwrap();
+        let result = super::prepare_confirm(&filters, &[], 2, |_, _| Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered())));
+        let error = result.err().expect("nothing to submit");
+        assert_eq!(error.to_string(), unanswered().to_string(), "fails as before, with the first worker error");
+        drop(attempt);
+        assert!(attempts.begin(&filters, FRAME).is_some(), "every seat is retried on the next cycle");
+    }
+
+    #[test]
+    fn a_worker_that_does_not_answer_does_not_hold_up_the_others() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        let (answered, answer_seen) = mpsc::channel::<()>();
+        let (answered, answer_seen) = (Mutex::new(answered), Mutex::new(answer_seen));
+        let overlapped = AtomicBool::new(false);
+        // The silent worker's seat comes first, as it may in plan order.
+        let requests = vec![(vec![2], Vec::new()), (vec![1], Vec::new())];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut answers = super::query_remote_workers(&requests, 8, deadline, |filter, _, _| match filter {
+            // Stands in for a worker that times out: it gives up once the
+            // other has answered, or after five seconds if asked after it.
+            [2] => {
+                let seen = answer_seen.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+                overlapped.store(seen, Ordering::SeqCst);
+                Err(unanswered())
+            }
+            _ => {
+                let _ = answered.lock().unwrap().send(());
+                Ok(Some(vec![roots_of(filter)]))
+            }
+        });
+        assert!(overlapped.load(Ordering::SeqCst), "the answering worker is asked while the other is waited for");
+        let prepared = super::prepare_confirm(&[vec![2], vec![1]], &[], 2, |filter, targets| {
+            Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
+        })
+        .expect("the answering worker's seat is confirmed");
+        assert_eq!(prepared.filters, vec![vec![1]]);
+        assert_eq!(prepared.roots, vec![roots_of(&[1])]);
+        assert_eq!(left_out_filters(&prepared), vec![vec![2]]);
+    }
+
+    /// A round ends at its deadline: a worker that has not answered by then
+    /// is late, the seats after it are not asked, and both are left out
+    /// rather than encoded by the master. The next round asks the late seat
+    /// after the others, so the seats behind it answer.
+    #[test]
+    fn a_round_ends_at_its_deadline_and_asks_late_seats_last_next() {
+        use super::LeftOutCause;
+        let late = super::LateSeats::default();
+        let asked = std::sync::Mutex::new(Vec::new());
+        // [2] stands in for a worker that never answers: it holds its call
+        // for the whole time it is given.
+        let query = |filter: &[u8], _: &[Vec<u8>], timeout: std::time::Duration| {
+            asked.lock().unwrap().push(filter.to_vec());
+            if filter == [2] {
+                std::thread::sleep(timeout);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable("worker storage confirm timed out".into()));
+            }
+            Ok(Some(vec![roots_of(filter)]))
+        };
+        let round = |answers: &std::collections::HashMap<Vec<u8>, super::RemoteAnswer>, filter: u8| {
+            match answers.get(&vec![filter]).expect("every seat has an answer") {
+                Ok(Some(_)) => None,
+                Ok(None) => panic!("no seat runs on the master"),
+                Err((cause, _)) => Some(*cause),
+            }
+        };
+        let plan = || vec![(vec![2], Vec::new()), (vec![1], Vec::new()), (vec![3], Vec::new())];
+
+        let mut requests = plan();
+        late.ask_last(&mut requests);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(300);
+        let mut answers = super::query_remote_workers(&requests, 1, deadline, query);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "the round ends by its deadline");
+        assert_eq!(*asked.lock().unwrap(), vec![vec![2]]);
+        assert_eq!([2, 1, 3].map(|filter| round(&answers, filter)),
+            [Some(LeftOutCause::Late), Some(LeftOutCause::Unasked), Some(LeftOutCause::Unasked)]);
+        late.record(&answers);
+        let unasked = answers.remove(&vec![1]).unwrap();
+        assert!(matches!(super::remote_answer(&[1], &[], unasked), Some(super::Prepared::Unanswered(LeftOutCause::Unasked, _))),
+            "an unasked seat is left out, not encoded by the master");
+
+        let mut requests = plan();
+        late.ask_last(&mut requests);
+        assert_eq!(requests.iter().map(|(filter, _)| filter[0]).collect::<Vec<_>>(), vec![1, 3, 2], "the late seat is asked last");
+        asked.lock().unwrap().clear();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let answers = super::query_remote_workers(&requests, 1, deadline, query);
+        assert_eq!([1, 3, 2].map(|filter| round(&answers, filter)), [None, None, Some(LeftOutCause::Late)]);
+        late.record(&answers);
+
+        let mut answered = std::collections::HashMap::new();
+        answered.insert(vec![2], Ok(Some(vec![roots_of(&[2])])));
+        late.record(&answered);
+        let mut requests = plan();
+        late.ask_last(&mut requests);
+        assert_eq!(requests.iter().map(|(filter, _)| filter[0]).collect::<Vec<_>>(), vec![2, 1, 3], "a seat that answers is late no more");
+    }
+
+    /// A worker's answer must hold one group for its shard and one for each
+    /// shard it was asked to pre-register: one that omits or repeats a group
+    /// leaves its seat out, and with it the seat that shares its merge target.
+    #[test]
+    fn a_worker_answer_missing_or_repeating_a_requested_shard_leaves_its_seat_out() {
+        let changes = vec![change(ShardChangeKind::Merge, 2, &[20, 21])];
+        let filters = [vec![20], vec![21], vec![5]];
+        let plan = confirm_encoding_plan(&filters, &changes, 8);
+        assert_eq!(plan[0], (vec![20], vec![vec![2]]), "20 encodes the merge target");
+        for (groups, submitted, left_out) in [
+            (vec![vec![20], vec![2]], vec![vec![20], vec![21], vec![5]], Vec::new()),
+            (vec![vec![20]], vec![vec![5]], vec![vec![20], vec![21]]),
+            (vec![vec![20], vec![2], vec![2]], vec![vec![5]], vec![vec![20], vec![21]]),
+            (vec![vec![20], vec![20], vec![2]], vec![vec![5]], vec![vec![20], vec![21]]),
+        ] {
+            let mut answers: std::collections::HashMap<Vec<u8>, super::RemoteAnswer> = plan
+                .iter()
+                .map(|(filter, targets)| {
+                    let answered: Vec<Vec<u8>> = if filter == &vec![20] { groups.clone() }
+                        else { std::iter::once(filter).chain(targets).cloned().collect() };
+                    (filter.clone(), Ok(Some(answered.iter().map(|group| roots_of(group)).collect())))
+                })
+                .collect();
+            let prepared = super::prepare_confirm(&filters, &changes, 8, |filter, targets| {
+                Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
+            })
+            .unwrap();
+            assert_eq!(prepared.filters, submitted, "worker of 20 answered {groups:?}");
+            assert_eq!(left_out_filters(&prepared), left_out, "worker of 20 answered {groups:?}");
+            if !left_out.is_empty() {
+                assert_eq!(super::left_out_causes(&prepared.left_out), "incomplete 1, merge target 1");
+            }
+        }
+    }
+
+    #[test]
+    fn a_seat_sharing_a_merge_target_with_a_left_out_seat_is_left_out_too() {
+        let changes = vec![change(ShardChangeKind::Merge, 2, &[20, 21])];
+        let prepared = super::prepare_confirm(&[vec![20], vec![21], vec![5]], &changes, 8, |filter, targets| {
+            Ok(match filter {
+                [20] => super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()),
+                _ => super::Prepared::Roots(
+                    std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect(),
+                ),
+            })
+        })
+        .unwrap();
+        assert_eq!(prepared.filters, vec![vec![5]], "21 would confirm without registering the merge target 20 claimed");
+        assert_eq!(prepared.roots, vec![roots_of(&[5])]);
+        assert_eq!(left_out_filters(&prepared), vec![vec![20], vec![21]]);
+    }
+
+    #[test]
+    fn a_local_preparation_error_still_aborts_the_confirm() {
+        let result = super::prepare_confirm(&[vec![1], vec![2]], &[], 2, |filter, _| match filter {
+            [1] => Err(quil_types::error::QuilError::Internal("store".into())),
+            _ => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
+        });
+        assert!(result.is_err());
     }
 
     #[test]

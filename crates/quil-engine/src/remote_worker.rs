@@ -447,12 +447,14 @@ impl RemoteWorkerManager {
     /// worker running it, from its own store. `Ok(None)`: no standalone worker
     /// runs this filter (including a Joining allocation, whose engine has not
     /// started); the caller encodes from its own store as before. Encoding a
-    /// large shard is slow; the caller bounds concurrency, this bounds the wait.
+    /// large shard is slow; the caller bounds concurrency and, by `timeout`,
+    /// the wait.
     pub async fn prepare_storage_confirm(
         &self,
         filter: &[u8],
         targets: &[Vec<u8>],
         frame_number: u64,
+        timeout: std::time::Duration,
     ) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>> {
         let channel = {
             let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
@@ -466,7 +468,7 @@ impl RemoteWorkerManager {
         let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
             .max_decoding_message_size(16 << 20);
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(600),
+            timeout,
             client.prepare_storage_confirm(quil_types::proto::node::PrepareStorageConfirmRequest {
                 filter: filter.to_vec(),
                 frame_number,
@@ -492,7 +494,9 @@ impl RemoteWorkerManager {
             .iter()
             .map(quil_execution::global_intrinsic::conversions::confirm_leaf_roots_from_proto)
             .collect();
-        if roots.iter().any(|group| group.filter != filter) {
+        // The worker encodes its shard and the shards a pending split or
+        // merge creates from it (`targets`); any other group is not its own.
+        if roots.iter().any(|group| group.filter != filter && !targets.contains(&group.filter)) {
             return Err(QuilError::ExecutionUnavailable("worker returned leaf roots for another filter".into()));
         }
         Ok(Some(roots))
@@ -998,8 +1002,26 @@ mod fee_relay_tests {
         async fn set_halted(&self, _: tonic::Request<node::SetHaltedRequest>) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
             Ok(tonic::Response::new(node::SetHaltedResponse {}))
         }
-        async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("not used by fee relay"))
+        /// Mode 8 answers for the requested shard and its targets, as a
+        /// worker does; mode 9 adds a group for a shard it was not asked for.
+        async fn prepare_storage_confirm(&self, request: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
+            let mode = self.mode.load(Ordering::SeqCst);
+            if !matches!(mode, 8 | 9) {
+                return Err(tonic::Status::unimplemented("not used by fee relay"));
+            }
+            let request = request.into_inner();
+            let mut groups: Vec<Vec<u8>> = std::iter::once(request.filter).chain(request.targets).collect();
+            if mode == 9 {
+                groups.push(vec![0xEE; 32]);
+            }
+            Ok(tonic::Response::new(node::PrepareStorageConfirmResponse {
+                leaf_roots: groups
+                    .into_iter()
+                    .map(|filter| quil_execution::global_intrinsic::conversions::confirm_leaf_roots_to_proto(
+                        &quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots { filter, entries: Vec::new() },
+                    ))
+                    .collect(),
+            }))
         }
         /// Mode 5 is an older build without the call.
         async fn evict_payload(&self, request: tonic::Request<node::EvictPayloadRequest>)
@@ -1216,6 +1238,48 @@ mod fee_relay_tests {
             RemoteDelivery::Failed,
             "no worker runs that shard"
         );
+        stop.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+    }
+
+    /// A worker's leaf roots for the shards a pending change creates from its
+    /// shard are accepted with its own; a group for any other shard is not.
+    #[tokio::test]
+    async fn a_worker_s_leaf_roots_for_its_pre_registration_targets_are_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(8));
+        let server = SnapshotServer {
+            mode: mode.clone(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+        });
+        let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        let targets = vec![vec![10; 32], vec![11; 32]];
+        let roots = manager
+            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10))
+            .await
+            .unwrap()
+            .expect("the worker runs the shard");
+        assert_eq!(
+            roots.iter().map(|group| group.filter.clone()).collect::<Vec<_>>(),
+            vec![vec![7; 32], vec![10; 32], vec![11; 32]],
+            "its shard and the shards a split creates from it"
+        );
+        mode.store(9, Ordering::SeqCst);
+        assert!(manager
+            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err()
+            .is_execution_unavailable(), "a group for a shard it was not asked for");
         stop.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
     }
