@@ -15,7 +15,7 @@ use std::time::Duration;
 use commonware_consensus::simplex::{
     elector::RoundRobin, Config, Engine, Floor, ForwardingPolicy,
 };
-use commonware_consensus::types::{Epoch, ViewDelta};
+use commonware_consensus::types::{Epoch, View, ViewDelta};
 use commonware_cryptography::Sha256;
 use commonware_p2p::Blocker;
 use commonware_parallel::Sequential;
@@ -55,6 +55,37 @@ pub struct GlobalEngineParams {
     pub skip_timeout: u64,
     /// Records votes and certificates for operators ([`crate::adapters::Liveness`]).
     pub liveness: Option<Arc<crate::adapters::Liveness>>,
+    /// Lets this node, as leader, skip notarized parents it cannot extend.
+    pub parent_fallback: Option<Arc<dyn ParentFallback>>,
+}
+
+/// Which certified parents a leader can build on, in view numbers: the
+/// engine's [`commonware_consensus::simplex::ParentFallback`]. The engine asks
+/// only about views that are also nullified, so they can never finalize, and
+/// skips those this says it cannot extend for an older certified parent above
+/// the last finalized view. Voters are unchanged and accept that parent, as
+/// every view between it and the proposal is nullified.
+pub trait ParentFallback: Send + Sync {
+    /// Whether this node can build on `payload`, certified at `view`. It runs
+    /// in the consensus loop, so it must be cheap; when unsure, answer true.
+    fn extendable(&self, view: u64, payload: Digest) -> bool;
+
+    /// The leader of `view` skipped `skipped` (newest first) for `parent`.
+    fn fell_back(&self, view: u64, parent: u64, skipped: &[u64]);
+}
+
+/// [`ParentFallback`] in the engine's terms.
+struct EngineParentFallback(Arc<dyn ParentFallback>);
+
+impl commonware_consensus::simplex::ParentFallback<Digest> for EngineParentFallback {
+    fn extendable(&self, view: View, payload: &Digest) -> bool {
+        self.0.extendable(view.get(), *payload)
+    }
+
+    fn fell_back(&self, view: View, parent: View, skipped: &[View]) {
+        let skipped: Vec<u64> = skipped.iter().map(|view| view.get()).collect();
+        self.0.fell_back(view.get(), parent.get(), &skipped);
+    }
 }
 
 impl GlobalEngineParams {
@@ -80,6 +111,7 @@ impl GlobalEngineParams {
             activity_timeout: 10,
             skip_timeout: 5,
             liveness: None,
+            parent_fallback: None,
         }
     }
 
@@ -150,6 +182,7 @@ where
         .with_liveness(params.liveness.clone());
     let relay = FalconRelay::new(sink, store.clone());
     let reporter = FalconReporter::new(finalizer, store).with_liveness(params.liveness.clone());
+    let parent_fallback = params.parent_fallback.clone();
 
     let cfg = Config {
         scheme,
@@ -183,7 +216,11 @@ where
         page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
         forwarding: ForwardingPolicy::Disabled,
     };
-    Engine::new(context.child("engine"), cfg)
+    let engine = Engine::new(context.child("engine"), cfg);
+    match parent_fallback {
+        Some(fallback) => engine.with_parent_fallback(Arc::new(EngineParentFallback(fallback))),
+        None => engine,
+    }
 }
 
 // ---------------------------------------------------------------------------

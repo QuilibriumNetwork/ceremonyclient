@@ -16,6 +16,7 @@ use commonware_runtime::{
     spawn_cell, BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, Storage,
 };
 use rand_core::CryptoRng;
+use std::sync::Arc;
 use tracing::debug;
 
 /// Instance of `simplex` consensus engine.
@@ -129,6 +130,13 @@ impl<
             resolver,
             resolver_mailbox,
         }
+    }
+
+    /// QUILIBRIUM: let this engine's leader skip certified, nullified parents
+    /// the application cannot extend ([`ParentFallback`](super::ParentFallback)).
+    pub fn with_parent_fallback(mut self, fallback: Arc<dyn super::ParentFallback<D>>) -> Self {
+        self.voter.set_parent_fallback(fallback);
+        self
     }
 
     /// Start the `simplex` consensus engine.

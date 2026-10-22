@@ -10,7 +10,7 @@ use crate::{
             Artifact, Certificate, Context, Finalization, Finalize, Notarization, Notarize,
             Nullification, Nullify, Proposal,
         },
-        Floor,
+        Floor, ParentFallback,
     },
     types::{Epoch, Participant, Round as Rnd, View, ViewDelta},
     Viewable,
@@ -25,12 +25,17 @@ use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, BTreeSet},
     mem::{replace, take},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
-use tracing::{debug, warn, Span};
+use tracing::{debug, info, warn, Span};
 
 /// The view number of the genesis block.
 const GENESIS_VIEW: View = View::zero();
+
+/// QUILIBRIUM: the most nullifications a fallback proposal forwards in one
+/// turn (see `State::take_fallback_nullifications`).
+const FALLBACK_NULLIFICATIONS: usize = 64;
 
 /// Reasons a proposal's ancestry cannot yet produce a verification context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -106,6 +111,14 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<
 
     certification_candidates: BTreeSet<View>,
     outstanding_certifications: BTreeSet<View>,
+    // QUILIBRIUM: see `find_parent`.
+    parent_fallback: Option<Arc<dyn ParentFallback<D>>>,
+    // QUILIBRIUM: `(view, parent, newest skipped view)` of our fallback
+    // proposal in the current view (see `take_fallback_nullifications`).
+    fallback_gap: Option<(View, View, View)>,
+    // QUILIBRIUM: our fallback turns that hit `FALLBACK_NULLIFICATIONS`; picks
+    // the window of views forwarded next.
+    fallback_capped_turns: usize,
 
     current_view: Gauge,
     tracked_views: Gauge,
@@ -140,11 +153,20 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
             views: BTreeMap::new(),
             certification_candidates: BTreeSet::new(),
             outstanding_certifications: BTreeSet::new(),
+            parent_fallback: None,
+            fallback_gap: None,
+            fallback_capped_turns: 0,
             current_view,
             tracked_views,
             timeouts,
             nullifications,
         }
+    }
+
+    /// QUILIBRIUM: let this node, as leader, skip certified parents the
+    /// application cannot extend (see `find_parent`).
+    pub fn set_parent_fallback(&mut self, fallback: Arc<dyn ParentFallback<D>>) {
+        self.parent_fallback = Some(fallback);
     }
 
     /// Seeds the state machine with the genesis payload and advances into view 1.
@@ -223,6 +245,8 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
         round.open_span();
         round.set_deadlines(leader_deadline, certification_deadline);
         self.view = view;
+        // QUILIBRIUM: a fallback proposal's forwarding ends with its view.
+        self.fallback_gap = None;
 
         // Update metrics
         let _ = self.current_view.try_set(view.get());
@@ -532,7 +556,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
 
         // Look for parent
         let parent = self.find_parent(view);
-        let (parent_view, parent_payload) = match parent {
+        let (parent_view, parent_payload, skipped) = match parent {
             Ok(parent) => parent,
             Err(missing) => {
                 debug!(%view, %missing, "missing parent during proposal");
@@ -544,11 +568,76 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
             .get_mut(&view)
             .expect("view must exist")
             .try_propose()?;
+        // QUILIBRIUM: reported once, as the leader turn starts building.
+        if let Some(fallback) = self.parent_fallback.as_ref().filter(|_| !skipped.is_empty()) {
+            fallback.fell_back(view, parent_view, &skipped);
+            self.fallback_gap = Some((view, parent_view, skipped[0]));
+        }
         Some(Context {
             round: Rnd::new(self.epoch, view),
             leader: leader.key,
             parent: (parent_view, parent_payload),
         })
+    }
+
+    /// QUILIBRIUM: the nullifications voters may lack to accept our fallback
+    /// proposal at `view`, once: those of the views from just above its
+    /// parent through the newest skipped view. A voter that certified the late
+    /// notarization of a skipped view entered the next view without that
+    /// view's nullification, and one that caught up through a certificate
+    /// passed the views below it without theirs. Neither can fetch them: its
+    /// resolver fetches only above its newest certified view, and a peer asked
+    /// for a view at or below its own newest certified view answers with that
+    /// certificate instead. `parent_payload` would wait for them. Views above
+    /// the newest skipped view are not forwarded: every voter passed them by
+    /// nullification or, holding no newer certified view, fetches them.
+    ///
+    /// At most [`FALLBACK_NULLIFICATIONS`] go out per turn, so a long gap does
+    /// not flood the committee: the skipped views first, then a window of the
+    /// views between, which advances on each of our capped turns. The cap is
+    /// safe: a voter still missing one does not fetch it but waits
+    /// (`try_verify`) until the view times out, so we only lose the turn,
+    /// which is nullified like any failed one. It keeps the nullifications it
+    /// received, as views above the last finalized one are retained, so our
+    /// later fallback turns fill in the rest of the range.
+    pub fn take_fallback_nullifications(&mut self, view: View) -> Vec<Nullification<S>> {
+        let Some((proposed, parent, newest)) = self.fallback_gap else {
+            return Vec::new();
+        };
+        if proposed != view {
+            return Vec::new();
+        }
+        self.fallback_gap = None;
+        let (mut views, between): (Vec<View>, Vec<View>) =
+            View::range(parent.next(), newest.next())
+                .filter(|gap| self.is_nullified(*gap))
+                .partition(|gap| self.is_certified(*gap).is_some());
+        let nullified = views.len() + between.len();
+        views.truncate(FALLBACK_NULLIFICATIONS);
+        let room = FALLBACK_NULLIFICATIONS - views.len();
+        if between.len() <= room {
+            views.extend(between);
+        } else if room > 0 {
+            let windows = between.len().div_ceil(room);
+            let start = (self.fallback_capped_turns % windows) * room;
+            views.extend(between.iter().skip(start).take(room));
+            self.fallback_capped_turns = self.fallback_capped_turns.wrapping_add(1);
+        }
+        views.sort();
+        let nullifications: Vec<_> = views
+            .into_iter()
+            .filter_map(|gap| self.nullification(gap).cloned())
+            .collect();
+        info!(
+            %view,
+            %parent,
+            newest_skipped = %newest,
+            forwarded = nullifications.len(),
+            nullified_between = nullified,
+            capped = nullified > FALLBACK_NULLIFICATIONS,
+            "leader forwards nullifications with its fallback proposal"
+        );
+        nullifications
     }
 
     /// Records a locally constructed proposal once the automaton finishes building it.
@@ -715,18 +804,40 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: ElectorConfig<S>, D: Diges
 
     /// Finds the parent payload for a given view by walking backwards through
     /// the chain, skipping nullified views until finding a certified payload.
-    fn find_parent(&self, view: View) -> Result<(View, D), View> {
+    ///
+    /// QUILIBRIUM: a certified view that is also nullified is skipped too when
+    /// the application cannot extend it (see [`ParentFallback`]); the skipped
+    /// views are returned, newest first. A late notarization can certify a view
+    /// the others already nullified; it can never finalize (an honest voter
+    /// never casts both a nullify and a finalize vote for a view, so the two
+    /// quorums cannot coexist). Nor can a finalized view be nullified, so the
+    /// walk stops at the last finalized view (or, if that round is gone,
+    /// returns `Err`) and never passes it; every skipped view lies above it
+    /// and no finalized block descends from one. Skipping loses nothing
+    /// finalized, and voters accept the older parent because every view
+    /// between it and the proposal is nullified (`parent_payload`). The
+    /// `last_finalized` guard only matters beyond the fault bound.
+    fn find_parent(&self, view: View) -> Result<(View, D, Vec<View>), View> {
         // If the view is the genesis view, consider it to be its own parent.
         let mut cursor = view.previous().unwrap_or(GENESIS_VIEW);
+        let mut skipped = Vec::new();
 
         loop {
-            // Return the first certified (including finalized) parent.
+            // Return the first certified (including finalized) parent the
+            // application can extend.
             if let Some(parent) = self.is_certified(cursor) {
-                return Ok((cursor, *parent));
-            }
-
-            // If the view is also not nullified, there is a gap in certificates.
-            if !self.is_nullified(cursor) {
+                let unextendable = cursor > self.last_finalized
+                    && self.is_nullified(cursor)
+                    && self
+                        .parent_fallback
+                        .as_ref()
+                        .is_some_and(|fallback| !fallback.extendable(cursor, parent));
+                if !unextendable {
+                    return Ok((cursor, *parent, skipped));
+                }
+                skipped.push(cursor);
+            } else if !self.is_nullified(cursor) {
+                // If the view is also not nullified, there is a gap in certificates.
                 return Err(cursor);
             }
 
@@ -2626,6 +2737,441 @@ mod tests {
 
             // Attempt to notarize after timeout
             assert!(state.construct_notarize(view).is_none());
+        });
+    }
+
+    // QUILIBRIUM: a leader's fallback past certified, nullified parents its
+    // application cannot extend (`ParentFallback`).
+
+    /// Refuses the listed payloads and records each reported fallback.
+    #[derive(Default)]
+    struct Refusing {
+        unextendable: Vec<Sha256Digest>,
+        asked: std::sync::Mutex<Vec<View>>,
+        fell_back: std::sync::Mutex<Vec<(View, View, Vec<View>)>>,
+    }
+
+    impl ParentFallback<Sha256Digest> for Refusing {
+        fn extendable(&self, view: View, payload: &Sha256Digest) -> bool {
+            self.asked.lock().unwrap().push(view);
+            !self.unextendable.contains(payload)
+        }
+
+        fn fell_back(&self, view: View, parent: View, skipped: &[View]) {
+            self.fell_back
+                .lock()
+                .unwrap()
+                .push((view, parent, skipped.to_vec()));
+        }
+    }
+
+    fn refusing(unextendable: &[Sha256Digest]) -> Arc<Refusing> {
+        Arc::new(Refusing {
+            unextendable: unextendable.to_vec(),
+            ..Default::default()
+        })
+    }
+
+    fn fallback_state<S: Scheme<Sha256Digest>>(
+        context: deterministic::Context,
+        scheme: S,
+    ) -> State<deterministic::Context, S, RoundRobin, Sha256Digest> {
+        let mut state = State::new(
+            context,
+            Config {
+                scheme,
+                elector: <RoundRobin>::default(),
+                epoch: Epoch::new(1),
+                activity_timeout: ViewDelta::new(10),
+                leader_timeout: Duration::from_secs(1),
+                certification_timeout: Duration::from_secs(2),
+                timeout_retry: Duration::from_secs(3),
+            },
+        );
+        state.set_genesis(test_genesis());
+        state
+    }
+
+    /// Notarizes `payload` at `view` on `parent` and certifies it.
+    fn certify_view<S: Scheme<Sha256Digest>>(
+        state: &mut State<deterministic::Context, S, RoundRobin, Sha256Digest>,
+        schemes: &[S],
+        verifier: &S,
+        view: View,
+        parent: View,
+        payload: Sha256Digest,
+    ) {
+        let proposal = Proposal::new(Rnd::new(state.epoch(), view), parent, payload);
+        let votes: Vec<_> = schemes
+            .iter()
+            .map(|scheme| Notarize::sign(scheme, proposal.clone()).unwrap())
+            .collect();
+        let notarization = Notarization::from_notarizes(verifier, votes.iter(), &Sequential)
+            .expect("notarization");
+        assert!(state.add_notarization(notarization).0);
+        assert!(state.certified(view, true).is_some());
+    }
+
+    fn nullify_view<S: Scheme<Sha256Digest>>(
+        state: &mut State<deterministic::Context, S, RoundRobin, Sha256Digest>,
+        schemes: &[S],
+        verifier: &S,
+        view: View,
+    ) {
+        let round = Rnd::new(state.epoch(), view);
+        let votes: Vec<_> = schemes
+            .iter()
+            .map(|scheme| Nullify::sign::<Sha256Digest>(scheme, round).unwrap())
+            .collect();
+        let nullification =
+            Nullification::from_nullifies(verifier, &votes, &Sequential).expect("nullification");
+        assert!(state.add_nullification(nullification));
+    }
+
+    const EXTENDABLE: Sha256Digest = Sha256Digest([2u8; 32]);
+    const TOO_DEEP: Sha256Digest = Sha256Digest([4u8; 32]);
+
+    /// View 1 certified; view 2 certified and nullified (extendable); view 3
+    /// nullified; view 4 certified and nullified (too deep to extend); view 5
+    /// nullified. The local signer leads view 6 (RoundRobin: (1 + 6) % 4).
+    fn late_notarizations<S: Scheme<Sha256Digest>>(
+        state: &mut State<deterministic::Context, S, RoundRobin, Sha256Digest>,
+        schemes: &[S],
+        verifier: &S,
+    ) {
+        certify_view(state, schemes, verifier, View::new(1), GENESIS_VIEW, Sha256Digest::from([1u8; 32]));
+        certify_view(state, schemes, verifier, View::new(2), View::new(1), EXTENDABLE);
+        nullify_view(state, schemes, verifier, View::new(2));
+        nullify_view(state, schemes, verifier, View::new(3));
+        certify_view(state, schemes, verifier, View::new(4), View::new(2), TOO_DEEP);
+        nullify_view(state, schemes, verifier, View::new(4));
+        nullify_view(state, schemes, verifier, View::new(5));
+        assert_eq!(state.current_view(), View::new(6));
+    }
+
+    #[test]
+    fn find_parent_skips_unextendable_nullified_certified_views() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[3].clone());
+            late_notarizations(&mut state, &schemes, &verifier);
+            let fallback = refusing(&[TOO_DEEP]);
+            state.set_parent_fallback(fallback.clone());
+
+            assert_eq!(
+                state.find_parent(View::new(6)),
+                Ok((View::new(2), EXTENDABLE, vec![View::new(4)]))
+            );
+            // Only certified, nullified views are offered to the application.
+            assert_eq!(*fallback.asked.lock().unwrap(), vec![View::new(4), View::new(2)]);
+
+            // The leader builds on view 2 and reports the fallback once.
+            assert_eq!(state.leader_index(View::new(6)), Some(Participant::new(3)));
+            let context = state.try_propose().expect("leader proposes");
+            assert_eq!(context.parent, (View::new(2), EXTENDABLE));
+            assert_eq!(
+                *fallback.fell_back.lock().unwrap(),
+                vec![(View::new(6), View::new(2), vec![View::new(4)])]
+            );
+            assert!(state.try_propose().is_none());
+            assert_eq!(fallback.fell_back.lock().unwrap().len(), 1);
+
+            // Voters, which consult no fallback, accept the older parent: every
+            // view between it and the proposal is nullified.
+            let proposal = Proposal::new(
+                Rnd::new(state.epoch(), View::new(6)),
+                View::new(2),
+                Sha256Digest::from([6u8; 32]),
+            );
+            assert_eq!(state.parent_payload(&proposal), Ok(EXTENDABLE));
+
+            // With its proposal the leader forwards, once, the nullifications of
+            // the views from its parent through the newest skipped view; view
+            // 5, above it, every voter passed by nullification.
+            let forwarded: Vec<View> = state
+                .take_fallback_nullifications(View::new(6))
+                .iter()
+                .map(|nullification| nullification.view())
+                .collect();
+            assert_eq!(forwarded, vec![View::new(3), View::new(4)]);
+            assert!(state.take_fallback_nullifications(View::new(6)).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_fallback_proposal_forwards_nothing_once_its_view_ends() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[3].clone());
+            late_notarizations(&mut state, &schemes, &verifier);
+            state.set_parent_fallback(refusing(&[TOO_DEEP]));
+            assert!(state.try_propose().is_some());
+            nullify_view(&mut state, &schemes, &verifier, View::new(6));
+            assert_eq!(state.current_view(), View::new(7));
+            assert!(state.take_fallback_nullifications(View::new(6)).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_voter_accepts_a_fallback_proposal_once_it_holds_the_nullifications() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            // The leader of view 6 falls back past view 4 to view 2.
+            let mut leader = fallback_state(context.child("leader"), schemes[3].clone());
+            late_notarizations(&mut leader, &schemes, &verifier);
+            leader.set_parent_fallback(refusing(&[TOO_DEEP]));
+            let context6 = leader.try_propose().expect("leader proposes");
+            assert_eq!(context6.parent, (View::new(2), EXTENDABLE));
+            let forwarded = leader.take_fallback_nullifications(View::new(6));
+
+            // A voter, without any fallback, that certified view 4's late
+            // notarization and so entered view 5 without its nullification.
+            let mut voter = fallback_state(context.child("voter"), schemes[1].clone());
+            certify_view(&mut voter, &schemes, &verifier, View::new(1), GENESIS_VIEW, Sha256Digest::from([1u8; 32]));
+            certify_view(&mut voter, &schemes, &verifier, View::new(2), View::new(1), EXTENDABLE);
+            nullify_view(&mut voter, &schemes, &verifier, View::new(2));
+            nullify_view(&mut voter, &schemes, &verifier, View::new(3));
+            certify_view(&mut voter, &schemes, &verifier, View::new(4), View::new(2), TOO_DEEP);
+            nullify_view(&mut voter, &schemes, &verifier, View::new(5));
+            assert_eq!(voter.current_view(), View::new(6));
+            let proposal = Proposal::new(context6.round, View::new(2), Sha256Digest::from([6u8; 32]));
+            assert!(voter.set_proposal(View::new(6), proposal.clone()));
+            // It waits for view 4's nullification, which its resolver would no
+            // longer fetch...
+            assert!(voter.try_verify().is_none());
+            assert_eq!(
+                voter.parent_payload(&proposal),
+                Err(ParentPayloadError::MissingNullification {
+                    proposal_view: View::new(6),
+                    parent_view: View::new(2),
+                    missing_view: View::new(4),
+                })
+            );
+            // ...and verifies the proposal once the leader's forwarded ones arrive.
+            for nullification in forwarded {
+                voter.add_nullification(nullification);
+            }
+            let (verify, verified) = voter.try_verify().expect("voter verifies");
+            assert_eq!(verify.parent, (View::new(2), EXTENDABLE));
+            assert_eq!(verified, proposal);
+        });
+    }
+
+    #[test]
+    fn find_parent_reports_a_certificate_gap_below_a_skipped_view() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[0].clone());
+            // View 1 certified; view 2 holds no certificate; view 3 certified
+            // and nullified, too deep; view 4 nullified.
+            certify_view(&mut state, &schemes, &verifier, View::new(1), GENESIS_VIEW, EXTENDABLE);
+            certify_view(&mut state, &schemes, &verifier, View::new(3), View::new(1), TOO_DEEP);
+            nullify_view(&mut state, &schemes, &verifier, View::new(3));
+            nullify_view(&mut state, &schemes, &verifier, View::new(4));
+            assert_eq!(state.current_view(), View::new(5));
+            assert_eq!(
+                state.find_parent(View::new(5)),
+                Ok((View::new(3), TOO_DEEP, vec![]))
+            );
+            // Skipping view 3 exposes the gap: wait for view 2's certificate.
+            state.set_parent_fallback(refusing(&[TOO_DEEP]));
+            assert_eq!(state.find_parent(View::new(5)), Err(View::new(2)));
+            assert!(state.take_fallback_nullifications(View::new(5)).is_empty());
+        });
+    }
+
+    #[test]
+    fn find_parent_without_a_fallback_keeps_the_newest_certified_view() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[3].clone());
+            late_notarizations(&mut state, &schemes, &verifier);
+
+            // No fallback: today's choice, the newest certified view.
+            assert_eq!(
+                state.find_parent(View::new(6)),
+                Ok((View::new(4), TOO_DEEP, vec![]))
+            );
+            // A fallback that can extend everything changes nothing, and a
+            // leader turn without a skip reports nothing.
+            let fallback = refusing(&[]);
+            state.set_parent_fallback(fallback.clone());
+            assert_eq!(
+                state.find_parent(View::new(6)),
+                Ok((View::new(4), TOO_DEEP, vec![]))
+            );
+            let context = state.try_propose().expect("leader proposes");
+            assert_eq!(context.parent, (View::new(4), TOO_DEEP));
+            assert!(fallback.fell_back.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn find_parent_keeps_a_certified_view_that_is_not_nullified() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[0].clone());
+            // View 1 certified only, view 2 certified and nullified, view 3
+            // nullified; the application can extend neither.
+            certify_view(&mut state, &schemes, &verifier, View::new(1), GENESIS_VIEW, EXTENDABLE);
+            certify_view(&mut state, &schemes, &verifier, View::new(2), View::new(1), TOO_DEEP);
+            nullify_view(&mut state, &schemes, &verifier, View::new(2));
+            nullify_view(&mut state, &schemes, &verifier, View::new(3));
+            let fallback = refusing(&[EXTENDABLE, TOO_DEEP]);
+            state.set_parent_fallback(fallback.clone());
+
+            // View 2 is skipped; view 1 could still finalize, so it is kept
+            // even though the application cannot extend it.
+            assert_eq!(
+                state.find_parent(View::new(4)),
+                Ok((View::new(1), EXTENDABLE, vec![View::new(2)]))
+            );
+            assert_eq!(*fallback.asked.lock().unwrap(), vec![View::new(2)]);
+        });
+    }
+
+    #[test]
+    fn find_parent_never_goes_below_last_finalized() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            let mut state = fallback_state(context.child("state"), schemes[0].clone());
+            certify_view(&mut state, &schemes, &verifier, View::new(1), GENESIS_VIEW, EXTENDABLE);
+            // View 2 finalized and, beyond the fault bound, also nullified.
+            let proposal = Proposal::new(Rnd::new(state.epoch(), View::new(2)), View::new(1), TOO_DEEP);
+            let votes: Vec<_> = schemes
+                .iter()
+                .map(|scheme| Finalize::sign(scheme, proposal.clone()).unwrap())
+                .collect();
+            let finalization = Finalization::from_finalizes(&verifier, votes.iter(), &Sequential)
+                .expect("finalization");
+            state.add_finalization(finalization);
+            nullify_view(&mut state, &schemes, &verifier, View::new(2));
+            nullify_view(&mut state, &schemes, &verifier, View::new(3));
+            assert_eq!(state.last_finalized(), View::new(2));
+            state.set_parent_fallback(refusing(&[EXTENDABLE, TOO_DEEP]));
+
+            assert_eq!(
+                state.find_parent(View::new(4)),
+                Ok((View::new(2), TOO_DEEP, vec![]))
+            );
+        });
+    }
+
+    /// The views of the nullifications a fallback proposal at `view` forwards.
+    fn forwarded_views<S: Scheme<Sha256Digest>>(
+        state: &mut State<deterministic::Context, S, RoundRobin, Sha256Digest>,
+        view: View,
+    ) -> Vec<View> {
+        state
+            .take_fallback_nullifications(view)
+            .iter()
+            .map(|nullification| nullification.view())
+            .collect()
+    }
+
+    /// View 1 certified; view 2 nullified; view `newest` and view 3 certified
+    /// and nullified, too deep to extend; every other view up to `current`
+    /// nullified.
+    fn skipped_pair<S: Scheme<Sha256Digest>>(
+        state: &mut State<deterministic::Context, S, RoundRobin, Sha256Digest>,
+        schemes: &[S],
+        verifier: &S,
+        newest: u64,
+        current: u64,
+    ) {
+        certify_view(state, schemes, verifier, View::new(1), GENESIS_VIEW, EXTENDABLE);
+        nullify_view(state, schemes, verifier, View::new(2));
+        certify_view(state, schemes, verifier, View::new(3), View::new(1), TOO_DEEP);
+        nullify_view(state, schemes, verifier, View::new(3));
+        for view in 4..newest {
+            nullify_view(state, schemes, verifier, View::new(view));
+        }
+        certify_view(state, schemes, verifier, View::new(newest), View::new(3), TOO_DEEP);
+        for view in newest..current {
+            nullify_view(state, schemes, verifier, View::new(view));
+        }
+        assert_eq!(state.current_view(), View::new(current));
+    }
+
+    #[test]
+    fn a_fallback_proposal_forwards_only_views_through_the_newest_skipped_one() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            // Parent 1, skipped views 3 and 5, then 96 views only nullified;
+            // the local signer leads view 102 (RoundRobin: (1 + 102) % 4).
+            let mut state = fallback_state(context.child("state"), schemes[3].clone());
+            skipped_pair(&mut state, &schemes, &verifier, 5, 102);
+            state.set_parent_fallback(refusing(&[TOO_DEEP]));
+            let context = state.try_propose().expect("leader proposes");
+            assert_eq!(context.parent, (View::new(1), EXTENDABLE));
+
+            // Views 2 to 5 go out; views 6 to 101, which every voter passed by
+            // nullification, do not.
+            assert_eq!(
+                forwarded_views(&mut state, View::new(102)),
+                (2..=5).map(View::new).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_proposal_forwards_a_capped_window_that_advances_each_turn() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture {
+                schemes, verifier, ..
+            } = ed25519::fixture(&mut context, b"ns", 4);
+            // Parent 1 and skipped views 3 and 80: 79 views to forward, more
+            // than the cap. The local signer leads views 82 and 86.
+            let mut state = fallback_state(context.child("state"), schemes[3].clone());
+            skipped_pair(&mut state, &schemes, &verifier, 80, 82);
+            state.set_parent_fallback(refusing(&[TOO_DEEP]));
+
+            assert_eq!(state.try_propose().expect("leader proposes").parent.0, View::new(1));
+            let first = forwarded_views(&mut state, View::new(82));
+            assert_eq!(first.len(), FALLBACK_NULLIFICATIONS);
+            // The skipped views first, then the views between from the parent up.
+            let mut expected: Vec<View> = (2..=64).map(View::new).collect();
+            expected.push(View::new(80));
+            assert_eq!(first, expected);
+
+            // The next turn forwards the rest of the range, and nothing above it.
+            for view in 82..86 {
+                nullify_view(&mut state, &schemes, &verifier, View::new(view));
+            }
+            assert_eq!(state.try_propose().expect("leader proposes").parent.0, View::new(1));
+            let second = forwarded_views(&mut state, View::new(86));
+            let mut expected = vec![View::new(3)];
+            expected.extend((65..=80).map(View::new));
+            assert_eq!(second, expected);
+            let mut all: Vec<View> = first.into_iter().chain(second).collect();
+            all.sort();
+            all.dedup();
+            assert_eq!(all, (2..=80).map(View::new).collect::<Vec<_>>());
         });
     }
 }

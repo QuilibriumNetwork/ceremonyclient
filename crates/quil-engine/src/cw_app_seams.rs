@@ -1898,7 +1898,7 @@ pub fn activate_app_consensus_cw(
     let sink = Arc::new(AppSeamSink::new(transport.clone(), peers.clone()));
     // A session's handoff proposer waits for the parent before using its
     // private execution; the plain host waits here.
-    proposer = bind_private_parents(proposer, private_parents, &store, sink.clone(), session.is_none());
+    proposer = bind_private_parents(proposer, private_parents.clone(), &store, sink.clone(), session.is_none());
     let proposer = Arc::new(proposer);
     // Seed the genesis parent so the first proposal resolves its frame number.
     proposer.note_frame(genesis_digest, genesis_frame_number);
@@ -1952,6 +1952,9 @@ pub fn activate_app_consensus_cw(
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
     params.liveness = session.as_ref().map(|host| host.liveness.clone());
+    // A leader skips nullified notarized parents too deep to execute privately.
+    params.parent_fallback = private_parents
+        .map(|parents| parents as Arc<dyn quil_cw_consensus::engine_host::ParentFallback>);
     let mut adopted_genesis = None;
     // Populate the persisted head BEFORE the host can replay its journal. These
     // bytes are candidates, not proof that this process validated historical

@@ -16,6 +16,19 @@ use quil_types::proto::global::AppShardFrame;
 /// cover.
 const MAX_PRIVATE_CHAIN: usize = 8;
 
+/// [`AppParentExecutor::extendable`] verdicts kept, by view, parent and
+/// materialized height. A leader asks about a few views per turn.
+const EXTENDABLE_VERDICTS: usize = 32;
+
+/// A selected parent whose stored ancestry does not reach the materialized
+/// tip within [`MAX_PRIVATE_CHAIN`] frames, so no member can build on it, or
+/// (judged as a nullified parent) reaches it only at that limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Refused {
+    /// The parent's height above the materialized tip.
+    depth: u64,
+}
+
 /// One validated unfinalized frame: `(digest, frame number, exact bytes)`.
 pub(crate) type ChainBody = (Digest, u64, Vec<u8>);
 
@@ -83,6 +96,7 @@ pub struct PrivateAppParent {
 }
 
 /// The materialized tip a parent must extend.
+#[derive(Clone)]
 struct Tip {
     cursor: u64,
     digest: [u8; 32],
@@ -109,6 +123,11 @@ pub struct AppParentExecutor {
     blocks: std::sync::OnceLock<BlockStore>,
     // One execution at a time; the result serves the leader and every vote.
     prepared: std::sync::Mutex<Option<Arc<PrivateAppParent>>>,
+    /// See [`Self::extendable`].
+    verdicts: std::sync::Mutex<std::collections::VecDeque<((u64, Digest, u64), Option<Refused>)>>,
+    /// The tip as last read by a proposal or vote; [`Self::extendable`] runs
+    /// in the consensus loop and must not wait for the store's commit lock.
+    tip_hint: std::sync::Mutex<Option<Tip>>,
 }
 
 impl AppParentExecutor {
@@ -144,6 +163,8 @@ impl AppParentExecutor {
             session_base,
             blocks: std::sync::OnceLock::new(),
             prepared: std::sync::Mutex::new(None),
+            verdicts: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tip_hint: std::sync::Mutex::new(None),
         }
     }
 
@@ -169,6 +190,12 @@ impl AppParentExecutor {
     }
 
     fn tip(&self) -> Result<Tip> {
+        let tip = self.read_tip()?;
+        *self.tip_hint.lock().unwrap_or_else(|e| e.into_inner()) = Some(tip.clone());
+        Ok(tip)
+    }
+
+    fn read_tip(&self) -> Result<Tip> {
         let shard = self.hypergraph.capture_committed_shard(&self.filter)?;
         let recorded = shard
             .records
@@ -216,6 +243,48 @@ impl AppParentExecutor {
         Ok(self.tip()?.digest == parent.0)
     }
 
+    /// Whether a leader can build on `parent`, certified at `view` and also
+    /// nullified, leaving room for the next leader: false when its stored
+    /// ancestry does not reach the materialized tip within [`MAX_PRIVATE_CHAIN`]
+    /// frames ([`Self::unfinalized_chain`]), or reaches it only at that limit,
+    /// where a child would be the last frame anyone could extend. Judged from
+    /// the bodies alone, without execution. Consensus asks this in its loop,
+    /// so it reads the tip a proposal or vote last read rather than the store,
+    /// and caches definitive verdicts by materialized height. Anything it
+    /// cannot judge (no current tip, a missing, undecodable or seal body)
+    /// answers true, leaving the leader's choice as it was.
+    pub(crate) fn extendable(&self, parent: Digest, view: u64) -> bool {
+        self.refusal(parent, view).is_none()
+    }
+
+    fn refusal(&self, parent: Digest, view: u64) -> Option<Refused> {
+        let height = self.materialized.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (view, parent, height);
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, verdict)) = verdicts.iter().find(|(cached, _)| *cached == key) {
+            return *verdict;
+        }
+        let hint = self.tip_hint.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // A tip read at another height than the engine's is stale or ahead.
+        let tip = hint.filter(|tip| tip.cursor == height)?;
+        let verdict = if tip.digest == parent.0 {
+            None
+        } else {
+            match self.walk_chain(&tip, parent, view) {
+                Ok(Ok((chain, _))) if chain.len() >= MAX_PRIVATE_CHAIN => Some(Refused { depth: chain.len() as u64 }),
+                Ok(Ok(_)) => None,
+                Ok(Err(refused)) => Some(refused),
+                // A body may still arrive: judge again next time.
+                Err(_) => return None,
+            }
+        };
+        if verdicts.len() >= EXTENDABLE_VERDICTS {
+            verdicts.pop_front();
+        }
+        verdicts.push_back((key, verdict));
+        verdict
+    }
+
     /// Execute the selected parent privately, or return the prepared result.
     /// The parent and its unfinalized ancestors down to the materialized tip
     /// ([`Self::unfinalized_chain`], at most [`MAX_PRIVATE_CHAIN`] frames)
@@ -227,6 +296,7 @@ impl AppParentExecutor {
             .prepared
             .lock()
             .map_err(|_| unavailable("private parent cache poisoned"))?;
+        let started = std::time::Instant::now();
         let tip = self.tip()?;
         if let Some(existing) = prepared.as_ref() {
             if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor
@@ -235,8 +305,6 @@ impl AppParentExecutor {
                 return Ok(existing.clone());
             }
         }
-        // Drop any stale branch before capturing another.
-        *prepared = None;
         if tip.digest == parent.0 {
             return Err(unavailable("selected parent is the materialized tip"));
         }
@@ -281,6 +349,9 @@ impl AppParentExecutor {
             .ok_or_else(|| unavailable("selected parent has no header"))?;
         let number = header.frame_number;
 
+        // Drop any stale branch before capturing another, but only now: a
+        // proposal on a parent that cannot be executed keeps the one in use.
+        *prepared = None;
         let branch = match (
             self.global_anchor_store.backing_store_identity(),
             self.exec.crdt().backing_store_identity(),
@@ -364,11 +435,12 @@ impl AppParentExecutor {
             None,
         );
         info!(
-            filter = %hex::encode(&self.filter[..self.filter.len().min(8)]),
+            filter = %hex::encode(&self.filter),
             frame = number,
             view = parent_view,
             frames = chain.len(),
             processed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "executed unfinalized selected app parent privately"
         );
         let result = Arc::new(PrivateAppParent {
@@ -424,23 +496,40 @@ impl AppParentExecutor {
         parent: Digest,
         parent_view: u64,
     ) -> Result<(Vec<AppShardFrame>, Vec<ChainBody>)> {
+        self.walk_chain(tip, parent, parent_view)?
+            .map_err(|_| unavailable("selected parent does not extend the materialized tip"))
+    }
+
+    /// [`Self::unfinalized_chain`], telling the bodies' definitive refusal
+    /// apart from what this member cannot read (a missing, undecodable or
+    /// seal body).
+    fn walk_chain(
+        &self,
+        tip: &Tip,
+        parent: Digest,
+        parent_view: u64,
+    ) -> Result<std::result::Result<(Vec<AppShardFrame>, Vec<ChainBody>), Refused>> {
         let blocks = self.blocks.get().ok_or_else(|| unavailable("selected parent body is not available"))?;
-        let refused = || unavailable("selected parent does not extend the materialized tip");
         let mut chain: Vec<AppShardFrame> = Vec::new();
         let mut bodies = Vec::new();
         let mut next = parent;
+        let mut depth = None;
         loop {
             let bytes = blocks.get(&next).ok_or_else(|| unavailable("selected parent body is not available"))?;
+            if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
+                return Err(unavailable("selected parent body is a terminal seal"));
+            }
             let frame = decode_app_frame(&bytes).ok_or_else(|| unavailable("undecodable selected parent"))?;
             let header = frame.header.as_ref().ok_or_else(|| unavailable("selected parent has no header"))?;
+            let refused = Refused { depth: *depth.get_or_insert(header.frame_number.saturating_sub(tip.cursor)) };
             if app_frame_digest(&frame) != Some(next) || header.address != self.filter || header.rank <= tip.view {
-                return Err(refused());
+                return Ok(Err(refused));
             }
             match chain.last().and_then(|above| above.header.as_ref()) {
                 Some(above) if above.frame_number != header.frame_number + 1 || above.rank <= header.rank => {
-                    return Err(refused());
+                    return Ok(Err(refused));
                 }
-                None if header.rank != parent_view => return Err(refused()),
+                None if header.rank != parent_view => return Ok(Err(refused)),
                 _ => {}
             }
             let reaches_tip = header.parent_selector == digest_from_identity(tip.digest).as_ref();
@@ -449,19 +538,21 @@ impl AppParentExecutor {
             bodies.push((next, number, bytes));
             if reaches_tip {
                 if number != tip.cursor + 1 {
-                    return Err(refused());
+                    return Ok(Err(refused));
                 }
                 break;
             }
             if chain.len() >= MAX_PRIVATE_CHAIN || number <= tip.cursor + 1 {
-                return Err(refused());
+                return Ok(Err(refused));
             }
-            let identity: [u8; 32] = selector.as_slice().try_into().map_err(|_| refused())?;
+            let Ok(identity) = <[u8; 32]>::try_from(selector.as_slice()) else {
+                return Ok(Err(refused));
+            };
             next = digest_from_identity(identity);
         }
         chain.reverse();
         bodies.reverse();
-        Ok((chain, bodies))
+        Ok(Ok((chain, bodies)))
     }
 
     /// The canonical leader rebound to a prepared parent for `rank`.
@@ -471,6 +562,39 @@ impl AppParentExecutor {
         rank: u64,
     ) -> Result<Arc<dyn quil_consensus::leader_provider::LeaderProvider<AppShardState>>> {
         Ok(Arc::new(self.leader.for_parent(parent, rank)?))
+    }
+}
+
+/// A leader skips notarized parents that were nullified (they can never
+/// finalize) and that no member can extend, for an older certified parent.
+impl quil_cw_consensus::engine_host::ParentFallback for AppParentExecutor {
+    fn extendable(&self, view: u64, payload: Digest) -> bool {
+        AppParentExecutor::extendable(self, payload, view)
+    }
+
+    fn fell_back(&self, view: u64, parent: u64, skipped: &[u64]) {
+        // The newest skipped parent's height above the tip, as last judged.
+        let depth = skipped.first().and_then(|newest| {
+            let verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+            verdicts
+                .iter()
+                .rev()
+                .find(|((cached, _, _), _)| cached == newest)
+                .and_then(|(_, verdict)| verdict.map(|refused| refused.depth))
+        });
+        info!(
+            filter = %hex::encode(&self.filter),
+            view,
+            parent_view = parent,
+            skipped = ?skipped,
+            // Views from the parent through the newest skipped one, whose
+            // nullifications simplex forwards (a bounded number per turn).
+            nullification_gap = skipped.first().map_or(0, |newest| newest.saturating_sub(parent)),
+            depth = ?depth,
+            max_depth = MAX_PRIVATE_CHAIN,
+            materialized = self.materialized.load(std::sync::atomic::Ordering::SeqCst),
+            "app leader builds on an older certified parent: newer notarized parents were nullified and lie max_depth or more frames above the materialized tip"
+        );
     }
 }
 

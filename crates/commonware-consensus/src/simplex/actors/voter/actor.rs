@@ -13,7 +13,7 @@ use crate::{
             Activity, Artifact, Certificate, Context, Finalization, Finalize, Notarization,
             Notarize, Nullification, Nullify, Proposal, Vote,
         },
-        Floor, Plan,
+        Floor, ParentFallback, Plan,
     },
     types::{Round as Rnd, View},
     CertifiableAutomaton, Relay, Reporter, Viewable, LATENCY,
@@ -40,6 +40,7 @@ use rand_core::CryptoRng;
 use std::{
     num::NonZeroUsize,
     pin::Pin,
+    sync::Arc,
     task::{self, Poll},
 };
 use tracing::{debug, info, info_span, trace, warn, Instrument as _, Span};
@@ -335,6 +336,11 @@ impl<
 
         // Broadcast certificate
         sender.send(Recipients::All, certificate, true);
+    }
+
+    /// QUILIBRIUM: see [`State::set_parent_fallback`].
+    pub fn set_parent_fallback(&mut self, fallback: Arc<dyn ParentFallback<D>>) {
+        self.state.set_parent_fallback(fallback);
     }
 
     /// Blocks an equivocator.
@@ -850,6 +856,14 @@ impl<
             }
         }
         if let Some(notarize) = staged.notarize {
+            // QUILIBRIUM: with our fallback proposal, the nullifications its
+            // voters may lack and can no longer fetch (see State).
+            for nullification in self.state.take_fallback_nullifications(notarize.view()) {
+                self.broadcast_certificate(
+                    certificate_sender,
+                    Certificate::Nullification(nullification),
+                );
+            }
             debug!(proposal=?notarize.proposal, "broadcasting notarize");
             self.broadcast_vote(vote_sender, Vote::Notarize(notarize));
         }
