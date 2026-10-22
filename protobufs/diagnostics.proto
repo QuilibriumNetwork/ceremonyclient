@@ -30,6 +30,10 @@ enum Phase {
   PHASE_UNKNOWN = 10;
   // A phase this build does not know.
   PHASE_UNRECOGNIZED = 11;
+  // The worker's allocation is joining or activating in this node's prover
+  // registry, so its consensus waits for activation (`join_confirm_epoch`,
+  // `activation_frame`). Readers that predate it see an unknown phase.
+  PHASE_JOINING = 12;
 }
 
 // Why a worker's phase holds (`WorkerExecution.blocker`).
@@ -124,6 +128,15 @@ message WorkerHealth {
   optional uint64 seal_generation = 20;
   // When this node saw GLOBAL record the seal; 0 until then.
   uint64 seal_recorded_unix_ms = 21;
+  // While the worker's allocation joins: the epoch its join must be
+  // confirmed in, until it is confirmed.
+  optional uint64 join_confirm_epoch = 22;
+  // While it joins or activates: the GLOBAL frame it joins its committee
+  // at, if confirmed in time.
+  optional uint64 activation_frame = 23;
+  // While it waits on committed GLOBAL state (`PHASE_WAITING`): the GLOBAL
+  // frame by which the awaited event happens.
+  optional uint64 awaited_frame = 24;
 }
 
 message HealthReport {

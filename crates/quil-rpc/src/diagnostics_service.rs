@@ -26,6 +26,7 @@ use quil_types::proto::diagnostics::diagnostics_service_server::{DiagnosticsServ
 use quil_types::proto::diagnostics::{
     Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase, WorkerHealth,
 };
+use quil_types::consensus::JoinWait;
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
 use crate::node_service::WorkerEntry;
@@ -48,7 +49,7 @@ pub const REFUSAL_SUMMARY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// (the threshold of the local worker view).
 pub const STALE_AFTER_MS: u64 = 30_000;
 
-const PHASES: [(&str, Phase); 10] = [
+const PHASES: [(&str, Phase); 11] = [
     ("starting", Phase::Starting),
     ("waiting", Phase::Waiting),
     ("syncing", Phase::Syncing),
@@ -59,6 +60,8 @@ const PHASES: [(&str, Phase); 10] = [
     ("stopped", Phase::Stopped),
     ("running", Phase::Running),
     ("unknown", Phase::Unknown),
+    // Not an engine state: the master's registry view of a joining worker.
+    ("joining", Phase::Joining),
 ];
 
 const BLOCKERS: [(&str, Blocker); 13] = [
@@ -176,8 +179,18 @@ pub fn peer_tail(peer: &PeerId) -> String {
 }
 
 /// One worker of the master's worker view, with the committed GLOBAL head
-/// of its shard's session.
-pub fn worker_health(entry: &WorkerEntry, head: Option<&GlobalAppFrameHead>) -> WorkerHealth {
+/// of its shard's session and what its allocation's join waits for.
+///
+/// A joining or activating allocation reads as [`Phase::Joining`] whether
+/// its worker runs no engine (an unconfirmed join binds the filter without
+/// consensus) or runs one that cannot start before activation, so an
+/// expected wait does not read as unobserved or blocked; the blocker and
+/// recovery columns still carry what the engine reports.
+pub fn worker_health(
+    entry: &WorkerEntry,
+    head: Option<&GlobalAppFrameHead>,
+    join_wait: Option<JoinWait>,
+) -> WorkerHealth {
     let mut worker = WorkerHealth {
         core_id: entry.core_id,
         filter: entry.filter.clone(),
@@ -189,6 +202,17 @@ pub fn worker_health(entry: &WorkerEntry, head: Option<&GlobalAppFrameHead>) -> 
     if let Some(execution) = &entry.execution {
         observe(&mut worker, execution);
     }
+    if let Some(wait) = join_wait {
+        if let JoinWait::Confirmation { epoch } = wait {
+            worker.join_confirm_epoch = Some(epoch);
+        }
+        worker.activation_frame = Some(wait.activation_frame());
+        if matches!(worker.phase(), Phase::Unspecified | Phase::Starting | Phase::Waiting | Phase::Blocked
+            | Phase::Unknown | Phase::Running)
+        {
+            worker.set_phase(Phase::Joining);
+        }
+    }
     worker
 }
 
@@ -196,6 +220,7 @@ fn observe(worker: &mut WorkerHealth, execution: &WorkerExecution) {
     worker.set_phase(phase(&execution.state, &execution.blocker));
     worker.set_blocker(blocker(&execution.blocker));
     worker.observed_unix_ms = execution.observed_unix_ms;
+    worker.awaited_frame = execution.awaited_frame;
     worker.materialized_frame = execution.materialized_frame;
     worker.last_advance_unix_ms = execution.last_advance_unix_ms;
     if let Some(recovery) = &execution.recovery {
@@ -231,6 +256,9 @@ pub struct HealthInputs {
     /// Committed GLOBAL session heads, by shard filter.
     pub committee_heads: HashMap<Vec<u8>, GlobalAppFrameHead>,
     pub global_head_frame: u64,
+    /// What this prover's joining or activating allocations wait for, by
+    /// shard filter, in this node's prover registry.
+    pub join_waits: HashMap<Vec<u8>, JoinWait>,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -257,7 +285,8 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
             continue;
         }
         let head = (!entry.filter.is_empty()).then(|| inputs.committee_heads.get(&entry.filter)).flatten();
-        let worker = worker_health(entry, head);
+        let join_wait = (!entry.filter.is_empty()).then(|| inputs.join_waits.get(&entry.filter).copied()).flatten();
+        let worker = worker_health(entry, head, join_wait);
         let len = worker.encoded_len();
         let framed = 1 + prost::length_delimiter_len(len) + len;
         if bytes + framed > MAX_REPORT_BYTES {
@@ -595,6 +624,7 @@ mod tests {
             workers: vec![entry(1, &[7; 32], None)],
             committee_heads: HashMap::new(),
             global_head_frame: 9,
+            join_waits: HashMap::new(),
         });
         DiagnosticsServer::new(Arc::new(admission), source, vec![0xab; 32])
     }
@@ -782,13 +812,14 @@ mod tests {
                 ..Default::default()
             }),
             seal: Some(SessionSeal { generation: 6, drain: "partial via 192.0.2.10".into(), recorded_unix_ms: 1_700, ..Default::default() }),
+            awaited_frame: None,
         }
     }
 
     #[test]
     fn a_worker_reports_its_observations_without_their_texts() {
         let head = GlobalAppFrameHead { frame: 1_204, global_frame: 90_000, generation: 7 };
-        let worker = worker_health(&entry(3, &[5; 32], Some(noisy_execution())), Some(&head));
+        let worker = worker_health(&entry(3, &[5; 32], Some(noisy_execution())), Some(&head), None);
         assert_eq!((worker.phase(), worker.blocker()), (Phase::Blocked, Blocker::StateUnavailable));
         assert_eq!((worker.materialized_frame, worker.committee_head_frame, worker.committed_generation),
             (Some(1_180), Some(1_204), Some(7)));
@@ -808,11 +839,53 @@ mod tests {
             workers: vec![entry(3, &[5; 32], Some(noisy_execution()))],
             committee_heads: HashMap::from([(vec![5; 32], head)]),
             global_head_frame: 90_001,
+            join_waits: HashMap::new(),
         };
         let encoded = build_report(&inputs, &[1; 32], 3_000).encode_to_vec();
         for secret in ["192.0.2", "/home", "operator", "refused", "replayed", "partial", "state unavailable"] {
             assert!(!encoded.windows(secret.len()).any(|w| w == secret.as_bytes()), "{secret} leaked");
         }
+    }
+
+    /// A worker whose allocation joins reads as joining, with the epoch its
+    /// confirm is due in or the frame it activates at, whether it runs no
+    /// engine or one refused before activation; a serving engine keeps its
+    /// phase, and the engine's blocker and recovery stay in the report.
+    #[test]
+    fn a_joining_allocation_reads_as_joining_with_what_it_awaits() {
+        let blocked = WorkerExecution {
+            state: "blocked".into(),
+            blocker: "consensus startup unavailable".into(),
+            observed_unix_ms: 2_000,
+            recovery: Some(ShardRecovery { phase: "idle".into(), attempts: 3, consecutive_failures: 3, ..Default::default() }),
+            ..Default::default()
+        };
+        let unconfirmed = worker_health(&entry(1, &[1; 32], None), None, Some(JoinWait::Confirmation { epoch: 1276 }));
+        assert_eq!((unconfirmed.phase(), unconfirmed.join_confirm_epoch, unconfirmed.activation_frame),
+            (Phase::Joining, Some(1276), Some(1277 * 720)));
+        let activating = worker_health(&entry(2, &[2; 32], Some(blocked)), None, Some(JoinWait::Activation { frame: 918_720 }));
+        assert_eq!((activating.phase(), activating.blocker(), activating.join_confirm_epoch, activating.activation_frame),
+            (Phase::Joining, Blocker::ConsensusStartupUnavailable, None, Some(918_720)));
+        assert_eq!((activating.recovery_attempts, activating.recovery_consecutive_failures), (3, 3));
+        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 2_000, ..Default::default() };
+        let serving = worker_health(&entry(3, &[3; 32], Some(serving)), None, Some(JoinWait::Activation { frame: 918_720 }));
+        assert_eq!(serving.phase(), Phase::Serving);
+        let seat = WorkerExecution { state: "waiting".into(), blocker: "committee admission unavailable".into(),
+            observed_unix_ms: 2_000, awaited_frame: Some(919_440), ..Default::default() };
+        let seat = worker_health(&entry(6, &[6; 32], Some(seat)), None, None);
+        assert_eq!((seat.phase(), seat.blocker(), seat.awaited_frame),
+            (Phase::Waiting, Blocker::CommitteeAdmissionUnavailable, Some(919_440)));
+        let unknown = worker_health(&entry(4, &[4; 32], None), None, None);
+        assert_eq!((unknown.phase(), unknown.activation_frame), (Phase::Unspecified, None));
+
+        let inputs = HealthInputs {
+            workers: vec![entry(1, &[1; 32], None), entry(5, &[], None)],
+            join_waits: HashMap::from([(vec![1; 32], JoinWait::Confirmation { epoch: 1276 }), (Vec::new(), JoinWait::Activation { frame: 1 })]),
+            ..Default::default()
+        };
+        let phases: Vec<(u32, Phase)> = build_report(&inputs, &[], 0).workers.iter().map(|w| (w.core_id, w.phase())).collect();
+        assert_eq!(phases, [(1, Phase::Joining), (5, Phase::Unspecified)], "an idle worker has no join");
+        assert_eq!(phase_name(Phase::Joining), "joining");
     }
 
     #[test]
@@ -822,6 +895,7 @@ mod tests {
             workers: vec![entry(4, &[], None), entry(2, &[2; 32], None), entry(1, &[], None), entry(3, &[3; 32], None)],
             committee_heads: HashMap::from([(vec![2; 32], head(200)), (vec![3; 32], head(300)), (Vec::new(), head(9))]),
             global_head_frame: 5,
+            join_waits: HashMap::new(),
         };
         let report = build_report(&inputs, &[], 0);
         let order: Vec<(u32, Option<u64>, Option<u64>)> =
@@ -837,6 +911,7 @@ mod tests {
             committee_heads: (0..300u32).map(|core| (vec![core as u8; 32],
                 GlobalAppFrameHead { frame: u64::MAX, global_frame: u64::MAX, generation: u64::MAX })).collect(),
             global_head_frame: u64::MAX,
+            join_waits: HashMap::new(),
         };
         let light = build_report(&many(None), &[0xff; 32], u64::MAX);
         assert_eq!((light.workers.len(), light.omitted_workers), (MAX_WORKERS, 44));

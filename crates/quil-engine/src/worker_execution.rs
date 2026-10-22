@@ -82,6 +82,16 @@ impl SharedWorkerExecution {
         let mut s = self.record.lock().unwrap();
         s.state = state.into();
         s.blocker = blocker.into();
+        s.awaited_frame = None;
+        s.observed_unix_ms = now_ms();
+    }
+
+    /// A wait for `blocker` that committed GLOBAL state ends by `frame`.
+    pub fn waiting_until(&self, blocker: &str, frame: u64) {
+        let mut s = self.record.lock().unwrap();
+        s.state = "waiting".into();
+        s.blocker = blocker.into();
+        s.awaited_frame = Some(frame);
         s.observed_unix_ms = now_ms();
     }
 
@@ -482,6 +492,10 @@ mod tests {
         s.state("running", "");
         assert!(s.snapshot().blocker.is_empty());
         assert!(s.snapshot().observed_unix_ms > 0);
+        s.waiting_until("committee admission unavailable", 919_440);
+        assert_eq!((s.snapshot().state.as_str(), s.snapshot().awaited_frame), ("waiting", Some(919_440)));
+        s.state("serving", "");
+        assert_eq!(s.snapshot().awaited_frame, None, "a later state ends the wait");
     }
 
     #[test]
