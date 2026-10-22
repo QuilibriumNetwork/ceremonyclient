@@ -83,6 +83,26 @@ pub(crate) fn classify(execution: Option<&WorkerExecution>, now_ms: u64) -> Host
     }
 }
 
+impl Hosting {
+    /// Whether the worker can host the session of a seat standing at `seat`:
+    /// it hosts, or, outside the session, its start passed every check of
+    /// the shard's state and only the committee refused its key. A worker
+    /// still syncing or recovering the shard has not passed those checks.
+    pub(crate) fn able(&self, seat: Seat) -> bool {
+        match self {
+            Hosting::Hosting => true,
+            Hosting::Absent { blocker, .. } => seat != Seat::Member && blocker == REFUSED_FOR_SEAT_ONLY,
+            Hosting::Unknown => false,
+        }
+    }
+
+    /// Whether the report shows the worker unable to host at `seat`. An
+    /// unknown report is never held against its seat.
+    pub(crate) fn seen_unable(&self, seat: Seat) -> bool {
+        matches!(self, Hosting::Absent { .. }) && !self.able(seat)
+    }
+}
+
 /// A standalone worker that did not answer its report request for `reason`.
 pub(crate) fn unanswered(reason: &str) -> Hosting {
     Hosting::Absent { state: "unreachable".into(), blocker: reason.into() }
@@ -143,12 +163,7 @@ impl SessionHosting {
         if self.unhosted.get(filter).is_some_and(|run| run.core_id != core_id) {
             self.unhosted.remove(filter);
         }
-        let able = match &hosting {
-            Hosting::Hosting => true,
-            Hosting::Absent { blocker, .. } => seat != Seat::Member && blocker == REFUSED_FOR_SEAT_ONLY,
-            Hosting::Unknown => false,
-        };
-        if able {
+        if hosting.able(seat) {
             return self.unhosted.remove(filter).filter(|run| run.withheld);
         }
         if seat != Seat::Member && self.unhosted.get(filter).is_some_and(|run| !run.withheld && !run.from_start) {
@@ -242,6 +257,21 @@ mod tests {
         assert_eq!(classify(Some(&report("blocked", now - FRESH_MS - 1)), now), Hosting::Unknown);
         assert_eq!(classify(Some(&report("blocked", 0)), now), Hosting::Unknown);
         assert_eq!(classify(Some(&report("unknown", now)), now), Hosting::Unknown);
+    }
+
+    /// A worker is able to host when it hosts, or, outside its session, is
+    /// refused only for its seat; only a report of another blocker shows it
+    /// unable, and an unknown one shows nothing.
+    #[test]
+    fn a_worker_refused_only_for_its_seat_is_able_outside_its_session() {
+        for seat in [Seat::Member, Seat::Lapsed, Seat::Outside] {
+            assert!(Hosting::Hosting.able(seat) && !Hosting::Hosting.seen_unable(seat), "{seat:?}");
+            assert!(!absent().able(seat) && absent().seen_unable(seat), "{seat:?}");
+            assert!(!Hosting::Unknown.able(seat) && !Hosting::Unknown.seen_unable(seat), "{seat:?}");
+            let outside = seat != Seat::Member;
+            assert_eq!((refused_for_seat_only().able(seat), refused_for_seat_only().seen_unable(seat)),
+                (outside, !outside), "{seat:?}");
+        }
     }
 
     /// Engines report the seat-only refusal under this name.
