@@ -579,6 +579,9 @@ struct AppLeaderProvider {
     /// is a PROPOSER SELF-attestation (single member = the frame's prover), NOT
     /// the legacy multi-member committee attestation assembled from vote openings.
     frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
+    /// Shared with the engine: the replica epoch below which the self-seal
+    /// has evicted `kv_db` (`app_shard_metadata::retire_unchallengeable_replicas`).
+    replicas_retired_below: Arc<std::sync::atomic::AtomicU64>,
     /// Order-independent fingerprint of THIS CW instance's committee (the fixed
     /// simplex validator set built at `start_consensus_cw`). The finalization
     /// cert a proposed frame receives is signed by exactly this committee, but
@@ -840,6 +843,7 @@ impl AppLeaderProvider {
             frame_requests: self.frame_requests.clone(),
             kv_db: self.kv_db.clone(),
             frame_attestations: self.frame_attestations.clone(),
+            replicas_retired_below: self.replicas_retired_below.clone(),
             routing_seen: self.routing_seen.clone(),
             instance_committee_fp: self.instance_committee_fp,
             session_genesis: self.session_genesis.clone(),
@@ -1578,7 +1582,16 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             _ => {}
                         }
                     }
-                    // (2) SDR-seal from the worker's OWN crdt into its OWN replica_store.
+                    // (2) SDR-seal from the worker's OWN crdt into its OWN replica_store,
+                    // after evicting the replicas no frame can still challenge
+                    // (#734's window): a standalone worker's store has no other eviction.
+                    crate::app_shard_metadata::retire_unchallengeable_replicas(
+                        &replica_store,
+                        &self.replicas_retired_below,
+                        epoch,
+                        &self.filter,
+                        frame_number,
+                    );
                     if let Err(e) = crate::app_shard_metadata::compute_storage_confirm(
                         own_crdt,
                         &replica_store,
@@ -2164,6 +2177,9 @@ pub struct AppConsensusEngine {
     /// frame this node proposed. The `AppFrameAssembler` reads it to attach the
     /// openings to the full `AppShardFrame`. See `AppLeaderProvider::frame_attestations`.
     frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
+    /// See `AppLeaderProvider::replicas_retired_below`; kept here so a rebuilt
+    /// consensus instance does not evict and log the same boundary again.
+    replicas_retired_below: Arc<std::sync::atomic::AtomicU64>,
     /// `requests_root` of frames this node FINALIZED through (BLS-verified)
     /// consensus, keyed by frame number. The trust anchor for materializing
     /// a full frame received on the wire as a follower: the received
@@ -2412,6 +2428,7 @@ impl AppConsensusEngine {
             pre_state_heal: (0, None),
             frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            replicas_retired_below: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             finalized_requests_roots: HashMap::new(),
             received_full_frames: HashMap::new(),
             frame_gap: FrameGap::default(),
@@ -5553,6 +5570,7 @@ impl AppConsensusEngine {
             frame_requests: self.frame_requests.clone(),
             kv_db: self.kv_db.clone(),
             frame_attestations: self.frame_attestations.clone(),
+            replicas_retired_below: self.replicas_retired_below.clone(),
             routing_seen: self.routing_seen.clone(),
             // Pin the committee this instance signs with, so the leader can
             // refuse to propose frames whose verifier-reconstructed committee

@@ -83,6 +83,7 @@ fn leader_with(
         frame_requests: Arc::new(std::sync::Mutex::new(Default::default())),
         kv_db: None,
         frame_attestations: Arc::new(std::sync::Mutex::new(Default::default())),
+        replicas_retired_below: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         routing_seen: Arc::new(std::sync::Mutex::new(Default::default())),
         instance_committee_fp: None,
         session_genesis: None,

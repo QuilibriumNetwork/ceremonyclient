@@ -133,6 +133,9 @@ pub struct WorkerOnlyNode {
     /// meant the whole attestation block was skipped — the worker NEVER attested,
     /// so its shard reward was silently zeroed by the global proof-of-storage gate.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    /// The replica epoch below which this worker's confirms have evicted
+    /// `kv_db` (see `encode_worker_storage_confirm`).
+    replicas_retired_below: Arc<std::sync::atomic::AtomicU64>,
     /// Current engine handle (set after Respawn).
     engine_handle: std::sync::Mutex<Option<AppEngineHandle>>,
     /// Stop the old engine and its transport wait before rebinding this worker.
@@ -457,6 +460,7 @@ impl WorkerOnlyNode {
             execution_engine: None,
             inclusion_prover: None,
             kv_db: None,
+            replicas_retired_below: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             engine_handle: std::sync::Mutex::new(None),
             engine_cancel: std::sync::Mutex::new(None),
             respawn_lock: tokio::sync::Mutex::new(()),
@@ -1673,22 +1677,21 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             return Err(tonic::Status::unavailable("worker has no shard storage"));
         };
         let member = self.worker.local_prover_address.clone();
-        // A confirm in epoch E registers, and encodes, the leaves for E + 1.
-        let epoch = quil_types::consensus::epoch_for_frame(req.frame_number) + 1;
+        let retired_below = self.worker.replicas_retired_below.clone();
+        let frame_number = req.frame_number;
         let filter = req.filter;
         // The bound shard first, then the shards a recorded change creates
         // from it, all from this worker's store.
         let mut filters = vec![filter.clone()];
         filters.extend(req.targets.into_iter().filter(|target| !target.is_empty() && *target != filter));
         let roots = tokio::task::spawn_blocking(move || {
-            crate::app_shard_metadata::compute_storage_confirm(
+            encode_worker_storage_confirm(
                 &crdt,
                 &quil_store::replica_store::ReplicaStore::new(kv),
+                &retired_below,
                 &filters,
                 &member,
-                epoch,
-                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
-                &quil_crypto::sdr::SdrParams::default(),
+                frame_number,
             )
         })
         .await
@@ -1708,6 +1711,37 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             },
         ))
     }
+}
+
+/// A confirm at `frame_number`, in epoch E, registers and encodes the leaves
+/// for E + 1. First evict the replicas no frame can still challenge, with the
+/// window the master's reconfirmation applies to the stores it encodes
+/// (#734): nothing else evicts a standalone worker's store.
+fn encode_worker_storage_confirm(
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    replicas: &quil_store::replica_store::ReplicaStore,
+    retired_below: &std::sync::atomic::AtomicU64,
+    filters: &[Vec<u8>],
+    member: &[u8],
+    frame_number: u64,
+) -> Result<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>> {
+    let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    crate::app_shard_metadata::retire_unchallengeable_replicas(
+        replicas,
+        retired_below,
+        current_epoch,
+        filters.first().map_or(&[][..], Vec::as_slice),
+        frame_number,
+    );
+    crate::app_shard_metadata::compute_storage_confirm(
+        crdt,
+        replicas,
+        filters,
+        member,
+        current_epoch + 1,
+        quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+        &quil_crypto::sdr::SdrParams::default(),
+    )
 }
 
 // =====================================================================
@@ -1965,6 +1999,54 @@ fn multiaddr_to_http_endpoint(ma: &str, default_port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Confirms in epochs E..E+3 encode E+1..E+4; by the last, the replicas
+    /// of every epoch below E+2 are gone, the backlog an older build left
+    /// included, and the previous, current and next epochs remain.
+    #[test]
+    fn worker_confirms_evict_replicas_no_frame_can_challenge() {
+        use quil_execution::global_intrinsic::leaf_id_bytes;
+        use quil_hypergraph::Location;
+        quil_crypto::init();
+        let crdt = quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        );
+        let app = 0x44u8;
+        let filter = vec![app; 32];
+        for d in 0u8..3 {
+            crdt.add_vertex(
+                &Location { app_address: [app; 32], data_address: [d; 32] },
+                &vec![d.wrapping_add(1); 256],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let replicas = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        let retired_below = std::sync::atomic::AtomicU64::new(0);
+        let member = vec![0xC2u8; 32];
+        let first = 10u64;
+        replicas.put(first - 3, b"backlog", b"old").unwrap();
+        let mut leaves = Vec::new();
+        for epoch in first..=first + 3 {
+            let frame = epoch * quil_types::consensus::epoch_length_frames() + 1;
+            let roots = encode_worker_storage_confirm(
+                &crdt, &replicas, &retired_below, std::slice::from_ref(&filter), &member, frame,
+            )
+            .expect("worker confirm");
+            leaves = roots[0].entries.iter().map(|e| leaf_id_bytes(&filter, &e.prefix)).collect();
+            assert!(!leaves.is_empty(), "the shard's data is encoded");
+        }
+        assert!(replicas.get(first - 3, b"backlog").unwrap().is_none(), "the backlog is evicted");
+        for leaf in &leaves {
+            assert!(replicas.get(first + 1, leaf).unwrap().is_none(), "epoch E+1 is evicted");
+            for epoch in first + 2..=first + 4 {
+                assert!(replicas.get(epoch, leaf).unwrap().is_some(), "epoch {epoch} is kept");
+            }
+        }
+    }
 
     /// Without a master to take them, a reward proof is not gossiped (regular
     /// nodes hold no GLOBAL_PROVER subscription to publish on) while a closing

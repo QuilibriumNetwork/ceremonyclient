@@ -331,6 +331,59 @@ pub(crate) fn has_committed_shard_data(crdt: &HypergraphCrdt, filter: &[u8]) -> 
     !partition_shard_leaves(crdt, &shard_key, &sub_prefix).is_empty()
 }
 
+/// The oldest storage epoch whose replicas a frame in `current_epoch` can
+/// still challenge. The previous epoch stays: early in an epoch, frames can
+/// still anchor their storage beacon before its boundary (#734).
+pub fn replica_keep_from(current_epoch: u64) -> u64 {
+    current_epoch.saturating_sub(1)
+}
+
+/// Before encoding into `replica_store`, evict the replicas below
+/// [`replica_keep_from`], as the master's reconfirmation does for the stores
+/// it encodes. A standalone worker's store has no other eviction, so it kept
+/// one replica set per epoch. `retired_below` holds the boundary already
+/// applied to this store: each boundary is evicted and logged once, and a
+/// failure leaves it for the next encoding. Returns whether this call evicted.
+pub fn retire_unchallengeable_replicas(
+    replica_store: &quil_store::replica_store::ReplicaStore,
+    retired_below: &std::sync::atomic::AtomicU64,
+    current_epoch: u64,
+    filter: &[u8],
+    frame_number: u64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let keep_from = replica_keep_from(current_epoch);
+    let previous = retired_below.load(Ordering::Acquire);
+    if keep_from <= previous {
+        return false;
+    }
+    match replica_store.evict_below_epoch(keep_from) {
+        Ok(()) => {
+            retired_below.fetch_max(keep_from, Ordering::AcqRel);
+            // `since_epoch` 0: the first eviction since start, which also
+            // drops any backlog an earlier build left.
+            tracing::info!(
+                frame = frame_number,
+                filter = %hex::encode(filter),
+                since_epoch = previous,
+                keep_from_epoch = keep_from,
+                "evicted storage replicas no frame can challenge",
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                frame = frame_number,
+                filter = %hex::encode(filter),
+                keep_from_epoch = keep_from,
+                %error,
+                "storage replica eviction failed; retrying at the next encoding",
+            );
+            false
+        }
+    }
+}
+
 /// Worker confirm / epoch-boundary hook (PoRep wiring E). For each shard
 /// `filter` the prover is confirming, partition its committed subtree into
 /// storage leaves, SDR-encode each into the member's UNIQUE replica, register
@@ -997,6 +1050,39 @@ mod tests {
             );
             assert_eq!(leaf.block_commitments().len() as u64, e.num_blocks);
         }
+    }
+
+    /// Each boundary evicts once, keeps the previous epoch, and a later
+    /// epoch evicts again.
+    #[test]
+    fn replica_retirement_keeps_the_previous_epoch_and_applies_each_boundary_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let replica_store = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        for epoch in 3..=7 {
+            replica_store.put(epoch, b"leaf", &[epoch as u8]).unwrap();
+        }
+        let retired_below = AtomicU64::new(0);
+        assert!(retire_unchallengeable_replicas(&replica_store, &retired_below, 6, b"f", 1));
+        assert_eq!(retired_below.load(Ordering::Acquire), 5);
+        for epoch in 3..=4 {
+            assert!(replica_store.get(epoch, b"leaf").unwrap().is_none(), "epoch {epoch} is evicted");
+        }
+        for epoch in 5..=7 {
+            assert_eq!(replica_store.get(epoch, b"leaf").unwrap(), Some(vec![epoch as u8]));
+        }
+        replica_store.put(4, b"leaf", b"late").unwrap();
+        assert!(
+            !retire_unchallengeable_replicas(&replica_store, &retired_below, 6, b"f", 2),
+            "an applied boundary is not evicted or logged again",
+        );
+        assert!(retire_unchallengeable_replicas(&replica_store, &retired_below, 7, b"f", 3));
+        assert!(replica_store.get(4, b"leaf").unwrap().is_none());
+        assert!(replica_store.get(5, b"leaf").unwrap().is_none());
+        assert_eq!(replica_store.get(6, b"leaf").unwrap(), Some(vec![6]));
+        // A low epoch cannot underflow the boundary.
+        assert!(!retire_unchallengeable_replicas(&replica_store, &AtomicU64::new(0), 0, b"f", 4));
     }
 
     #[test]

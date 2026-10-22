@@ -95,20 +95,86 @@ pub const DEFAULT_PINNED_GENERATIONS: usize = 64;
 /// About two and a half minutes of generations at one per 10 s frame.
 pub const MIN_PINNED_GENERATIONS: usize = 16;
 
+/// How often a store's pruner summarizes its passes, empty ones included.
+const PASS_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// The passes of one store's pruner since its last summary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PassTally {
+    passes: u64,
+    empty: u64,
+    failed: u64,
+    trees: usize,
+    nodes: usize,
+    values: usize,
+}
+
+/// Tallies a pruner's passes and releases them at most once per
+/// [`PASS_SUMMARY_INTERVAL`], so a store whose passes find nothing still
+/// shows that its pruner runs.
+#[derive(Debug)]
+struct PassSummary {
+    since: std::time::Instant,
+    tally: PassTally,
+}
+
+impl PassSummary {
+    fn new(now: std::time::Instant) -> Self {
+        Self { since: now, tally: PassTally::default() }
+    }
+
+    /// Count one pass (`None`: it failed). Returns the tally and its window
+    /// once the interval has elapsed, and starts the next window.
+    fn record(&mut self, pass: Option<RetentionPass>, now: std::time::Instant) -> Option<(PassTally, Duration)> {
+        let tally = &mut self.tally;
+        tally.passes += 1;
+        match pass {
+            Some(RetentionPass { trees, nodes, values }) => {
+                if trees == 0 && nodes == 0 && values == 0 {
+                    tally.empty += 1;
+                }
+                tally.trees += trees;
+                tally.nodes += nodes;
+                tally.values += values;
+            }
+            None => tally.failed += 1,
+        }
+        let window = now.saturating_duration_since(self.since);
+        if window < PASS_SUMMARY_INTERVAL {
+            return None;
+        }
+        self.since = now;
+        Some((std::mem::take(&mut self.tally), window))
+    }
+}
+
 /// Prune `crdt` every `policy.interval` until it is dropped.
 pub fn spawn_retention_pruner(crdt: &Arc<HypergraphCrdt>, policy: RetentionPolicy, label: String) {
     let crdt: Weak<HypergraphCrdt> = Arc::downgrade(crdt);
+    let mut summary = PassSummary::new(std::time::Instant::now());
     let spawned = std::thread::Builder::new().name(format!("prune-{label}")).spawn(move || loop {
         std::thread::sleep(policy.interval);
         let Some(crdt) = crdt.upgrade() else { return };
         let started = std::time::Instant::now();
-        match crdt.prune_retaining_with(policy.retain_frames, policy.max_blob_deletes, policy.max_value_deletes) {
-            Ok(RetentionPass { trees, nodes, values }) if trees > 0 || nodes > 0 || values > 0 => {
-                let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(store = %label, trees, nodes, values, ms, "pruned retained versions");
+        let pass = match crdt.prune_retaining_with(policy.retain_frames, policy.max_blob_deletes, policy.max_value_deletes) {
+            Ok(pass @ RetentionPass { trees, nodes, values }) => {
+                if trees > 0 || nodes > 0 || values > 0 {
+                    let ms = started.elapsed().as_millis() as u64;
+                    tracing::info!(store = %label, trees, nodes, values, ms, "pruned retained versions");
+                }
+                Some(pass)
             }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(store = %label, %error, "retained-version prune failed; retrying next pass"),
+            Err(error) => {
+                tracing::warn!(store = %label, %error, "retained-version prune failed; retrying next pass");
+                None
+            }
+        };
+        if let Some((tally, window)) = summary.record(pass, std::time::Instant::now()) {
+            let PassTally { passes, empty, failed, trees, nodes, values } = tally;
+            tracing::info!(
+                store = %label, window_s = window.as_secs(), passes, empty, failed, trees, nodes, values,
+                "retained-version pruning summary",
+            );
         }
     });
     if let Err(error) = spawned {
@@ -130,6 +196,28 @@ mod tests {
         assert!(!pruning_enabled(Some("not a switch"), true));
         assert!(!pruning_enabled(Some("0"), false));
         assert!(pruning_enabled(Some(" 1 "), true));
+    }
+
+    /// Passes are summarized once the interval has elapsed, empty and failed
+    /// passes included, and each summary starts a new window.
+    #[test]
+    fn pass_summaries_count_every_pass_at_most_once_an_interval() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u64| start + Duration::from_secs(minutes * 60);
+        let mut summary = PassSummary::new(start);
+        let found = RetentionPass { trees: 1, nodes: 2, values: 3 };
+        assert_eq!(summary.record(Some(RetentionPass::default()), at(10)), None);
+        assert_eq!(summary.record(None, at(20)), None);
+        assert_eq!(summary.record(Some(found), at(50)), None);
+        assert_eq!(
+            summary.record(Some(RetentionPass::default()), at(60)),
+            Some((PassTally { passes: 4, empty: 2, failed: 1, trees: 1, nodes: 2, values: 3 }, PASS_SUMMARY_INTERVAL)),
+        );
+        assert_eq!(summary.record(Some(RetentionPass::default()), at(70)), None);
+        assert_eq!(
+            summary.record(Some(RetentionPass::default()), at(125)),
+            Some((PassTally { passes: 2, empty: 2, ..PassTally::default() }, Duration::from_secs(65 * 60))),
+        );
     }
 
     /// The pin cap defaults to [`DEFAULT_PINNED_GENERATIONS`], can be switched

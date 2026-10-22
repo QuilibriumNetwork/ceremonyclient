@@ -1089,7 +1089,7 @@ fn prune_confirmation_replicas(
     filters: &[Vec<u8>],
     current_epoch: u64,
 ) {
-    let keep_from = current_epoch.saturating_sub(1);
+    let keep_from = crate::app_shard_metadata::replica_keep_from(current_epoch);
     let workers = filters.iter().filter_map(|filter| {
         worker.and_then(|resolve| resolve(filter)).map(|(_, replicas)| replicas)
     });
