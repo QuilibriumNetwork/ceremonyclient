@@ -109,7 +109,8 @@ pub struct Row {
     pub outcome_less_frames_in_window: u64,
     pub median_frame_interval_ms: Option<i64>,
     /// Shards the window classifies `producing`, live or not (`census`
-    /// counts the live ones); 0 while the window is incomplete.
+    /// counts the live ones); while the window is incomplete, only those
+    /// with an applied app frame in it (a lower bound).
     pub producing_shards: u64,
     /// Shards with a header of any outcome in the window.
     pub shards_with_headers_in_window: u64,

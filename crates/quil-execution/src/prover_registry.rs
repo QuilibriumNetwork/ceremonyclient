@@ -2398,7 +2398,7 @@ fn map_prover_status(byte: u8) -> Option<ProverStatus> {
 }
 
 /// Map the raw RDF status byte for `allocation:ProverAllocation`.
-fn map_allocation_status(byte: u8) -> ProverStatus {
+pub fn map_allocation_status(byte: u8) -> ProverStatus {
     match byte {
         0 => ProverStatus::Joining,
         1 => ProverStatus::Active,

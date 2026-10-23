@@ -405,7 +405,7 @@ impl ProdProverTreeSyncer {
                 }
             };
             let got = crate::forest_sync::sync_subtree_one_phase(
-                &mut client, &handle, &self.crdt, app, phase, source_version, bits.clone(), pinned,
+                &mut client, &handle, &self.crdt, app, filter, phase, source_version, bits.clone(), pinned,
             ).await?;
             if pinned.is_some_and(|expected| got != expected) {
                 return Ok(false);
@@ -482,7 +482,10 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         }
         let addr = self.resolve_addr().await?;
         let synced = self.sync_shard_tree_from(&addr, filter, expected_roots).await;
-        if !matches!(synced, Ok(true)) {
+        // A turn handed back at its hold limit is no failure of the archive.
+        if !matches!(synced, Ok(true))
+            && !synced.as_ref().is_err_and(quil_engine::worker_execution::turn_spent)
+        {
             // The next attempt starts at another archive when one is known;
             // what this one installed stays.
             source_failed(&addr);

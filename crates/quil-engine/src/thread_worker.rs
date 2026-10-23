@@ -798,9 +798,8 @@ impl ThreadWorkerManager {
                                                                     if sync_in_progress.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                                                         continue;
                                                                     }
-                                                                    let local = match clock.get_latest_shard_clock_frame(&filter) {
-                                                                        Ok(frame) => Some(frame),
-                                                                        Err(quil_types::error::QuilError::NotFound(_)) => None,
+                                                                    match clock.get_latest_shard_clock_frame(&filter) {
+                                                                        Ok(_) | Err(quil_types::error::QuilError::NotFound(_)) => {}
                                                                         Err(error) => {
                                                                             warn!(filter = %hex::encode(&filter), %error, "cannot determine local shard lineage for sync");
                                                                             sync_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -822,17 +821,19 @@ impl ThreadWorkerManager {
                                                                         // so its per-peer read slots: a few recover at a
                                                                         // time rather than all failing busy together. A
                                                                         // replay onto held frames goes before checkpoint
-                                                                        // installs; a blocked successor session goes first
-                                                                        // and keeps its turn for further replay batches.
-                                                                        let attempt = async {
-                                                                            crate::worker_execution::recovery_phase("waiting_for_permit");
-                                                                            let blocked = lb.execution_record().successor_blocked_flag();
-                                                                            let _turn = crate::recovery_turns::SHARD_RECOVERY_TURNS.acquire(blocked.clone(), local.is_some()).await;
-                                                                            crate::prover_tree_syncer::recover_shard_from_latest(
-                                                                                syncer.as_ref(), &filter, local, &lb, Some(&*blocked),
-                                                                            ).await
+                                                                        // installs; a blocked successor session or an
+                                                                        // owed re-anchor goes first. A tree install past
+                                                                        // the hold limit hands its turn back and queues
+                                                                        // again (recovery_turns).
+                                                                        let lineage = || match clock.get_latest_shard_clock_frame(&filter) {
+                                                                            Ok(frame) => Ok(Some(frame)),
+                                                                            Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
+                                                                            Err(error) => Err(error),
                                                                         };
-                                                                        let _ = lb.execution_record().recovering(&filter, attempt).await;
+                                                                        let _ = crate::prover_tree_syncer::recover_in_turns(
+                                                                            &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,
+                                                                            core_id, &lb, lb.execution_record(), lineage,
+                                                                        ).await;
                                                                     });
                                                                 }
                                                                 _ => {

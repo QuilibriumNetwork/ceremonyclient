@@ -186,7 +186,11 @@ fn a_row_is_the_window_at_its_frame_plus_its_own_frames() {
 
     let r = &rows[&2_520];
     assert!(!r.window_complete);
-    assert_eq!((r.producing_shards, r.missing_frames_in_window, r.missing_frames), (0, 1, 1), "no claim");
+    assert_eq!(
+        (r.producing_shards, r.missing_frames_in_window, r.missing_frames),
+        (1, 1, 1),
+        "an applied app frame is positive evidence in an incomplete window"
+    );
     assert_eq!((r.applied, r.timestamp_ms), (59, Some(2_520 * 15_500)));
 
     let r = &rows[&2_760];

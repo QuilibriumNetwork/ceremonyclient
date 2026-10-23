@@ -588,6 +588,9 @@ pub struct ProverLifecycle {
     /// identical bundles. Entries older than `LEAVE_COOLDOWN_FRAMES`
     /// are pruned lazily on read so the map can't grow unbounded.
     last_leave_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Seats whose renewal was skipped for a pending leave, with the epoch
+    /// it was last reported in (`renewal_awaits_leave`).
+    renewal_skips_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -670,6 +673,7 @@ impl ProverLifecycle {
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
+            renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -958,6 +962,37 @@ impl ProverLifecycle {
             auto_bound.contains(filter)
                 && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
         })).unwrap_or(true)
+    }
+
+    /// Whether this node proposed leaving `filter` within
+    /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`, so its renewal waits: once
+    /// the leave lands the seat is Leaving, every node refuses a confirm that
+    /// names it, and the refusal takes the other seats of its message down
+    /// with it. Reported at info once per seat per epoch.
+    fn renewal_awaits_leave(&self, filter: &[u8], frame_number: u64) -> bool {
+        let Some(proposed) = self.last_leave_attempt.read().ok()
+            .and_then(|attempts| attempts.get(filter).copied())
+            .filter(|last| frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES)
+        else {
+            return false;
+        };
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let due = self.renewal_skips_reported.lock().is_ok_and(|mut reported| {
+            if reported.get(filter).is_some_and(|last| *last >= epoch) {
+                return false;
+            }
+            reported.retain(|_, last| last.saturating_add(1) >= epoch);
+            reported.insert(filter.to_vec(), epoch);
+            true
+        });
+        if due {
+            tracing::info!(frame = frame_number, epoch, filter = hex::encode(filter), leave_proposed_frame = proposed,
+                resume_frame = proposed + LEAVE_COOLDOWN_FRAMES, scope = "local",
+                "seat renewal skipped: this node proposed leaving the seat; a confirm naming a seat being left is \
+                 refused with every seat of its message. Expected while the leave lands; renewal resumes if it \
+                 has not landed by the resume frame (reported once per seat per epoch)");
+        }
+        true
     }
 
     /// Drop filters whose last Leave proposal is within
@@ -1795,6 +1830,7 @@ impl ProverLifecycle {
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
             let renewals = expired_epoch_filters.into_iter()
                 .filter(|f| worker_bound_filters.contains(f))
+                .filter(|f| !self.renewal_awaits_leave(f, frame_number))
                 .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
                     None => true,
                     Some(Hold::Settling { until }) => {
@@ -2412,9 +2448,13 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
             // Capacity for auto-managed allocations is the worker count
-            // less the operator's pins, matching the set above, and never
-            // more than the configured count leaves after those pins.
-            let auto_worker_capacity = workers.iter().filter(|w| !w.manually_managed).count()
+            // less the workers bound to the operator's pins, matching the
+            // set above. An idle manual worker still counts, as in
+            // `select_excess_active_filters`: the allocator binds an unbound
+            // allocation to it first, so subtracting it found a surplus of
+            // one per idle manual worker and left a holding it could serve.
+            let auto_worker_capacity = workers.iter()
+                .filter(|w| !w.manually_managed || w.filter.is_empty()).count()
                 .min(worker_capacity.saturating_sub(manually_managed_filters.len()));
             let overcapacity = sheddable_filters.len().saturating_sub(auto_worker_capacity);
             let overcapacity_filters: Vec<Vec<u8>> = if overcapacity == 0 {
@@ -2468,9 +2508,15 @@ impl ProverLifecycle {
             // (canonical, persists). Detected purely from the shard-filter set, so
             // it does not depend on the reassignment landing. A leaf has no
             // descendants → not flagged → stable, no churn.
+            //
+            // Operator pins are included here and below: the seat they
+            // protect no longer exists, so no worker can serve it, and a
+            // prover kept on a split-away parent is counted by the split
+            // proposer as if it still ran there. The manual decide bucket
+            // confirms the leave at maturity, and the operator is told
+            // below that the worker idles once it departs.
             let split_parent_filters: Vec<Vec<u8>> = active_filters
                 .iter()
-                .filter(|f| !manually_managed_filters.contains(*f))
                 .filter(|f| !pending_leave_filters.contains(*f))
                 .filter(|f| settled_split_away(f))
                 .cloned()
@@ -2479,7 +2525,6 @@ impl ProverLifecycle {
             // of its frames, and the worker can cover a real shard.
             let retired_filters: Vec<Vec<u8>> = active_filters
                 .iter()
-                .filter(|f| !manually_managed_filters.contains(*f))
                 .filter(|f| !pending_leave_filters.contains(*f))
                 .filter(|f| retired.contains(*f))
                 .cloned()
@@ -2643,6 +2688,22 @@ impl ProverLifecycle {
 
             if leave_candidates.len() > MAX_PROPOSALS_PER_CYCLE {
                 leave_candidates.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+
+            // Only a gone shard can put an operator pin here; the per-filter
+            // cooldown above bounds this to one line per proposal.
+            for f in leave_candidates.iter().filter(|f| manually_managed_filters.contains(*f)) {
+                let reason = if split_parent_filters.contains(f) { "split_parent" } else { "retired" };
+                for w in workers.iter().filter(|w| w.manually_managed && &w.filter == f) {
+                    tracing::warn!(
+                        core_id = w.core_id,
+                        filter = %hex::encode(f),
+                        frame = frame_number,
+                        reason,
+                        "lifecycle: proposing leave off a manual worker's shard, which no longer exists; \
+                         the worker idles once the leave departs: join it to a live shard or switch it to auto"
+                    );
+                }
             }
 
             if !leave_candidates.is_empty() {
@@ -4667,6 +4728,70 @@ mod proposal_loop_tests {
                     "a delayed bootstrap renewal must not race cleanup: {actions:?}");
             }
         }
+    }
+
+    /// A seat lapsed past its recovery epoch whose leave is in flight gets
+    /// no worker and no renewal, while one whose renewal is in flight keeps
+    /// both (2026-10-22: an idle worker was bound to a seat being left, and
+    /// the renewal planned for it sank the whole confirm once it was Leaving).
+    #[test]
+    fn a_seat_whose_leave_is_in_flight_is_not_rebound_or_renewed() {
+        use crate::submission_attempts::OpKind;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        for (kind, renewed) in [(OpKind::Confirm, true), (OpKind::Leave, false)] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(idle_worker(1));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut lapsed = alloc(held.clone(), ProverStatus::Active, 10);
+            lapsed.epoch = 0;
+            reg.set_prover(prover(address.clone(), vec![lapsed]));
+            reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.note_renewals_offered();
+            let running = lc.submission_attempts.begin(std::slice::from_ref(&held), 1440, kind).unwrap();
+            lc.allocator.on_new_frame(1441).unwrap();
+            assert_eq!(wm.range_workers().unwrap()[0].filter == held, renewed, "{kind:?} in flight");
+            lc.set_prover_root_verified_frame(1441);
+            let actions = lc.evaluate(1441, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
+                renewed, "{kind:?} in flight: {actions:?}");
+            drop(running);
+        }
+    }
+
+    /// A bound seat this node proposed leaving is not renewed until the leave
+    /// cooldown ends: a confirm naming it once the leave lands is refused,
+    /// with every other seat of its message.
+    #[test]
+    fn renewal_skips_a_seat_with_a_recent_leave() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let other = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(allocated_worker(2, other.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let lapsed = |filter: &Vec<u8>| ProverAllocationInfo { epoch: 0, ..alloc(filter.clone(), ProverStatus::Active, 10) };
+        reg.set_prover(prover(address.clone(), vec![lapsed(&held), lapsed(&other)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50), shard_summary(other.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewals = |frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.into_iter().find_map(|a| match a {
+                LifecycleAction::ReconfirmEpoch { filters, .. } => Some(filters),
+                _ => None,
+            }).unwrap_or_default()
+        };
+        lc.record_leave_attempts(std::slice::from_ref(&held), 721);
+        assert_eq!(renewals(725), vec![other.clone()], "the seat being left is skipped, the other renews");
+        assert_eq!(renewals(721 + LEAVE_COOLDOWN_FRAMES - 1), vec![other.clone()]);
+        let mut both = renewals(721 + LEAVE_COOLDOWN_FRAMES);
+        both.sort();
+        assert_eq!(both, vec![held, other], "renewed once the cooldown ends");
     }
 
     #[test]
@@ -6763,6 +6888,52 @@ mod proposal_loop_tests {
         );
     }
 
+    /// The leave sweep's over-capacity rule had the same phantom surplus:
+    /// it subtracted every manual worker from the capacity for auto
+    /// holdings, though an idle one holds no pin and the allocator binds an
+    /// unbound allocation to it first. With six auto workers serving six
+    /// holdings, an idle manual worker and a seventh holding not yet bound
+    /// (the operator's join just landed), it proposed leaving one.
+    #[test]
+    fn an_idle_manual_worker_counts_as_capacity_in_the_leave_sweep() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        for i in 1..=6u32 {
+            wm.add(allocated_worker(i, filter_bytes(0xA0 + i as u8)));
+        }
+        let mut manual = idle_worker(7);
+        manual.manually_managed = true;
+        wm.add(manual);
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=7u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary { filter: f, status_counts: counts, total_size: 1_000_000 });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "seven workers can serve seven holdings; got {:?}",
+            actions
+        );
+    }
+
     #[test]
     fn unsynced_tree_emits_nothing() {
         let address = vec![0xCDu8; 32];
@@ -7696,6 +7867,65 @@ mod proposal_loop_tests {
         assert!(!leaves(merged.clone()).contains(&retired), "an archive listed it within the hour (the seeded sizes)");
         lifecycle.remote_reported_at.lock().unwrap().clear();
         assert!(leaves(merged).contains(&retired), "no view lists it");
+    }
+
+    /// An operator pin on a gone shard was never shed: the manual worker
+    /// stayed on a shard no worker can serve until the operator noticed.
+    /// The leave is proposed as for an auto holding, retired or split away.
+    #[test]
+    fn a_manual_pin_on_a_gone_shard_is_left() {
+        let address = vec![0xCDu8; 32];
+        let app = [0x1Du8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let retired = quil_forest::encode_shard_bit_path(&app, &[true, false]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut pinned = allocated_worker(1, retired.clone());
+        pinned.manually_managed = true;
+        wm.add(pinned);
+        reg.set_prover(prover(address.clone(), vec![alloc(retired.clone(), ProverStatus::Active, 4)]));
+        reg.set_summaries(vec![shard_summary(parent.clone(), 3), shard_summary(retired.clone(), 2)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(900);
+        lifecycle.set_shards_store(put_grid(&app, &[&[true]], None));
+        let sizes: HashMap<Vec<u8>, u64> = [(parent.clone(), 1_000_000u64)].into_iter().collect();
+        let leaves = || {
+            lifecycle.set_remote_shard_sizes(sizes.clone());
+            let actions = lifecycle.evaluate(900, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.iter().filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+        assert!(!leaves().contains(&retired), "the refresh it asked for is pending");
+        lifecycle.remote_reported_at.lock().unwrap().clear();
+        assert!(leaves().contains(&retired), "a manual pin on a retired shard is left");
+
+        let app = [0x1Eu8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let children = [false, true].map(|bit| quil_forest::encode_shard_bit_path(&app, &[false, bit])).to_vec();
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut pinned = allocated_worker(1, parent.clone());
+        pinned.manually_managed = true;
+        wm.add(pinned);
+        let address = vec![0xCDu8; 32];
+        reg.set_prover(prover(address.clone(), vec![alloc(parent.clone(), ProverStatus::Active, 4)]));
+        reg.set_summaries(vec![shard_summary(parent.clone(), 8)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(242);
+        lifecycle.set_shards_store(put_grid(&app, &[&[false, false], &[false, true]], None));
+        let sizes: HashMap<Vec<u8>, u64> = children.iter().map(|c| (c.clone(), 734u64)).collect();
+        let leaves = || {
+            lifecycle.set_remote_shard_sizes(sizes.clone());
+            let actions = lifecycle.evaluate(242, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.iter().filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+        assert!(!leaves().contains(&parent), "the refresh it asked for is pending");
+        assert!(leaves().contains(&parent), "a manual pin on a split-away parent is left");
     }
 
     /// Manual-bucket confirm: when a Joining alloc reaches confirm

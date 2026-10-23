@@ -56,11 +56,34 @@ pub struct HandoffProposer {
     /// Told, for each seal of this close it verifies, whether the seal's
     /// state roots equal its own ([`Self::with_checkpoint_votes`]).
     checkpoint_votes: Option<CheckpointVotes>,
+    /// Asked why no closing request authorizes a seal
+    /// ([`Self::with_closing_probe`]).
+    closing_probe: Option<ClosingProbe>,
 }
 
 /// Called with `true` when a verified seal's checkpoint equals this member's,
 /// and `false` when it differs only in its state roots.
 pub type CheckpointVotes = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Why this member's authorized parent names no closing request, asked when a
+/// seal of its session arrives ([`HandoffProposer::with_closing_probe`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosingAbsence {
+    /// The missing input, for the refusal: the request absent from the
+    /// committed GLOBAL view at its frame, or present while the checkpoint is
+    /// not yet sealable.
+    pub detail: String,
+    /// The committed GLOBAL view is behind the GLOBAL head and a refresh that
+    /// can land within the vote's patience is on its way, so a later check
+    /// can find the request.
+    pub refreshing: bool,
+}
+
+pub type ClosingProbe = Arc<dyn Fn() -> ClosingAbsence + Send + Sync>;
+
+/// How long a seal waits before it is checked again while this member's
+/// committed GLOBAL view is being refreshed.
+pub const CLOSING_REQUEST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Why no authorized parent was found: a short reason and its specifics.
 type Unauthorized = (&'static str, String);
@@ -94,6 +117,7 @@ impl HandoffProposer {
             liveness: None,
             seal_parents: None,
             checkpoint_votes: None,
+            closing_probe: None,
         })
     }
 
@@ -106,6 +130,33 @@ impl HandoffProposer {
     pub fn with_checkpoint_votes(mut self, votes: Option<CheckpointVotes>) -> Self {
         self.checkpoint_votes = votes;
         self
+    }
+
+    /// Name what a refused seal of this session lacked, and let it wait while
+    /// this member's committed GLOBAL view is behind and a refresh can land
+    /// (the probe says when: on a regular node, for its in-process workers).
+    /// Such a node refreshes that view from an archive, so at an epoch
+    /// boundary a leader whose view was fresher proposed seals its members
+    /// refused, losing views until most of them had refreshed. Each later
+    /// check is the complete verification, so waiting never accepts a seal
+    /// that a current view refuses.
+    pub fn with_closing_probe(mut self, probe: Option<ClosingProbe>) -> Self {
+        self.closing_probe = probe;
+        self
+    }
+
+    /// The wait for a seal of this session whose closing request the
+    /// committed GLOBAL view does not hold while a refresh is on its way.
+    fn closing_wait(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
+        let probe = self.closing_probe.as_ref()?;
+        Seal::decode(bytes).ok().filter(|seal| seal.session == self.session_id)?;
+        let absence = probe();
+        if !absence.refreshing {
+            return None;
+        }
+        // Counted only if the view ends before the request arrives.
+        self.note(Step::Verify, context, "seal while no closing request", absence.detail);
+        Some(CLOSING_REQUEST_WAIT)
     }
 
     /// `proposed` against this member's `local` checkpoint: agreement, or a
@@ -450,16 +501,23 @@ impl GlobalProposer for HandoffProposer {
 
     /// A data frame waits as the data proposer says (its GLOBAL anchor just
     /// ahead of this node); without this a member that receives the anchor
-    /// moments after the leader refuses the proposal outright. A seal is
+    /// moments after the leader refuses the proposal outright. A seal waits
+    /// for its checkpoint to finalize here, and for a closing request this
+    /// member's refreshing GLOBAL view does not hold yet; otherwise it is
     /// checked at once.
     fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
         if Seal::is_encoding(bytes) {
-            // A seal's checkpoint must have finalized here first (see
-            // `propose_with_context`); it does moments after the view opens.
-            let unfinalized = self.selected_seal(context).is_none()
-                && self.checked_parent(context, &self.read_parent).is_err()
-                && self.recognised_seal(context).is_none();
-            return unfinalized.then_some(std::time::Duration::from_millis(250));
+            if self.selected_seal(context).is_some() {
+                return None;
+            }
+            return match self.checked_parent(context, &self.read_parent) {
+                // A seal's checkpoint must have finalized here first (see
+                // `propose_with_context`); it does moments after the view opens.
+                Err(_) => self.recognised_seal(context).is_none()
+                    .then_some(std::time::Duration::from_millis(250)),
+                Ok(parent) if parent.closing_request.is_none() => self.closing_wait(context, bytes),
+                Ok(_) => None,
+            };
         }
         self.inner.verify_delay(context, bytes)
     }
@@ -491,7 +549,12 @@ impl GlobalProposer for HandoffProposer {
         };
         if Seal::is_encoding(&bytes) {
             let Some(request) = parent.closing_request else {
-                self.note(Step::Verify, context, "seal while no closing request", String::new());
+                // Only a seal of this session asks this member's view, which
+                // may request a refresh of it.
+                let ours = Seal::decode(&bytes).is_ok_and(|seal| seal.session == self.session_id);
+                let detail = self.closing_probe.as_ref().filter(|_| ours)
+                    .map(|probe| probe().detail).unwrap_or_default();
+                self.note(Step::Verify, context, "seal while no closing request", detail);
                 return false;
             };
             let Ok(seal) = Seal::decode(&bytes) else {

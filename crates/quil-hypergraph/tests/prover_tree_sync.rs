@@ -147,6 +147,53 @@ fn atomic_subtree_chunks_preserve_siblings_and_install_readable_data() {
     assert!(target.get_vertex_data_checked(&location(0x60)).unwrap().is_none());
 }
 
+/// A sync stopped between chunks (a recovery handing its turn back) leaves
+/// those chunks installed and its scope marked incomplete; a sync prepared
+/// afresh plans only the rest and completes the subtree.
+#[test]
+fn an_interrupted_sync_resumes_from_its_installed_chunks() {
+    use quil_forest::{bit_path_to_prefix, shard_prefix_to_filter, SubtreeSyncAnchor};
+    let app = [0x72; 32];
+    let bits = [false, true];
+    let filter = shard_prefix_to_filter(&app, &bit_path_to_prefix(&bits));
+    let location = |byte| Location { app_address: app, data_address: [byte; 32] };
+    let source = fresh_crdt();
+    source.set_unified_tree(true);
+    let bytes = [0x40, 0x48, 0x50, 0x58];
+    for byte in bytes { source.add_vertex(&location(byte), &[byte; 48]).unwrap(); }
+    source.commit(1).unwrap();
+    let (version, _) = source.serve_forest_head(&app, 0).unwrap();
+    let root = source.sub_shard_commitment_for_filter("vertex", "adds", &filter).try_into().unwrap();
+    let reader = InProcTreeReader { source, shard_id: app.to_vec(), phase: 0 };
+    let target = fresh_crdt();
+    target.set_unified_tree(true);
+    let prepare = || target.prepare_phase_sync(&reader, version, &app, 0, &bits, Some(SubtreeSyncAnchor::SubtreeRoot(root))).unwrap();
+    let mut plan = prepare();
+    assert_eq!(plan.remaining().len(), 4);
+    assert!(plan.resumable());
+    let mut installed = Vec::new();
+    for _ in 0..2 {
+        let byte = plan.remaining()[0].0[0];
+        target.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        installed.push(byte);
+    }
+    drop(plan);
+    assert!(target.sync_incomplete(&app, &bits).unwrap());
+    let mut plan = prepare();
+    assert!(plan.resumable(), "a sync begun on an empty scope is no repair");
+    assert_eq!(plan.remaining().len(), 2, "only the leaves not yet installed are planned");
+    assert!(plan.remaining().iter().all(|(key, _)| !installed.contains(&key[0])));
+    while let Some((key, _)) = plan.remaining().first() {
+        let byte = key[0];
+        target.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+    }
+    assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+    assert!(!target.sync_incomplete(&app, &bits).unwrap());
+    for byte in bytes {
+        assert_eq!(target.get_vertex_data_checked(&location(byte)).unwrap(), Some(vec![byte; 48]));
+    }
+}
+
 /// A failed local GLOBAL replay can create records that never existed at the
 /// authenticated source. Repair must remove them, including when JMT leaves
 /// collapse to a different branch shape, and retain source values at common keys.

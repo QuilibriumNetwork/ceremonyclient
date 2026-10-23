@@ -18,7 +18,14 @@ use quil_execution::global_intrinsic::{
     addressed_signature::AddressedSignature,
     prover_filter_ops::ProverLeave,
     prover_join::ProverJoin,
-    prover_ops::{ProverConfirm, ProverReject, ProverSeniorityMerge, ShardMerge, ShardSplit},
+    leaf_root_registration::{check_confirm_leaf_roots, MAX_CONFIRM_LEAF_ROOT_GROUPS},
+    prover_ops::{
+        check_filters, ProverConfirm, ProverReject, ProverSeniorityMerge, ShardMerge, ShardSplit,
+        MAX_FILTERS_PER_OP, MAX_FILTER_LEN, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT,
+        TYPE_PROVER_SENIORITY_MERGE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
+    },
+    prover_filter_ops::TYPE_PROVER_LEAVE,
+    prover_join::TYPE_PROVER_JOIN,
     sig_with_pop::SignatureWithPop,
 };
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -30,6 +37,7 @@ use crate::worker::WorkerManager;
 use crate::prover_message_transport::ProverMessageTransport;
 use crate::message_collector::{MessageCollector, SubmitOutcome};
 use crate::current_frame::CurrentFrame;
+use crate::submission_attempts::OpKind;
 
 /// End-to-end submission pipeline for prover lifecycle actions.
 ///
@@ -116,6 +124,22 @@ pub type RemoteStorageConfirm = std::sync::Arc<
         + Send + Sync,
 >;
 
+/// A filter-carrying op other than a join or confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterOp {
+    Leave,
+    Reject,
+}
+
+impl FilterOp {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Leave => "leave",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 /// Hard ceiling on lifecycle submissions that do NOT perform VDF
 /// compute (confirms, rejects, leaves, seniority merge). Each of
 /// these is sign + canonicalize + publish; the only legitimately
@@ -178,6 +202,10 @@ enum LeftOutCause {
     Incomplete,
     /// It pre-registers a shard a left-out seat was to encode.
     MergeTarget,
+    /// Its filter or leaf roots exceed what every node decodes in a confirm.
+    OverLimit,
+    /// Its committed allocation no longer accepts the confirm (`confirm_refusal`).
+    Refused,
 }
 
 impl LeftOutCause {
@@ -188,11 +216,14 @@ impl LeftOutCause {
             Self::Unasked => "unasked",
             Self::Incomplete => "incomplete",
             Self::MergeTarget => "merge target",
+            Self::OverLimit => "over decode limit",
+            Self::Refused => "refused",
         }
     }
 }
 
-/// A seat a confirm leaves out, with why; retried on the next cycle.
+/// A seat a confirm leaves out, with why; retried on the next cycle, or in
+/// the next epoch when it is over the decode limits.
 struct LeftOutSeat {
     filter: Vec<u8>,
     /// Shards this seat was to pre-register for the confirm.
@@ -206,16 +237,35 @@ struct LeftOutSeat {
 struct PreparedConfirm {
     filters: Vec<Vec<u8>>,
     roots: LeafRoots,
+    /// How many of `roots`, in order, each of `filters` registers: its
+    /// shard's and those it pre-registers.
+    seat_groups: Vec<usize>,
     left_out: Vec<LeftOutSeat>,
 }
 
 impl PreparedConfirm {
-    /// Release the left-out seats' reservations so the next cycle retries
-    /// them; the submitted seats stay reserved until published.
-    fn release_left_out(&self, attempt: &mut crate::submission_attempts::SubmissionAttempt) {
-        let left_out: Vec<Vec<u8>> = self.left_out.iter().map(|seat| seat.filter.clone()).collect();
-        attempt.release(&left_out);
+    /// Settle the left-out seats' reservations: a seat its worker did not
+    /// prepare is released, so the next cycle retries it; a seat over the
+    /// decode limits is fenced from `frame` until the epoch ends, as
+    /// preparing it again (a full storage encode) within the epoch would only
+    /// leave it out again; the next epoch's renewal retries it. A refused
+    /// seat is fenced for the retry fence. The submitted seats stay reserved
+    /// until published.
+    fn settle_left_out(&self, attempt: &mut crate::submission_attempts::SubmissionAttempt, frame: u64) {
+        let filters = |settled: fn(LeftOutCause) -> bool| {
+            self.left_out.iter().filter(|seat| settled(seat.cause)).map(|seat| seat.filter.clone()).collect::<Vec<_>>()
+        };
+        attempt.fence_for_epoch(&filters(|cause| cause == LeftOutCause::OverLimit), frame);
+        attempt.fence(&filters(|cause| cause == LeftOutCause::Refused), frame);
+        attempt.release(&filters(|cause| !matches!(cause, LeftOutCause::OverLimit | LeftOutCause::Refused)));
     }
+}
+
+/// Why no node would decode a confirm carrying this seat, if none would: its
+/// filter or its leaf-root groups exceed the decoders' limits. Such a seat is
+/// left out, so the seats sharing its message still go out.
+fn seat_over_limit(filter: &[u8], roots: &LeafRoots) -> Option<QuilError> {
+    check_filters(&[filter.to_vec()]).and_then(|()| check_confirm_leaf_roots(roots)).err()
 }
 
 /// Prepare a confirm of `filters` along `confirm_encoding_plan`. A seat whose
@@ -224,23 +274,44 @@ impl PreparedConfirm {
 /// next cycle. A seat that was to encode a shard a left-out seat had claimed
 /// (a shared merge target) is left out with it, so every submitted seat
 /// registers the shards a change creates from it, as a full confirm does.
-/// When no seat is left, the first worker error aborts the confirm, as does
-/// any other preparation error.
-fn prepare_confirm<F>(
+/// A seat whose filter or leaf roots exceed what every node decodes is left
+/// out too (`seat_over_limit`), so it does not take its message-mates down,
+/// as is one `refused` finds GLOBAL would no longer accept a confirm for,
+/// once every seat is prepared. When no seat is left and none is over those
+/// limits or refused, the first worker error aborts the confirm, as does any
+/// other preparation error.
+fn prepare_confirm<F, R>(
     filters: &[Vec<u8>],
     changes: &[quil_types::store::PendingShardChange],
     epoch: u64,
     mut prepare: F,
+    mut refused: R,
 ) -> Result<PreparedConfirm>
 where
     F: FnMut(&[u8], &[Vec<u8>]) -> Result<Prepared>,
+    R: FnMut(&[u8]) -> Option<QuilError>,
 {
     let mut prepared: Vec<(Vec<u8>, Vec<Vec<u8>>, LeafRoots)> = Vec::with_capacity(filters.len());
     let mut left_out: Vec<LeftOutSeat> = Vec::new();
     for (filter, targets) in confirm_encoding_plan(filters, changes, epoch) {
         match prepare(&filter, &targets)? {
-            Prepared::Roots(roots) => prepared.push((filter, targets, roots)),
+            Prepared::Roots(roots) => match seat_over_limit(&filter, &roots) {
+                None => prepared.push((filter, targets, roots)),
+                Some(error) => left_out.push(LeftOutSeat { filter, targets, cause: LeftOutCause::OverLimit, error }),
+            },
             Prepared::Unanswered(cause, error) => left_out.push(LeftOutSeat { filter, targets, cause, error }),
+        }
+    }
+    // A seat whose allocation changed while it was prepared (a leave of it
+    // landed) would sink every seat of its message.
+    let mut index = 0;
+    while index < prepared.len() {
+        match refused(&prepared[index].0) {
+            Some(error) => {
+                let (filter, targets, _) = prepared.remove(index);
+                left_out.push(LeftOutSeat { filter, targets, cause: LeftOutCause::Refused, error });
+            }
+            None => index += 1,
         }
     }
     // A shard claimed by a left-out seat is encoded by no submitted seat.
@@ -267,15 +338,270 @@ where
             ),
         });
     }
-    if prepared.is_empty() && !left_out.is_empty() {
+    // A seat over the decode limits or refused is settled rather than
+    // failed, so it is not prepared again every frame.
+    if prepared.is_empty()
+        && !left_out.is_empty()
+        && left_out.iter().all(|seat| !matches!(seat.cause, LeftOutCause::OverLimit | LeftOutCause::Refused))
+    {
         return Err(left_out.remove(0).error);
     }
-    let mut confirm = PreparedConfirm { filters: Vec::with_capacity(prepared.len()), roots: Vec::new(), left_out };
+    let mut confirm = PreparedConfirm {
+        filters: Vec::with_capacity(prepared.len()),
+        roots: Vec::new(),
+        seat_groups: Vec::with_capacity(prepared.len()),
+        left_out,
+    };
     for (filter, _, roots) in prepared {
         confirm.filters.push(filter);
+        confirm.seat_groups.push(roots.len());
         confirm.roots.extend(roots);
     }
     Ok(confirm)
+}
+
+/// Split a confirm into messages every node decodes: each names at most
+/// `MAX_FILTERS_PER_OP` filters and registers at most
+/// `MAX_CONFIRM_LEAF_ROOT_GROUPS` leaf-root groups. A seat's groups stay in
+/// the message that names it, as GLOBAL honours a group only for a shard the
+/// same confirm names or one a change creates from it. Each message is
+/// signed, submitted and retried on its own.
+fn confirm_messages(
+    filters: Vec<Vec<u8>>,
+    roots: LeafRoots,
+    seat_groups: &[usize],
+) -> Vec<(Vec<Vec<u8>>, LeafRoots)> {
+    let mut messages: Vec<(Vec<Vec<u8>>, LeafRoots)> = Vec::new();
+    let mut roots = roots.into_iter();
+    for (index, filter) in filters.into_iter().enumerate() {
+        let seat: LeafRoots = roots.by_ref().take(seat_groups.get(index).copied().unwrap_or(0)).collect();
+        let fits = messages.last().is_some_and(|(filters, roots)| {
+            filters.len() < MAX_FILTERS_PER_OP && roots.len() + seat.len() <= MAX_CONFIRM_LEAF_ROOT_GROUPS
+        });
+        if !fits {
+            messages.push((Vec::new(), Vec::new()));
+        }
+        if let Some((filters, roots)) = messages.last_mut() {
+            filters.push(filter);
+            roots.extend(seat);
+        }
+    }
+    // Groups no seat accounts for stay with the last message, as before.
+    if let Some((_, last)) = messages.last_mut() {
+        last.extend(roots);
+    }
+    messages
+}
+
+/// Split the filters of a join, leave or reject into lists one op carries.
+fn filter_chunks(filters: &[Vec<u8>]) -> Vec<Vec<Vec<u8>>> {
+    filters.chunks(MAX_FILTERS_PER_OP).map(<[Vec<u8>]>::to_vec).collect()
+}
+
+/// One line when a prover operation is split into several messages.
+fn report_split(op: &'static str, filters: usize, messages: usize, frame_number: u64) {
+    if messages > 1 {
+        info!(
+            op,
+            frame = frame_number,
+            epoch = quil_types::consensus::epoch_for_frame(frame_number),
+            filters,
+            chunks = messages,
+            max_filters = MAX_FILTERS_PER_OP,
+            "prover operation split into several messages: each carries at most the filters every node \
+             decodes, and is submitted and retried on its own"
+        );
+    }
+}
+
+/// Decode a prover op as every node does, so this node never publishes one
+/// they all refuse: a prover with 105 seats renewed 103 in one confirm, over
+/// the filter limit, saw each publication succeed and retried it every few
+/// frames while all 103 seats lapsed.
+fn decode_prover_op(inner: &[u8]) -> Result<()> {
+    let Some(prefix) = inner.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])) else {
+        return Err(QuilError::InvalidArgument("prover op shorter than its type prefix".into()));
+    };
+    match prefix {
+        TYPE_PROVER_JOIN => ProverJoin::from_canonical_bytes(inner).map(drop),
+        TYPE_PROVER_CONFIRM => ProverConfirm::from_canonical_bytes(inner).map(drop),
+        TYPE_PROVER_REJECT => ProverReject::from_canonical_bytes(inner).map(drop),
+        TYPE_PROVER_LEAVE => ProverLeave::from_canonical_bytes(inner).map(drop),
+        TYPE_PROVER_SENIORITY_MERGE => ProverSeniorityMerge::from_canonical_bytes(inner).map(drop),
+        TYPE_SHARD_SPLIT => ShardSplit::from_canonical_bytes(inner).map(drop),
+        TYPE_SHARD_MERGE => ShardMerge::from_canonical_bytes(inner).map(drop),
+        _ => Ok(()),
+    }
+}
+
+/// How the error of a prover op `refuse_undecodable` refused starts.
+const UNDECODABLE: &str = "prover operation does not decode";
+
+/// When a refused op of kind `op` (as `own_prover_ops::describe` names it)
+/// is built again: the sender of a join, confirm, leave or reject fences its
+/// filters for the retry fence; a seniority merge waits out its cooldown; a
+/// shard split or merge is proposed again when its shard is next eligible.
+fn refusal_retry(op: &str) -> &'static str {
+    match op {
+        "join" | "confirm" | "leave" | "reject" => "its filters are retried after the retry fence",
+        "seniority_merge" => "proposed again after the seniority merge cooldown",
+        "shard_split" | "shard_merge" => "proposed again when the shard is next eligible",
+        _ => "built again when its sender next proposes it",
+    }
+}
+
+/// Refuse to publish a prover op no node decodes; `refusal_retry` says when
+/// it is built again. The warning is given at most once per op kind per
+/// epoch.
+fn refuse_undecodable(inner: &[u8], frame_number: u64) -> Result<()> {
+    let Err(error) = decode_prover_op(inner) else {
+        return Ok(());
+    };
+    let (op, filters) = crate::own_prover_ops::describe(inner);
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    if refusal_reports().due(&op, epoch) {
+        warn!(
+            op,
+            frame = frame_number,
+            epoch,
+            filters = filters.len(),
+            longest_filter = filters.iter().map(Vec::len).max().unwrap_or(0),
+            max_filters = MAX_FILTERS_PER_OP,
+            max_filter_len = MAX_FILTER_LEN,
+            max_leaf_root_groups = MAX_CONFIRM_LEAF_ROOT_GROUPS,
+            %error,
+            retry = refusal_retry(op),
+            scope = "this node",
+            action = "report this line as a defect: the node built an op over the limits every node decodes",
+            "prover operation not published: no node can decode it, so no frame would include it (reported once \
+             per op kind per epoch)"
+        );
+    }
+    Err(QuilError::InvalidArgument(format!("{UNDECODABLE}: {op}: {error}")))
+}
+
+/// Whether `error` is `refuse_undecodable`'s: the op's filters are then
+/// fenced, not retried on the next cycle.
+fn is_undecodable(error: &QuilError) -> bool {
+    matches!(error, QuilError::InvalidArgument(message) if message.starts_with(UNDECODABLE))
+}
+
+/// Keys already reported in an epoch: an anomaly that recurs while it lasts
+/// is warned at most once per epoch per key.
+struct EpochReports<K>(Mutex<HashMap<K, u64>>);
+
+impl<K> Default for EpochReports<K> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash> EpochReports<K> {
+    /// Whether `key` is due a report in `epoch`; records the report.
+    fn due(&self, key: &K, epoch: u64) -> bool {
+        let Ok(mut reported) = self.0.lock() else { return false };
+        if reported.get(key).is_some_and(|last| *last >= epoch) {
+            return false;
+        }
+        reported.retain(|_, last| last.saturating_add(1) >= epoch);
+        reported.insert(key.clone(), epoch);
+        true
+    }
+}
+
+/// Op kinds whose refusal by `refuse_undecodable` was reported, by epoch.
+fn refusal_reports() -> &'static EpochReports<&'static str> {
+    static REPORTS: OnceLock<EpochReports<&'static str>> = OnceLock::new();
+    REPORTS.get_or_init(EpochReports::default)
+}
+
+/// Seats left out of an op over the decode limits that were reported, by op
+/// kind and epoch.
+fn over_limit_reports() -> &'static EpochReports<(&'static str, Vec<u8>)> {
+    static REPORTS: OnceLock<EpochReports<(&'static str, Vec<u8>)>> = OnceLock::new();
+    REPORTS.get_or_init(EpochReports::default)
+}
+
+/// Warn of the seats an op leaves out because no node would decode a message
+/// carrying them, each at most once per epoch: they are fenced until the
+/// epoch ends and retried in the next, and the op goes ahead for the others.
+fn report_over_limit(op: &'static str, frame_number: u64, seats: &[(Vec<u8>, String)]) {
+    const LISTED: usize = 4;
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    let due: Vec<&(Vec<u8>, String)> =
+        seats.iter().filter(|(filter, _)| over_limit_reports().due(&(op, filter.clone()), epoch)).collect();
+    if due.is_empty() {
+        return;
+    }
+    let mut reasons: Vec<&str> = due.iter().map(|(_, reason)| reason.as_str()).collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    warn!(
+        op,
+        frame = frame_number,
+        epoch,
+        seats = due.len(),
+        filters = %due.iter().take(LISTED).map(|(filter, _)| hex::encode(filter)).collect::<Vec<_>>().join(","),
+        more_filters = due.len().saturating_sub(LISTED),
+        reasons = %reasons.iter().take(3).copied().collect::<Vec<_>>().join("; "),
+        scope = "this node",
+        action = "report this line as a defect: the node prepared a seat over the limits every node decodes",
+        "prover operation leaves out seats no node would decode in it; sending the others, retrying these in \
+         the next epoch (each reported once per epoch)"
+    );
+}
+
+/// Keep the filters `keep` admits, with their worker ids when the ids pair
+/// one-to-one with the filters.
+fn retain_paired(filters: &mut Vec<Vec<u8>>, worker_ids: Option<&mut Vec<u32>>, mut keep: impl FnMut(&[u8]) -> bool) {
+    let kept: Vec<bool> = filters.iter().map(|filter| keep(filter.as_slice())).collect();
+    if let Some(ids) = worker_ids.filter(|ids| ids.len() == kept.len()) {
+        let mut index = 0;
+        ids.retain(|_| {
+            index += 1;
+            kept[index - 1]
+        });
+    }
+    let mut index = 0;
+    filters.retain(|_| {
+        index += 1;
+        kept[index - 1]
+    });
+}
+
+/// Split a join's filters into the lists one op carries, each with the
+/// worker ids paired with its filters; ids that do not pair one-to-one with
+/// the filters (none, for an admin join) go with every chunk.
+pub fn join_chunks(filters: &[Vec<u8>], worker_ids: &[u32]) -> Vec<(Vec<Vec<u8>>, Vec<u32>)> {
+    let paired = worker_ids.len() == filters.len();
+    filters
+        .chunks(MAX_FILTERS_PER_OP)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let workers = if paired {
+                worker_ids[index * MAX_FILTERS_PER_OP..][..chunk.len()].to_vec()
+            } else {
+                worker_ids.to_vec()
+            };
+            (chunk.to_vec(), workers)
+        })
+        .collect()
+}
+
+/// Wrap a prover op in a single-request `MessageBundle` for the transport,
+/// refusing one no node decodes.
+fn prover_bundle(inner_bytes: Vec<u8>, frame_number: u64) -> Result<Vec<u8>> {
+    refuse_undecodable(&inner_bytes, frame_number)?;
+    let req = CanonicalMessageRequest::wrap(inner_bytes)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let bundle = CanonicalMessageBundle {
+        requests: vec![Some(req)],
+        timestamp: now_ms,
+    };
+    bundle.to_canonical_bytes()
 }
 
 /// Standalone workers asked at once for their seats' leaf roots.
@@ -425,7 +751,7 @@ fn remote_answer(filter: &[u8], targets: &[Vec<u8>], answer: RemoteAnswer) -> Op
 }
 
 /// How many left-out seats each cause accounts for, e.g. `failed 2, late 1`.
-fn left_out_causes(left_out: &[LeftOutSeat]) -> String {
+fn left_out_causes<'a>(left_out: impl IntoIterator<Item = &'a LeftOutSeat>) -> String {
     let mut counts: std::collections::BTreeMap<LeftOutCause, usize> = Default::default();
     for seat in left_out {
         *counts.entry(seat.cause).or_default() += 1;
@@ -435,7 +761,7 @@ fn left_out_causes(left_out: &[LeftOutSeat]) -> String {
 
 /// The distinct errors of left-out seats with their counts, most frequent
 /// first, at most three.
-fn left_out_errors(left_out: &[LeftOutSeat]) -> String {
+fn left_out_errors<'a>(left_out: impl IntoIterator<Item = &'a LeftOutSeat>) -> String {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for seat in left_out {
         let error = seat.error.to_string();
@@ -466,8 +792,9 @@ struct ConsumedMergeTarget {
     credited: Option<Vec<u8>>,
 }
 
-/// Read a spent marker from the node's committed GLOBAL state.
-fn spent_marker(
+/// Read a vertex (a spent marker, an allocation) from the node's committed
+/// GLOBAL state.
+fn global_vertex(
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     address: &[u8; 32],
 ) -> Result<Option<Vec<u8>>> {
@@ -477,6 +804,42 @@ fn spent_marker(
         address,
         &va_disc,
     )
+}
+
+/// Seats left out of a confirm as refused that were reported, by epoch.
+fn refused_seat_reports() -> &'static EpochReports<Vec<u8>> {
+    static REPORTS: OnceLock<EpochReports<Vec<u8>>> = OnceLock::new();
+    REPORTS.get_or_init(EpochReports::default)
+}
+
+/// Why every node would refuse a confirm naming `filter` at `frame_number`,
+/// if it would: `validate_confirm_timing` on the committed allocation of the
+/// prover `pubkey`, as GLOBAL checks each filter of a confirm, where one
+/// refused filter sinks the whole message. The allocation can change while
+/// the confirm is prepared (a leave of the seat lands). The rule reads only
+/// the frame's epoch, which inclusion shares (`validate_confirm_epoch`).
+/// Nothing for an absent or unreadable allocation, which GLOBAL skips too.
+/// Reported at info once per seat per epoch.
+fn confirm_refusal(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    pubkey: &[u8],
+    filter: &[u8],
+    frame_number: u64,
+) -> Option<QuilError> {
+    let address = quil_execution::global_intrinsic::materialize::allocation_address(pubkey, filter).ok()?;
+    let blob = global_vertex(crdt, &address).ok().flatten().filter(|blob| !blob.is_empty())?;
+    let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+    let error = quil_execution::global_intrinsic::verify::validate_confirm_timing(frame_number, &tree).err()?;
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+    if refused_seat_reports().due(&filter.to_vec(), epoch) {
+        let status = quil_execution::global_schema::read_field(&tree, "allocation:ProverAllocation", "Status")
+            .and_then(|status| status.first().copied())
+            .map(quil_execution::prover_registry::map_allocation_status);
+        info!(frame = frame_number, epoch, filter = hex::encode(filter), status = ?status, %error, scope = "local",
+            "confirmation leaves out a seat whose committed allocation no longer accepts it (a leave of it landed, \
+             or it is already confirmed); submitting the others (reported once per seat per epoch)");
+    }
+    Some(error)
 }
 
 /// Build the `ProverSeniorityMerge` of `seeds` at `frame_number`, leaving out
@@ -578,20 +941,7 @@ fn consumed_target_credit(target: &ConsumedMergeTarget, own: &[u8; 32]) -> (Stri
 /// a target found consumed is reported at once and again at most once per
 /// epoch while the lifecycle keeps proposing merges. Holds only this node's
 /// own targets.
-#[derive(Default)]
-struct ConsumedTargetReports(Mutex<HashMap<ConsumedMergeTarget, u64>>);
-
-impl ConsumedTargetReports {
-    /// Whether `target` is due a report in `epoch`; records the report.
-    fn due(&self, target: &ConsumedMergeTarget, epoch: u64) -> bool {
-        let Ok(mut reported) = self.0.lock() else { return false };
-        if reported.get(target).is_some_and(|last| *last >= epoch) {
-            return false;
-        }
-        reported.insert(target.clone(), epoch);
-        true
-    }
-}
+type ConsumedTargetReports = EpochReports<ConsumedMergeTarget>;
 
 fn consumed_target_reports() -> &'static ConsumedTargetReports {
     static REPORTS: OnceLock<ConsumedTargetReports> = OnceLock::new();
@@ -600,12 +950,14 @@ fn consumed_target_reports() -> &'static ConsumedTargetReports {
 
 impl ProverPipeline {
     fn dispatch_confirmation(
-        self: &Arc<Self>, filters: Vec<Vec<u8>>, frame_number: u64,
+        self: &Arc<Self>, mut filters: Vec<Vec<u8>>, frame_number: u64,
         needs_storage: bool, prune_replicas: bool,
     ) {
-        let Some(attempt) = self.lifecycle.submission_attempts.begin(&filters, frame_number) else {
-            tracing::info!(frame = frame_number, filters = filters.len(), needs_storage,
-                "confirmation dispatch skipped: an attempt for this filter/epoch is already recorded");
+        // A seat whose message failed is retried without resending the seats
+        // already published (see `reserve_filters`). A confirm of leaves is
+        // part of leaving: a renewal's fence must not hold it off.
+        let kind = if needs_storage { OpKind::Confirm } else { OpKind::Leave };
+        let Some(attempt) = self.reserve_filters("confirm", kind, &mut filters, None, frame_number) else {
             return;
         };
         tracing::info!(frame = frame_number, filters = filters.len(), needs_storage, prune_replicas,
@@ -615,7 +967,7 @@ impl ProverPipeline {
             // Limit expensive preparation independently from network timeouts.
             // Keep the reservation inside the blocking task: cancelling its
             // waiter cannot start a second encoder while the first still runs.
-            let (filters, roots, attempt) = if needs_storage {
+            let (filters, roots, seat_groups, mut attempt) = if needs_storage {
                 static ENCODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
                 let Ok(permit) = ENCODERS.acquire().await else { return; };
                 let encoder = me.clone();
@@ -635,10 +987,10 @@ impl ProverPipeline {
                 match prepared {
                     Ok((Ok(prepared), mut attempt)) => {
                         if !prepared.left_out.is_empty() {
-                            prepared.release_left_out(&mut attempt);
+                            prepared.settle_left_out(&mut attempt, me.frame_now(frame_number));
                             me.report_left_out_seats(frame_number, &prepared);
                         }
-                        (prepared.filters, prepared.roots, attempt)
+                        (prepared.filters, prepared.roots, prepared.seat_groups, attempt)
                     }
                     Ok((Err(e), _attempt)) => {
                         warn!(frame = frame_number, %e, "confirmation preparation failed; retrying on next cycle");
@@ -650,17 +1002,37 @@ impl ProverPipeline {
                     }
                 }
             } else {
-                (filters, Vec::new(), attempt)
+                let mut attempt = attempt;
+                let refused: Vec<Vec<u8>> = me.hypergraph.as_ref().map_or_else(Vec::new, |crdt| filters.iter()
+                    .filter(|filter| confirm_refusal(crdt, &me.bls_pubkey, filter, frame_number).is_some())
+                    .cloned().collect());
+                attempt.fence(&refused, me.frame_now(frame_number));
+                let filters: Vec<Vec<u8>> = filters.into_iter().filter(|filter| !refused.contains(filter)).collect();
+                let seat_groups = vec![0; filters.len()];
+                (filters, Vec::new(), seat_groups, attempt)
             };
-            match tokio::time::timeout(
-                NON_VDF_SUBMIT_TIMEOUT,
-                me.submit_confirm(filters, frame_number, roots),
-            ).await {
-                Ok(Ok(())) => {
-                    attempt.published(me.current_frame.as_ref().map(|f| f.effective()).unwrap_or(frame_number));
+            // Every node refuses a confirm over the filter or leaf-root group
+            // limits, so a longer one is split; a failed message leaves its
+            // seats to the next cycle and the others still go out. A message
+            // the guard refuses keeps its seats fenced instead: rebuilding it
+            // on the next cycle would only be refused again.
+            let total = filters.len();
+            let messages = confirm_messages(filters, roots, &seat_groups);
+            let chunks = messages.len();
+            report_split("confirm", total, chunks, frame_number);
+            for (chunk, (filters, roots)) in messages.into_iter().enumerate() {
+                let count = filters.len();
+                match tokio::time::timeout(
+                    NON_VDF_SUBMIT_TIMEOUT,
+                    me.submit_confirm(filters.clone(), frame_number, roots),
+                ).await {
+                    Ok(Ok(())) => attempt.published_subset(&filters, me.frame_now(frame_number)),
+                    Ok(Err(e)) if is_undecodable(&e) => attempt.fence(&filters, me.frame_now(frame_number)),
+                    Ok(Err(e)) => warn!(frame = frame_number, chunk, chunks, filters = count, %e,
+                        "confirmation submission failed; retrying these filters on next cycle"),
+                    Err(_) => warn!(frame = frame_number, chunk, chunks, filters = count,
+                        "confirmation submission timed out; retrying these filters on next cycle"),
                 }
-                Ok(Err(e)) => warn!(frame = frame_number, %e, "confirmation submission failed"),
-                Err(_) => warn!(frame = frame_number, "confirmation submission timed out"),
             }
         });
     }
@@ -668,12 +1040,24 @@ impl ProverPipeline {
     /// Warn, once per confirm, of the seats it leaves out because their
     /// workers did not prepare their storage, or not by the round's deadline:
     /// the confirm goes ahead for the others, and these are retried on the
-    /// next cycle.
+    /// next cycle. Seats over the decode limits are reported apart (see
+    /// `report_over_limit`).
     fn report_left_out_seats(&self, frame_number: u64, prepared: &PreparedConfirm) {
         const LISTED: usize = 16;
+        // Refused seats are reported as they are found (`confirm_refusal`).
+        let (over_limit, unprepared): (Vec<&LeftOutSeat>, Vec<&LeftOutSeat>) = prepared.left_out.iter()
+            .filter(|seat| seat.cause != LeftOutCause::Refused)
+            .partition(|seat| seat.cause == LeftOutCause::OverLimit);
+        if !over_limit.is_empty() {
+            let seats: Vec<(Vec<u8>, String)> =
+                over_limit.iter().map(|seat| (seat.filter.clone(), seat.error.to_string())).collect();
+            report_over_limit("confirm", frame_number, &seats);
+        }
+        if unprepared.is_empty() {
+            return;
+        }
         let workers = self.worker_manager.range_workers().unwrap_or_default();
-        let mut core_ids: Vec<u32> = prepared
-            .left_out
+        let mut core_ids: Vec<u32> = unprepared
             .iter()
             .filter_map(|seat| workers.iter().find(|w| w.filter == seat.filter).map(|w| w.core_id))
             .collect();
@@ -683,13 +1067,13 @@ impl ProverPipeline {
         warn!(
             frame = frame_number,
             epoch = quil_types::consensus::epoch_for_frame(frame_number),
-            left_out = prepared.left_out.len(),
+            left_out = unprepared.len(),
             requested = prepared.left_out.len() + prepared.filters.len(),
             submitted = prepared.filters.len(),
-            causes = %left_out_causes(&prepared.left_out),
+            causes = %left_out_causes(unprepared.iter().copied()),
             core_ids = %listed,
             more_core_ids = core_ids.len().saturating_sub(LISTED),
-            errors = %left_out_errors(&prepared.left_out),
+            errors = %left_out_errors(unprepared.iter().copied()),
             scope = "local workers",
             action = "check that these workers run, the master can reach them and they answer within the round",
             "confirmation leaves out seats whose workers did not prepare their storage in time; \
@@ -700,25 +1084,27 @@ impl ProverPipeline {
     /// Dispatch a lifecycle action. Non-blocking: spawns a tokio task
     /// to handle the (slow) VDF + sign + submit work so the caller's
     /// frame-processing loop continues.
-    pub fn dispatch(self: &Arc<Self>, action: LifecycleAction) {
+    pub fn dispatch(self: &Arc<Self>, mut action: LifecycleAction) {
         // Confirmations acquire the same reservation inside their preparation
         // helper, where ownership also follows blocking encoders. Other shard
         // operations reserve before spawning so another evaluation cannot race.
-        let mut reservation = match &action {
-            LifecycleAction::ProposeJoin { filters, frame_number, .. }
-            | LifecycleAction::RejectJoins { filters, frame_number }
-            | LifecycleAction::ProposeLeave { filters, frame_number }
+        let reserved = match &mut action {
+            LifecycleAction::ProposeJoin { filters, worker_ids, frame_number } => {
+                Some(self.reserve_filters("join", OpKind::Join, filters, Some(worker_ids), *frame_number))
+            }
+            LifecycleAction::RejectJoins { filters, frame_number }
             | LifecycleAction::RejectLeaves { filters, frame_number } => {
-                match self.lifecycle.submission_attempts.begin(filters, *frame_number) {
-                    Some(attempt) => Some(attempt),
-                    None => {
-                        info!(frame = *frame_number, filters = filters.len(),
-                            "shard submission deferred: another operation owns a filter");
-                        return;
-                    }
-                }
+                Some(self.reserve_filters("reject", OpKind::Reject, filters, None, *frame_number))
+            }
+            LifecycleAction::ProposeLeave { filters, frame_number } => {
+                Some(self.reserve_filters("leave", OpKind::Leave, filters, None, *frame_number))
             }
             _ => None,
+        };
+        let mut reservation = match reserved {
+            Some(None) => return,
+            Some(attempt) => attempt,
+            None => None,
         };
         match action {
             LifecycleAction::Noop => {}
@@ -738,45 +1124,34 @@ impl ProverPipeline {
                 // permanently stuck.
                 const SUBMIT_JOIN_TIMEOUT: std::time::Duration =
                     std::time::Duration::from_secs(90);
-                // TODO
                 // Chunk the filters so no single ProverJoin exceeds the
-                // decoder's `MAX_FILTERS` (100) / `MAX_PROOF_LEN` (51600 =
-                // 100*516) ceiling — a >100-shard node would otherwise emit one
-                // over-cap message the archive silently drops at decode. Each
-                // chunk is an independent, valid join (one prover key, a subset
-                // of shards) that the archive processes additively; `submit_join`
-                // marks all `worker_ids` pending on each, which is idempotent.
-                // Today there are ~49 shards ⇒ a single chunk, byte-identical to
-                // the pre-chunking behaviour. Each chunk gets its own VDF-bounded
-                // timeout since chunk N's proofs are independent of chunk N-1's.
-                const MAX_FILTERS_PER_JOIN: usize = 100;
+                // decoder's `MAX_FILTERS` (100) ceiling — a >100-shard node
+                // would otherwise emit one over-cap message every node drops
+                // at decode. Each chunk is an independent, valid join (one
+                // prover key, a subset of shards) that GLOBAL processes
+                // additively, and marks only its own workers pending. As for
+                // confirms, leaves and rejects, a chunk that fails or times
+                // out leaves its filters to the next cycle while the others
+                // still go out; `proof_in_progress` is held for at most one
+                // timeout per chunk. Today there are ~49 shards ⇒ a single
+                // chunk, byte-identical to the pre-chunking behaviour.
                 tokio::spawn(async move {
-                    let chunks: Vec<Vec<Vec<u8>>> = if filters.is_empty() {
-                        vec![Vec::new()]
-                    } else {
-                        filters
-                            .chunks(MAX_FILTERS_PER_JOIN)
-                            .map(|c| c.to_vec())
-                            .collect()
-                    };
+                    let chunks = join_chunks(&filters, &worker_ids);
                     let chunk_count = chunks.len();
+                    report_split("join", filters.len(), chunk_count, frame_number);
                     let mut attempt = reservation.take().expect("join reservation acquired");
-                    for (idx, chunk) in chunks.into_iter().enumerate() {
-                        let submitted_filters = chunk.clone();
+                    for (idx, (chunk, chunk_workers)) in chunks.into_iter().enumerate() {
                         match tokio::time::timeout(
                             SUBMIT_JOIN_TIMEOUT,
-                            me.submit_join(chunk, &worker_ids, frame_number),
+                            me.submit_join(chunk.clone(), &chunk_workers, frame_number),
                         )
                         .await
                         {
-                            Ok(Ok(())) => {
-                                let published = me.current_frame.as_ref()
-                                    .map(|f| f.effective()).unwrap_or(frame_number);
-                                attempt.published_subset(&submitted_filters, published);
-                            }
+                            Ok(Ok(())) => attempt.published_subset(&chunk, me.frame_now(frame_number)),
+                            Ok(Err(e)) if is_undecodable(&e) => attempt.fence(&chunk, me.frame_now(frame_number)),
                             Ok(Err(e)) => {
-                                warn!(frame = frame_number, chunk = idx, chunk_count, %e, "ProposeJoin submission failed");
-                                break;
+                                warn!(frame = frame_number, chunk = idx, chunk_count, %e,
+                                    "ProposeJoin submission failed; retrying these filters on next cycle");
                             }
                             Err(_) => {
                                 warn!(
@@ -784,9 +1159,8 @@ impl ProverPipeline {
                                     chunk = idx,
                                     chunk_count,
                                     timeout_s = SUBMIT_JOIN_TIMEOUT.as_secs(),
-                                    "ProposeJoin submission timed out — clearing proof_in_progress",
+                                    "ProposeJoin submission timed out; retrying these filters on next cycle",
                                 );
-                                break;
                             }
                         }
                     }
@@ -797,56 +1171,12 @@ impl ProverPipeline {
                 self.dispatch_confirmation(filters, frame_number, true, false);
             }
             LifecycleAction::RejectJoins { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
                 let attempt = reservation.take().expect("shard reservation acquired");
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_reject(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {
-                            attempt.published(me.current_frame.as_ref()
-                                .map(|f| f.effective()).unwrap_or(frame_number));
-                        }
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "RejectJoins submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "RejectJoins submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.spawn_filter_op(FilterOp::Reject, "RejectJoins", filters, frame_number, attempt);
             }
             LifecycleAction::ProposeLeave { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
                 let attempt = reservation.take().expect("shard reservation acquired");
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_leave(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {
-                            attempt.published(me.current_frame.as_ref()
-                                .map(|f| f.effective()).unwrap_or(frame_number));
-                        }
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ProposeLeave submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ProposeLeave submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.spawn_filter_op(FilterOp::Leave, "ProposeLeave", filters, frame_number, attempt);
             }
             LifecycleAction::ConfirmLeaves { filters, frame_number } => {
                 self.dispatch_confirmation(filters, frame_number, false, false);
@@ -855,30 +1185,8 @@ impl ProverPipeline {
                 self.dispatch_confirmation(filters, frame_number, true, true);
             }
             LifecycleAction::RejectLeaves { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
                 let attempt = reservation.take().expect("shard reservation acquired");
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_reject(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {
-                            attempt.published(me.current_frame.as_ref()
-                                .map(|f| f.effective()).unwrap_or(frame_number));
-                        }
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "RejectLeaves submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "RejectLeaves submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.spawn_filter_op(FilterOp::Reject, "RejectLeaves", filters, frame_number, attempt);
             }
             LifecycleAction::ProposeSeniorityMerge { frame_number } => {
                 let me = self.clone();
@@ -903,6 +1211,100 @@ impl ProverPipeline {
                 });
             }
         }
+    }
+
+    /// Submit a leave or reject, split into ops every node decodes. Each is
+    /// published on its own: one that fails leaves its filters to the next
+    /// cycle while those already published stay fenced, as do those of one
+    /// the guard refuses.
+    fn spawn_filter_op(
+        self: &Arc<Self>,
+        op: FilterOp,
+        label: &'static str,
+        filters: Vec<Vec<u8>>,
+        frame_number: u64,
+        mut attempt: crate::submission_attempts::SubmissionAttempt,
+    ) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let chunks = filter_chunks(&filters);
+            let chunk_count = chunks.len();
+            report_split(op.name(), filters.len(), chunk_count, frame_number);
+            for (chunk, filters) in chunks.into_iter().enumerate() {
+                let submit = async {
+                    match op {
+                        FilterOp::Leave => me.submit_leave(filters.clone(), frame_number).await,
+                        FilterOp::Reject => me.submit_reject(filters.clone(), frame_number).await,
+                    }
+                };
+                match tokio::time::timeout(NON_VDF_SUBMIT_TIMEOUT, submit).await {
+                    Ok(Ok(())) => attempt.published_subset(&filters, me.frame_now(frame_number)),
+                    Ok(Err(e)) if is_undecodable(&e) => attempt.fence(&filters, me.frame_now(frame_number)),
+                    Ok(Err(e)) => {
+                        warn!(frame = frame_number, chunk, chunk_count, %e,
+                            "{label} submission failed; retrying these filters on next cycle");
+                    }
+                    Err(_) => {
+                        warn!(
+                            frame = frame_number,
+                            chunk,
+                            chunk_count,
+                            timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                            "{label} submission timed out; retrying these filters on next cycle",
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// The frame a publication or fence is recorded at: the node's latest
+    /// frame, else the action's.
+    fn frame_now(&self, frame_number: u64) -> u64 {
+        self.current_frame.as_ref().map_or(frame_number, |frame| frame.effective())
+    }
+
+    /// Reserve a shard operation's filters for one attempt. A filter a
+    /// running or recently published attempt owns stays with it and is
+    /// dropped here, with its paired worker id: after one message of a split
+    /// operation fails, the next cycle sends that message's filters, not the
+    /// published ones again. A filter longer than every node decodes is
+    /// fenced and reported instead of sent, so its message-mates still go
+    /// out; it stays fenced from ops of its `kind` until the epoch ends.
+    /// `None` when nothing is left to send.
+    fn reserve_filters(
+        &self,
+        op: &'static str,
+        kind: OpKind,
+        filters: &mut Vec<Vec<u8>>,
+        mut worker_ids: Option<&mut Vec<u32>>,
+        frame_number: u64,
+    ) -> Option<crate::submission_attempts::SubmissionAttempt> {
+        let requested = filters.len();
+        let attempts = &self.lifecycle.submission_attempts;
+        retain_paired(filters, worker_ids.as_deref_mut(), |filter| !attempts.owned(filter, frame_number, kind));
+        let Some(mut attempt) = attempts.begin(filters, frame_number, kind) else {
+            info!(op, frame = frame_number, filters = requested,
+                "shard submission deferred: another operation owns its filters");
+            return None;
+        };
+        let over_long: Vec<Vec<u8>> = filters.iter().filter(|filter| filter.len() > MAX_FILTER_LEN).cloned().collect();
+        if !over_long.is_empty() {
+            retain_paired(filters, worker_ids, |filter| filter.len() <= MAX_FILTER_LEN);
+            attempt.fence_for_epoch(&over_long, self.frame_now(frame_number));
+            let seats: Vec<(Vec<u8>, String)> = over_long
+                .into_iter()
+                .map(|filter| {
+                    let reason = format!("filter of {} bytes (at most {MAX_FILTER_LEN})", filter.len());
+                    (filter, reason)
+                })
+                .collect();
+            report_over_limit(op, frame_number, &seats);
+            if filters.is_empty() {
+                return None;
+            }
+        }
+        Some(attempt)
     }
 
     fn domain(label: &[u8]) -> Result<[u8; 32]> {
@@ -1017,7 +1419,7 @@ impl ProverPipeline {
         );
         crate::metrics::inc_prover_joins_submitted();
 
-        self.publish_prover_message(bytes).await?;
+        self.publish_prover_message(bytes, frame_number).await?;
 
         // Publish succeeded — NOW burn the 4-frame cooldown. Setting
         // this earlier (in lifecycle's evaluate) would waste join
@@ -1084,7 +1486,7 @@ impl ProverPipeline {
             release = %confirm.release.map_or_else(|| "none".to_string(), |release| release.to_string()),
             "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message(bytes, frame_number).await
     }
 
     /// Partition committed shard data into PoRep leaves, encode and persist the
@@ -1103,7 +1505,12 @@ impl ProverPipeline {
             (self.hypergraph.as_ref(), self.replica_store.as_ref())
         else {
             if filters.iter().all(Vec::is_empty) {
-                return Ok(PreparedConfirm { filters: filters.to_vec(), roots: Vec::new(), left_out: Vec::new() });
+                return Ok(PreparedConfirm {
+                    filters: filters.to_vec(),
+                    roots: Vec::new(),
+                    seat_groups: vec![0; filters.len()],
+                    left_out: Vec::new(),
+                });
             }
             return Err(QuilError::Internal("storage confirmation requires hypergraph and replica store".into()));
         };
@@ -1165,7 +1572,7 @@ impl ProverPipeline {
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 &quil_crypto::sdr::SdrParams::default(),
             )?))
-        })
+        }, |filter| confirm_refusal(crdt, &self.bls_pubkey, filter, frame_number))
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -1192,7 +1599,7 @@ impl ProverPipeline {
 
         info!(frame = frame_number, filter_count = filters.len(), "submitting ProverReject");
         crate::metrics::inc_prover_rejects_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message(bytes, frame_number).await
     }
 
     /// Submit a `ShardSplit` proposal for the given shard → child set.
@@ -1228,7 +1635,7 @@ impl ProverPipeline {
             "submitting ShardSplit"
         );
         crate::metrics::inc_shard_splits_submitted();
-        self.publish_prover_message_local_first(bytes).await
+        self.publish_prover_message_local_first(bytes, frame_number).await
     }
 
     /// Submit a `ShardMerge` proposal for the given shard list →
@@ -1264,7 +1671,7 @@ impl ProverPipeline {
             "submitting ShardMerge"
         );
         crate::metrics::inc_shard_merges_submitted();
-        self.publish_prover_message_local_first(bytes).await
+        self.publish_prover_message_local_first(bytes, frame_number).await
     }
 
     /// Submit a `ProverSeniorityMerge` to raise on-chain seniority.
@@ -1284,7 +1691,7 @@ impl ProverPipeline {
             &self.bls_pubkey,
             &self.prover_address,
             bls_signer.as_ref(),
-            |address| self.hypergraph.as_ref().map_or(Ok(None), |crdt| spent_marker(crdt, address)),
+            |address| self.hypergraph.as_ref().map_or(Ok(None), |crdt| global_vertex(crdt, address)),
         )?;
         self.report_consumed_merge_targets(&consumed, frame_number);
         let Some(merge) = merge else {
@@ -1300,7 +1707,7 @@ impl ProverPipeline {
             consumed = consumed.len(),
             "submitting ProverSeniorityMerge"
         );
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message(bytes, frame_number).await
     }
 
     /// Report each consumed merge target once, and at most once per epoch
@@ -1364,29 +1771,16 @@ impl ProverPipeline {
 
         info!(frame = frame_number, filter_count = filters.len(), "submitting ProverLeave");
         crate::metrics::inc_prover_leaves_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message(bytes, frame_number).await
     }
 
-    /// Wrap `inner_bytes` in a `MessageBundle` and hand off to the
-    /// configured transport. The transport is responsible for the
-    /// gRPC fan-out + pubsub publish (production) or in-memory
-    /// broadcast (tests).
-    fn build_prover_bundle(&self, inner_bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let req = CanonicalMessageRequest::wrap(inner_bytes)?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let bundle = CanonicalMessageBundle {
-            requests: vec![Some(req)],
-            timestamp: now_ms,
-        };
-        bundle.to_canonical_bytes()
-    }
-
-    async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+    /// Wrap `inner_bytes`, an op built at `frame_number`, in a
+    /// `MessageBundle` (see `prover_bundle`) and hand off to the configured
+    /// transport. The transport is responsible for the gRPC fan-out + pubsub
+    /// publish (production) or in-memory broadcast (tests).
+    async fn publish_prover_message(&self, inner_bytes: Vec<u8>, frame_number: u64) -> Result<()> {
         let tracked = inner_bytes.clone();
-        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
+        let bundle_bytes = prover_bundle(inner_bytes, frame_number)?;
         self.transport.publish_prover_bundle(bundle_bytes).await?;
         let frame = self.current_frame.as_ref().map_or(0, |frame| frame.effective());
         crate::own_prover_ops::tracker().submitted(&tracked, frame);
@@ -1414,8 +1808,8 @@ impl ProverPipeline {
     /// still submits its op instead of failing with "no archive accepted". Used
     /// for ShardSplit/ShardMerge, which the coverage orchestrator generates on
     /// the frame producer itself.
-    async fn publish_prover_message_local_first(&self, inner_bytes: Vec<u8>) -> Result<()> {
-        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
+    async fn publish_prover_message_local_first(&self, inner_bytes: Vec<u8>, frame_number: u64) -> Result<()> {
+        let bundle_bytes = prover_bundle(inner_bytes, frame_number)?;
         let looped = self.loopback_to_local_mempool(&bundle_bytes);
         let published = self.transport.publish_prover_bundle(bundle_bytes).await;
         if looped || published.is_ok() {
@@ -1455,6 +1849,7 @@ fn prune_confirmation_replicas(
 #[cfg(test)]
 mod tests {
     use super::confirm_encoding_plan;
+    use crate::submission_attempts::OpKind;
     use quil_types::store::{PendingShardChange, ShardChangeKind};
 
     #[test]
@@ -1537,24 +1932,24 @@ mod tests {
         use std::sync::Arc;
         let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
         let filters = vec![vec![1], vec![2]];
-        let mut attempt = attempts.begin(&filters, FRAME).unwrap();
+        let mut attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
         let prepared = super::prepare_confirm(&filters, &[], 2, |filter, _| {
             Ok(match filter {
                 [2] => super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()),
                 _ => super::Prepared::Roots(vec![roots_of(filter)]),
             })
-        })
+        }, |_| None)
         .expect("the seat whose worker answers is confirmed");
         assert_eq!(prepared.filters, vec![vec![1]], "the confirm names only the prepared seat");
         assert_eq!(prepared.roots, vec![roots_of(&[1])]);
         assert_eq!(left_out_filters(&prepared), vec![vec![2]]);
         assert_eq!(super::left_out_errors(&prepared.left_out), "execution unavailable: worker storage confirm: tcp connect error (1)");
-        prepared.release_left_out(&mut attempt);
-        assert!(attempts.begin(&[vec![2]], FRAME).is_some(), "the left-out seat is free for the next cycle");
-        assert!(attempts.begin(&[vec![1]], FRAME).is_none(), "the submitted seat stays reserved");
+        prepared.settle_left_out(&mut attempt, FRAME);
+        assert!(attempts.begin(&[vec![2]], FRAME, OpKind::Confirm).is_some(), "the left-out seat is free for the next cycle");
+        assert!(attempts.begin(&[vec![1]], FRAME, OpKind::Confirm).is_none(), "the submitted seat stays reserved");
         attempt.published(FRAME);
-        assert!(attempts.begin(&[vec![1]], FRAME + 1).is_none(), "only the submitted seat is fenced as published");
-        assert!(attempts.begin(&[vec![2]], FRAME + 1).is_some());
+        assert!(attempts.begin(&[vec![1]], FRAME + 1, OpKind::Confirm).is_none(), "only the submitted seat is fenced as published");
+        assert!(attempts.begin(&[vec![2]], FRAME + 1, OpKind::Confirm).is_some());
     }
 
     #[test]
@@ -1562,12 +1957,12 @@ mod tests {
         use std::sync::Arc;
         let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
         let filters = vec![vec![1], vec![2]];
-        let attempt = attempts.begin(&filters, FRAME).unwrap();
-        let result = super::prepare_confirm(&filters, &[], 2, |_, _| Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered())));
+        let attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
+        let result = super::prepare_confirm(&filters, &[], 2, |_, _| Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered())), |_| None);
         let error = result.err().expect("nothing to submit");
         assert_eq!(error.to_string(), unanswered().to_string(), "fails as before, with the first worker error");
         drop(attempt);
-        assert!(attempts.begin(&filters, FRAME).is_some(), "every seat is retried on the next cycle");
+        assert!(attempts.begin(&filters, FRAME, OpKind::Confirm).is_some(), "every seat is retried on the next cycle");
     }
 
     #[test]
@@ -1596,7 +1991,7 @@ mod tests {
         assert!(overlapped.load(Ordering::SeqCst), "the answering worker is asked while the other is waited for");
         let prepared = super::prepare_confirm(&[vec![2], vec![1]], &[], 2, |filter, targets| {
             Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
-        })
+        }, |_| None)
         .expect("the answering worker's seat is confirmed");
         assert_eq!(prepared.filters, vec![vec![1]]);
         assert_eq!(prepared.roots, vec![roots_of(&[1])]);
@@ -1687,7 +2082,7 @@ mod tests {
                 .collect();
             let prepared = super::prepare_confirm(&filters, &changes, 8, |filter, targets| {
                 Ok(answers.remove(filter).and_then(|answer| super::remote_answer(filter, targets, answer)).expect("every seat was asked"))
-            })
+            }, |_| None)
             .unwrap();
             assert_eq!(prepared.filters, submitted, "worker of 20 answered {groups:?}");
             assert_eq!(left_out_filters(&prepared), left_out, "worker of 20 answered {groups:?}");
@@ -1707,7 +2102,7 @@ mod tests {
                     std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect(),
                 ),
             })
-        })
+        }, |_| None)
         .unwrap();
         assert_eq!(prepared.filters, vec![vec![5]], "21 would confirm without registering the merge target 20 claimed");
         assert_eq!(prepared.roots, vec![roots_of(&[5])]);
@@ -1719,7 +2114,7 @@ mod tests {
         let result = super::prepare_confirm(&[vec![1], vec![2]], &[], 2, |filter, _| match filter {
             [1] => Err(quil_types::error::QuilError::Internal("store".into())),
             _ => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
-        });
+        }, |_| None);
         assert!(result.is_err());
     }
 
@@ -1737,6 +2132,348 @@ mod tests {
             "each split child from the parent's storage; a shared merge target once",
         );
         assert_eq!(confirm_encoding_plan(&[vec![1]], &changes, 9), vec![(vec![1], vec![])], "only a change applying next epoch");
+    }
+
+    /// A filter `n` distinct over a few hundred seats.
+    fn seat(n: usize) -> Vec<u8> {
+        let mut filter = vec![0xC0; 32];
+        filter[..2].copy_from_slice(&(n as u16).to_be_bytes());
+        filter
+    }
+
+    /// A shard change applying at epoch 8, between any filters.
+    fn change_of(kind: ShardChangeKind, parent: Vec<u8>, children: Vec<Vec<u8>>) -> PendingShardChange {
+        PendingShardChange { kind, parent, children, effective_epoch: 8, proposed_frame: 0 }
+    }
+
+    /// Prepare a confirm at epoch 8 as the master does: each seat registers
+    /// its shard and those `changes` create from it; a seat `bare` admits
+    /// registers none, as a leave confirm does.
+    fn prepared_with(
+        filters: &[Vec<u8>],
+        changes: &[PendingShardChange],
+        bare: impl Fn(&[u8]) -> bool,
+    ) -> super::PreparedConfirm {
+        super::prepare_confirm(filters, changes, 8, |filter, targets| {
+            Ok(super::Prepared::Roots(if bare(filter) {
+                Vec::new()
+            } else {
+                std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect()
+            }))
+        }, |_| None)
+        .unwrap()
+    }
+
+    /// Split a prepared confirm and check every message is one each node
+    /// decodes, that GLOBAL honours each of its groups (for a shard the
+    /// message names, or one a change creates from those shards), and that
+    /// together they confirm every seat once, in order.
+    fn split_and_decode(
+        prepared: super::PreparedConfirm,
+        changes: &[PendingShardChange],
+    ) -> Vec<(Vec<Vec<u8>>, super::LeafRoots)> {
+        use quil_execution::global_intrinsic::{
+            addressed_signature::AddressedSignature,
+            leaf_root_registration::{pre_registration_targets, MAX_CONFIRM_LEAF_ROOT_GROUPS},
+            prover_ops::{ProverConfirm, MAX_FILTERS_PER_OP},
+        };
+        let (filters, roots) = (prepared.filters.clone(), prepared.roots.clone());
+        let messages = super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups);
+        for (message_filters, message_roots) in &messages {
+            assert!(message_filters.len() <= MAX_FILTERS_PER_OP, "{} filters", message_filters.len());
+            assert!(message_roots.len() <= MAX_CONFIRM_LEAF_ROOT_GROUPS, "{} groups", message_roots.len());
+            let created = pre_registration_targets(changes, message_filters, 8);
+            for group in message_roots {
+                assert!(
+                    message_filters.contains(&group.filter) || created.contains(&group.filter),
+                    "GLOBAL honours the group of {} in the message that carries it",
+                    hex::encode(&group.filter)
+                );
+            }
+            let confirm = ProverConfirm {
+                frame_number: 721,
+                public_key_signature_bls48581: Some(AddressedSignature { signature: vec![1; 666], address: vec![2; 32] }),
+                filters: message_filters.clone(),
+                leaf_roots: message_roots.clone(),
+                ..Default::default()
+            };
+            let decoded = ProverConfirm::from_canonical_bytes(&confirm.to_canonical_bytes().unwrap())
+                .expect("every message decodes");
+            assert_eq!((&decoded.filters, &decoded.leaf_roots), (message_filters, message_roots));
+        }
+        assert_eq!(messages.iter().flat_map(|(f, _)| f.clone()).collect::<Vec<_>>(), filters);
+        assert_eq!(messages.iter().flat_map(|(_, r)| r.clone()).collect::<Vec<_>>(), roots);
+        messages
+    }
+
+    fn sizes(messages: &[(Vec<Vec<u8>>, super::LeafRoots)]) -> Vec<usize> {
+        messages.iter().map(|(filters, _)| filters.len()).collect()
+    }
+
+    /// A renewal of more seats than one confirm decodes (a prover with 105
+    /// seats renewed 103 at once, and every node refused it) is split into
+    /// messages each node decodes.
+    #[test]
+    fn a_long_confirm_is_split_into_messages_every_node_decodes() {
+        for (seats, expected) in [(103, vec![100, 3]), (250, vec![100, 100, 50]), (100, vec![100]), (1, vec![1])] {
+            let filters: Vec<Vec<u8>> = (0..seats).map(seat).collect();
+            let messages = split_and_decode(prepared_with(&filters, &[], |_| false), &[]);
+            assert_eq!(sizes(&messages), expected, "{seats} seats");
+        }
+    }
+
+    /// Seats that pre-register the shards their split creates register
+    /// several groups each: a message also stays within the group limit, and
+    /// each seat's children stay in its message.
+    #[test]
+    fn a_confirm_split_keeps_each_seat_with_the_shards_its_split_creates() {
+        let split = |filter: &Vec<u8>| {
+            let children = (0..8u8).map(|c| [filter.as_slice(), &[c]].concat()).collect();
+            change_of(ShardChangeKind::Split, filter.clone(), children)
+        };
+        // 100 seats of 9 groups: 900 groups, over the limit of 256.
+        let filters: Vec<Vec<u8>> = (0..100).map(seat).collect();
+        let changes: Vec<PendingShardChange> = filters.iter().map(split).collect();
+        let messages = split_and_decode(prepared_with(&filters, &changes, |_| false), &changes);
+        assert_eq!(sizes(&messages), vec![28, 28, 28, 16]);
+        // Mixed: every tenth seat splits; a seat without storage (a leave
+        // confirm) registers none.
+        let filters: Vec<Vec<u8>> = (0..250).map(seat).collect();
+        let changes: Vec<PendingShardChange> = filters.iter().step_by(10).map(split).collect();
+        let bare = |filter: &[u8]| {
+            let n = u16::from_be_bytes([filter[0], filter[1]]);
+            n % 7 == 0 && n % 10 != 0
+        };
+        split_and_decode(prepared_with(&filters, &changes, bare), &changes);
+    }
+
+    /// A merge target two confirmed seats share is registered once, by the
+    /// first source; its filter is no prefix of either. The split keeps it in
+    /// the message naming that source, where GLOBAL honours it.
+    #[test]
+    fn a_confirm_split_keeps_a_merge_target_with_the_source_that_registers_it() {
+        let target = |k: usize| {
+            let mut filter = vec![0xD0; 32];
+            filter[..2].copy_from_slice(&(k as u16).to_be_bytes());
+            filter
+        };
+        // 240 seats; each pair merges into its own target.
+        let filters: Vec<Vec<u8>> = (0..240).map(seat).collect();
+        let changes: Vec<PendingShardChange> = (0..120)
+            .map(|k| change_of(ShardChangeKind::Merge, target(k), vec![filters[2 * k].clone(), filters[2 * k + 1].clone()]))
+            .collect();
+        let prepared = prepared_with(&filters, &changes, |_| false);
+        assert_eq!(prepared.roots.len(), 360, "each target once");
+        let messages = split_and_decode(prepared, &changes);
+        assert_eq!(sizes(&messages), vec![100, 100, 40]);
+        let first_targets: Vec<Vec<u8>> = messages[1].1.iter().map(|group| group.filter.clone()).filter(|f| f[2] == 0xD0).collect();
+        assert_eq!(first_targets, (50..100).map(target).collect::<Vec<_>>(), "with their sources' message");
+    }
+
+    /// Preparation records how many groups each submitted seat registers,
+    /// which keeps the groups aligned when a confirm is split.
+    #[test]
+    fn a_prepared_confirm_counts_each_seats_groups() {
+        let changes = vec![change(ShardChangeKind::Split, 1, &[10, 11])];
+        let prepared = super::prepare_confirm(&[vec![1], vec![2], vec![3]], &changes, 8, |filter, targets| {
+            if filter == &[3u8][..] {
+                return Ok(super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()));
+            }
+            Ok(super::Prepared::Roots(std::iter::once(filter).chain(targets.iter().map(Vec::as_slice)).map(roots_of).collect()))
+        }, |_| None).unwrap();
+        assert_eq!(prepared.filters, vec![vec![1], vec![2]]);
+        assert_eq!(prepared.seat_groups, vec![3, 1], "the split parent registers its two children too");
+        assert_eq!(prepared.roots.len(), 4);
+    }
+
+    /// A seat whose leaf roots exceed what every node decodes is left out
+    /// with its own cause, so the seats that would share its message still go
+    /// out, and fenced until the epoch ends rather than released, so it is
+    /// not prepared again within the epoch; a seat its worker did not prepare
+    /// is retried at once.
+    #[test]
+    fn a_seat_over_a_decode_limit_is_left_out_and_fenced() {
+        use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        use std::sync::Arc;
+        let too_many_entries = ConfirmLeafRoots { filter: seat(5), entries: vec![LeafRootEntry::default(); 257] };
+        let prepare = |filter: &[u8], _: &[Vec<u8>]| -> quil_types::error::Result<super::Prepared> {
+            Ok(match u16::from_be_bytes([filter[0], filter[1]]) {
+                5 => super::Prepared::Roots(vec![too_many_entries.clone()]),
+                7 => super::Prepared::Roots(vec![roots_of(filter); 257]),
+                9 => super::Prepared::Unanswered(super::LeftOutCause::Failed, unanswered()),
+                _ => super::Prepared::Roots(vec![roots_of(filter)]),
+            })
+        };
+        let filters: Vec<Vec<u8>> = (0..103).map(seat).collect();
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let mut attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 8, prepare, |_| None).unwrap();
+        assert_eq!(left_out_filters(&prepared), vec![seat(5), seat(7), seat(9)]);
+        assert_eq!(super::left_out_causes(&prepared.left_out), "failed 1, over decode limit 2");
+        let errors = super::left_out_errors(&prepared.left_out);
+        assert!(errors.contains("257 entries (at most 256)") && errors.contains("257 leaf-root groups"), "{errors}");
+        prepared.settle_left_out(&mut attempt, FRAME);
+        assert!(attempts.begin(&[seat(9)], FRAME + 1, OpKind::Confirm).is_some(), "a worker failure is retried on the next cycle");
+        let messages = split_and_decode(prepared, &[]);
+        assert_eq!(sizes(&messages), vec![100], "the others fill one message");
+        drop(attempt); // Nothing was published.
+        assert!(!attempts.owned(&seat(0), FRAME + 1, OpKind::Confirm), "an unpublished seat is retried on the next cycle");
+        let next_epoch = FRAME + quil_types::consensus::epoch_length_frames();
+        for over in [seat(5), seat(7)] {
+            assert!(attempts.owned(&over, FRAME + 30, OpKind::Confirm), "not prepared again after the retry fence");
+            assert!(attempts.owned(&over, next_epoch - 1, OpKind::Confirm), "nor until the epoch ends");
+            assert!(!attempts.owned(&over, next_epoch, OpKind::Confirm), "retried in the next epoch");
+            assert!(!attempts.owned(&over, FRAME + 30, OpKind::Leave), "the fence does not hold off a leave");
+        }
+        let left = attempts.begin(&[seat(5)], FRAME + 30, OpKind::Leave);
+        assert!(left.is_some(), "a seat over the decode limits can still be left");
+        drop(left);
+        for over in [seat(5), seat(7)] {
+            assert!(attempts.owned(&over, FRAME + 31, OpKind::Confirm), "an unpublished leave leaves the renewal fenced");
+        }
+        // With every seat over a limit the confirm is settled, not failed.
+        let prepared = super::prepare_confirm(&[seat(5)], &[], 8, prepare, |_| None).expect("settled, not failed");
+        assert!(prepared.filters.is_empty());
+        assert!(super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups).is_empty());
+    }
+
+    /// Committed GLOBAL state holding this prover's allocation of each
+    /// filter: joined at frame 10, confirmed in epoch 1 (so registered for
+    /// epoch 2), and left at the given frame.
+    fn global_with_allocations(seats: &[(Vec<u8>, Option<u64>)]) -> std::sync::Arc<quil_hypergraph::HypergraphCrdt> {
+        use quil_execution::global_intrinsic::materialize;
+        use quil_execution::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+        use std::sync::Arc;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(crdt.clone());
+        let va_disc = vertex_adds_discriminator().unwrap();
+        for (filter, left) in seats {
+            let (address, mut tree) = materialize::materialize_prover_join(BLS_KEY, std::slice::from_ref(filter), 10, 0)
+                .unwrap().allocations.remove(0);
+            materialize::materialize_prover_confirm(&mut tree, 730, None).unwrap();
+            if let Some(frame) = left {
+                materialize::materialize_prover_leave(&mut tree, *frame).unwrap();
+            }
+            let blob = quil_execution::prover_registry::vertex_tree_to_blob(&tree);
+            state
+                .set(&quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc, 1, blob)
+                .unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        crdt
+    }
+
+    /// A seat whose leave landed while its renewal was prepared is left out
+    /// of the confirm and the others still go out: every node refuses a
+    /// confirm naming a seat Leaving since this epoch, and with it every seat
+    /// of the message (2026-10-22). It is fenced, not prepared again at once,
+    /// and with every seat refused nothing is submitted.
+    #[test]
+    fn a_seat_turned_leaving_while_prepared_is_left_out_of_its_confirm() {
+        const RENEWAL: u64 = 1460; // Epoch 2: renews the seats for epoch 3.
+        let (kept, left) = (seat(1), seat(2));
+        let global = global_with_allocations(&[(kept.clone(), None), (left.clone(), Some(1450))]);
+        let refused = |filter: &[u8]| super::confirm_refusal(&global, BLS_KEY, filter, RENEWAL);
+        assert!(refused(&kept).is_none(), "a seat registered for this epoch renews");
+        assert!(refused(&seat(3)).is_none(), "an absent allocation is left to GLOBAL");
+        let prepare = |filter: &[u8], _: &[Vec<u8>]| -> quil_types::error::Result<super::Prepared> {
+            Ok(super::Prepared::Roots(vec![roots_of(filter)]))
+        };
+        let attempts = std::sync::Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let filters = vec![kept.clone(), left.clone()];
+        let mut attempt = attempts.begin(&filters, RENEWAL, OpKind::Confirm).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 3, prepare, refused).unwrap();
+        assert_eq!(prepared.filters, vec![kept.clone()], "the Leaving seat is left out");
+        assert_eq!(super::left_out_causes(&prepared.left_out), "refused 1");
+        prepared.settle_left_out(&mut attempt, RENEWAL);
+        let messages = super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups);
+        assert_eq!(messages, vec![(vec![kept.clone()], vec![roots_of(&kept)])], "the other seat still goes out");
+        drop(attempt);
+        assert!(attempts.owned(&left, RENEWAL + 29, OpKind::Confirm), "fenced, not prepared again at once");
+        assert!(!attempts.owned(&left, RENEWAL + 30, OpKind::Confirm));
+        let prepared = super::prepare_confirm(&[left.clone()], &[], 3, prepare, refused).expect("settled, not failed");
+        assert!(super::confirm_messages(prepared.filters, prepared.roots, &prepared.seat_groups).is_empty());
+    }
+
+    /// The guard every publication passes: an op over a decode limit (here a
+    /// leaf-root group of 257 entries) is not bundled for the transport, and
+    /// its error marks it refused, so its sender fences its filters.
+    #[test]
+    fn a_bundle_of_an_op_no_node_decodes_is_refused() {
+        use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        use quil_execution::global_intrinsic::{ProverConfirm, ProverLeave};
+        let confirm = |entries: usize| {
+            ProverConfirm {
+                frame_number: FRAME,
+                filters: vec![seat(1)],
+                leaf_roots: vec![ConfirmLeafRoots { filter: seat(1), entries: vec![LeafRootEntry::default(); entries] }],
+                ..Default::default()
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        assert!(super::prover_bundle(confirm(256), FRAME).is_ok());
+        let refused = super::prover_bundle(confirm(257), FRAME).unwrap_err();
+        assert!(super::is_undecodable(&refused), "{refused}");
+        let leave = ProverLeave { filters: vec![vec![1; 65]], ..Default::default() }.to_canonical_bytes().unwrap();
+        assert!(super::is_undecodable(&super::prover_bundle(leave, FRAME).unwrap_err()));
+        assert!(!super::is_undecodable(&quil_types::error::QuilError::Internal("no archive accepted".into())));
+    }
+
+    /// The guard refuses an op over the decoders' limits and lets one at
+    /// the limits through; joins, leaves and rejects split by the same limit.
+    #[test]
+    fn an_op_no_node_decodes_is_not_published() {
+        use quil_execution::global_intrinsic::{prover_ops::MAX_FILTERS_PER_OP, ProverLeave};
+        let leave = |filters: Vec<Vec<u8>>| ProverLeave { filters, ..Default::default() }.to_canonical_bytes().unwrap();
+        assert!(super::refuse_undecodable(&leave((0..MAX_FILTERS_PER_OP).map(seat).collect()), FRAME).is_ok());
+        assert!(super::refuse_undecodable(&leave((0..=MAX_FILTERS_PER_OP).map(seat).collect()), FRAME).is_err());
+        assert!(super::refuse_undecodable(&leave(vec![vec![1; 65]]), FRAME).is_err(), "a filter over 64 bytes");
+        let confirm = quil_execution::global_intrinsic::ProverConfirm {
+            filters: (0..103).map(seat).collect(),
+            ..Default::default()
+        };
+        assert!(super::refuse_undecodable(&confirm.to_canonical_bytes().unwrap(), FRAME).is_err());
+        let filters: Vec<Vec<u8>> = (0..250).map(seat).collect();
+        assert_eq!(super::filter_chunks(&filters).iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![100, 100, 50], "a leave or reject is split the same way");
+        let workers: Vec<u32> = (0..250).collect();
+        let joins = super::join_chunks(&filters, &workers);
+        assert_eq!(joins.iter().map(|(_, ids)| ids.clone()).collect::<Vec<_>>(),
+            vec![(0..100).collect::<Vec<u32>>(), (100..200).collect(), (200..250).collect()],
+            "each join marks only its own workers pending");
+        assert_eq!(joins.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), super::filter_chunks(&filters));
+        assert!(super::join_chunks(&filters, &[]).iter().all(|(_, ids)| ids.is_empty()), "an admin join names none");
+    }
+
+    /// The refusal warning says when each kind is built again: only the ops
+    /// that name filters have a retry fence.
+    #[test]
+    fn a_refusal_names_when_each_kind_is_built_again() {
+        for op in ["join", "confirm", "leave", "reject"] {
+            assert_eq!(super::refusal_retry(op), "its filters are retried after the retry fence", "{op}");
+        }
+        assert_eq!(super::refusal_retry("seniority_merge"), "proposed again after the seniority merge cooldown");
+        for op in ["shard_split", "shard_merge"] {
+            assert_eq!(super::refusal_retry(op), "proposed again when the shard is next eligible", "{op}");
+        }
+    }
+
+    /// An anomaly that recurs every cycle is reported once per epoch per key.
+    #[test]
+    fn an_epoch_report_is_due_once_per_epoch() {
+        let reports = super::EpochReports::<&'static str>::default();
+        assert!(reports.due(&"confirm", 5));
+        assert!(!reports.due(&"confirm", 5));
+        assert!(reports.due(&"leave", 5), "per key");
+        assert!(reports.due(&"confirm", 6));
     }
 
     const FRAME: u64 = 720;
@@ -1785,7 +2522,7 @@ mod tests {
         seeds: &[[u8; 57]],
     ) -> (Option<super::ProverSeniorityMerge>, Vec<super::ConsumedMergeTarget>) {
         super::seniority_merge(FRAME, seeds, BLS_KEY, &OWN, &prover_signer(), |address| {
-            super::spent_marker(global, address)
+            super::global_vertex(global, address)
         })
         .unwrap()
     }

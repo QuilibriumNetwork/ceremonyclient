@@ -241,29 +241,67 @@ const STAGED_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(3
 /// the complete, current target root is reported as a successful sync.
 /// A local commit landing mid-download rebases the plan (see
 /// [`quil_hypergraph::HypergraphCrdt::rebase_phase_sync`]) rather than
-/// discarding the download.
+/// discarding the download. `filter` names the shard in logs.
 #[allow(clippy::too_many_arguments)]
 async fn sync_phase_data(
     client: &mut ArchiveClient,
     handle: &tokio::runtime::Handle,
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
+    filter: &[u8],
     phase: u32,
     source_version: u64,
     bit_path: Vec<bool>,
     anchor: Option<quil_forest::SubtreeSyncAnchor>,
 ) -> Result<[u8; 32]> {
+    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
+    let (client, store, shard) = (client.clone(), crdt.clone(), shard_id.to_vec());
+    let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
+        let (mut client, store, shard) = (client.clone(), store.clone(), shard.clone());
+        async move { fetch_sync_blobs(&mut client, &store, &shard, phase, source_version, &leaves).await }
+    };
+    install_phase(crdt, shard_id, filter, phase, source_version, bit_path, anchor, remote, fetch).await
+}
+
+/// [`sync_phase_data`] from `source`, whose blobs `fetch` supplies for the
+/// leaves of each chunk.
+///
+/// A worker's recovery past its turn's hold limit hands the turn back after
+/// a chunk with more of the phase to come
+/// ([`quil_engine::worker_execution::recovery_turn_spent`]), never at a phase
+/// boundary: the chunk leaves its scope marked incomplete
+/// (`HypergraphCrdt::sync_incomplete`), so the shard's partial data never
+/// counts as staged between turns, while a phase it completed leaves no
+/// marker for the phases after it. Its installed chunks stay, and its next
+/// sync diffs against them.
+#[allow(clippy::too_many_arguments)]
+async fn install_phase<R, F, Fut>(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_id: &[u8],
+    filter: &[u8],
+    phase: u32,
+    source_version: u64,
+    bit_path: Vec<bool>,
+    anchor: Option<quil_forest::SubtreeSyncAnchor>,
+    source: R,
+    mut fetch: F,
+) -> Result<[u8; 32]>
+where
+    R: quil_forest::BatchTreeReader + Send + 'static,
+    F: FnMut(Vec<([u8; 32], Option<Vec<u8>>)>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Vec<u8>>>>,
+{
     use quil_hypergraph::crdt::{
         sync_blob_matches, sync_phase_advanced, sync_staged_writes, MAX_SYNC_CHUNK_BYTES, MAX_SYNC_CHUNK_LEAVES,
     };
-    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
+    use quil_engine::worker_execution::{recovery_turn_spent, turn_spent_error};
     let c = crdt.clone();
     let sid = shard_id.to_vec();
     let started = std::time::Instant::now();
     let mut plan = tokio::task::spawn_blocking(move || {
-        c.prepare_phase_sync(&remote, source_version, &sid, phase as usize, &bit_path, anchor)
+        c.prepare_phase_sync(&source, source_version, &sid, phase as usize, &bit_path, anchor)
     }).await.map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
-    let short = hex::encode(&shard_id[..shard_id.len().min(8)]);
+    let filter = hex::encode(filter);
     let mut planned = plan.remaining().len();
     // A worker's recovery reports its progress; other syncs report nothing.
     let progress = |installed: usize, planned: usize| {
@@ -271,7 +309,7 @@ async fn sync_phase_data(
     };
     progress(0, planned);
     if planned > 0 {
-        info!(shard = %short, phase, leaves = planned, walk_secs = started.elapsed().as_secs(),
+        info!(%filter, phase, leaves = planned, walk_secs = started.elapsed().as_secs(),
             "sync phase: installing changed leaves");
     }
     let mut next_report = 1024usize;
@@ -282,7 +320,7 @@ async fn sync_phase_data(
             let installed = planned.saturating_sub(plan.remaining().len());
             progress(installed, planned);
             if installed >= next_report {
-                info!(shard = %short, phase, installed, planned, "sync phase: installing");
+                info!(%filter, phase, installed, planned, "sync phase: installing");
                 next_report *= 2;
             }
             // Take leaves up to the chunk's leaf and byte limits; sizes are
@@ -307,7 +345,7 @@ async fn sync_phase_data(
                 take += 1;
             }
             let leaves = plan.remaining()[..take].to_vec();
-            let blobs = fetch_sync_blobs(client, crdt, shard_id, phase, source_version, &leaves).await?;
+            let blobs = fetch(leaves).await?;
             let c = crdt.clone();
             let (returned, applied) = tokio::task::spawn_blocking(move || {
                 let applied = c.apply_sync_chunk(&mut plan, &blobs);
@@ -318,6 +356,13 @@ async fn sync_phase_data(
                 Ok(()) => {
                     staged_since = None;
                     quil_engine::worker_execution::recovery_installed(take as u64);
+                    // Only with more of the phase to come, so the scope
+                    // stays marked incomplete. A repair of legacy state
+                    // restarts its audit when prepared again, so it keeps
+                    // its turn until done.
+                    if !plan.remaining().is_empty() && plan.resumable() && recovery_turn_spent() {
+                        return Err(turn_spent_error());
+                    }
                 }
                 Err(e) if sync_staged_writes(&e) => {
                     let since = *staged_since.get_or_insert_with(std::time::Instant::now);
@@ -330,7 +375,7 @@ async fn sync_phase_data(
                     rebases += 1;
                     plan = rebase(crdt, plan).await?;
                     planned = plan.remaining().len();
-                    info!(shard = %short, phase, rebases, leaves = planned,
+                    info!(%filter, phase, rebases, leaves = planned,
                         "sync phase: local tree advanced; rebased onto it");
                 }
                 Err(e) => return Err(e),
@@ -376,24 +421,26 @@ pub async fn sync_one_phase(
     source_version: u64,
     remote_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    sync_phase_data(client, handle, crdt, shard_id, phase, source_version, Vec::new(),
+    sync_phase_data(client, handle, crdt, shard_id, shard_id, phase, source_version, Vec::new(),
         remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot)).await
 }
 
-/// Pull only the covered subtree from a unified application, pinned to the
-/// subtree commitment carried in the trusted shard header.
+/// Pull only the covered subtree of shard `filter` from a unified
+/// application, pinned to the subtree commitment carried in the trusted
+/// shard header.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_subtree_one_phase(
     client: &mut ArchiveClient,
     handle: &tokio::runtime::Handle,
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     app: &[u8],
+    filter: &[u8],
     phase: u32,
     source_version: u64,
     bit_path: Vec<bool>,
     pinned_subtree_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    sync_phase_data(client, handle, crdt, app, phase, source_version, bit_path,
+    sync_phase_data(client, handle, crdt, app, filter, phase, source_version, bit_path,
         pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot)).await
 }
 
@@ -586,6 +633,95 @@ mod tests {
             self.resolve_calls += 1;
             Ok(self.resolved)
         }
+    }
+
+    /// An in-memory tree.
+    fn memory_crdt() -> Arc<quil_hypergraph::HypergraphCrdt> {
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()), Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_unified_tree(true);
+        crdt
+    }
+
+    /// The blob of the vertex at `address` in [`source_of`]'s trees.
+    fn blob_of(address: &[u8; 32]) -> Vec<u8> {
+        address[..8].repeat(5)
+    }
+
+    /// A tree of `app` holding `count` vertices, committed: its phase-0
+    /// version and root.
+    fn source_of(app: [u8; 32], count: u16) -> (Arc<quil_hypergraph::HypergraphCrdt>, u64, [u8; 32]) {
+        let source = memory_crdt();
+        for i in 0..count {
+            let mut address = [0x5a; 32];
+            address[..2].copy_from_slice(&i.to_be_bytes());
+            source.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: address }, &blob_of(&address))
+                .unwrap();
+        }
+        source.commit(1).unwrap();
+        let (version, root) = source.serve_forest_head(&app, 0).unwrap();
+        (source, version, root)
+    }
+
+    /// Install phase 0 of `app` from `source` into `target`, counting the
+    /// leaves whose blobs it fetched.
+    async fn install_from(
+        source: &Arc<quil_hypergraph::HypergraphCrdt>, target: &Arc<quil_hypergraph::HypergraphCrdt>,
+        app: [u8; 32], version: u64, root: [u8; 32], fetched: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<[u8; 32]> {
+        let reader = quil_hypergraph::testing::CrdtTreeReader { source: source.clone(), shard_id: app.to_vec(), phase: 0 };
+        let fetched = fetched.clone();
+        let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
+            fetched.fetch_add(leaves.len(), std::sync::atomic::Ordering::SeqCst);
+            async move { Ok::<_, QuilError>(leaves.iter().map(|(key, _)| blob_of(key)).collect()) }
+        };
+        install_phase(target, &app, &app, 0, version, Vec::new(),
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)), reader, fetch).await
+    }
+
+    /// A recovery whose turn is spent hands it back only inside a phase,
+    /// after a chunk, with the scope marked incomplete, so the shard's data
+    /// does not count as staged between turns; at the start of a phase it
+    /// goes on, and a phase of one chunk completes. The next sync resumes
+    /// from the installed chunks.
+    #[tokio::test]
+    async fn a_spent_turn_is_handed_back_inside_a_phase_with_its_scope_incomplete() {
+        use quil_engine::worker_execution::{recovery_installed, turn_spent, with_recovery_turn, SharedWorkerExecution};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let spent = std::time::Duration::from_secs(3600);
+        let execution = SharedWorkerExecution::default();
+
+        // A phase of one chunk, started with the turn spent by an earlier
+        // phase's leaves, completes.
+        let small = [0x74; 32];
+        let (source, version, root) = source_of(small, 10);
+        let target = memory_crdt();
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let installed = with_recovery_turn(&execution, spent, async {
+            recovery_installed(1);
+            install_from(&source, &target, small, version, root, &fetched).await
+        }).await;
+        assert_eq!(installed.unwrap(), root, "a phase boundary is no hand-back");
+        assert!(!target.sync_incomplete(&small, &[]).unwrap());
+
+        // A phase of two chunks hands the turn back after its first.
+        let large = [0x73; 32];
+        let (source, version, root) = source_of(large, 1_100);
+        let target = memory_crdt();
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let handed_back = with_recovery_turn(&execution, spent, async {
+            recovery_installed(1);
+            install_from(&source, &target, large, version, root, &fetched).await
+        }).await;
+        assert!(handed_back.as_ref().is_err_and(turn_spent), "{handed_back:?}");
+        assert_eq!(fetched.load(Ordering::SeqCst), 1_024, "a chunk of the phase is installed first");
+        assert!(target.sync_incomplete(&large, &[]).unwrap(), "the partial scope stays marked incomplete");
+
+        // The next sync plans only the rest and completes the scope.
+        assert_eq!(install_from(&source, &target, large, version, root, &fetched).await.unwrap(), root);
+        assert_eq!(fetched.load(Ordering::SeqCst), 1_100, "no leaf fetched twice");
+        assert!(!target.sync_incomplete(&large, &[]).unwrap());
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<quil_hypergraph::HypergraphCrdt>) {
