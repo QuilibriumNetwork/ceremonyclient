@@ -1212,9 +1212,12 @@ pub fn successor_state_matches_held(
                 // (it never held the range, or holds another version). As a
                 // recoverable gap it requests the shard sync, which installs
                 // the state from an archive pinned to the sealed roots
-                // (`origin_anchors`); as a consensus error it retried the same
-                // comparison forever.
-                return Err(unavailable("local state differs from the predecessor's sealed checkpoint"));
+                // ([`sealed_state_mismatch`]); as a consensus error it retried
+                // the same comparison forever. The refusal names both roots.
+                return Err(unavailable(SealedStateMismatch {
+                    generation: source.generation, frame: checkpoint.frame,
+                    local_roots: local.roots, sealed_roots: checkpoint.state_roots,
+                }.to_string()));
             }
             // A shard that never materialized a frame has no cursor record; its
             // history is the chain's starting value, as the parent reader has it.
@@ -1230,6 +1233,76 @@ pub fn successor_state_matches_held(
         }
     }
     Ok(())
+}
+
+/// Why [`successor_state_matches`] refuses a member at its same-filter
+/// predecessor's sealed checkpoint that holds other state there.
+pub const SEALED_STATE_DIFFERS: &str = "local state differs from the predecessor's sealed checkpoint";
+
+/// A member whose committed cursor is at its same-filter predecessor's
+/// sealed checkpoint, with committed roots other than the sealed ones
+/// ([`sealed_state_mismatch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedStateMismatch {
+    /// The predecessor's generation.
+    pub generation: u64,
+    /// The frame its seal names, at which this member's cursor is.
+    pub frame: u64,
+    /// This member's committed roots.
+    pub local_roots: [[u8; 32]; 4],
+    pub sealed_roots: [[u8; 32]; 4],
+}
+
+impl SealedStateMismatch {
+    /// The first four bytes of each of `roots`, in hex.
+    pub fn prefixes(roots: &[[u8; 32]; 4]) -> String {
+        roots.iter().map(|root| hex::encode(&root[..4])).collect::<Vec<_>>().join(",")
+    }
+}
+
+impl std::fmt::Display for SealedStateMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{SEALED_STATE_DIFFERS} (generation {} sealed at frame {}: committed roots here {}, sealed roots {})",
+            self.generation, self.frame, Self::prefixes(&self.local_roots), Self::prefixes(&self.sealed_roots))
+    }
+}
+
+/// The [`SealedStateMismatch`] for which [`successor_state_matches`] refuses
+/// a member of `filter`'s current session, if any: its committed cursor is at
+/// a same-filter origin's sealed (not fenced) checkpoint, the origins taken
+/// as [`effective_origins`] gives them, and its committed roots are not the
+/// sealed ones. Such a member has no frame to replay: the shard sync installs
+/// the sealed state, pinned to its roots, instead.
+pub fn sealed_state_mismatch(
+    global: &Arc<HypergraphCrdt>,
+    shard: &Arc<HypergraphCrdt>,
+    filter: &[u8],
+) -> Result<Option<SealedStateMismatch>> {
+    let view = CommittedView::capture(global)?;
+    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
+    let origins = match effective_origins(&view, &session) {
+        Ok(effective) => effective.origins,
+        Err(QuilError::ExecutionUnavailable(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for (source, checkpoint) in origins {
+        if source.filter != filter || handoff::is_fenced(&view, &source.id()?)? {
+            continue;
+        }
+        let local = shard.capture_committed_shard(filter)?;
+        let cursor = local
+            .records
+            .read_record(&quil_store::encoding::consensus_materialized_cursor_key(filter))?
+            .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0);
+        if cursor == checkpoint.frame && local.roots != checkpoint.state_roots {
+            return Ok(Some(SealedStateMismatch {
+                generation: source.generation, frame: checkpoint.frame,
+                local_roots: local.roots, sealed_roots: checkpoint.state_roots,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// A session's origins as the state it starts from: each same-filter origin
@@ -2175,6 +2248,75 @@ mod successor_tests {
             let page: Vec<_> = frames.iter().filter(|f| f.frame >= from && f.frame <= through).take(2).cloned().collect();
             Box::pin(async move { Ok(page) })
         })
+    }
+
+    /// A member whose cursor is at its predecessor's sealed checkpoint, with
+    /// other state there, is refused with the frame and both roots, and
+    /// [`sealed_state_mismatch`] names the same, also under a session sealed
+    /// at its base: the shard sync installs the sealed state from them. A
+    /// member holding the sealed state, or one behind the seal, has none
+    /// (…091f80 at frame 4693, 2026-10-23).
+    #[test]
+    fn a_member_at_a_sealed_checkpoint_with_other_state_is_named_with_both_roots() {
+        let (global, state) = global_state();
+        let clock = quil_store::RocksClockStore::new(quil_store::RocksDb::open_in_memory().unwrap().inner());
+        let filter = vec![0x0b; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        let at = |byte: u8| quil_hypergraph::Location { app_address: [0x0b; 32], data_address: [byte; 32] };
+        let member = crdt();
+        member.add_vertex(&at(7), &[7; 64]).unwrap();
+        let mut history = handoff::history::start(&source).unwrap();
+        for frame in 1..=3 {
+            member.commit_with_frame_cursor_and_records(frame, &cursor_key, &outflow_records(&filter, frame)).unwrap();
+            history = handoff::history::link(history, &outgoing(&filter, frame)).unwrap();
+        }
+        let sealed = member.capture_committed_shard(&filter).unwrap().roots;
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: [0x33; 32], state_roots: sealed, history_root: history },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 4);
+        let second = handoff::head(&state, &filter).unwrap().unwrap();
+        let close = handoff::schedule(&state, 5, vec![filter.clone()], vec![DesiredCommittee {
+            filter: filter.clone(), members: second.members.clone(),
+        }]).unwrap();
+        commit(&global, &state, 5);
+        let seal = Seal {
+            request: close.id().unwrap(), session: second.id().unwrap(), view: 9,
+            checkpoint: Checkpoint {
+                frame: 3, view: 0, digest: second.genesis, state_roots: [[0xb0; 32]; 4], history_root: [0xb1; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&second, &signers, &seal);
+        assert!(handoff::apply_submission(&state, 6, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 6);
+        let third = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!((third.generation, third.base_frame), (3, 3));
+
+        let other = crdt();
+        other.add_vertex(&at(9), &[9; 64]).unwrap();
+        other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&filter, 3)).unwrap();
+        let local = other.capture_committed_shard(&filter).unwrap().roots;
+        assert_ne!(local, sealed);
+        assert_eq!(sealed_state_mismatch(&global, &other, &filter).unwrap(),
+            Some(SealedStateMismatch { generation: 1, frame: 3, local_roots: local, sealed_roots: sealed }));
+        let error = successor_state_matches(&global, &other, &clock, &third).unwrap_err();
+        assert!(matches!(error, QuilError::ExecutionUnavailable(_)), "a recoverable gap: {error}");
+        assert_eq!(error.to_string(), format!(
+            "execution unavailable: app committee session: local state differs from the predecessor's sealed \
+            checkpoint (generation 1 sealed at frame 3: committed roots here {}, sealed roots {})",
+            SealedStateMismatch::prefixes(&local), SealedStateMismatch::prefixes(&sealed)));
+
+        assert_eq!(sealed_state_mismatch(&global, &member, &filter).unwrap(), None, "holds the sealed state");
+        successor_state_matches(&global, &member, &clock, &third).expect("holds the sealed state");
+        let behind = crdt();
+        behind.add_vertex(&at(9), &[9; 64]).unwrap();
+        behind.commit_with_frame_cursor_and_records(2, &cursor_key, &outflow_records(&filter, 2)).unwrap();
+        assert_eq!(sealed_state_mismatch(&global, &behind, &filter).unwrap(), None, "behind the seal: it replays");
     }
 
     /// A member that joined the predecessor through an archive-anchored jump

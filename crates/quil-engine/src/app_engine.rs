@@ -101,6 +101,12 @@ pub enum AppEngineMessage {
     CommittedTip {
         reply: tokio::sync::oneshot::Sender<Option<u64>>,
     },
+    /// This member's committed state at its same-filter predecessor's sealed
+    /// checkpoint, when it is not the sealed state
+    /// (`app_handoff::sealed_state_mismatch`).
+    SealedStateMismatch {
+        reply: tokio::sync::oneshot::Sender<Option<crate::app_handoff::SealedStateMismatch>>,
+    },
     /// The fence of the re-anchor this shard owes, if any
     /// (`app_handoff::ReanchorMarker`).
     ReanchorFence {
@@ -385,6 +391,15 @@ impl AppEngineHandle {
         let (reply, receive) = tokio::sync::oneshot::channel();
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             self.msg_tx.send(AppEngineMessage::CommittedTip { reply }).await.ok()?;
+            receive.await.ok().flatten()
+        }).await.ok().flatten()
+    }
+
+    /// `None` also when unknown (no committee sessions, or the engine is busy).
+    pub(crate) async fn sealed_state_mismatch(&self) -> Option<crate::app_handoff::SealedStateMismatch> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::SealedStateMismatch { reply }).await.ok()?;
             receive.await.ok().flatten()
         }).await.ok().flatten()
     }
@@ -4560,6 +4575,18 @@ impl AppConsensusEngine {
                                     .inspect_err(|error| debug!(core_id = self.core_id, %error, "committed session tip unavailable"))
                                     .ok().flatten());
                             let _ = reply.send(tip);
+                        }
+                        Some(AppEngineMessage::SealedStateMismatch { reply }) => {
+                            let mismatch = match (self.global_hypergraph.as_ref(), self.execution_engine.as_ref()) {
+                                (Some(global), Some(manager)) if quil_types::consensus::committee_handoff_policy().is_some() => {
+                                    crate::app_handoff::sealed_state_mismatch(global, &manager.crdt(), &self.filter)
+                                        .inspect_err(|error| debug!(core_id = self.core_id, %error,
+                                            "state at the predecessor's sealed checkpoint unavailable"))
+                                        .ok().flatten()
+                                }
+                                _ => None,
+                            };
+                            let _ = reply.send(mismatch);
                         }
                         Some(AppEngineMessage::ReanchorFence { reply }) => {
                             use crate::prover_tree_syncer::ReanchorAttempt;
