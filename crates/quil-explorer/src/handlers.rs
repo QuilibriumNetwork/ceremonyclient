@@ -34,6 +34,12 @@ const CACHE_LONG: &str = "public, max-age=31536000, immutable";
 const CACHE_180: &str = "public, max-age=180";
 const CACHE_60: &str = "public, max-age=60";
 const PROVER_CACHE_TTL: Duration = Duration::from_secs(180);
+/// Bodies the response cache holds at most. Its keys come from request
+/// paths and queries, so it is bounded: once full of live entries, further
+/// bodies are served uncached until entries expire.
+pub(crate) const CACHE_MAX_ENTRIES: usize = 1024;
+/// How long a client is asked to wait while a full token scan runs.
+const TOKEN_SCAN_RETRY_SECS: u64 = 5;
 /// Longest a prover snapshot serves requests at its frame (one GLOBAL
 /// frame is about 9 s).
 const PROVER_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
@@ -75,6 +81,17 @@ fn error(status: StatusCode, message: &str) -> Response {
     let mut map = BTreeMap::new();
     map.insert("error", message);
     build_response(status, json_value(&map), None)
+}
+
+/// 503 with `Retry-After`, for work the explorer limits instead of queueing.
+pub(crate) fn busy(message: &str, retry_after_secs: u64) -> Response {
+    let mut resp = error(StatusCode::SERVICE_UNAVAILABLE, message);
+    resp.headers_mut().insert("Retry-After", HeaderValue::from(retry_after_secs));
+    resp
+}
+
+fn token_scan_busy() -> Response {
+    busy("a full token scan is already running; retry shortly", TOKEN_SCAN_RETRY_SECS)
 }
 
 fn method_not_allowed() -> Response {
@@ -631,7 +648,8 @@ fn cache_put(state: &ExplorerState, key: String, body: Vec<u8>) {
 /// Insert `body` under `key`, first dropping expired entries: `cache_get`
 /// only skips them, so every distinct key (each `/provers` filter and
 /// status combination, each shard detail) would otherwise keep its body
-/// for the node's lifetime.
+/// for the node's lifetime. A new key finding [`CACHE_MAX_ENTRIES`] live
+/// entries is not cached.
 fn cache_insert(
     cache: &mut HashMap<String, (Instant, Vec<u8>)>,
     now: Instant,
@@ -639,6 +657,9 @@ fn cache_insert(
     body: Vec<u8>,
 ) {
     cache.retain(|_, (expiry, _)| *expiry > now);
+    if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+        return;
+    }
     cache.insert(key, (now + PROVER_CACHE_TTL, body));
 }
 
@@ -1962,6 +1983,18 @@ pub async fn handle_token_supply(
             return build_response(StatusCode::OK, body, Some(CACHE_60));
         }
     }
+    let _scanning = if want_scan {
+        let Ok(permit) = state.token_scan.try_acquire() else {
+            return token_scan_busy();
+        };
+        // A scan that ended while this request waited for the cache read.
+        if let Some(body) = cache_get(&state, "token_supply_scan") {
+            return build_response(StatusCode::OK, body, Some(CACHE_60));
+        }
+        Some(permit)
+    } else {
+        None
+    };
 
     // Audited baseline: the migration receipt (count, Σ). Read via the canonical
     // reader so it matches how the intrinsic wrote it.
@@ -2117,6 +2150,12 @@ pub async fn handle_token_coins(
         Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
     };
     let cache_key = format!("token_coins:{}", hex::encode(owner));
+    if let Some(body) = cache_get(&state, &cache_key) {
+        return build_response(StatusCode::OK, body, Some(CACHE_60));
+    }
+    let Ok(_scanning) = state.token_scan.try_acquire() else {
+        return token_scan_busy();
+    };
     if let Some(body) = cache_get(&state, &cache_key) {
         return build_response(StatusCode::OK, body, Some(CACHE_60));
     }
@@ -2674,6 +2713,65 @@ mod tests {
         assert!(!cache.contains_key("old"));
         assert_eq!(cache.get("live").map(|(_, body)| body.clone()), Some(vec![2]));
         assert!(cache.contains_key("new"));
+    }
+
+    #[test]
+    fn cache_holds_at_most_its_bound_of_live_entries() {
+        let mut cache = HashMap::new();
+        let t0 = Instant::now();
+        for n in 0..CACHE_MAX_ENTRIES + 10 {
+            cache_insert(&mut cache, t0, format!("k{n}"), vec![1]);
+        }
+        assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&format!("k{}", CACHE_MAX_ENTRIES)), "a new key past the bound is not cached");
+        cache_insert(&mut cache, t0, "k0".into(), vec![2]);
+        assert_eq!(cache.get("k0").map(|(_, body)| body.clone()), Some(vec![2]), "a held key is refreshed");
+        let later = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
+        cache_insert(&mut cache, later, "fresh".into(), vec![3]);
+        assert_eq!(cache.len(), 1, "expired entries make room");
+    }
+
+    #[tokio::test]
+    async fn token_scans_run_one_at_a_time() {
+        let state = empty_state();
+        let held = state.token_scan.clone().try_acquire_owned().unwrap();
+        let owner = "11".repeat(32);
+        let coins = || handle_token_coins(Method::GET, State(state.clone()), Path(owner.clone()), Query(HashMap::new()));
+        let busy = coins().await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()["Retry-After"], TOKEN_SCAN_RETRY_SECS.to_string().as_str());
+        let scan = HashMap::from([("scan".to_string(), "1".to_string())]);
+        let supply = handle_token_supply(Method::GET, State(state.clone()), Query(scan.clone())).await;
+        assert_eq!(supply.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let plain = handle_token_supply(Method::GET, State(state.clone()), Query(HashMap::new())).await;
+        assert_eq!(plain.status(), StatusCode::OK, "the supply without a scan is not held back");
+        drop(held);
+        assert_eq!(coins().await.status(), StatusCode::OK);
+        assert_eq!(handle_token_supply(Method::GET, State(state.clone()), Query(scan)).await.status(), StatusCode::OK);
+        assert_eq!(state.token_scan.available_permits(), 1, "a finished scan returns its permit");
+    }
+
+    /// An explorer over an empty in-memory store.
+    fn empty_state() -> ExplorerState {
+        let db = quil_store::RocksDb::open_in_memory().expect("an in-memory store");
+        let raw = db.inner();
+        let hg = Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        ExplorerState::new(
+            Arc::new(quil_store::RocksClockStore::new(raw.clone())),
+            crdt,
+            Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
+            Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
+            Arc::new(quil_store::RocksShardsStore::new(raw)),
+            None,
+            None,
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(crate::RecentMessageRing::new(16)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
     }
 
     #[test]
