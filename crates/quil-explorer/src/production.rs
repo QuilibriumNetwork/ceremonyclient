@@ -14,7 +14,11 @@
 //! task combines the index with the registry census and committed handoff
 //! state into a [`Snapshot`] after each advance; the handlers only read the
 //! latest one. Responses name both the head and `indexed_through`, so index
-//! lag is told apart from network lag. Windows are counted in GLOBAL frames;
+//! lag is told apart from network lag. While the index lags, the classes
+//! keep describing the window through `indexed_through`, flagged `stale`
+//! with that `as_of_frame`; while the live set or the prover census cannot
+//! be read, the last snapshot that read them serves on, flagged the same
+//! way. Windows are counted in GLOBAL frames;
 //! seconds follow from the median frame interval. Every
 //! [`history::ROW_FRAMES`] frames the task also records a history row
 //! (see [`history`]).
@@ -212,8 +216,11 @@ pub struct ShardView {
 #[derive(Clone, Debug, Default)]
 pub struct IndexView {
     pub indexed_through: Option<u64>,
-    /// The window spans `WINDOW_FRAMES` indexed frames, none missing, and
-    /// the index is not waiting beyond the grace.
+    /// Self-reported header timestamp of `indexed_through` (ms).
+    pub through_timestamp_ms: Option<i64>,
+    /// The window spans `WINDOW_FRAMES` indexed frames, none missing. A
+    /// wait beyond the grace leaves it set: the classes then describe the
+    /// window through `indexed_through` (see [`WindowInfo::stale`]).
     pub window_complete: bool,
     /// The frame the index has waited for beyond the grace.
     pub waiting_frame: Option<u64>,
@@ -553,6 +560,11 @@ impl ProductionIndex {
         }
         IndexView {
             indexed_through: self.indexed_through,
+            through_timestamp_ms: self
+                .window
+                .back()
+                .filter(|e| Some(e.frame) == self.indexed_through)
+                .and_then(|e| e.timestamp),
             window_complete: self.window_complete(),
             waiting_frame: None,
             missing_frames: self.window.iter().filter(|e| e.missing).count() as u64,
@@ -591,8 +603,9 @@ impl FrameEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
-    /// The window is not fully indexed, holds a missing frame, or the
-    /// shard has headers of unknown outcome and none applied: no claim.
+    /// No app frame applied in the window, and the window is not fully
+    /// indexed, holds a missing frame, or holds headers of the shard of
+    /// unknown outcome: no claim.
     NoData,
     Producing,
     /// Fewer effectively active members than a certificate needs.
@@ -615,13 +628,13 @@ impl Class {
 }
 
 /// Classes, exclusive and in this order. An applied app frame is positive
-/// evidence, so it outranks the shard's headers of unknown outcome.
+/// evidence: it makes the shard producing even in an incomplete window (a
+/// missing frame, a short index) and outranks the shard's headers of
+/// unknown outcome. The negative classes need the complete window.
 pub fn classify(window_complete: bool, applied_in_window: u64, unknown_in_window: u64, active_members: u64) -> Class {
-    if !window_complete {
-        Class::NoData
-    } else if applied_in_window > 0 {
+    if applied_in_window > 0 {
         Class::Producing
-    } else if unknown_in_window > 0 {
+    } else if !window_complete || unknown_in_window > 0 {
         Class::NoData
     } else if active_members < MIN_SHARD_CONSENSUS_PROVERS {
         Class::BelowQuorum
@@ -673,6 +686,10 @@ pub struct GridView {
 const NO_STORE_GRID: &str = "the shards store holds no QUIL grid row";
 const NO_CACHE: &str = "no archive shard-info refresh has answered yet";
 const NO_CACHE_GRID: &str = "the archive shard-info cache lists no QUIL grid shard";
+/// An empty live set is a failed read, never a network without shards.
+pub const NO_LIVE: &str = "no live shard: no registry filter is on the grid and no grid shard holds data";
+pub const NO_REGISTRY: &str = "the prover registry's shard summaries cannot be read";
+pub const NO_PROVERS: &str = "the prover registry has not been read yet: no effectively active census";
 
 /// The grid from the shards store, for an archive: its rows and the
 /// shard sizes `compute_shard_sizes` reads (lowercase hex keys).
@@ -685,12 +702,9 @@ pub fn grid_from_store(
     if grid.is_empty() {
         return GridView { source: GridSource::LocalStore, unavailable: Some(NO_STORE_GRID), ..Default::default() };
     }
-    GridView {
-        source: GridSource::LocalStore,
-        live: live_filters(registry.iter().map(Vec::as_slice), sizes),
-        grid: Some(grid),
-        unavailable: None,
-    }
+    let live = live_filters(registry.iter().map(Vec::as_slice), sizes);
+    let unavailable = live.is_empty().then_some(NO_LIVE);
+    GridView { source: GridSource::LocalStore, live, grid: Some(grid), unavailable }
 }
 
 /// The grid from the node's archive shard-info cache, for a regular node.
@@ -708,12 +722,9 @@ pub fn grid_from_cache(registry: &[Vec<u8>], cache: Option<HashMap<Vec<u8>, (u64
         .iter()
         .map(|(filter, (bytes, data_shards))| (hex::encode(filter), (num_bigint::BigInt::from(*bytes), *data_shards)))
         .collect();
-    GridView {
-        source: GridSource::ArchiveCache,
-        live: live_filters(registry.iter().map(Vec::as_slice), &sizes),
-        grid: Some(grid),
-        unavailable: None,
-    }
+    let live = live_filters(registry.iter().map(Vec::as_slice), &sizes);
+    let unavailable = live.is_empty().then_some(NO_LIVE);
+    GridView { source: GridSource::ArchiveCache, live, grid: Some(grid), unavailable }
 }
 
 /// What the response combines with the index.
@@ -721,8 +732,10 @@ pub struct Inputs<'a> {
     pub head_frame: u64,
     /// The live set and the grid.
     pub grid: &'a GridView,
-    /// Effectively active allocations by filter.
-    pub active: &'a HashMap<Vec<u8>, u64>,
+    /// Effectively active allocations by filter, with the frame of the
+    /// prover snapshot they were counted from; `None` before the registry
+    /// was first read: no census, so no negative class.
+    pub active: Option<(u64, &'a HashMap<Vec<u8>, u64>)>,
     /// Shards in a full coverage halt.
     pub halted: &'a BTreeSet<Vec<u8>>,
     pub committed: &'a HashMap<Vec<u8>, Committed>,
@@ -737,10 +750,35 @@ pub struct WindowInfo {
     pub window_frames: u64,
     pub window_complete: bool,
     /// The frame the index has waited for beyond the grace (not stored or
-    /// not materialized); the window reads incomplete meanwhile.
+    /// not materialized); the window reads incomplete meanwhile, and the
+    /// classes describe the window through `indexed_through` (`stale`).
     pub index_waiting_frame: Option<u64>,
     /// From self-reported GLOBAL header timestamps.
     pub median_frame_interval_ms: Option<i64>,
+    /// The node's stored GLOBAL head and its self-reported header timestamp
+    /// (ms): the received head when its frame is stored, else the highest
+    /// stored frame; `null` when unreadable.
+    pub stored_head_frame: Option<u64>,
+    pub stored_head_timestamp_ms: Option<i64>,
+    /// The GLOBAL frame the classes, counts and shards describe:
+    /// `indexed_through`, or an older snapshot's while the live set or the
+    /// census cannot be read (see `stale_reason`). With its header
+    /// timestamp (ms).
+    pub as_of_frame: Option<u64>,
+    pub as_of_timestamp_ms: Option<i64>,
+    /// `head_frame` minus `as_of_frame`.
+    pub lag_frames: Option<u64>,
+    /// The values trail the network: the index waits beyond the grace or
+    /// trails the head by more than it, the census or the live set is
+    /// older than the head, or an older snapshot's values are served.
+    /// `stale_reason` says why.
+    pub stale: bool,
+    pub stale_reason: Option<String>,
+    /// False while no snapshot has read the live set and the census: the
+    /// counts are then placeholders, not measurements.
+    pub values_known: bool,
+    /// When the snapshot was built (Unix ms); responses serve the latest.
+    pub built_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -764,8 +802,8 @@ pub struct Summary {
     /// Shard headers in the window for filters off the live set; `null`
     /// while the grid is unavailable.
     pub off_grid_inclusions_in_window: Option<u64>,
-    /// Frames never stored: every shard reads `no_data` while one is in
-    /// the window.
+    /// Frames never stored: shards without an applied app frame read
+    /// `no_data` while one is in the window.
     pub missing_frames_in_window: u64,
     /// Frames without (all) outcomes: shards with headers in them and none
     /// applied read `no_data`.
@@ -812,6 +850,8 @@ pub struct ProductionReport {
     pub summary: Summary,
     /// Sorted by filter.
     pub shards: Vec<ShardProduction>,
+    /// Why this build's values are unknown (logged, not served apart).
+    pub unknown_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -848,6 +888,54 @@ impl ProductionReport {
 
     pub fn stats(&self) -> AppShardsStats {
         AppShardsStats { window: self.window.clone(), summary: self.summary.clone() }
+    }
+
+    pub(crate) fn add_stale_reason(&mut self, reason: String) {
+        self.window.stale = true;
+        self.window.stale_reason = Some(match self.window.stale_reason.take() {
+            Some(earlier) => format!("{earlier}; {reason}"),
+            None => reason,
+        });
+    }
+
+    /// Mark the counts unknown: an input of the census could not be read.
+    pub fn mark_unknown(&mut self, reason: &str) {
+        self.window.values_known = false;
+        self.unknown_reason = Some(match self.unknown_reason.take() {
+            Some(earlier) => format!("{earlier}; {reason}"),
+            None => reason.to_string(),
+        });
+        self.add_stale_reason(format!("values unknown: {reason}"));
+    }
+
+    /// The report to serve: this one, or, while its values are unknown, the
+    /// last one whose values were known, flagged stale as of its frame,
+    /// with this one's index state, head and freshness. Placeholders are
+    /// never served over known values.
+    pub fn or_last_known(self, previous: Option<&ProductionReport>) -> ProductionReport {
+        let Some(previous) = previous.filter(|p| p.window.values_known && !self.window.values_known) else {
+            return self;
+        };
+        let as_of = previous.window.as_of_frame;
+        let mut window = WindowInfo {
+            as_of_frame: as_of,
+            as_of_timestamp_ms: previous.window.as_of_timestamp_ms,
+            lag_frames: as_of.map(|a| self.window.head_frame.saturating_sub(a)),
+            values_known: true,
+            ..self.window
+        };
+        let reason = window.stale_reason.take().unwrap_or_default();
+        window.stale_reason = Some(match as_of {
+            Some(frame) => format!("{reason}; serving the last known values, as of frame {frame}"),
+            None => format!("{reason}; serving the last known values"),
+        });
+        window.stale = true;
+        ProductionReport {
+            window,
+            summary: previous.summary.clone(),
+            shards: previous.shards.clone(),
+            unknown_reason: self.unknown_reason,
+        }
     }
 }
 
@@ -893,19 +981,31 @@ pub fn assemble(view: &IndexView, inputs: &Inputs) -> ProductionReport {
         head_frame: inputs.head_frame,
         indexed_through: view.indexed_through,
         window_frames: WINDOW_FRAMES,
-        window_complete: view.window_complete,
+        window_complete: view.window_complete && view.waiting_frame.is_none(),
         index_waiting_frame: view.waiting_frame,
         median_frame_interval_ms: view.median_frame_interval_ms,
+        stored_head_frame: None,
+        stored_head_timestamp_ms: None,
+        as_of_frame: view.indexed_through,
+        as_of_timestamp_ms: view.through_timestamp_ms,
+        lag_frames: view.indexed_through.map(|t| inputs.head_frame.saturating_sub(t)),
+        stale: false,
+        stale_reason: None,
+        values_known: true,
+        built_at_ms: 0,
     };
     let empty = ShardView::default();
     let mut classes = ClassCounts::default();
     let mut totals = WindowCounts::default();
     let live = &inputs.grid.live;
+    let census = inputs.active.map(|(_, active)| active);
+    // Without a census only positive evidence classifies.
+    let complete = view.window_complete && census.is_some();
     let mut shards = Vec::with_capacity(live.len());
     for filter in live {
         let shard = view.shards.get(filter).unwrap_or(&empty);
-        let active = inputs.active.get(filter).copied().unwrap_or(0);
-        let class = classify(view.window_complete, shard.window.applied, shard.window.unknown, active);
+        let active = census.and_then(|c| c.get(filter)).copied().unwrap_or(0);
+        let class = classify(complete, shard.window.applied, shard.window.unknown, active);
         match class {
             Class::NoData => classes.no_data += 1,
             Class::Producing => classes.producing += 1,
@@ -965,7 +1065,29 @@ pub fn assemble(view: &IndexView, inputs: &Inputs) -> ProductionReport {
         grid_digest: grid.map(grid_digest),
         grid_unavailable: inputs.grid.unavailable,
     };
-    ProductionReport { window, summary, shards }
+    let mut report = ProductionReport { window, summary, shards, unknown_reason: None };
+    match (view.waiting_frame, view.indexed_through) {
+        (Some(frame), through) => report.add_stale_reason(format!(
+            "the index waits for GLOBAL frame {frame}, not stored or not materialized although the head \
+             passed it by the grace; {}",
+            through.map_or_else(|| "nothing indexed yet".to_string(), |t| format!("indexed through frame {t}"))
+        )),
+        (None, Some(through)) if inputs.head_frame > through.saturating_add(OUTCOME_GRACE) => report.add_stale_reason(
+            format!("the index trails the head by {} frames: catching up", inputs.head_frame - through),
+        ),
+        _ => {}
+    }
+    match inputs.active {
+        None => report.mark_unknown(NO_PROVERS),
+        Some((frame, _)) if frame < inputs.head_frame => report.add_stale_reason(format!(
+            "the prover census is from frame {frame}: the prover snapshot could not be rebuilt since"
+        )),
+        Some(_) => {}
+    }
+    if live.is_empty() {
+        report.mark_unknown(inputs.grid.unavailable.unwrap_or(NO_LIVE));
+    }
+    report
 }
 
 /// The latest response, built by the indexer task.
@@ -1003,6 +1125,8 @@ pub struct BuildTimings {
     pub total: Duration,
     pub grid_source: GridSource,
     pub grid_unavailable: Option<&'static str>,
+    /// Why the last live-set re-read failed while an older one serves.
+    pub grid_kept: Option<&'static str>,
 }
 
 fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -1139,6 +1263,8 @@ struct Tick {
     advance: Advance,
     stall: Option<StallEvent>,
     build: Option<(BuildTimings, u64)>,
+    /// Why this tick's build could not read the live set or the census.
+    unknown: Option<String>,
     next: u64,
     through: Option<u64>,
     planned: Option<BackfillPlan>,
@@ -1162,15 +1288,22 @@ impl Indexer {
         let mut view = (advance.indexed > 0).then(|| index.view());
         let mut row = view.as_ref().and_then(|view| history::row_of(index, view));
         let mut build = None;
+        let mut unknown = None;
         if snapshot_due(view_changed, self.last_build, Instant::now()) {
             let mut view = view.take().unwrap_or_else(|| index.view());
             view.waiting_frame = self.stall.waiting_frame();
-            view.window_complete &= view.waiting_frame.is_none();
             let (report, timings) = crate::handlers::build_production_report(state, head, &view, &mut self.sets);
-            if let Some(row) = row.as_mut() {
-                history::attach_census(row, &report.summary, head);
-            }
             let live = report.summary.live_shards;
+            if report.window.values_known {
+                if let Some(row) = row.as_mut() {
+                    history::attach_census(row, &report.summary, head);
+                }
+            }
+            unknown = report.unknown_reason.clone().or_else(|| {
+                timings.grid_kept.map(|reason| format!("the live shard set cannot be re-read ({reason}); the previous one serves"))
+            });
+            let previous = state.production_snapshot.read().clone();
+            let report = report.or_last_known(previous.as_ref().map(|s| &s.report));
             *state.production_snapshot.write() = Some(Arc::new(Snapshot::new(report)));
             self.last_build = Some(Instant::now());
             build = Some((timings, live));
@@ -1228,6 +1361,7 @@ impl Indexer {
             advance,
             stall,
             build,
+            unknown,
             next: index.next_frame(),
             through: index.indexed_through(),
             planned,
@@ -1352,15 +1486,64 @@ fn log_backfill(tick: &Tick, blocked: &mut Option<String>) {
     *blocked = now;
 }
 
+/// Census inputs the snapshot builds cannot read, since when, and when
+/// that was last warned.
+struct Unreadable {
+    reason: String,
+    since: Instant,
+    warned: Instant,
+}
+
+/// Warn when the census inputs become unreadable, again every
+/// [`STALL_REPEAT`] (or on a new reason) while they stay so, and note when
+/// a build reads them again; both with the duration.
+fn log_unknown(tick: &Tick, unreadable: &mut Option<Unreadable>, now: Instant) {
+    if tick.build.is_none() {
+        return;
+    }
+    match (&tick.unknown, unreadable.as_mut()) {
+        (Some(reason), None) => {
+            tracing::warn!(
+                reason = %reason,
+                "explorer production snapshot cannot read the live shard set or the prover census; \
+                 /shards/production and /stats app_shards serve the last known values flagged stale \
+                 (values_known false before any); retrying",
+            );
+            *unreadable = Some(Unreadable { reason: reason.clone(), since: now, warned: now });
+        }
+        (Some(reason), Some(state)) => {
+            if state.reason != *reason || now.saturating_duration_since(state.warned) >= STALL_REPEAT {
+                tracing::warn!(
+                    reason = %reason,
+                    unreadable_s = now.saturating_duration_since(state.since).as_secs(),
+                    "explorer production snapshot still cannot read the live shard set or the prover census",
+                );
+                state.reason = reason.clone();
+                state.warned = now;
+            }
+        }
+        (None, Some(state)) => {
+            tracing::info!(
+                unreadable_s = now.saturating_duration_since(state.since).as_secs(),
+                "explorer production snapshot reads the live shard set and the prover census again",
+            );
+            *unreadable = None;
+        }
+        (None, None) => {}
+    }
+}
+
 fn log_tick(
     tick: &Tick,
     head: u64,
     elapsed: Duration,
     failing: &mut Option<String>,
     blocked: &mut Option<String>,
+    unreadable: &mut Option<Unreadable>,
     builds: &mut BuildLog,
 ) {
     log_backfill(tick, blocked);
+    log_unknown(tick, unreadable, Instant::now());
     let advance = &tick.advance;
     if tick.rebuild {
         let (build_ms, live_shards, grid_source) =
@@ -1382,7 +1565,8 @@ fn log_tick(
             last,
             count = advance.missing.len(),
             "explorer production index: this archive lacks these GLOBAL frames although materialization \
-             passed them by the grace; every shard reads no_data until they leave the window",
+             passed them by the grace; shards without an applied app frame read no_data until they \
+             leave the window",
         );
     }
     if let (Some(first), Some(last)) = (advance.outcome_less.first(), advance.outcome_less.last()) {
@@ -1403,7 +1587,8 @@ fn log_tick(
             grace = OUTCOME_GRACE,
             cause = stall_cause(frame, advance.materialized),
             "explorer production index waits for a GLOBAL frame the head passed by the grace; \
-             /shards/production reads no_data until it moves",
+             /shards/production serves the classes of the window through the last indexed frame, \
+             flagged stale, until it moves",
         ),
         Some(StallEvent::Persisting { frame, waited }) => tracing::warn!(
             frame,
@@ -1448,6 +1633,7 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
     let mut indexer: Option<Indexer> = None;
     let mut failing: Option<String> = None;
     let mut blocked: Option<String> = None;
+    let mut unreadable: Option<Unreadable> = None;
     let mut builds =
         BuildLog { since: Instant::now(), count: 0, total: Duration::ZERO, max: Duration::ZERO, last_slow: None };
     loop {
@@ -1466,7 +1652,7 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
         .await;
         match result {
             Ok((working, tick)) => {
-                log_tick(&tick, head, started.elapsed(), &mut failing, &mut blocked, &mut builds);
+                log_tick(&tick, head, started.elapsed(), &mut failing, &mut blocked, &mut unreadable, &mut builds);
                 indexer = Some(working);
             }
             Err(e) => tracing::warn!(error = %e, "explorer production index task failed; rebuilding"),

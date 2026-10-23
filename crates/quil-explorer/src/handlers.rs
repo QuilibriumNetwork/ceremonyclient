@@ -983,8 +983,10 @@ pub async fn handle_key_prover(
 /// snapshot, so one build serves every dashboard request in that window
 /// (each refresh asks for eviction risk, seniority, kicked provers and
 /// stats). The age bound refreshes the snapshot when the frame stands
-/// still. At most one snapshot is held: a newer one replaces it.
-fn all_provers(state: &ExplorerState, frame: u64) -> Arc<Vec<ProverInfo>> {
+/// still. At most one snapshot is held: a newer one replaces it. Returns
+/// the frame the snapshot was built at; `None` while no build has
+/// succeeded (unknown, never an empty registry).
+fn all_provers(state: &ExplorerState, frame: u64) -> Option<(u64, Arc<Vec<ProverInfo>>)> {
     snapshot_for(&state.provers_snapshot, frame, Instant::now(), || {
         let summaries = state.prover_registry.get_prover_shard_summaries(frame).ok()?;
         let mut filters: Vec<Vec<u8>> = vec![Vec::new()];
@@ -997,28 +999,34 @@ fn all_provers(state: &ExplorerState, frame: u64) -> Arc<Vec<ProverInfo>> {
 /// `PROVER_SNAPSHOT_MAX_AGE` before `now`; otherwise `build`'s value, which
 /// replaces it. The lock is held while building, so concurrent requests
 /// needing a new snapshot build one copy, not several. A failed build
-/// (`None`) is not kept: the previous snapshot, if any, serves on and the
-/// next request builds again.
-fn snapshot_for<T: Default>(
+/// (`None`) is not kept: the previous snapshot, if any, serves on with its
+/// frame and the next request builds again; with none, `None`.
+fn snapshot_for<T>(
     slot: &Mutex<Option<(u64, Instant, Arc<T>)>>,
     frame: u64,
     now: Instant,
     build: impl FnOnce() -> Option<T>,
-) -> Arc<T> {
+) -> Option<(u64, Arc<T>)> {
     let mut slot = slot.lock();
     if let Some((built_frame, built_at, value)) = &*slot {
         if *built_frame == frame
             && now.saturating_duration_since(*built_at) < PROVER_SNAPSHOT_MAX_AGE
         {
-            return Arc::clone(value);
+            return Some((frame, Arc::clone(value)));
         }
     }
     let Some(value) = build() else {
-        return slot.as_ref().map_or_else(|| Arc::new(T::default()), |(_, _, v)| Arc::clone(v));
+        return slot.as_ref().map(|(built_frame, _, v)| (*built_frame, Arc::clone(v)));
     };
     let value = Arc::new(value);
     *slot = Some((frame, now, Arc::clone(&value)));
-    value
+    Some((frame, value))
+}
+
+/// The answer of an endpoint that needs the prover snapshot before its
+/// first successful build.
+fn provers_unavailable() -> Response {
+    error(StatusCode::SERVICE_UNAVAILABLE, "prover registry not read yet")
 }
 
 /// Per-allocation inactivity assessment, mirroring
@@ -1262,7 +1270,9 @@ pub async fn handle_eviction_risk(
     let halts = current_halts(&state, frame);
     let threshold = crate::EVICTION_THRESHOLD_FRAMES;
 
-    let provers = all_provers(&state, frame);
+    let Some((_, provers)) = all_provers(&state, frame) else {
+        return provers_unavailable();
+    };
     let active_by_filter = active_allocations_by_filter(&provers, frame);
     let fresh_by_filter = fresh_allocations_by_filter(
         &provers,
@@ -1370,7 +1380,9 @@ pub async fn handle_seniority(
     let limit: Option<usize> = params.get("limit").and_then(|s| s.parse().ok());
 
     let frame = state.current_frame.load(Ordering::Relaxed);
-    let snapshot = all_provers(&state, frame);
+    let Some((_, snapshot)) = all_provers(&state, frame) else {
+        return provers_unavailable();
+    };
     let mut provers: Vec<&ProverInfo> = snapshot.iter().collect();
     // Seniority descending; ties broken by address ascending for stability.
     provers.sort_by(|a, b| b.seniority.cmp(&a.seniority).then_with(|| a.address.cmp(&b.address)));
@@ -1409,7 +1421,10 @@ pub async fn handle_kicked(method: Method, State(state): State<ExplorerState>) -
         return method_not_allowed();
     }
     let frame = state.current_frame.load(Ordering::Relaxed);
-    let mut entries: Vec<KickedEntry> = all_provers(&state, frame)
+    let Some((_, provers)) = all_provers(&state, frame) else {
+        return provers_unavailable();
+    };
+    let mut entries: Vec<KickedEntry> = provers
         .iter()
         .filter(|p| p.status == ProverStatus::Kicked)
         .map(|p| KickedEntry {
@@ -1446,6 +1461,14 @@ struct StatsResponse {
     /// The `/shards/production/history` rows held; appended after
     /// `app_shards`.
     app_shard_history: production::history::HistoryStats,
+    /// The frame the prover snapshot behind `total_provers`, `by_status`,
+    /// `total_seniority`, `eviction_pending` and `at_risk` was read at;
+    /// `null` while the registry has not been read, the counts then being
+    /// placeholders. Appended last.
+    provers_as_of_frame: Option<u64>,
+    /// The prover snapshot is older than `current_frame` (a failed rebuild)
+    /// or missing.
+    provers_stale: bool,
 }
 
 pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) -> Response {
@@ -1456,7 +1479,10 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     let halts = current_halts(&state, frame);
     let threshold = crate::EVICTION_THRESHOLD_FRAMES;
 
-    let provers = all_provers(&state, frame);
+    let (provers_as_of_frame, provers) = match all_provers(&state, frame) {
+        Some((built, provers)) => (Some(built), provers),
+        None => (None, Arc::new(Vec::new())),
+    };
     let active_by_filter = active_allocations_by_filter(&provers, frame);
     let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
     let mut total_seniority: u64 = 0;
@@ -1497,6 +1523,8 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         halted_shards,
         app_shards,
         app_shard_history,
+        provers_as_of_frame,
+        provers_stale: provers_as_of_frame != Some(frame),
     };
     json_ok(&response, None)
 }
@@ -1530,20 +1558,85 @@ fn committed_heads(
         .collect()
 }
 
+/// How often an unavailable live set, or one whose re-read failed, is read
+/// again.
+const GRID_RETRY: Duration = Duration::from_secs(30);
+
 /// The live set and the grid, read again once [`PROVER_CACHE_TTL`] old (as
-/// `/provers/shards` caches its shard sizes), and on every build while
-/// unavailable.
+/// `/provers/shards` caches its shard sizes), and every [`GRID_RETRY`]
+/// while unavailable or while a re-read fails. A failed re-read keeps the
+/// last grid read with a live set, flagged stale.
 #[derive(Default)]
 pub(crate) struct ShardSets {
+    /// The last read attempt.
     refreshed: Option<Instant>,
     grid: production::GridView,
+    /// When `grid` was read.
+    read_at: Option<Instant>,
+    /// Why the last re-read failed while an older `grid` serves.
+    failed: Option<&'static str>,
 }
 
-#[cfg(test)]
 impl ShardSets {
+    /// Read the grid with `read` when due at `now`.
+    pub(crate) fn refresh(&mut self, now: Instant, read: impl FnOnce() -> production::GridView) {
+        let every = if self.grid.unavailable.is_some() || self.failed.is_some() { GRID_RETRY } else { PROVER_CACHE_TTL };
+        if self.refreshed.is_some_and(|at| now.saturating_duration_since(at) < every) {
+            return;
+        }
+        self.refreshed = Some(now);
+        let grid = read();
+        match grid.unavailable {
+            Some(reason) if self.read_at.is_some() && self.grid.unavailable.is_none() => self.failed = Some(reason),
+            _ => {
+                self.grid = grid;
+                self.read_at = Some(now);
+                self.failed = None;
+            }
+        }
+    }
+
+    /// Why the serving grid is older than the last read attempt, and its
+    /// age at `now`.
+    pub(crate) fn kept(&self, now: Instant) -> Option<(&'static str, Duration)> {
+        Some((self.failed?, now.saturating_duration_since(self.read_at?)))
+    }
+
+    #[cfg(test)]
     pub(crate) fn grid_view(&self) -> &production::GridView {
         &self.grid
     }
+}
+
+/// The live set and the grid as the registry and the grid source read now.
+fn read_grid(state: &ExplorerState, head: u64) -> production::GridView {
+    let Ok(summaries) = state.prover_registry.get_prover_shard_summaries(head) else {
+        let source = if state.archive_grid.is_some() {
+            production::GridSource::ArchiveCache
+        } else {
+            production::GridSource::LocalStore
+        };
+        return production::GridView { source, unavailable: Some(production::NO_REGISTRY), ..Default::default() };
+    };
+    let registry: Vec<Vec<u8>> = summaries.into_iter().map(|s| s.filter).collect();
+    match &state.archive_grid {
+        Some(cache) => production::grid_from_cache(&registry, cache()),
+        None => production::grid_from_store(
+            &registry,
+            &compute_shard_sizes(state),
+            &state.shards_store.range_app_shards().unwrap_or_default(),
+        ),
+    }
+}
+
+/// The node's stored GLOBAL head and its header timestamp: the received
+/// head's header when stored (a header read), else the latest stored frame.
+fn stored_head(state: &ExplorerState, head: u64) -> Option<(u64, i64)> {
+    if let Ok(header) = state.clock_store.get_global_clock_frame_header(head) {
+        return Some((header.frame_number, header.timestamp));
+    }
+    let header = state.clock_store.get_latest_global_clock_frame().ok()?.header?;
+    Some((header.frame_number, header.timestamp))
 }
 
 /// Build the production report for `view`: the indexer task's work, never a
@@ -1557,25 +1650,11 @@ pub(crate) fn build_production_report(
     let started = Instant::now();
     let mut stage = Instant::now();
     let mut lap = || std::mem::replace(&mut stage, Instant::now()).elapsed();
-    let stale = sets.refreshed.is_none_or(|at| at.elapsed() >= PROVER_CACHE_TTL);
-    if stale || sets.grid.unavailable.is_some() {
-        let registry: Vec<Vec<u8>> = state
-            .prover_registry
-            .get_prover_shard_summaries(head)
-            .map(|summaries| summaries.into_iter().map(|s| s.filter).collect())
-            .unwrap_or_default();
-        sets.grid = match &state.archive_grid {
-            Some(cache) => production::grid_from_cache(&registry, cache()),
-            None => production::grid_from_store(
-                &registry,
-                &compute_shard_sizes(state),
-                &state.shards_store.range_app_shards().unwrap_or_default(),
-            ),
-        };
-        sets.refreshed = Some(Instant::now());
-    }
+    let now = Instant::now();
+    sets.refresh(now, || read_grid(state, head));
+    let kept = sets.kept(now);
     let shard_sets = lap();
-    let active = active_allocations_by_filter(&all_provers(state, head), head);
+    let active = all_provers(state, head).map(|(frame, provers)| (frame, active_allocations_by_filter(&provers, head)));
     let census = lap();
     let halted: BTreeSet<Vec<u8>> = current_halts(state, head)
         .into_iter()
@@ -1585,17 +1664,29 @@ pub(crate) fn build_production_report(
     let halts = lap();
     let committed = committed_heads(state, &sets.grid.live);
     let committed_time = lap();
-    let report = production::assemble(
+    let mut report = production::assemble(
         view,
         &production::Inputs {
             head_frame: head,
             grid: &sets.grid,
-            active: &active,
+            active: active.as_ref().map(|(frame, active)| (*frame, active)),
             halted: &halted,
             committed: &committed,
             quil: quil_str,
         },
     );
+    if let Some((reason, age)) = kept {
+        report.add_stale_reason(format!(
+            "the live shard set cannot be re-read ({reason}): serving the one read {}s ago",
+            age.as_secs()
+        ));
+    }
+    let stored = stored_head(state, head);
+    report.window.stored_head_frame = stored.map(|(frame, _)| frame);
+    report.window.stored_head_timestamp_ms = stored.map(|(_, timestamp)| timestamp);
+    report.window.built_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     let assemble = lap();
     let timings = production::BuildTimings {
         shard_sets,
@@ -1606,6 +1697,7 @@ pub(crate) fn build_production_report(
         total: started.elapsed(),
         grid_source: sets.grid.source,
         grid_unavailable: sets.grid.unavailable,
+        grid_kept: kept.map(|(reason, _)| reason),
     };
     (report, timings)
 }
@@ -2528,10 +2620,13 @@ mod tests {
             halted_shards: 0,
             app_shards,
             app_shard_history: production::history::Rows::default().stats(),
+            provers_as_of_frame: Some(7),
+            provers_stale: false,
         };
         let old = r#"{"current_frame":7,"eviction_threshold":360,"total_provers":2,"by_status":{"active":2},"total_seniority":5,"eviction_pending":1,"at_risk":1,"halted_shards":0"#;
         let history = r#""app_shard_history":{"rows":0,"first_row_frame":null,"last_row_frame":null,"backfill_complete":false}"#;
-        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null,{history}}}"#));
+        let provers = r#""provers_as_of_frame":7,"provers_stale":false"#;
+        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null,{history},{provers}}}"#));
 
         let (none, empty) = (HashMap::new(), BTreeSet::new());
         let grid = production::GridView { grid: Some(BTreeSet::new()), ..Default::default() };
@@ -2540,7 +2635,7 @@ mod tests {
             &production::Inputs {
                 head_frame: 9,
                 grid: &grid,
-                active: &none,
+                active: Some((9, &none)),
                 halted: &empty,
                 committed: &HashMap::new(),
                 quil: quil_str,
@@ -2549,12 +2644,12 @@ mod tests {
         let s = to_str(&stats(Some(report.stats())));
         assert!(
             s.starts_with(&format!(
-                r#"{old},"app_shards":{{"head_frame":9,"indexed_through":null,"window_frames":240,"window_complete":false,"index_waiting_frame":null,"median_frame_interval_ms":null,"live_shards":0,"#
+                r#"{old},"app_shards":{{"head_frame":9,"indexed_through":null,"window_frames":240,"window_complete":false,"index_waiting_frame":null,"median_frame_interval_ms":null,"stored_head_frame":null,"stored_head_timestamp_ms":null,"as_of_frame":null,"as_of_timestamp_ms":null,"lag_frames":null,"stale":true,"stale_reason":"values unknown: no live shard: no registry filter is on the grid and no grid shard holds data","values_known":false,"built_at_ms":0,"live_shards":0,"#
             )),
             "{s}"
         );
         assert!(
-            s.ends_with(&format!(r#""grid_source":"local_store","grid_shards":0,"grid_digest":"e3b0c442","grid_unavailable":null}},{history}}}"#)),
+            s.ends_with(&format!(r#""grid_source":"local_store","grid_shards":0,"grid_digest":"e3b0c442","grid_unavailable":null}},{history},{provers}}}"#)),
             "{s}"
         );
     }
@@ -2909,32 +3004,69 @@ mod tests {
         };
         let half = PROVER_SNAPSHOT_MAX_AGE / 2;
         let t0 = Instant::now();
-        let first = snapshot_for(&slot, 10, t0, || build(1));
-        let again = snapshot_for(&slot, 10, t0 + half, || build(2));
+        let first = snapshot_for(&slot, 10, t0, || build(1)).unwrap();
+        let again = snapshot_for(&slot, 10, t0 + half, || build(2)).unwrap();
         assert_eq!(builds.get(), 1);
-        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(&first.1, &again.1));
         // A new frame rebuilds.
         let t1 = t0 + half;
-        let next = snapshot_for(&slot, 11, t1, || build(3));
-        assert_eq!((builds.get(), *next), (2, 3));
+        let next = snapshot_for(&slot, 11, t1, || build(3)).unwrap();
+        assert_eq!((builds.get(), next.0, *next.1), (2, 11, 3));
         // The same frame shares within the max age and rebuilds past it.
-        assert_eq!(*snapshot_for(&slot, 11, t1 + half, || build(4)), 3);
+        assert_eq!(*snapshot_for(&slot, 11, t1 + half, || build(4)).unwrap().1, 3);
         assert_eq!(builds.get(), 2);
-        assert_eq!(*snapshot_for(&slot, 11, t1 + PROVER_SNAPSHOT_MAX_AGE, || build(5)), 5);
+        assert_eq!(*snapshot_for(&slot, 11, t1 + PROVER_SNAPSHOT_MAX_AGE, || build(5)).unwrap().1, 5);
         assert_eq!(builds.get(), 3);
+    }
+
+    #[test]
+    fn shard_sets_back_off_and_keep_the_last_good_grid() {
+        let good = |tag: u8| production::GridView {
+            live: BTreeSet::from([vec![tag]]),
+            grid: Some(BTreeSet::from([vec![tag]])),
+            ..Default::default()
+        };
+        let failed = || production::GridView { unavailable: Some(production::NO_REGISTRY), ..Default::default() };
+        let reads = std::cell::Cell::new(0u32);
+        let read = |grid: production::GridView| {
+            reads.set(reads.get() + 1);
+            grid
+        };
+        let t0 = Instant::now();
+        let mut sets = ShardSets::default();
+        // A failed first read leaves the grid unavailable (values unknown),
+        // read again every GRID_RETRY, not on every build.
+        sets.refresh(t0, || read(failed()));
+        assert_eq!((sets.grid.unavailable, sets.kept(t0), reads.get()), (Some(production::NO_REGISTRY), None, 1));
+        sets.refresh(t0 + GRID_RETRY / 2, || read(good(1)));
+        assert_eq!(reads.get(), 1);
+        let t1 = t0 + GRID_RETRY;
+        sets.refresh(t1, || read(good(1)));
+        assert_eq!((sets.grid.live.len(), sets.grid.unavailable, reads.get()), (1, None, 2));
+        // A good grid is read again once PROVER_CACHE_TTL old; a failed
+        // re-read keeps it, flagged with its age, and retries sooner.
+        sets.refresh(t1 + PROVER_CACHE_TTL / 2, || read(failed()));
+        assert_eq!(reads.get(), 2);
+        let t2 = t1 + PROVER_CACHE_TTL;
+        sets.refresh(t2, || read(failed()));
+        assert_eq!((sets.grid.live.clone(), sets.grid.unavailable, reads.get()), (BTreeSet::from([vec![1]]), None, 3));
+        assert_eq!(sets.kept(t2), Some((production::NO_REGISTRY, PROVER_CACHE_TTL)));
+        sets.refresh(t2 + GRID_RETRY, || read(good(2)));
+        assert_eq!((sets.grid.live.clone(), sets.kept(t2 + GRID_RETRY), reads.get()), (BTreeSet::from([vec![2]]), None, 4));
     }
 
     #[test]
     fn snapshot_for_keeps_the_last_snapshot_when_a_build_fails() {
         let slot = Mutex::new(None);
         let t0 = Instant::now();
-        // Nothing built yet: an empty answer, not kept.
-        assert_eq!(*snapshot_for(&slot, 10, t0, || None::<u32>), 0);
+        let read = |frame, value: Option<u32>| snapshot_for(&slot, frame, t0, || value).map(|(f, v)| (f, *v));
+        // Nothing built yet: unknown (never an empty answer), nothing kept.
+        assert_eq!(read(10, None), None);
         assert!(slot.lock().is_none());
-        assert_eq!(*snapshot_for(&slot, 10, t0, || Some(7)), 7);
-        // A failed build at a new frame serves the previous snapshot and
-        // leaves it in place, so the next request builds again.
-        assert_eq!(*snapshot_for(&slot, 11, t0, || None), 7);
-        assert_eq!(*snapshot_for(&slot, 11, t0, || Some(8)), 8);
+        assert_eq!(read(10, Some(7)), Some((10, 7)));
+        // A failed build at a new frame serves the previous snapshot with
+        // its frame and leaves it in place, so the next request builds again.
+        assert_eq!(read(11, None), Some((10, 7)));
+        assert_eq!(read(11, Some(8)), Some((11, 8)));
     }
 }
