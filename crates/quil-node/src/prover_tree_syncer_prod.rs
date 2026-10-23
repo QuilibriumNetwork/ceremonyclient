@@ -68,9 +68,10 @@ fn recently_failed(addr: &str) -> bool {
 const FRAME_CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A shard frame read connection's key: the dialing thread and the archive.
-/// A channel's I/O runs on the runtime that dialed it, and each in-process
-/// worker has its own single-threaded runtime, so one worker's reads never
-/// wait on another's.
+/// Each in-process worker keeps its own connections, so one worker's reads
+/// never queue behind another's; their I/O runs on the shared archive I/O
+/// runtime (`quil_rpc::archive_client`), where a blocked worker thread
+/// cannot stall it.
 pub(crate) type FrameClientKey = (std::thread::ThreadId, String);
 
 struct FrameClient<C> {
@@ -133,9 +134,8 @@ fn frame_clients() -> std::sync::MutexGuard<'static, FrameClients<ArchiveClient>
     FRAME_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Close connection `id` of `key` in `clients` once it has been idle, on
-/// the runtime that runs its I/O, so an idle channel does not keep pinging
-/// the archive.
+/// Close connection `id` of `key` in `clients` once it has been idle, so an
+/// idle channel does not keep pinging the archive.
 pub(crate) async fn reap_frame_client<C: Clone>(
     clients: &'static std::sync::Mutex<FrameClients<C>>,
     key: FrameClientKey,
