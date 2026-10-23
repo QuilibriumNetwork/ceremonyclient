@@ -3639,12 +3639,17 @@ impl AppConsensusEngine {
         // or an executed tip. Bootstrap asked every frame for its own
         // certificate, so a shard whose archive tip or tip predecessor had
         // none never bootstrapped. Structure and output are checked either way.
+        // The digest looks through same-filter sessions that closed at their
+        // base, as replay's does: once every session based at a seal had
+        // closed there without a frame, the head's direct origins named no
+        // frame, and each joiner refused the sealed frame on every attempt
+        // (…091f80 at frame 4693, generations 13 to 23, 2026-10-23).
         let committed = |frame: &quil_types::proto::global::AppShardFrame| -> bool {
             let (Some(global), Some(header)) = (self.global_hypergraph.as_ref(), frame.header.as_ref()) else {
                 return false;
             };
             let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
-            crate::app_handoff::committed_frame_digest(global, &self.filter, header.frame_number)
+            crate::app_handoff::committed_frame_digest_looked_through(global, &self.filter, header.frame_number)
                 .ok().flatten() == Some(digest)
         };
         let certified = |frame: &quil_types::proto::global::AppShardFrame| {
@@ -12534,6 +12539,31 @@ mod tests {
         assert_eq!(error, no_state);
     }
 
+    /// Frame 8 of QUIL_TOKEN over the fixtures' frame 7 (output 0x43...),
+    /// without a certificate, its output the one its header produces: a
+    /// sealed session's last frame. `timestamp` tells two such frames apart.
+    fn sealed_frame_eight(timestamp: i64) -> quil_types::proto::global::AppShardFrame {
+        let parent = quil_crypto::poseidon::hash_bytes_to_32(&[0x43; 32]).unwrap();
+        let mut header = quil_types::proto::global::FrameHeader {
+            address: quil_execution::domains::QUIL_TOKEN.to_vec(), frame_number: 8, rank: 9, timestamp,
+            parent_selector: parent.to_vec(), state_roots: vec![vec![1; 32]; 4], ..Default::default()
+        };
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector, &header.requests_root, &header.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]), header.frame_number, header.rank,
+            &header.prover, header.difficulty, header.fee_multiplier_vote, header.timestamp,
+            &header.storage_attestation_root,
+            quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+            &header.settlements, &header.accumulator, &header.spends,
+        ).to_vec();
+        quil_types::proto::global::AppShardFrame { header: Some(header), ..Default::default() }
+    }
+
+    /// The digest GLOBAL commits for `frame`: `poseidon(output)`.
+    fn output_digest(frame: &quil_types::proto::global::AppShardFrame) -> [u8; 32] {
+        quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap()
+    }
+
     /// A sealed session's last frame has no certificate of its own and no
     /// certified frame after it: the digest GLOBAL committed for it at the
     /// seal authenticates it alone, and it is then validated as a frame final
@@ -12543,29 +12573,11 @@ mod tests {
     /// validation, and a frame of the committed digest is still validated.
     #[tokio::test]
     async fn archive_replay_takes_a_sealed_last_frame_by_the_digest_global_committed() {
-        let parent = quil_crypto::poseidon::hash_bytes_to_32(&[0x43; 32]).unwrap();
-        let sealed_frame = |timestamp: i64| {
-            let mut header = quil_types::proto::global::FrameHeader {
-                address: quil_execution::domains::QUIL_TOKEN.to_vec(), frame_number: 8, rank: 9, timestamp,
-                parent_selector: parent.to_vec(), state_roots: vec![vec![1; 32]; 4], ..Default::default()
-            };
-            header.output = quil_crypto::porep::deterministic_app_frame_output(
-                &header.parent_selector, &header.requests_root, &header.state_roots,
-                &quil_crypto::porep::derive_storage_beacon(0, &[]), header.frame_number, header.rank,
-                &header.prover, header.difficulty, header.fee_multiplier_vote, header.timestamp,
-                &header.storage_attestation_root,
-                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
-                &header.settlements, &header.accumulator, &header.spends,
-            ).to_vec();
-            quil_types::proto::global::AppShardFrame { header: Some(header), ..Default::default() }
-        };
-        let digest = |frame: &quil_types::proto::global::AppShardFrame|
-            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap();
-        let (sealed, other) = (sealed_frame(1), sealed_frame(2));
+        let (sealed, other) = (sealed_frame_eight(1), sealed_frame_eight(2));
         let no_state = "execution unavailable: archive replay has no local state";
         let refused = "archive replay frame has no certified descendant, and frame 8 is not the frame GLOBAL committed";
 
-        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, digest(&sealed))));
+        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, output_digest(&sealed))));
         let error = engine.replay_archive_frame(sealed.clone(), Vec::new()).await.unwrap_err().to_string();
         assert_eq!(error, no_state, "authenticated, validated and linked; only the fixture's local state is missing");
         let error = engine.replay_archive_frame(other, Vec::new()).await.unwrap_err().to_string();
@@ -12578,9 +12590,9 @@ mod tests {
 
         // The committed digest of a frame whose output its header does not
         // produce: authenticated, then refused by validation.
-        let mut forged = sealed_frame(1);
+        let mut forged = sealed_frame_eight(1);
         forged.header.as_mut().unwrap().output = vec![0x50; 32];
-        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, digest(&forged))));
+        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, output_digest(&forged))));
         let error = engine.replay_archive_frame(forged, Vec::new()).await.unwrap_err().to_string();
         assert!(error.contains("deterministic output does not match header"), "{error}");
     }
@@ -12647,6 +12659,44 @@ mod tests {
         let error = engine.validate_archive_sync_anchor(&anchor, Some(&predecessor), None).await.unwrap_err().to_string();
         assert!(error.starts_with("invalid argument: archive sync anchor frame 8: ")
             && !error.contains("has no certificate"), "{error}");
+    }
+
+    /// A sealed session's last frame anchors a shard sync by the digest
+    /// GLOBAL committed for it also once the sessions based at its seal
+    /// closed there without a frame of their own: looked through, their
+    /// origin's seal names it. Asked of the head's direct origins only, which
+    /// name no frame, the anchor check refused it on every attempt, and no
+    /// new member could join (…091f80 at frame 4693 under generations 13 to
+    /// 23, 2026-10-23).
+    #[tokio::test]
+    async fn the_sync_anchor_check_takes_a_sealed_last_frame_under_sessions_closed_at_the_seal() {
+        use quil_execution::global_intrinsic::handoff::{self, schedule, DesiredCommittee};
+        let sealed = sealed_frame_eight(1);
+        let (mut engine, predecessor, _, global) = engine_with_sessions_from_seven(0x43, Some((8, output_digest(&sealed))));
+        // GLOBAL fences generation 3, based at the seal, at its base, never
+        // having run, and bases generation 4 there.
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let commit = |frame| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let third = handoff::head(&state, &engine.filter).unwrap().unwrap();
+        let request = handoff::schedule(&state, 7, vec![engine.filter.clone()],
+            vec![DesiredCommittee { filter: engine.filter.clone(), members: third.members.clone() }]).unwrap();
+        commit(7);
+        let due = schedule::fence_due_frame(request.frame);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[engine.filter.clone()], None).unwrap(), 1);
+        commit(due);
+        let head = handoff::head(&state, &engine.filter).unwrap().unwrap();
+        assert_eq!((head.generation, head.base_frame), (4, 8));
+        assert_eq!(crate::app_handoff::committed_frame_digest(&global, &engine.filter, 8).unwrap(), None,
+            "the head's direct origin names no frame");
+        // The anchor passes; the refusal is now the fixture predecessor's,
+        // which has no certificate and which no checkpoint names.
+        let error = engine.validate_archive_sync_anchor(&sealed, Some(&predecessor), None).await.unwrap_err().to_string();
+        assert!(error.starts_with("invalid argument: archive sync predecessor frame 7: invalid argument: has no certificate"),
+            "{error}");
     }
 
     /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without
