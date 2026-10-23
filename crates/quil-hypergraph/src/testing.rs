@@ -16,6 +16,40 @@ use quil_types::store::{
     ChangeRecord, HypergraphStore, Iterator as KvIterator, ShardKey, Transaction,
 };
 
+/// A [`quil_forest::BatchTreeReader`] over a source CRDT's forest, calling
+/// its `serve_forest_*` methods directly: a sync's source without gRPC
+/// (mirrors `quil_rpc::RemoteTreeReader`).
+pub struct CrdtTreeReader {
+    pub source: Arc<crate::HypergraphCrdt>,
+    pub shard_id: Vec<u8>,
+    pub phase: usize,
+}
+
+impl quil_forest::BatchTreeReader for CrdtTreeReader {}
+
+impl jmt::storage::TreeReader for CrdtTreeReader {
+    fn get_node_option(&self, node_key: &jmt::storage::NodeKey) -> anyhow::Result<Option<jmt::storage::Node>> {
+        let key = borsh::to_vec(node_key)?;
+        match self.source.serve_forest_node(&self.shard_id, self.phase, &key) {
+            Some(bytes) => Ok(Some(borsh::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_value_option(
+        &self,
+        max_version: jmt::Version,
+        key_hash: jmt::KeyHash,
+    ) -> anyhow::Result<Option<jmt::OwnedValue>> {
+        Ok(self.source.serve_forest_value(&self.shard_id, self.phase, max_version, key_hash.0))
+    }
+
+    fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(jmt::storage::NodeKey, jmt::storage::LeafNode)>> {
+        // The Merkle-diff sync addresses nodes explicitly.
+        Ok(None)
+    }
+}
+
 /// A no-op transaction that accepts all writes and returns nothing.
 pub struct NoopTxn;
 

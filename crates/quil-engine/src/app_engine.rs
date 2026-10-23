@@ -405,13 +405,36 @@ impl AppEngineHandle {
         anchor: quil_types::proto::global::AppShardFrame,
         predecessor: Option<quil_types::proto::global::AppShardFrame>,
     ) -> Result<()> {
-        let (reply, receive) = tokio::sync::oneshot::channel();
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        let frame = anchor.header.as_ref().map_or(0, |header| header.frame_number);
         self.msg_tx.send(AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor, reply }).await
             .map_err(|_| QuilError::ExecutionUnavailable("shard engine stopped before sync completion".into()))?;
         // Keep the worker's in-flight guard until the actor finishes. A timeout
         // here could start another tree install during the first anchor replay.
-        // Actor shutdown drops the reply and releases the waiting worker.
-        let installed = receive.await
+        // Actor shutdown drops the reply and releases the waiting worker. The
+        // wait holds no archive recovery turn; a long one is warned about at
+        // a bounded interval, and its end named.
+        let started = tokio::time::Instant::now();
+        let mut warned = false;
+        let installed = loop {
+            match tokio::time::timeout(INSTALL_REPLY_WARN, &mut receive).await {
+                Ok(installed) => break installed,
+                Err(_) => {
+                    warned = true;
+                    warn!(filter = hex::encode(&self.filter), frame, waited_secs = started.elapsed().as_secs(),
+                        scope = "this node",
+                        action = "the archive trees are installed and the shard engine has not answered their \
+                            checkpoint; it holds no archive recovery turn, and only this worker's shard sync waits; \
+                            report it with this line if it persists",
+                        "shard engine has not finished installing an archive checkpoint");
+                }
+            }
+        };
+        if warned {
+            info!(filter = hex::encode(&self.filter), frame, waited_secs = started.elapsed().as_secs(),
+                "shard engine finished installing a late archive checkpoint");
+        }
+        let installed = installed
             .map_err(|_| QuilError::ExecutionUnavailable("shard sync completion was cancelled".into()))?;
         if installed { Ok(()) } else {
             Err(QuilError::ExecutionUnavailable("shard engine rejected sync completion".into()))
@@ -2772,6 +2795,34 @@ impl AppConsensusEngine {
         Ok(true)
     }
 
+    /// Tell the archive recovery turns whether an owed re-anchor's requested
+    /// attempt waits for a shard sync to take it, or an attempt that handed
+    /// its turn back waits to be requested again: that sync goes first.
+    fn publish_reanchor_armed(&self) {
+        self.execution.set_reanchor_armed(
+            (self.fence_reanchor.armed && self.fence_reanchor.owed().is_some()) || self.execution.reanchor_yield_pending());
+    }
+
+    /// The owed re-anchor is no longer owed at `now` ([`FenceReanchor::finished`]).
+    fn finish_reanchor(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let owed = self.fence_reanchor.finished(now);
+        self.publish_reanchor_armed();
+        owed
+    }
+
+    /// Whether the re-anchor's attempt handed its archive recovery turn back
+    /// at the hold limit, its installed leaves kept
+    /// (`SharedWorkerExecution::reanchor_yielded`): if so the next sync takes
+    /// it again, first in the recovery turns, without counting a failure or
+    /// waiting for the retry interval. Read at each start check and each
+    /// sync's re-anchor question, so it cannot be lost.
+    fn absorb_reanchor_yield(&mut self) {
+        if self.execution.take_reanchor_yield() {
+            self.fence_reanchor.rearm();
+        }
+        self.publish_reanchor_armed();
+    }
+
     /// The re-anchor marker this shard recorded, read from the store on
     /// first use. A read failure is not remembered: the next check reads
     /// again. A malformed marker is cleared, and warned about once.
@@ -2822,7 +2873,7 @@ impl AppConsensusEngine {
     /// one.
     fn expire_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
         crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
-        let owed = self.fence_reanchor.finished(std::time::Instant::now())
+        let owed = self.finish_reanchor(std::time::Instant::now())
             .map_or_else(|| "unknown".to_string(), |owed| owed.as_secs().to_string());
         let head = self.global_hypergraph.as_ref()
             .and_then(|global| crate::app_handoff::head_summary(global, &self.filter));
@@ -2862,7 +2913,7 @@ impl AppConsensusEngine {
     /// trees are the archive's (or the shard's own), and catch-up goes on.
     fn clear_stale_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
         crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
-        let owed = self.fence_reanchor.finished(std::time::Instant::now())
+        let owed = self.finish_reanchor(std::time::Instant::now())
             .map_or_else(|| "unknown".to_string(), |owed| owed.as_secs().to_string());
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
             fence = marker.fence, from_cursor = marker.from_cursor, owed_secs = %owed,
@@ -2956,6 +3007,7 @@ impl AppConsensusEngine {
         crate::app_handoff::write_reanchor_marker(self.clock_store.as_ref(), &self.filter, &marker)?;
         self.fence_reanchor.marker = Some(Some(marker));
         self.fence_reanchor.arm(now);
+        self.publish_reanchor_armed();
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation, local_head = cursor,
             frame = streak.frame, phase, failures = streak.failures, failing_secs = streak.duration.as_secs(),
             anchor_frame = committed.unwrap_or_default(), scope = "this node",
@@ -2975,7 +3027,9 @@ impl AppConsensusEngine {
     /// took, or an attempt running past [`FENCE_REANCHOR_HUNG`], is warned
     /// about.
     fn request_fence_reanchor(&mut self, now: std::time::Instant) {
+        self.absorb_reanchor_yield();
         let Some(silent) = self.fence_reanchor.due(now) else { return };
+        self.publish_reanchor_armed();
         if let Some(reason) = silent {
             self.note_reanchor_wait(reason, now);
         }
@@ -3030,7 +3084,7 @@ impl AppConsensusEngine {
         let rebased = crate::app_handoff::rebase_for_reanchor(
             &shard, self.clock_store.as_ref(), &self.filter, marker, anchor, predecessor, discard_above,
         )?;
-        let owed = self.fence_reanchor.finished(std::time::Instant::now());
+        let owed = self.finish_reanchor(std::time::Instant::now());
         let line = match marker.cause() {
             crate::app_handoff::ReanchorCause::PastFence =>
                 "shard re-anchor rebase committed: the discarded frames are dropped and the anchor replays next",
@@ -3620,8 +3674,10 @@ impl AppConsensusEngine {
     /// sync's last anchor refusal, or, when `pending` is the wait for the
     /// predecessor's outgoing history, that wait.
     fn warn_predecessor_blocked(&mut self, now: std::time::Instant, pending: &QuilError) {
-        // Its archive recoveries go first while it waits (thread_worker).
-        self.execution.set_successor_blocked(true);
+        // Its archive recoveries go first while it waits (recovery_turns),
+        // unless it is leaving or not seated.
+        let priority = self.successor_priority();
+        self.execution.set_successor_blocked(priority);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
         let predecessor = self.global_hypergraph.as_ref()
             .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
@@ -3634,7 +3690,7 @@ impl AppConsensusEngine {
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
                 local_frame = self.last_materialized_frame,
                 cause = "predecessor outgoing history recovery still in progress",
-                blocked_secs = blocked.as_secs(), scope = "this node",
+                blocked_secs = blocked.as_secs(), recovery_priority = priority, scope = "this node",
                 action = "this worker cannot join the shard's consensus until it rebuilds the predecessor's \
                     outgoing history from certified headers or an archive; it retries; a 'predecessor outgoing \
                     history could not be recovered' warning names a failing source; report it with this line \
@@ -3670,8 +3726,30 @@ impl AppConsensusEngine {
             anchored_global_frame = %or_none(refusal.and_then(|r| r.global_frame)),
             cause = refusal.map_or("no recovery refusal recorded yet", |r| r.cause),
             last_error = %refusal.map_or("none", |r| r.error.as_str()),
-            blocked_secs = blocked.as_secs(), scope = "this node", action = action,
+            blocked_secs = blocked.as_secs(), recovery_priority = priority, scope = "this node", action = action,
             "successor session blocked: predecessor state not recovered through its seal");
+    }
+
+    /// Whether this blocked successor's archive recoveries go first: for a
+    /// worker seated in the session it would start, unless its allocation
+    /// of the shard has ended at the latest GLOBAL frame (left past its
+    /// notice, expired, rejected or kicked). A seated member still in
+    /// deferred activation, or serving its leave notice, counts toward its
+    /// session's quorum. An unseated worker still recovers, in arrival
+    /// order, so seated members' recoveries go before its (an operator's
+    /// node: a worker whose allocation was leaving queued its checkpoint
+    /// install as a blocked successor).
+    fn successor_priority(&self) -> bool {
+        if self.start_context.not_seated.is_some() {
+            return false;
+        }
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        let own: Vec<_> = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
+            .map(|prover| prover.allocations.into_iter().filter(|a| a.confirmation_filter == self.filter)
+                .map(|a| a.effective_status(global_frame)).collect())
+            .unwrap_or_default();
+        own.is_empty() || own.into_iter().any(|status| !status.is_terminal() && !status.is_expired())
     }
 
     /// Follow a consensus start attempt: whether it left this successor
@@ -4360,6 +4438,7 @@ impl AppConsensusEngine {
                         }
                         Some(AppEngineMessage::ReanchorFence { reply }) => {
                             use crate::prover_tree_syncer::ReanchorAttempt;
+                            self.absorb_reanchor_yield();
                             let attempt = match self.owed_reanchor_now() {
                                 Ok(Some(marker)) if self.fence_reanchor.take_attempt(std::time::Instant::now()) => {
                                     ReanchorAttempt::Take(marker.fence)
@@ -4372,6 +4451,7 @@ impl AppConsensusEngine {
                                 // attempt goes to the next one.
                                 self.fence_reanchor.rearm();
                             }
+                            self.publish_reanchor_armed();
                         }
                         Some(AppEngineMessage::ReanchorFailed { reason }) => {
                             self.fence_reanchor.outcome();
@@ -10317,6 +10397,10 @@ const FENCE_REANCHOR_HUNG: Duration = Duration::from_secs(30 * 60);
 /// shard's trees.
 const MISMATCH_REANCHOR_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
+/// How often a shard sync waiting on the engine's installation of its
+/// checkpoint warns while it waits.
+const INSTALL_REPLY_WARN: Duration = Duration::from_secs(10 * 60);
+
 /// Why an owed re-anchor waits when no shard sync took its last request.
 const REANCHOR_UNTAKEN: &str = "no shard sync took the requested attempt";
 
@@ -11164,18 +11248,20 @@ mod tests {
 
     /// A successor whose start waits on its predecessor's state takes the
     /// next recovery turn, though its recovery queued before the refusal.
-    #[tokio::test]
-    async fn a_blocked_successor_start_moves_its_queued_recovery_first() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// An engine for tests over `registry`, with its handle and the
+    /// receiver of its events.
+    fn test_engine(
+        registry: Arc<crate::test_support::TestProverRegistry>,
+    ) -> (AppConsensusEngine, AppEngineHandle, mpsc::UnboundedReceiver<AppEngineEvent>) {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
-        let (events, _received) = mpsc::unbounded_channel();
+        let (events, received) = mpsc::unbounded_channel();
         let private = [7; 57];
         let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
         let deps = AppEngineDeps {
             delivery_frame_source: None,
             clock_store: clock, global_anchor_store: None, global_hypergraph: None,
-            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            prover_registry: registry,
             frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
             message_collector: Arc::new(MessageCollector::new()),
             fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
@@ -11186,23 +11272,106 @@ mod tests {
             execution_engine: None, inclusion_prover: None, kv_db: None,
             app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
         };
-        let (mut engine, handle) =
-            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        let (engine, handle) = AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        (engine, handle, received)
+    }
+
+    /// This node's prover (`test_engine`'s), allocated to the engine's shard
+    /// with `status`.
+    fn local_prover(status: quil_types::consensus::ProverStatus) -> quil_types::consensus::ProverInfo {
+        use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
+        ProverInfo {
+            public_key: vec![], address: vec![1; 32], status: ProverStatus::Active, kick_frame_number: 0,
+            allocations: vec![ProverAllocationInfo {
+                status, confirmation_filter: quil_execution::domains::QUIL_TOKEN.to_vec(), rejection_filter: vec![],
+                join_frame_number: 0, leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
+                kick_frame_number: 0, join_confirm_frame_number: 0, join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0, leave_reject_frame_number: 0, last_active_frame_number: 0,
+                last_signed_frame_number: 0, epoch: u64::MAX, ring: 0, vertex_address: vec![],
+            }],
+            available_storage: 0, seniority: 0, delegate_address: vec![],
+        }
+    }
+
+    /// A blocked successor's recoveries go first for a worker seated in its
+    /// session, joining and leaving members included, unless its allocation
+    /// ended; an unseated worker still recovers, in arrival order.
+    #[tokio::test]
+    async fn an_unseated_or_departed_successor_takes_no_recovery_priority() {
+        use quil_types::consensus::{EffectiveStatus, ProverStatus};
+        use std::sync::atomic::Ordering;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _events) = test_engine(registry.clone());
+        let prover = local_prover;
+        let flag = handle.execution_record().successor_blocked_flag();
+        let pending = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
+        registry.set_prover(prover(ProverStatus::Rejected));
+        engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+        assert!(!flag.load(Ordering::Relaxed), "an ended allocation's recovery waits its turn");
+        for status in [ProverStatus::Leaving, ProverStatus::Joining, ProverStatus::Active] {
+            registry.set_prover(prover(status));
+            engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+            assert!(flag.load(Ordering::Relaxed), "a seated {status:?} member goes first");
+        }
+        engine.start_context.not_seated = Some(NotSeated {
+            allocations: vec![EffectiveStatus::Active], global_frame: 1, release: None, join_wait: None, session_wait: None,
+        });
+        engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+        assert!(!flag.load(Ordering::Relaxed), "an unseated worker's recovery waits its turn");
+    }
+
+    /// An owed re-anchor's requested attempt puts its worker's next shard
+    /// sync first in the recovery turns until a sync takes it, and again
+    /// when the attempt hands its turn back; a finished re-anchor no longer.
+    #[tokio::test]
+    async fn a_requested_reanchor_attempt_goes_first_until_a_sync_takes_it() {
+        use std::sync::atomic::Ordering;
+        let (mut engine, handle, _events) = test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        let flag = handle.execution_record().reanchor_armed_flag();
+        let marker = crate::app_handoff::ReanchorMarker { generation: 2, fence: 1015, from_cursor: 1018, head: None };
+        engine.fence_reanchor.marker = Some(Some(marker));
+        engine.request_fence_reanchor(std::time::Instant::now());
+        assert!(flag.load(Ordering::Relaxed), "a requested attempt goes first");
+        assert!(engine.fence_reanchor.take_attempt(std::time::Instant::now()));
+        engine.publish_reanchor_armed();
+        assert!(!flag.load(Ordering::Relaxed), "a taken attempt no longer waits");
+        handle.execution_record().reanchor_yielded();
+        assert!(flag.load(Ordering::Relaxed), "a handed-back attempt goes first again at once");
+        engine.publish_reanchor_armed();
+        assert!(flag.load(Ordering::Relaxed), "until the engine requests it again");
+        engine.request_fence_reanchor(std::time::Instant::now());
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(engine.fence_reanchor.take_attempt(std::time::Instant::now()), "the next sync takes the attempt");
+        engine.publish_reanchor_armed();
+        assert!(!flag.load(Ordering::Relaxed));
+        engine.finish_reanchor(std::time::Instant::now());
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_successor_start_moves_its_queued_recovery_first() {
+        use std::sync::atomic::Ordering;
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, handle, _received) = test_engine(registry.clone());
         let turns: &'static crate::recovery_turns::RecoveryTurns =
             Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
-        let held = turns.acquire(Arc::new(AtomicBool::new(false)), false).await;
+        let claim = |core: u32, execution: crate::worker_execution::SharedWorkerExecution| crate::recovery_turns::Claim {
+            core, filter: vec![core as u8; 32], kind: crate::recovery_turns::RecoveryKind::Install, execution, ticket: None,
+        };
+        let held = turns.acquire(claim(1, Default::default())).await;
+        registry.set_prover(local_prover(quil_types::consensus::ProverStatus::Active));
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let run = |name: &'static str, blocked: Arc<AtomicBool>| {
+        let run = |name: &'static str, core: u32, execution: crate::worker_execution::SharedWorkerExecution| {
             let order = order.clone();
             tokio::spawn(async move {
-                let _turn = turns.acquire(blocked, false).await;
+                let _turn = turns.acquire(claim(core, execution)).await;
                 order.lock().unwrap().push(name);
             })
         };
-        let other = run("other", Arc::new(AtomicBool::new(false)));
+        let other = run("other", 2, Default::default());
         tokio::task::yield_now().await;
         let successor_flag = handle.execution_record().successor_blocked_flag();
-        let successor = run("successor", successor_flag.clone());
+        let successor = run("successor", 3, handle.execution_record().clone());
         tokio::task::yield_now().await;
         let pending = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
         engine.note_predecessor_block(Some(&pending), std::time::Instant::now());

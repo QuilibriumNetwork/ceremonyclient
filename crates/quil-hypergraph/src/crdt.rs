@@ -128,6 +128,10 @@ pub struct ForestSyncPlan {
 impl ForestSyncPlan {
     pub fn remaining(&self) -> &[([u8; 32], Option<Vec<u8>>)] { &self.leaves[self.next..] }
     pub fn target_root(&self) -> [u8; 32] { self.target_root }
+    /// Whether a sync prepared afresh resumes from the chunks this plan
+    /// installed: it diffs against them. A repair of legacy state audits
+    /// every leaf again, so stopping it part way loses its progress.
+    pub fn resumable(&self) -> bool { !self.repair_existing }
 }
 
 /// The local tree moved under a sync in progress (see

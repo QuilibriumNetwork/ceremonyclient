@@ -901,7 +901,7 @@ impl WorkerOnlyNode {
                                                     biased;
                                                     _ = cancel.cancelled() => {},
                                                     _ = target.execution_record().recovering(&filter, crate::prover_tree_syncer::recover_shard_from_latest(
-                                                        syncer.as_ref(), &filter, local, &target, None,
+                                                        syncer.as_ref(), &filter, local, &target, None, None,
                                                     )) => {}
                                                 }
                                             });

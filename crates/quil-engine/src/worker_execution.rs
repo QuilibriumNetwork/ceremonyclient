@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 
 use crate::prover_tree_syncer::{ReplayTurn, ShardRecoveryProgress};
+use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
 
 tokio::task_local! {
     /// The record of the worker whose archive recovery runs on this task.
@@ -62,6 +63,41 @@ pub struct SharedWorkerExecution {
     successor_blocked: Arc<AtomicBool>,
     /// Failed recovery attempts by shard.
     streaks: Arc<Mutex<HashMap<Vec<u8>, FailureStreak>>>,
+    /// This worker's shard owes a re-anchor whose requested attempt no
+    /// shard sync has taken yet.
+    reanchor_armed: Arc<AtomicBool>,
+    /// An attempt of the owed re-anchor handed its turn back, and the
+    /// engine has not yet requested the attempt again.
+    reanchor_yield: Arc<AtomicBool>,
+    /// The archive recovery turn this worker's recovery holds.
+    turn: Arc<Mutex<TurnHold>>,
+}
+
+/// An archive recovery turn as its holder's recovery sees it
+/// ([`crate::recovery_turns`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TurnHold {
+    /// When it was granted; `None` while none is held.
+    pub(crate) since: Option<tokio::time::Instant>,
+    pub(crate) kind: RecoveryKind,
+    /// Its hold limit passed: the recovery hands it back at its next chunk
+    /// boundary ([`recovery_turn_spent`]).
+    pub(crate) yielding: bool,
+}
+
+/// What a tree sync returns when its recovery hands its turn back at the
+/// hold limit ([`recovery_turn_spent`]).
+pub const RECOVERY_TURN_SPENT: &str =
+    "archive recovery turn reached its hold limit; the installed leaves stay and the next turn resumes from them";
+
+/// The error a tree sync returns when its recovery hands its turn back.
+pub fn turn_spent_error() -> quil_types::error::QuilError {
+    quil_types::error::QuilError::ExecutionUnavailable(RECOVERY_TURN_SPENT.into())
+}
+
+/// Whether `error` is a turn handed back ([`turn_spent_error`]), not a failure.
+pub fn turn_spent(error: &quil_types::error::QuilError) -> bool {
+    matches!(error, quil_types::error::QuilError::ExecutionUnavailable(m) if m == RECOVERY_TURN_SPENT)
 }
 
 impl SharedWorkerExecution {
@@ -75,6 +111,54 @@ impl SharedWorkerExecution {
     /// The flag behind [`Self::set_successor_blocked`], read by the recovery
     /// turn queue each time it grants a turn.
     pub(crate) fn successor_blocked_flag(&self) -> Arc<AtomicBool> { self.successor_blocked.clone() }
+
+    /// Whether this worker's shard owes a re-anchor whose requested attempt
+    /// waits for a shard sync to take it. That sync takes the next recovery
+    /// turn before others.
+    pub fn set_reanchor_armed(&self, armed: bool) {
+        self.reanchor_armed.store(armed, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_reanchor_armed`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn reanchor_armed_flag(&self) -> Arc<AtomicBool> { self.reanchor_armed.clone() }
+
+    /// An attempt of the owed re-anchor handed its turn back at the hold
+    /// limit: its recovery queues again first, and the engine requests the
+    /// attempt again when it next looks ([`Self::take_reanchor_yield`]). A
+    /// flag rather than a message, which a full mailbox would drop.
+    pub(crate) fn reanchor_yielded(&self) {
+        self.reanchor_yield.store(true, Ordering::Relaxed);
+        self.reanchor_armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a re-anchor attempt handed its turn back since the engine
+    /// last looked; clears it.
+    pub(crate) fn take_reanchor_yield(&self) -> bool {
+        self.reanchor_yield.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether a re-anchor attempt handed its turn back and the engine has
+    /// not looked since.
+    pub(crate) fn reanchor_yield_pending(&self) -> bool {
+        self.reanchor_yield.load(Ordering::Relaxed)
+    }
+
+    /// This worker's recovery holds a turn from `since`, to do `kind`.
+    pub(crate) fn hold_turn(&self, kind: RecoveryKind, since: tokio::time::Instant) {
+        *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            TurnHold { since: Some(since), kind, yielding: false };
+    }
+
+    /// The turn this worker's recovery holds, if any.
+    pub(crate) fn turn(&self) -> TurnHold {
+        *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The turn was released: how it was held.
+    pub(crate) fn end_turn(&self) -> TurnHold {
+        std::mem::take(&mut *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
 
     pub fn snapshot(&self) -> WorkerExecution { self.record.lock().unwrap().clone() }
 
@@ -179,7 +263,8 @@ impl SharedWorkerExecution {
     /// Run one recovery attempt of `filter`, attributing the phases, source
     /// and leaf progress reported on this task to this worker, then record
     /// and log how it ended. A recovery that found nothing usable is an
-    /// error, not an outcome. A deferred one (`ShardRecoveryProgress::Deferred`)
+    /// error, not an outcome; one that handed its turn back at the hold limit
+    /// (`ShardRecoveryProgress::Yielded`) installed leaves, an outcome. A deferred one (`ShardRecoveryProgress::Deferred`)
     /// attempted nothing: the record is left as it was, and neither the
     /// shard's failure streak nor the node's archive state hears of it.
     pub(crate) async fn recovering(
@@ -462,6 +547,45 @@ pub fn recovery_phase(phase: &'static str) {
     let _ = RECOVERING.try_with(|s| s.recovery(|r, now| enter(r, phase, now)));
 }
 
+/// What the recovery on this task does with its turn, once it knows: a
+/// sync that takes an owed re-anchor's attempt re-anchors. Elsewhere
+/// nothing.
+pub(crate) fn recovery_kind(kind: RecoveryKind) {
+    let _ = RECOVERING.try_with(|s| s.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).kind = kind);
+}
+
+/// Whether the recovery on this task hands its archive recovery turn back
+/// now, at a chunk or phase boundary of its tree sync: it has held the turn
+/// for [`MAX_TURN_HOLD`] and installed leaves in it, so every turn makes
+/// progress and the next resumes from it. Elsewhere, or without a turn,
+/// false.
+pub fn recovery_turn_spent() -> bool {
+    RECOVERING.try_with(|s| {
+        let installed = s.record.lock().unwrap().recovery.as_ref().is_some_and(|r| r.attempt_installed_leaves > 0);
+        let mut turn = s.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spent = installed && turn.since.is_some_and(|since| since.elapsed() >= MAX_TURN_HOLD);
+        turn.yielding |= spent;
+        spent
+    }).unwrap_or(false)
+}
+
+/// Run `attempt` as the recovery of `execution`'s worker holding a turn
+/// granted `held` ago, with no leaves installed in it yet: a test of a tree
+/// sync in another crate sees [`recovery_turn_spent`] as a recovery would.
+#[doc(hidden)]
+pub async fn with_recovery_turn<T>(
+    execution: &SharedWorkerExecution,
+    held: Duration,
+    attempt: impl std::future::Future<Output = T>,
+) -> T {
+    let now = tokio::time::Instant::now();
+    execution.hold_turn(RecoveryKind::Install, now.checked_sub(held).unwrap_or(now));
+    execution.recovery(|r, _| r.attempt_installed_leaves = 0);
+    let result = RECOVERING.scope(execution.clone(), attempt).await;
+    execution.end_turn();
+    result
+}
+
 /// `installed` of the `planned` leaves of forest phase `tree_phase`, in the
 /// tree the recovery on this task is installing; elsewhere (prover-tree and
 /// archive syncs) nothing.
@@ -516,6 +640,34 @@ mod tests {
         assert!(execution.snapshot().blocker.is_empty());
         execution.consensus_phase(true, false, None, None);
         assert_eq!(execution.snapshot().state, "serving", "legacy hosts have no session seal");
+    }
+
+    /// A recovery hands its turn back only once it has held it for the
+    /// limit and installed leaves in it; elsewhere nothing is spent.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_is_spent_after_the_hold_limit_and_an_installed_chunk() {
+        assert!(!recovery_turn_spent(), "no recovery runs on this task");
+        let worker = SharedWorkerExecution::default();
+        let result = worker.recovering(&[7; 32], async {
+            assert!(!recovery_turn_spent(), "no turn is held");
+            worker.hold_turn(RecoveryKind::Install, tokio::time::Instant::now());
+            tokio::time::advance(MAX_TURN_HOLD).await;
+            assert!(!recovery_turn_spent(), "nothing installed in this turn yet");
+            assert!(!worker.turn().yielding);
+            recovery_installed(1_024);
+            assert!(recovery_turn_spent());
+            assert!(worker.turn().yielding);
+            recovery_kind(RecoveryKind::Reanchor);
+            assert_eq!(worker.turn().kind, RecoveryKind::Reanchor);
+            Ok(ShardRecoveryProgress::Yielded)
+        }).await;
+        assert_eq!(result.unwrap(), ShardRecoveryProgress::Yielded);
+        let r = worker.snapshot().recovery.unwrap();
+        assert_eq!((r.consecutive_failures, r.last_outcome.as_str()), (0, RECOVERY_TURN_SPENT), "a handed-back turn is progress");
+        assert!(turn_spent(&turn_spent_error()));
+        assert!(!turn_spent(&quil_types::error::QuilError::ExecutionUnavailable("archive connect: refused".into())));
+        assert!(worker.end_turn().yielding);
+        assert!(worker.turn().since.is_none());
     }
 
     #[tokio::test]
