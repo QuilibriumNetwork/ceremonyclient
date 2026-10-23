@@ -1295,17 +1295,43 @@ pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<Effe
 /// state even when it carries no certificate of its own (a frame final only
 /// through a descendant, or a sealed session's last frame).
 pub fn committed_frame_digest(global: &Arc<HypergraphCrdt>, filter: &[u8], number: u64) -> Result<Option<[u8; 32]>> {
-    let view = CommittedView::capture(global)?;
-    let Some(head) = handoff::head(&view, filter)? else { return Ok(None) };
+    committed_frame_digest_in(&CommittedView::capture(global)?, filter, number, false)
+}
+
+/// [`committed_frame_digest`], with the origins taken as [`effective_origins`]
+/// gives them: a same-filter session sealed or fenced at its base, never
+/// having run, is looked through to the checkpoint below it. A shard whose
+/// successors each closed at the sealed checkpoint without a frame of their
+/// own has only such sessions as direct origins, which name no frame.
+pub fn committed_frame_digest_looked_through(
+    global: &Arc<HypergraphCrdt>,
+    filter: &[u8],
+    number: u64,
+) -> Result<Option<[u8; 32]>> {
+    committed_frame_digest_in(&CommittedView::capture(global)?, filter, number, true)
+}
+
+fn committed_frame_digest_in(
+    view: &CommittedView,
+    filter: &[u8],
+    number: u64,
+    look_through: bool,
+) -> Result<Option<[u8; 32]>> {
+    let Some(head) = handoff::head(view, filter)? else { return Ok(None) };
     let tip_of = |session: &Session| -> Result<Option<[u8; 32]>> {
-        Ok(handoff::session_tip(&view, &session.id()?)?
+        Ok(handoff::session_tip(view, &session.id()?)?
             .filter(|tip| tip.frame == number)
             .map(|tip| tip.digest))
     };
     if let Some(digest) = tip_of(&head)? {
         return Ok(Some(digest));
     }
-    for (source, checkpoint) in handoff::origins(&view, &head.id()?)? {
+    let origins = match look_through.then(|| effective_origins(view, &head)) {
+        Some(Ok(effective)) => effective.origins,
+        Some(Err(QuilError::ExecutionUnavailable(_))) | None => handoff::origins(view, &head.id()?)?,
+        Some(Err(error)) => return Err(error),
+    };
+    for (source, checkpoint) in origins {
         if source.filter != filter {
             continue;
         }
@@ -1331,6 +1357,17 @@ pub fn committed_tip(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Opti
     let view = CommittedView::capture(global)?;
     let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
     Ok(Some(handoff::session_tip(&view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
+}
+
+/// [`committed_tip`] of each of `filters` that has a session, read from one
+/// committed view; a filter whose records cannot be read is left out.
+pub fn committed_tips(global: &Arc<HypergraphCrdt>, filters: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, u64)>> {
+    let view = CommittedView::capture(global)?;
+    Ok(filters.iter().filter_map(|filter| {
+        let session = handoff::head(&view, filter).ok()??;
+        let tip = handoff::session_tip(&view, &session.id().ok()?).ok()?;
+        Some((filter.clone(), tip.map_or(session.base_frame, |tip| tip.frame)))
+    }).collect())
 }
 
 /// Whether `ended`, a session of `filter`, is one the current session was
@@ -3957,6 +3994,21 @@ mod successor_tests {
         let committed = |frame| anchor_is_committed(&past.global, &past.filter, &frame).unwrap();
         assert!(committed(header_frame(&past.filter, 3, 0x33)), "the fenced frame, looked through to");
         assert!(!committed(header_frame(&past.filter, 3, 0x34)));
+    }
+
+    // A sealed or fenced frame stays committed when the successors based at
+    // it each closed there without a frame: looked through, their origin's
+    // checkpoint names it. Only that frame, under its own digest.
+    #[test]
+    fn a_checkpoint_under_sessions_closed_at_their_base_keeps_its_committed_digest() {
+        let past = past_fence();
+        past.fence_successor_at_its_base();
+        assert_eq!(committed_frame_digest(&past.global, &past.filter, 3).unwrap(), None);
+        assert_eq!(committed_frame_digest_looked_through(&past.global, &past.filter, 3).unwrap(),
+            Some(past.fenced_digest), "the checkpoint the closed successor was based at");
+        for (filter, number) in [(past.filter.clone(), 2), (past.filter.clone(), 4), (vec![0x08; 32], 3)] {
+            assert_eq!(committed_frame_digest_looked_through(&past.global, &filter, number).unwrap(), None);
+        }
     }
 
     // The anchor an attempt validated as GLOBAL's executed tip is accepted

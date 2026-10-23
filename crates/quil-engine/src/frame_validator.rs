@@ -1390,6 +1390,21 @@ impl BlsAppFrameValidator {
         self.validate_with_mode(frame, false, false)
     }
 
+    /// Whether `frame` is the frame GLOBAL committed for its shard at its
+    /// number, by the digest of its output
+    /// ([`crate::app_handoff::committed_frame_digest_looked_through`]):
+    /// GLOBAL verified that frame's certificate, or the seal that made it
+    /// final, so it is authenticated without a certificate of its own.
+    /// False without a handoff authority.
+    pub fn committed_by_global(&self, frame: &AppShardFrame) -> bool {
+        let (Some(global), Some(header)) = (self.handoff_authority.as_ref(), frame.header.as_ref()) else {
+            return false;
+        };
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        crate::app_handoff::committed_frame_digest_looked_through(global, &header.address, header.frame_number)
+            .ok().flatten() == Some(digest)
+    }
+
     /// A notarized frame used as the parent of the next proposal (a private
     /// parent and its unfinalized ancestors): validated as a proposal, and
     /// without possession when the only failure is a registration this node

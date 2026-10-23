@@ -518,7 +518,11 @@ where
             .is_some_and(|signature| !signature.signature.is_empty());
         let mut descendants = Vec::new();
         let mut bytes = frame.encoded_len();
-        if !certified(&frame) {
+        // GLOBAL's committed tip has no certified frame after it within the
+        // target when a seal made it final (a sealed session's last frame):
+        // `replay` authenticates it alone, by the digest GLOBAL committed.
+        let sealed_tip = next == committed && next == target;
+        if !certified(&frame) && !sealed_tip {
             for offset in 1..=crate::frame_validator::MAX_REPLAY_DESCENDANTS {
                 let number = next.checked_add(offset as u64)
                     .filter(|number| *number <= target)
@@ -1268,6 +1272,51 @@ mod tests {
         let missing = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(150),
             |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap_err();
         assert!(missing.to_string().contains("missing shard frame 141"), "{missing}");
+    }
+
+    /// An archive serving frames through 130, and frame 131 without a
+    /// certificate (a sealed session's last frame), reporting `tip` as latest.
+    struct SealedTipArchive { tip: u64 }
+
+    #[async_trait]
+    impl ProverTreeSyncer for SealedTipArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            let number = if number == 0 { self.tip } else { number };
+            Ok((number <= 131).then(|| {
+                let mut served = frame(number);
+                if number == 131 { served.header.as_mut().unwrap().public_key_signature_bls48581 = None; }
+                served
+            }))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+    }
+
+    /// GLOBAL's committed tip, made final by a seal, has no certified frame
+    /// after it: it is handed to `replay` alone, which authenticates it by
+    /// the digest GLOBAL committed. Replay used to stop at it for want of a
+    /// certified descendant, whether the archive's tip was the frame below
+    /// it or the frame itself (…091f80, frame 4693, 2026-10-20). Any other
+    /// frame without a certificate still needs a certified descendant.
+    #[tokio::test]
+    async fn replay_hands_the_committed_sealed_tip_alone() {
+        for tip in [130, 131] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let result = replay_shard_from_latest(&SealedTipArchive { tip }, &[5; 32], frame(130), 130, Some(131),
+                move |frame, descendants| {
+                    let height = frame.header.unwrap().frame_number;
+                    seen.lock().unwrap().push((height, descendants.len()));
+                    async move { Ok(height) }
+                }).await.unwrap();
+            assert_eq!(result, ShardReplay { materialized: 131, archive_tip: Some(tip), target: 131 });
+            assert_eq!(*calls.lock().unwrap(), vec![(131, 0)]);
+        }
+        for committed in [Some(130), None, Some(132)] {
+            let error = replay_shard_from_latest(&SealedTipArchive { tip: 131 }, &[5; 32], frame(130), 130, committed,
+                |_, _| async { panic!("an unauthenticated frame must not reach replay") }).await.unwrap_err();
+            assert!(error.to_string().contains("descendant"), "{error}");
+        }
     }
 
     /// Rotate across peer responses even when the local head already covers

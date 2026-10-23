@@ -3322,6 +3322,9 @@ impl AppConsensusEngine {
                 validate_certified_frame(&validator, frame, retained)
             }).await;
         }
+        if descendants.is_empty() {
+            return self.replay_committed_frame(frame).await;
+        }
         // Authenticate the terminal certificate and every intermediate body
         // and selector before replaying anything. Simplex finalizes ancestors,
         // which may span several headers without certificates of their own.
@@ -3384,6 +3387,68 @@ impl AppConsensusEngine {
             frame: Some(number), global_frame: None, at_unix_ms: crate::worker_execution::now_ms(),
             cause: "archive replay frame refused", error: error.to_string(),
         });
+    }
+
+    /// Replay `frame`, which has no certificate of its own and no certified
+    /// frame after it, when it is the frame GLOBAL committed for this shard
+    /// at its number
+    /// ([`crate::app_handoff::committed_frame_digest_looked_through`]): a
+    /// sealed session's last frame, final through the seal's certificate,
+    /// which GLOBAL verified. Its members apply and gossip it without a
+    /// certificate, and no certified frame of its session follows it, so a
+    /// successor replaying to the sealed checkpoint refused it for want of a
+    /// certified descendant (…091f80 at frame 4693, 2026-10-20). Its GLOBAL
+    /// anchor and storage history are prepared before it is validated as a
+    /// frame final through its child: structure, output and body. A frame
+    /// whose digest is not the committed one is refused.
+    async fn replay_committed_frame(&mut self, frame: quil_types::proto::global::AppShardFrame) -> Result<u64> {
+        let header = frame.header.as_ref().ok_or_else(|| {
+            QuilError::InvalidArgument("archive replay frame has no header".into())
+        })?;
+        let number = header.frame_number;
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
+        let committed = match self.global_hypergraph.as_ref() {
+            Some(global) if header.address == self.filter => {
+                crate::app_handoff::committed_frame_digest_looked_through(global, &self.filter, number)?
+            }
+            _ => None,
+        };
+        if committed != Some(digest) {
+            return Err(QuilError::InvalidSignature(format!(
+                "archive replay frame has no certified descendant, and frame {number} is not \
+                 the frame GLOBAL committed at its number"
+            )));
+        }
+        let validator = self.frame_validator();
+        let retained = match validator.prepare_storage_history_of_linked(&frame).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(frame = number, %error,
+                    "storage history of a frame GLOBAL committed unavailable; validating it without possession");
+                false
+            }
+        };
+        if !self.body_matches_requests_root(&frame) {
+            return Err(QuilError::InvalidArgument(format!(
+                "archive replay frame {number}: body does not match its requests root"
+            )));
+        }
+        let materialized = self.last_materialized_frame;
+        let replayed = self.replay_archive_frame_with(frame, None, |frame| {
+            if retained {
+                return validate_app_frame_panic_safe(&validator, frame, true);
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_linked_without_storage(frame))) {
+                Ok(result) => result,
+                Err(_) => Err(QuilError::Internal("committed frame validation panicked".into())),
+            }
+        }).await?;
+        if number > materialized {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), frame = number,
+                digest = hex::encode(&digest[..4]),
+                "archive replay materialized the frame GLOBAL committed, which has no certificate of its own");
+        }
+        Ok(replayed)
     }
 
     /// Replay `frame`, authenticated by `validate`; `terminal` is the
@@ -12080,10 +12145,11 @@ mod tests {
     }
 
     /// [`engine_with_session_based_at_seven`], where GLOBAL has also sealed
-    /// generation 2 at frame `later` and authorized generation 3 based on it,
-    /// when `later` is given: the engine's lineage then ends below the head
-    /// session's predecessor seal.
-    fn engine_with_sessions_from_seven(local_output: u8, later: Option<u64>) -> (
+    /// generation 2 at frame `later` with checkpoint digest `digest` and
+    /// authorized generation 3 based on it, when `(later, digest)` is given:
+    /// the engine's lineage then ends below the head session's predecessor
+    /// seal.
+    fn engine_with_sessions_from_seven(local_output: u8, later: Option<(u64, [u8; 32])>) -> (
         AppConsensusEngine, quil_types::proto::global::AppShardFrame, [u8; 32], Arc<quil_hypergraph::HypergraphCrdt>,
     ) {
         use quil_cw_consensus::handoff::{Checkpoint, Seal};
@@ -12129,14 +12195,14 @@ mod tests {
         commit(4);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!((successor.generation, successor.base_frame), (2, 7));
-        if let Some(later) = later {
+        if let Some((later, digest)) = later {
             let request = handoff::schedule(&state, 5, vec![filter.clone()],
                 vec![DesiredCommittee { filter: filter.clone(), members }]).unwrap();
             commit(5);
             let seal = Seal {
                 request: request.id().unwrap(), session: successor.id().unwrap(), view: 19,
                 checkpoint: Checkpoint {
-                    frame: later, view: 15, digest: quil_crypto::poseidon::hash_bytes_to_32(&[0x50; 32]).unwrap(),
+                    frame: later, view: 15, digest,
                     state_roots: [[1; 32]; 4], history_root: [0; 32],
                 },
             };
@@ -12261,13 +12327,65 @@ mod tests {
         assert_eq!(error, no_state);
     }
 
+    /// A sealed session's last frame has no certificate of its own and no
+    /// certified frame after it: the digest GLOBAL committed for it at the
+    /// seal authenticates it alone, and it is then validated as a frame final
+    /// through its child. Archive replay refused it for want of a certified
+    /// descendant, so every successor stalled below the seal (…091f80, frame
+    /// 4693, 2026-10-20). A frame of another digest is refused before any
+    /// validation, and a frame of the committed digest is still validated.
+    #[tokio::test]
+    async fn archive_replay_takes_a_sealed_last_frame_by_the_digest_global_committed() {
+        let parent = quil_crypto::poseidon::hash_bytes_to_32(&[0x43; 32]).unwrap();
+        let sealed_frame = |timestamp: i64| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: quil_execution::domains::QUIL_TOKEN.to_vec(), frame_number: 8, rank: 9, timestamp,
+                parent_selector: parent.to_vec(), state_roots: vec![vec![1; 32]; 4], ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector, &header.requests_root, &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(0, &[]), header.frame_number, header.rank,
+                &header.prover, header.difficulty, header.fee_multiplier_vote, header.timestamp,
+                &header.storage_attestation_root,
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                &header.settlements, &header.accumulator, &header.spends,
+            ).to_vec();
+            quil_types::proto::global::AppShardFrame { header: Some(header), ..Default::default() }
+        };
+        let digest = |frame: &quil_types::proto::global::AppShardFrame|
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap();
+        let (sealed, other) = (sealed_frame(1), sealed_frame(2));
+        let no_state = "execution unavailable: archive replay has no local state";
+        let refused = "archive replay frame has no certified descendant, and frame 8 is not the frame GLOBAL committed";
+
+        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, digest(&sealed))));
+        let error = engine.replay_archive_frame(sealed.clone(), Vec::new()).await.unwrap_err().to_string();
+        assert_eq!(error, no_state, "authenticated, validated and linked; only the fixture's local state is missing");
+        let error = engine.replay_archive_frame(other, Vec::new()).await.unwrap_err().to_string();
+        assert!(error.contains(refused), "{error}");
+
+        // Nothing GLOBAL committed at frame 8: refused.
+        let (mut engine, _, _, _) = engine_with_session_based_at_seven(0x43);
+        let error = engine.replay_archive_frame(sealed, Vec::new()).await.unwrap_err().to_string();
+        assert!(error.contains(refused), "{error}");
+
+        // The committed digest of a frame whose output its header does not
+        // produce: authenticated, then refused by validation.
+        let mut forged = sealed_frame(1);
+        forged.header.as_mut().unwrap().output = vec![0x50; 32];
+        let (mut engine, _, _, _) = engine_with_sessions_from_seven(0x43, Some((8, digest(&forged))));
+        let error = engine.replay_archive_frame(forged, Vec::new()).await.unwrap_err().to_string();
+        assert!(error.contains("deterministic output does not match header"), "{error}");
+    }
+
     /// A worker whose lineage ended at a session's base while that session
     /// ran on, sealed and handed over to another: its next frame is still the
     /// first frame of the session based at its head, not of GLOBAL's head
     /// session, and links to that session's genesis.
     #[tokio::test]
     async fn archive_replay_links_a_first_frame_below_the_head_sessions_seal() {
-        let (mut engine, _, genesis, _) = engine_with_sessions_from_seven(0x43, Some(12));
+        let (mut engine, _, genesis, _) = engine_with_sessions_from_seven(0x43,
+            Some((12, quil_crypto::poseidon::hash_bytes_to_32(&[0x50; 32]).unwrap())));
         let no_state = "execution unavailable: archive replay has no local state";
         let first = uncertified_frame(8, &genesis);
         let error = engine.replay_archive_frame_with(first.clone(), Some(&certified_frame_nine(2)), |_| Ok(true)).await

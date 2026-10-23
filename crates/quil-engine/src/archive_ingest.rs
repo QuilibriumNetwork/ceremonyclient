@@ -79,6 +79,13 @@ pub struct ArchiveAppShardIngest {
     /// How long a provably empty frame's body is sought before the frame is
     /// materialized from its certified header ([`EMPTY_FRAME_BODY_GRACE`]).
     empty_body_grace: Duration,
+    /// The shards allocated provers serve, whose committed GLOBAL tips
+    /// [`Self::request_committed_tips`] compares with what this archive serves.
+    prover_registry: Arc<dyn ProverRegistryTrait>,
+    /// When [`Self::request_committed_tips`] last compared them.
+    last_tip_scan: Option<Instant>,
+    /// Shards whose committed GLOBAL tip this archive does not serve.
+    missing_tips: HashMap<Vec<u8>, MissingTip>,
     #[cfg(test)]
     skip_header_authentication: bool,
 }
@@ -104,6 +111,26 @@ const _: () = assert!(PREFETCH_DEPTH < MAX_BUFFERED_FRAMES_PER_SHARD as u64);
 /// links to them. Keyed by output identity, so a well-formed impostor cannot
 /// displace the real frame at the same height.
 const MAX_HELD_FRAMES_PER_SHARD: usize = 32;
+/// How often an archive compares each shard's committed GLOBAL tip with the
+/// frame it serves ([`ArchiveAppShardIngest::request_committed_tips`]).
+const COMMITTED_TIP_SCAN: Duration = Duration::from_secs(60);
+/// How often the frame at a shard's committed tip is asked for while this
+/// archive does not serve it.
+const COMMITTED_TIP_ASK: Duration = Duration::from_secs(300);
+/// How long that frame stays missing before a warning, and between warnings.
+const COMMITTED_TIP_WARN: Duration = Duration::from_secs(3600);
+
+/// A shard's committed GLOBAL tip this archive does not serve, since when,
+/// and when it was last asked for and warned about.
+struct MissingTip {
+    tip: u64,
+    served: u64,
+    since: Instant,
+    asked: Option<Instant>,
+    asks: u32,
+    warned: Option<Instant>,
+}
+
 /// How long GLOBAL execution waits for the body of a frame whose certified
 /// header proves it carried no requests before materializing it from that
 /// header. Every gap-fetch round in the meantime asks every member and archive.
@@ -127,6 +154,9 @@ impl ArchiveAppShardIngest {
             // (frame_validator: deterministic-output) hard-errors and the
             // archive rejects every post-genesis app frame at ingest, so it
             // never materializes app-shard state.
+            prover_registry: prover_registry.clone(),
+            last_tip_scan: None,
+            missing_tips: HashMap::new(),
             validator: Arc::new(
                 BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
                     .with_clock_store(clock_store.clone())
@@ -300,6 +330,11 @@ impl ArchiveAppShardIngest {
     }
 
     pub fn retry_pending(&mut self) {
+        let holding: Vec<_> = self.held.keys().cloned().collect();
+        for address in holding {
+            self.serve_committed_held(&address);
+        }
+        self.request_committed_tips();
         if self.sequenced {
             return;
         }
@@ -435,6 +470,97 @@ impl ArchiveAppShardIngest {
                 buffered.remove(&farthest);
             }
         }
+    }
+
+    /// Serve the frame held without a certificate at `address`'s committed
+    /// tip when it is the frame GLOBAL committed there
+    /// ([`crate::app_handoff::committed_frame_digest_looked_through`]): a
+    /// sealed session's last frame, which the seal's certificate made final.
+    /// No certified frame of its session follows it, so it was never
+    /// admitted, no archive served it, and every successor replaying to the
+    /// seal stopped one frame short (…091f80, frame 4693, 2026-10-20). It
+    /// stays held: serving it neither buffers nor materializes it, which
+    /// only a certified child or GLOBAL's sequencing does.
+    fn serve_committed_held(&self, address: &[u8]) {
+        let Some(held) = self.held.get(address) else { return };
+        let Ok(Some(tip)) = crate::app_handoff::committed_tip(&self.hypergraph, address) else { return };
+        let at_tip = |identity: [u8; 32]| held.contains_key(&(tip, identity));
+        if held.range((tip, [0; 32])..=(tip, [0xff; 32])).next().is_none() {
+            return;
+        }
+        let served = self.clock_store.get_shard_clock_frame(address, tip, false).ok()
+            .and_then(|frame| frame.header)
+            .and_then(|header| quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok());
+        if served.is_some_and(at_tip) {
+            return;
+        }
+        let Ok(Some(digest)) = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, address, tip)
+        else {
+            return;
+        };
+        let Some(frame) = held.get(&(tip, digest)) else { return };
+        self.store_for_serving(frame);
+        info!(address = %hex::encode(address), frame = tip, digest = %hex::encode(&digest[..4]),
+            "archive serves the frame GLOBAL committed without a certificate of its own (a sealed session's last frame)");
+    }
+
+    /// Ask for the frame at each shard's committed GLOBAL tip this archive
+    /// does not serve, on the gap fetch, which asks the shard's members first
+    /// and then archives. An archive stores every frame GLOBAL sequences
+    /// before executing it, so its served tip trails the committed one only
+    /// where GLOBAL committed a frame it never sequenced: a sealed session's
+    /// last frame, final through the seal ([`Self::serve_committed_held`]).
+    /// Gossiped once, that frame was lost to every archive that restarted
+    /// since, and nothing asked for it again (…091f80, frame 4693,
+    /// 2026-10-20). A fetched frame is admitted as any fetched frame is, and
+    /// served only under the digest GLOBAL committed. Each shard is asked at
+    /// most every [`COMMITTED_TIP_ASK`]; a frame still missing after
+    /// [`COMMITTED_TIP_WARN`] is warned about once per that interval.
+    fn request_committed_tips(&mut self) {
+        let Some(sender) = self.gap_requests.clone() else { return };
+        if self.last_tip_scan.is_some_and(|at| at.elapsed() < COMMITTED_TIP_SCAN) {
+            return;
+        }
+        self.last_tip_scan = Some(Instant::now());
+        let global_frame = self.clock_store.get_latest_global_clock_frame().ok()
+            .and_then(|frame| frame.header).map_or(0, |header| header.frame_number);
+        let Ok(summaries) = self.prover_registry.get_prover_shard_summaries(global_frame) else { return };
+        let filters: Vec<Vec<u8>> = summaries.into_iter().map(|summary| summary.filter)
+            .filter(|filter| !filter.is_empty()).collect();
+        let Ok(tips) = crate::app_handoff::committed_tips(&self.hypergraph, &filters) else { return };
+        let mut missing = HashMap::new();
+        for (filter, tip) in tips {
+            let tracked = self.missing_tips.remove(&filter);
+            let served = self.clock_store.get_latest_shard_clock_frame_number(&filter).ok().flatten().unwrap_or(0);
+            if tip == 0 || served >= tip {
+                if let Some(found) = tracked.filter(|found| found.asks > 0) {
+                    info!(filter = %hex::encode(&filter), committed_tip = found.tip, asks = found.asks,
+                        missing_secs = found.since.elapsed().as_secs(),
+                        "archive serves the frame at a shard's committed GLOBAL tip it had asked its members for");
+                }
+                continue;
+            }
+            let now = Instant::now();
+            let mut entry = tracked.filter(|entry| entry.tip == tip)
+                .unwrap_or(MissingTip { tip, served, since: now, asked: None, asks: 0, warned: None });
+            entry.served = served;
+            if entry.asked.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK)
+                && sender.try_send((filter.clone(), tip)).is_ok()
+            {
+                entry.asked = Some(now);
+                entry.asks += 1;
+            }
+            if entry.since.elapsed() >= COMMITTED_TIP_WARN && entry.warned.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN) {
+                entry.warned = Some(now);
+                warn!(filter = %hex::encode(&filter), committed_tip = tip, served_tip = entry.served, asks = entry.asks,
+                    missing_secs = entry.since.elapsed().as_secs(),
+                    "archive cannot find the frame at a shard's committed GLOBAL tip: the shard's members and up to \
+                     8 archives were asked (the gap fetch's line for this frame names each answer); members \
+                     replaying to this tip stay blocked until one serves it");
+            }
+            missing.insert(filter, entry);
+        }
+        self.missing_tips = missing;
     }
 
     /// Store an authenticated frame where this archive serves shard frames
@@ -884,6 +1010,17 @@ where
     Fut: std::future::Future<Output = Option<AppShardFrame>>,
 {
     use quil_types::error::QuilError;
+    // A sealed session's last frame has no certificate of its own and no
+    // certified frame after it; the digest GLOBAL committed for it
+    // authenticates it instead. Its registrations were never prepared: the
+    // search for a descendant stopped first, and validation then refused it
+    // where this archive no longer resolves its GLOBAL anchor's registrations
+    // locally, so the frame the committed-tip request fetched was never held
+    // or served.
+    if !has_certificate(&frame) && validator.committed_by_global(&frame) {
+        let prepared = validator.prepare_storage_history_of_linked(&frame).await;
+        return (vec![frame], prepared);
+    }
     let mut run = vec![frame];
     while let Some(parent) = run.last().filter(|frame| !has_certificate(frame)).and_then(|frame| frame.header.clone()) {
         if run.len() > MAX_LINKED_RUN {
@@ -929,18 +1066,81 @@ mod tests {
     ) -> (ArchiveAppShardIngest, Arc<quil_hypergraph::testing::MemStore>) {
         let store = Arc::new(quil_hypergraph::testing::MemStore::new());
         let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), inclusion.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), inclusion));
+        (fixture_over(crdt, clock), store)
+    }
+
+    /// The fixture over the GLOBAL state `crdt`, serving from `clock` when given.
+    fn fixture_over(
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+    ) -> ArchiveAppShardIngest {
+        fixture_with_registry(crdt, clock, Arc::new(crate::test_support::TestProverRegistry::new()))
+    }
+
+    /// [`fixture_over`] with the prover registry `registry`.
+    fn fixture_with_registry(
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+        registry: Arc<crate::test_support::TestProverRegistry>,
+    ) -> ArchiveAppShardIngest {
+        let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
         let crypto = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
             inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
             crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
         ));
-        (ArchiveAppShardIngest::new(
-            Arc::new(crate::test_support::TestProverRegistry::new()),
+        ArchiveAppShardIngest::new(
+            registry,
             Arc::new(quil_crypto::FalconKeyConstructor),
             Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
             manager, inclusion, crdt, clock.unwrap_or(crypto.clock_store),
-        ), store)
+        )
+    }
+
+    /// GLOBAL state in which `filter`'s first session sealed at frame
+    /// `frame` with checkpoint digest `digest`, and its successor is based
+    /// there without a frame of its own.
+    fn sealed_global(filter: &[u8], frame: u64, digest: [u8; 32]) -> Arc<quil_hypergraph::HypergraphCrdt> {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
+        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
+        use quil_types::crypto::Signer as _;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let signers: Vec<_> = (0..3).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let source = Session {
+            chain_id: [7; 32], filter: filter.to_vec(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(), base_frame: 0,
+            authorization: [0; 32], members: members.clone(),
+        };
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        let commit = |number| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        commit(1);
+        handoff::initialize(&state, 2, &source).unwrap();
+        commit(2);
+        let request = handoff::schedule(&state, 3, vec![filter.to_vec()],
+            vec![DesiredCommittee { filter: filter.to_vec(), members }]).unwrap();
+        commit(3);
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame, view: 5, digest, state_roots: [[1; 32]; 4], history_root: [0; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(4);
+        assert_eq!(crate::app_handoff::committed_tip(&global, filter).unwrap(), Some(frame));
+        global
     }
 
     // These fixtures enter after certificate validation to exercise the gap
@@ -1048,6 +1248,125 @@ mod tests {
         assert_eq!(served(2), Some(frames[1].clone()));
         assert_eq!(served(3), Some(frames[2].clone()));
         assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frames[2]);
+    }
+
+    /// A sealed session's last frame has no certificate of its own and no
+    /// certified frame after it, so it was held and never served, and every
+    /// successor replaying to the seal stopped one frame short (…091f80,
+    /// frame 4693, 2026-10-20). Held at GLOBAL's committed tip under the
+    /// digest the seal committed, it is served, still neither buffered nor
+    /// materialized; an impostor at that height never is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_frame_global_committed_is_stored_for_serving() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        let served = |number| clock.get_shard_clock_frame(&filter, number, false).ok();
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        let mut impostor = frames[2].clone();
+        impostor.header.as_mut().unwrap().output = vec![0xee; 32];
+        ingest.admit(&filter, impostor, false);
+        ingest.retry_pending();
+        assert_eq!(served(3), None, "an impostor at the committed tip is never served");
+        ingest.admit(&filter, frames[2].clone(), false);
+        assert_eq!(served(3), None, "held");
+        ingest.retry_pending();
+        assert_eq!(served(3), Some(frames[2].clone()));
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frames[2]);
+        assert!(ingest.is_held(&filter, 3), "still held");
+        assert!(ingest.buffered.get(&filter).is_some_and(|buffered| !buffered.contains_key(&3)), "never buffered");
+        ingest.retry_pending();
+        assert_eq!(served(3), Some(frames[2].clone()));
+
+        // Under any other committed digest, nothing held is served.
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, [0x33; 32]), Some(clock.clone())).sequenced();
+        ingest.admit(&filter, frames[2].clone(), false);
+        ingest.retry_pending();
+        assert!(clock.get_shard_clock_frame(&filter, 3, false).is_err());
+    }
+
+    /// An archive that lost a sealed session's last frame (it restarted after
+    /// the frame was gossiped) never asked for it again, and no archive
+    /// served it (…091f80, frame 4693, 2026-10-20). A shard whose committed
+    /// GLOBAL tip is above the frame the archive serves gets that frame asked
+    /// for on the gap fetch, at most every few minutes; once fetched and
+    /// served under the committed digest, it is not asked for again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committed_tip_the_archive_does_not_serve_is_asked_for() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        registry.set_summaries(vec![quil_types::consensus::ProverShardSummary {
+            filter: filter.clone(), status_counts: HashMap::new(), total_size: 1,
+        }]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut ingest = fixture_with_registry(sealed_global(&filter, 3, sealed), Some(clock.clone()), registry)
+            .with_gap_fetch(tx).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        ingest.retry_pending();
+        assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 3), "the committed tip above the served frame 2");
+        ingest.last_tip_scan = None;
+        ingest.retry_pending();
+        assert!(rx.try_recv().is_err(), "asked at most once per interval");
+        assert_eq!(ingest.missing_tips.get(&filter).map(|missing| (missing.tip, missing.served, missing.asks)),
+            Some((3, 2, 1)));
+
+        // The fetched frame, without a certificate of its own, is served
+        // under the committed digest; then nothing is missing.
+        ingest.admit(&filter, frames[2].clone(), false);
+        ingest.retry_pending();
+        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        ingest.last_tip_scan = None;
+        ingest.retry_pending();
+        assert!(rx.try_recv().is_err());
+        assert!(ingest.missing_tips.is_empty());
+    }
+
+    /// A gap-fetched frame without a certificate of its own is prepared
+    /// only once its certified descendant is found, which a sealed session's
+    /// last frame never has: its registrations were never prepared, so
+    /// validation could refuse it and the frame was never served. The frame
+    /// GLOBAL committed is prepared at once, without asking for a
+    /// descendant, held and served; any other frame still needs one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gap_fetched_committed_frame_is_prepared_without_a_descendant_and_served() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        let validator = ingest.validator();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let fetch = |number: u64| {
+            asked.lock().unwrap().push(number);
+            async { None }
+        };
+        let (run, prepared) = prepare_gap_fetched(&validator, frames[2].clone(), fetch).await;
+        assert!(prepared.is_ok(), "{prepared:?}");
+        assert!(asked.lock().unwrap().is_empty(), "no descendant is asked for");
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        for frame in run {
+            ingest.admit(&filter, frame, false);
+        }
+        ingest.retry_pending();
+        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+
+        let mut impostor = frames[2].clone();
+        impostor.header.as_mut().unwrap().output = vec![0xee; 32];
+        let (_, prepared) = prepare_gap_fetched(&validator, impostor, fetch).await;
+        assert!(prepared.is_err());
+        assert_eq!(*asked.lock().unwrap(), vec![4], "any other frame still needs its certified descendant");
     }
 
     #[tokio::test(flavor = "multi_thread")]
