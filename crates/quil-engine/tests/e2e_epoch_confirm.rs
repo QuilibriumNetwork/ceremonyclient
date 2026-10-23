@@ -1319,3 +1319,232 @@ async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
     tokio::task::yield_now().await;
     assert_eq!(transport.count.load(Ordering::SeqCst), 2);
 }
+
+/// A transport recording each published prover op: its kind and filters, or
+/// why it did not decode. The publication numbered `fail_call` (from 0) fails.
+struct Recording {
+    calls: std::sync::atomic::AtomicUsize,
+    fail_call: usize,
+    published: Mutex<Vec<std::result::Result<(&'static str, Vec<Vec<u8>>), String>>>,
+}
+
+impl Recording {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_for(&self, calls: usize) {
+        for _ in 0..100 {
+            if self.calls() >= calls {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{} publications, expected {calls}", self.calls());
+    }
+}
+
+#[async_trait::async_trait]
+impl quil_engine::prover_message_transport::ProverMessageTransport for Recording {
+    async fn latest_global_frame_header(&self) -> QResult<gpb::GlobalFrameHeader> {
+        Ok(gpb::GlobalFrameHeader { frame_number: 10, ..Default::default() })
+    }
+    async fn publish_prover_bundle(&self, bytes: Vec<u8>) -> QResult<()> {
+        use quil_execution::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROVER_LEAVE};
+        use quil_execution::global_intrinsic::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
+        use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM};
+        use quil_execution::message_envelope::CanonicalMessageBundle;
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == self.fail_call {
+            return Err(quil_types::error::QuilError::Internal("no archive accepted".into()));
+        }
+        let bundle = CanonicalMessageBundle::from_canonical_bytes(&bytes)?;
+        let inner = &bundle.requests[0].as_ref().expect("one request").inner_bytes;
+        let decoded = match u32::from_be_bytes(inner[..4].try_into().unwrap()) {
+            TYPE_PROVER_CONFIRM => ProverConfirm::from_canonical_bytes(inner).map(|op| ("confirm", op.filters)),
+            TYPE_PROVER_LEAVE => ProverLeave::from_canonical_bytes(inner).map(|op| ("leave", op.filters)),
+            TYPE_PROVER_JOIN => ProverJoin::from_canonical_bytes(inner).map(|op| ("join", op.filters)),
+            _ => ProverReject::from_canonical_bytes(inner).map(|op| ("reject", op.filters)),
+        };
+        self.published.lock().push(decoded.map_err(|e| e.to_string()));
+        Ok(())
+    }
+}
+
+/// A pipeline publishing through a `Recording` whose `fail_call` fails.
+fn recording_rig(fail_call: usize) -> (TestPipelineRig, Arc<Recording>) {
+    let prover = TestProver::generate();
+    let transport = Arc::new(Recording {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_call,
+        published: Mutex::new(Vec::new()),
+    });
+    let test_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let mut rig = build_test_pipeline_with_registry(&prover, test_transport, Arc::new(TestProverRegistry::new()));
+    Arc::get_mut(&mut rig.pipeline).unwrap().transport = transport.clone();
+    (rig, transport)
+}
+
+/// A filter `n` distinct over a few thousand seats.
+fn seat(n: usize) -> Vec<u8> {
+    let mut filter = vec![0xC0; 32];
+    filter[..2].copy_from_slice(&(n as u16).to_be_bytes());
+    filter
+}
+
+/// A prover with more seats due than one confirm decodes (a prover with 105
+/// seats renewed 103 at once; every node refused the confirm and all 103
+/// lapsed) sends them as several confirms each node decodes. A message whose
+/// publication fails is retried alone: the seats already published are not
+/// sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_confirm_is_split_and_a_failed_message_is_retried_alone() {
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    use quil_execution::global_intrinsic::prover_ops::MAX_FILTERS_PER_OP;
+    let (rig, transport) = recording_rig(1);
+
+    // 103 seats: two messages; the second fails to publish.
+    let seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 1 });
+    transport.wait_for(2).await;
+    assert_eq!(*transport.published.lock(), vec![Ok(("confirm", seats[..MAX_FILTERS_PER_OP].to_vec()))]);
+    // The next cycles ask for all 103 again; only the failed message's seats
+    // go out, once its attempt has finished.
+    for _ in 0..100 {
+        rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 2 });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if transport.calls() >= 3 {
+            break;
+        }
+    }
+    transport.wait_for(3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(transport.calls(), 3, "nothing published twice");
+    assert_eq!(transport.published.lock()[1], Ok(("confirm", seats[MAX_FILTERS_PER_OP..].to_vec())));
+
+    // 250 seats: three messages, each decodable.
+    let seats: Vec<Vec<u8>> = (1000..1250).map(seat).collect();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 3 });
+    transport.wait_for(6).await;
+    let published = transport.published.lock()[2..].to_vec();
+    assert_eq!(
+        published,
+        vec![Ok(("confirm", seats[..100].to_vec())), Ok(("confirm", seats[100..200].to_vec())), Ok(("confirm", seats[200..].to_vec()))]
+    );
+}
+
+/// Leaves and rejects of more seats than one op carries are split the same
+/// way: a message whose publication fails is retried alone, without
+/// resending the seats already published, and a filter no node decodes is
+/// left out without taking its message-mates down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_leave_or_reject_is_split_and_a_failed_message_is_retried_alone() {
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    for kind in ["leave", "reject"] {
+        let action = |filters: Vec<Vec<u8>>, frame_number: u64| match kind {
+            "leave" => LifecycleAction::ProposeLeave { filters, frame_number },
+            _ => LifecycleAction::RejectLeaves { filters, frame_number },
+        };
+        let (rig, transport) = recording_rig(1);
+        // 103 seats and a filter longer than any node decodes: two messages;
+        // the second fails to publish.
+        let mut seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
+        seats.insert(50, vec![0xEE; 65]);
+        let sendable: Vec<Vec<u8>> = seats.iter().filter(|filter| filter.len() <= 64).cloned().collect();
+        rig.pipeline.dispatch(action(seats.clone(), 1));
+        transport.wait_for(2).await;
+        assert_eq!(*transport.published.lock(), vec![Ok((kind, sendable[..100].to_vec()))], "{kind}");
+        // The next cycles ask for every seat again; only the failed message's
+        // seats go out.
+        for _ in 0..100 {
+            rig.pipeline.dispatch(action(seats.clone(), 2));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if transport.calls() >= 3 {
+                break;
+            }
+        }
+        transport.wait_for(3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(transport.calls(), 3, "{kind}: nothing published twice");
+        assert_eq!(transport.published.lock()[1], Ok((kind, sendable[100..].to_vec())), "{kind}");
+    }
+}
+
+/// A join of more seats than one op carries goes out as several joins: one
+/// whose publication fails does not stop the others, and the next cycle
+/// sends only its seats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_join_goes_on_after_a_failed_message() {
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    let (rig, transport) = recording_rig(0);
+    let seats: Vec<Vec<u8>> = (0..250).map(seat).collect();
+    let join = |frame_number: u64| LifecycleAction::ProposeJoin { filters: seats.clone(), worker_ids: Vec::new(), frame_number };
+    rig.pipeline.dispatch(join(1));
+    transport.wait_for(3).await;
+    assert_eq!(
+        *transport.published.lock(),
+        vec![Ok(("join", seats[100..200].to_vec())), Ok(("join", seats[200..].to_vec()))],
+        "the messages after the failed one still go out"
+    );
+    for _ in 0..100 {
+        rig.pipeline.dispatch(join(2));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if transport.calls() >= 4 {
+            break;
+        }
+    }
+    transport.wait_for(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(transport.calls(), 4, "nothing published twice");
+    assert_eq!(transport.published.lock()[2], Ok(("join", seats[..100].to_vec())));
+}
+
+/// A seat whose leaf roots exceed what every node decodes (a group of 257
+/// entries) is left out of its confirm, and the seats that would share its
+/// message still go out. It is fenced until the epoch ends rather than
+/// released, so the next cycles of the epoch do not prepare it again; the
+/// next epoch's do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_over_a_decode_limit_does_not_hold_up_its_message() {
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+    let (mut rig, transport) = recording_rig(usize::MAX);
+    let bad = seat(5);
+    let asked: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (asked_by, over) = (asked.clone(), bad.clone());
+    let remote: quil_engine::prover_pipeline::RemoteStorageConfirm =
+        Arc::new(move |filter: &[u8], _: &[Vec<u8>], _: u64, _: std::time::Duration| -> QResult<Option<Vec<ConfirmLeafRoots>>> {
+            *asked_by.lock().entry(filter.to_vec()).or_default() += 1;
+            let entries = if filter == over.as_slice() { 257 } else { 1 };
+            Ok(Some(vec![ConfirmLeafRoots { filter: filter.to_vec(), entries: vec![LeafRootEntry::default(); entries] }]))
+        });
+    Arc::get_mut(&mut rig.pipeline).unwrap().remote_storage_confirm = Some(remote);
+
+    let seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
+    let good: Vec<Vec<u8>> = seats.iter().filter(|filter| **filter != bad).cloned().collect();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: seats.clone(), frame_number: 1 });
+    transport.wait_for(2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        *transport.published.lock(),
+        vec![Ok(("confirm", good[..100].to_vec())), Ok(("confirm", good[100..].to_vec()))],
+        "every other seat goes out"
+    );
+    for frame_number in 2..10 {
+        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: seats.clone(), frame_number });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(asked.lock().get(&bad).copied(), Some(1), "not prepared again within the fence");
+    assert_eq!(transport.calls(), 2, "nothing published twice");
+    // Past the retry fence it is still not prepared again within the epoch;
+    // the next epoch's renewal prepares it again.
+    let epoch_length = quil_types::consensus::epoch_length_frames();
+    assert!(epoch_length > 40, "a frame past the retry fence in the same epoch");
+    for (frame_number, asked_times) in [(40, 1), (epoch_length + 1, 2)] {
+        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: vec![bad.clone()], frame_number });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(asked.lock().get(&bad).copied(), Some(asked_times), "frame {frame_number}");
+    }
+    assert_eq!(transport.calls(), 2, "an over-limit seat alone publishes nothing");
+}

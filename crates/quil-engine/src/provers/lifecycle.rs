@@ -588,6 +588,9 @@ pub struct ProverLifecycle {
     /// identical bundles. Entries older than `LEAVE_COOLDOWN_FRAMES`
     /// are pruned lazily on read so the map can't grow unbounded.
     last_leave_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Seats whose renewal was skipped for a pending leave, with the epoch
+    /// it was last reported in (`renewal_awaits_leave`).
+    renewal_skips_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -670,6 +673,7 @@ impl ProverLifecycle {
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
+            renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -958,6 +962,37 @@ impl ProverLifecycle {
             auto_bound.contains(filter)
                 && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
         })).unwrap_or(true)
+    }
+
+    /// Whether this node proposed leaving `filter` within
+    /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`, so its renewal waits: once
+    /// the leave lands the seat is Leaving, every node refuses a confirm that
+    /// names it, and the refusal takes the other seats of its message down
+    /// with it. Reported at info once per seat per epoch.
+    fn renewal_awaits_leave(&self, filter: &[u8], frame_number: u64) -> bool {
+        let Some(proposed) = self.last_leave_attempt.read().ok()
+            .and_then(|attempts| attempts.get(filter).copied())
+            .filter(|last| frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES)
+        else {
+            return false;
+        };
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let due = self.renewal_skips_reported.lock().is_ok_and(|mut reported| {
+            if reported.get(filter).is_some_and(|last| *last >= epoch) {
+                return false;
+            }
+            reported.retain(|_, last| last.saturating_add(1) >= epoch);
+            reported.insert(filter.to_vec(), epoch);
+            true
+        });
+        if due {
+            tracing::info!(frame = frame_number, epoch, filter = hex::encode(filter), leave_proposed_frame = proposed,
+                resume_frame = proposed + LEAVE_COOLDOWN_FRAMES, scope = "local",
+                "seat renewal skipped: this node proposed leaving the seat; a confirm naming a seat being left is \
+                 refused with every seat of its message. Expected while the leave lands; renewal resumes if it \
+                 has not landed by the resume frame (reported once per seat per epoch)");
+        }
+        true
     }
 
     /// Drop filters whose last Leave proposal is within
@@ -1774,6 +1809,7 @@ impl ProverLifecycle {
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
             let renewals = expired_epoch_filters.into_iter()
                 .filter(|f| worker_bound_filters.contains(f))
+                .filter(|f| !self.renewal_awaits_leave(f, frame_number))
                 .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
                     None => true,
                     Some(Hold::Settling { until }) => {
@@ -4602,6 +4638,70 @@ mod proposal_loop_tests {
                     "a delayed bootstrap renewal must not race cleanup: {actions:?}");
             }
         }
+    }
+
+    /// A seat lapsed past its recovery epoch whose leave is in flight gets
+    /// no worker and no renewal, while one whose renewal is in flight keeps
+    /// both (2026-10-22: an idle worker was bound to a seat being left, and
+    /// the renewal planned for it sank the whole confirm once it was Leaving).
+    #[test]
+    fn a_seat_whose_leave_is_in_flight_is_not_rebound_or_renewed() {
+        use crate::submission_attempts::OpKind;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        for (kind, renewed) in [(OpKind::Confirm, true), (OpKind::Leave, false)] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(idle_worker(1));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut lapsed = alloc(held.clone(), ProverStatus::Active, 10);
+            lapsed.epoch = 0;
+            reg.set_prover(prover(address.clone(), vec![lapsed]));
+            reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.note_renewals_offered();
+            let running = lc.submission_attempts.begin(std::slice::from_ref(&held), 1440, kind).unwrap();
+            lc.allocator.on_new_frame(1441).unwrap();
+            assert_eq!(wm.range_workers().unwrap()[0].filter == held, renewed, "{kind:?} in flight");
+            lc.set_prover_root_verified_frame(1441);
+            let actions = lc.evaluate(1441, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
+                renewed, "{kind:?} in flight: {actions:?}");
+            drop(running);
+        }
+    }
+
+    /// A bound seat this node proposed leaving is not renewed until the leave
+    /// cooldown ends: a confirm naming it once the leave lands is refused,
+    /// with every other seat of its message.
+    #[test]
+    fn renewal_skips_a_seat_with_a_recent_leave() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let other = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(allocated_worker(2, other.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let lapsed = |filter: &Vec<u8>| ProverAllocationInfo { epoch: 0, ..alloc(filter.clone(), ProverStatus::Active, 10) };
+        reg.set_prover(prover(address.clone(), vec![lapsed(&held), lapsed(&other)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50), shard_summary(other.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewals = |frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.into_iter().find_map(|a| match a {
+                LifecycleAction::ReconfirmEpoch { filters, .. } => Some(filters),
+                _ => None,
+            }).unwrap_or_default()
+        };
+        lc.record_leave_attempts(std::slice::from_ref(&held), 721);
+        assert_eq!(renewals(725), vec![other.clone()], "the seat being left is skipped, the other renews");
+        assert_eq!(renewals(721 + LEAVE_COOLDOWN_FRAMES - 1), vec![other.clone()]);
+        let mut both = renewals(721 + LEAVE_COOLDOWN_FRAMES);
+        both.sort();
+        assert_eq!(both, vec![held, other], "renewed once the cooldown ends");
     }
 
     #[test]

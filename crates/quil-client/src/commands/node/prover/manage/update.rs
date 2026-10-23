@@ -10,6 +10,7 @@ use super::model::{
 };
 use super::msg::Msg;
 use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
+use super::super::sign;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -115,7 +116,8 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             err,
         } => {
             if let Some(e) = err {
-                return handle_action_failure(m, &format!("{action} failed"), &e, Some(Cmd::Fetch));
+                let prefix = format!("{action} failed");
+                return handle_action_failure(m, &action, &prefix, &e, filters_raw.len());
             }
             if !filters_raw.is_empty() {
                 begin_await(m, &action, &filters_raw, 0);
@@ -142,12 +144,8 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             ..
         } => {
             if let Some(e) = err {
-                return handle_action_failure(
-                    m,
-                    &format!("{action} broadcast failed"),
-                    &e,
-                    Some(Cmd::Fetch),
-                );
+                let prefix = format!("{action} broadcast failed");
+                return handle_action_failure(m, &action, &prefix, &e, filters_raw.len());
             }
             for f in &filters_raw {
                 m.broadcasted_filters.push(f.clone());
@@ -156,40 +154,10 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             if send_frame > m.await_send_frame {
                 m.await_send_frame = send_frame;
             }
-            if !m.action_queue.is_empty() {
-                m.status_msg = format!("{action} broadcast ({}/{})", m.action_index, m.action_total);
-                if let Some(cmd) = advance_queue(m) {
-                    return vec![cmd];
-                }
-                return vec![];
+            if let Some(cmd) = advance_queue(m) {
+                return vec![cmd];
             }
-            // Final broadcast — convert accumulated filters into await entries.
-            let entries: Vec<AwaitFilterEntry> = m
-                .broadcasted_filters
-                .iter()
-                .zip(m.broadcasted_statuses.iter())
-                .map(|(f, s)| AwaitFilterEntry {
-                    filter: f.clone(),
-                    original_status: *s,
-                    settled: false,
-                    outcome: String::new(),
-                })
-                .collect();
-            begin_await(m, &action, &[], 0);
-            m.await_filters = entries;
-            let n = m.await_filters.len();
-            if m.action_total > 1 {
-                m.status_msg = format!(
-                    "{} {}(s) broadcast (frame {}). Awaiting inclusion for {} filter(s)...",
-                    m.action_total, action, m.await_send_frame, n
-                );
-            } else {
-                m.status_msg = format!(
-                    "{} broadcast (frame {}). Awaiting inclusion for {} filter(s)...",
-                    action, m.await_send_frame, n
-                );
-            }
-            vec![Cmd::ScheduleAwaitCheck(Duration::from_secs(3))]
+            await_broadcast(m, &action)
         }
 
         Msg::AwaitCheck => {
@@ -221,13 +189,16 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                         "{action} check transient error ({}/{}): {e}",
                         m.await_retries, MAX_AWAIT_RETRIES
                     );
-                    m.status_is_error = false;
+                    let suffix = failed_suffix(m);
+                    m.status_msg.push_str(&suffix);
+                    m.status_is_error = m.failed_messages > 0;
                     let backoff = Duration::from_secs(3 * m.await_retries as u64);
                     return vec![Cmd::ScheduleAwaitCheck(backoff)];
                 }
-                finish_await(m);
+                let failed = failed_suffix(m);
                 m.status_msg =
-                    format!("{action} check failed after {} retries: {e}", m.await_retries);
+                    format!("{action} check failed after {} retries: {e}{failed}", m.await_retries);
+                finish_await(m);
                 m.status_is_error = true;
                 m.status_sticky = true;
                 return vec![Cmd::Fetch];
@@ -255,7 +226,9 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 elapsed,
                 m.await_send_frame,
             );
-            m.status_is_error = false;
+            let suffix = failed_suffix(m);
+            m.status_msg.push_str(&suffix);
+            m.status_is_error = m.failed_messages > 0;
             vec![Cmd::ScheduleAwaitCheck(Duration::from_secs(3))]
         }
 
@@ -334,6 +307,73 @@ fn finish_await(m: &mut Model) {
     m.action_index = 0;
     m.broadcasted_filters.clear();
     m.broadcasted_statuses.clear();
+    m.failed_messages = 0;
+    m.failed_filters = 0;
+    m.first_failure.clear();
+}
+
+/// Clear the previous action's queue, broadcast and failure state as a new
+/// action starts, so none of it leaks into this action's counts.
+fn reset_action(m: &mut Model) {
+    finish_await(m);
+    m.action_total = 1;
+    m.action_index = 1;
+}
+
+/// The messages of a split or batched action that failed, appended to its
+/// status lines: `; 1/3 messages failed (100 filter(s)): <first error>`.
+fn failed_suffix(m: &Model) -> String {
+    if m.failed_messages == 0 {
+        return String::new();
+    }
+    format!(
+        "; {}/{} messages failed ({} filter(s)): {}",
+        m.failed_messages, m.action_total, m.failed_filters, m.first_failure
+    )
+}
+
+/// Every message of the action went out or failed: await the filters the
+/// broadcast messages carried, and keep the failed ones in view.
+fn await_broadcast(m: &mut Model, action: &str) -> Vec<Cmd> {
+    let total = m.action_total;
+    let sent = total.saturating_sub(m.failed_messages);
+    let failed = failed_suffix(m);
+    if m.broadcasted_filters.is_empty() {
+        m.status_msg = format!("0/{total} {action} messages broadcast{failed}");
+        m.status_is_error = true;
+        m.status_sticky = true;
+        finish_await(m);
+        return vec![Cmd::Fetch];
+    }
+    let entries: Vec<AwaitFilterEntry> = m
+        .broadcasted_filters
+        .iter()
+        .zip(m.broadcasted_statuses.iter())
+        .map(|(f, s)| AwaitFilterEntry {
+            filter: f.clone(),
+            original_status: *s,
+            settled: false,
+            outcome: String::new(),
+        })
+        .collect();
+    begin_await(m, action, &[], 0);
+    m.await_filters = entries;
+    let n = m.await_filters.len();
+    let frame = m.await_send_frame;
+    m.status_msg = if total > 1 {
+        format!("{sent}/{total} {action} messages broadcast (frame {frame}). Awaiting inclusion for {n} filter(s)")
+    } else {
+        format!("{action} broadcast (frame {frame}). Awaiting inclusion for {n} filter(s)")
+    };
+    if failed.is_empty() {
+        m.status_msg.push_str("...");
+        m.status_is_error = false;
+    } else {
+        m.status_msg.push_str(&failed);
+        m.status_is_error = true;
+        m.status_sticky = true;
+    }
+    vec![Cmd::ScheduleAwaitCheck(Duration::from_secs(3))]
 }
 
 /// `buildConfirmed` + the `actionConfirmedMsg` handler, collapsed: build
@@ -350,6 +390,7 @@ fn finish_confirmed(m: &mut Model, frame: u64) -> Vec<Cmd> {
     let total = m.await_filters.len();
     let action = m.await_action.clone();
     let send_frame = m.await_send_frame;
+    let failed = failed_suffix(m);
 
     if unchanged == 0 {
         m.status_msg = format!("{action} confirmed at frame {frame} ({confirmed} filter(s))");
@@ -365,28 +406,45 @@ fn finish_confirmed(m: &mut Model, frame: u64) -> Vec<Cmd> {
         );
         m.status_is_error = confirmed == 0;
     }
+    if !failed.is_empty() {
+        m.status_msg.push_str(&failed);
+        m.status_is_error = true;
+    }
     m.status_sticky = true;
     finish_await(m);
     vec![Cmd::Fetch]
 }
 
+/// A message of the action failed. A single message reports its error; a
+/// message of a split or batched action is counted, the rest still go out,
+/// and the filters of those that went out are awaited.
 fn handle_action_failure(
     m: &mut Model,
+    action: &str,
     prefix: &str,
     err: &str,
-    fallback: Option<Cmd>,
+    filters: usize,
 ) -> Vec<Cmd> {
-    m.status_msg = format!("{prefix}: {err}");
-    m.status_is_error = true;
-    m.status_sticky = true;
+    if m.action_total <= 1 {
+        m.status_msg = format!("{prefix}: {err}");
+        m.status_is_error = true;
+        m.status_sticky = true;
+        finish_await(m);
+        return vec![Cmd::Fetch];
+    }
+    m.failed_messages += 1;
+    m.failed_filters += filters;
+    if m.first_failure.is_empty() {
+        m.first_failure = err.to_string();
+    }
     if let Some(cmd) = advance_queue(m) {
         return vec![cmd];
     }
-    m.action_in_flight = false;
-    fallback.into_iter().collect()
+    await_broadcast(m, action)
 }
 
-/// `advanceQueue` — start the next queued (single-filter) action.
+/// `advanceQueue` — start the next queued action: one filter of a batch, or
+/// the next message of a split multi-filter action.
 fn advance_queue(m: &mut Model) -> Option<Cmd> {
     if m.action_queue.is_empty() {
         return None;
@@ -394,14 +452,16 @@ fn advance_queue(m: &mut Model) -> Option<Cmd> {
     let next = m.action_queue.remove(0);
     m.action_index += 1;
     m.action_in_flight = true;
-    m.status_is_error = false;
     m.status_msg = format!(
         "Creating {} message ({}/{})...",
         next.action, m.action_index, m.action_total
     );
+    let suffix = failed_suffix(m);
+    m.status_msg.push_str(&suffix);
+    m.status_is_error = m.failed_messages > 0;
     Some(Cmd::Lifecycle {
         action: next.action,
-        filters: vec![next.filter],
+        filters: next.filters,
         original_status: next.status,
     })
 }
@@ -968,13 +1028,32 @@ fn start_multi_filter_action(
         m.status_is_error = true;
         return vec![];
     }
+    reset_action(m);
     m.action_in_flight = true;
     m.status_is_error = false;
     m.alloc_selected.clear();
-    m.status_msg = format!("Creating {action} message for {} allocation(s)...", filters.len());
+    // One op carries at most the filters every node decodes: a longer
+    // selection goes out as several messages, sent in turn like a batch.
+    let mut chunks: Vec<Vec<Vec<u8>>> = sign::op_chunks(&filters).map(<[Vec<u8>]>::to_vec).collect();
+    let first = chunks.remove(0);
+    if chunks.is_empty() {
+        m.status_msg = format!("Creating {action} message for {} allocation(s)...", filters.len());
+    } else {
+        m.action_queue = chunks
+            .into_iter()
+            .map(|filters| PendingAction { action: action.to_string(), filters, status })
+            .collect();
+        m.action_total = m.action_queue.len() + 1;
+        m.action_index = 1;
+        m.status_msg = format!(
+            "Creating {action} message (1/{}) for {} allocation(s)...",
+            m.action_total,
+            filters.len()
+        );
+    }
     let mut cmds = vec![Cmd::Lifecycle {
         action: action.to_string(),
-        filters,
+        filters: first,
         original_status: status,
     }];
     if !worker_ids.is_empty() {
@@ -994,7 +1073,7 @@ fn start_batch_action(
         if valid(row.status) {
             queue.push(PendingAction {
                 action: action.to_string(),
-                filter: row.filter.clone(),
+                filters: vec![row.filter.clone()],
                 status: row.status,
             });
         }
@@ -1008,6 +1087,7 @@ fn start_batch_action(
         return vec![];
     }
     let first = queue.remove(0);
+    reset_action(m);
     m.action_queue = queue;
     m.action_total = m.action_queue.len() + 1;
     m.action_index = 1;
@@ -1017,7 +1097,7 @@ fn start_batch_action(
     m.status_msg = format!("Creating {action} message (1/{})...", m.action_total);
     vec![Cmd::Lifecycle {
         action: action.to_string(),
-        filters: vec![first.filter],
+        filters: first.filters,
         original_status: first.status,
     }]
 }
@@ -1299,6 +1379,7 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 return vec![];
             }
             m.join_picker_active = false;
+            reset_action(m);
             m.action_in_flight = true;
             m.status_msg = format!(
                 "Joining {} shard(s) (VDF may take a while)...",
@@ -1332,6 +1413,7 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+    use super::super::model::FilterOutcome;
 
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();
@@ -1341,6 +1423,143 @@ mod tests {
         }), None, None);
         m.allocations[0].manually_managed = true;
         m
+    }
+
+    /// A multi-filter action over more allocations than one op carries goes
+    /// out as several messages, sent in turn; the await covers them all.
+    #[test]
+    fn a_long_multi_filter_action_is_sent_as_several_messages() {
+        let mut m = Model::new();
+        let filter = |n: u16| [n.to_be_bytes().as_slice(), &[0xC0; 30]].concat();
+        m.process_refresh_data(Some(NodeInfoResponse {
+            shard_allocations: (0..250).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
+            ..Default::default()
+        }), None, None);
+        let rows = m.allocations.clone();
+        let sent = |cmds: &[Cmd]| match cmds.first() {
+            Some(Cmd::Lifecycle { action, filters, .. }) if action == "Leave" => filters.clone(),
+            _ => panic!("a Leave message"),
+        };
+        let mut filters = sent(&start_multi_filter_action(&mut m, "Leave", rows, |s| s == 2));
+        assert_eq!(filters.len(), 100);
+        assert_eq!(m.status_msg, "Creating Leave message (1/3) for 250 allocation(s)...");
+        let broadcast = |filters: Vec<Vec<u8>>| Msg::ActionBroadcast {
+            action: "Leave".into(), filters_raw: filters, send_frame: 9, original_status: 2, err: None,
+        };
+        for expected in [100, 50] {
+            let next = sent(&apply_msg(&mut m, broadcast(filters.clone())));
+            assert_eq!(next.len(), expected);
+            filters = next;
+        }
+        assert!(matches!(apply_msg(&mut m, broadcast(filters)).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert_eq!(m.await_filters.len(), 250);
+        assert_eq!(m.status_msg, "3/3 Leave messages broadcast (frame 9). Awaiting inclusion for 250 filter(s)...");
+    }
+
+    /// A model with 250 operational allocations whose Leave was started:
+    /// three messages of 100, 100 and 50 filters.
+    fn leaving_250(m: &mut Model) -> Vec<Vec<u8>> {
+        let filter = |n: u16| [n.to_be_bytes().as_slice(), &[0xC0; 30]].concat();
+        m.process_refresh_data(Some(NodeInfoResponse {
+            shard_allocations: (0..250).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
+            ..Default::default()
+        }), None, None);
+        let rows = m.allocations.clone();
+        lifecycle_filters(&start_multi_filter_action(m, "Leave", rows, |s| s == 2))
+    }
+
+    fn lifecycle_filters(cmds: &[Cmd]) -> Vec<Vec<u8>> {
+        match cmds.first() {
+            Some(Cmd::Lifecycle { action, filters, .. }) if action == "Leave" => filters.clone(),
+            _ => panic!("a Leave message"),
+        }
+    }
+
+    fn leave_broadcast(filters: Vec<Vec<u8>>, err: Option<&str>) -> Msg {
+        Msg::ActionBroadcast {
+            action: "Leave".into(),
+            filters_raw: filters,
+            send_frame: if err.is_some() { 0 } else { 9 },
+            original_status: 2,
+            err: err.map(str::to_string),
+        }
+    }
+
+    /// A failed message of a split action stays in view through the await
+    /// and its result, and only the filters that went out are awaited.
+    #[test]
+    fn a_failed_message_of_a_split_action_is_reported_with_its_filters() {
+        let mut m = Model::new();
+        let first = leaving_250(&mut m);
+        let second = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(first.clone(), None)));
+        let third = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(second, Some("boom"))));
+        assert_eq!(third.len(), 50);
+        assert_eq!(m.status_msg, "Creating Leave message (3/3)...; 1/3 messages failed (100 filter(s)): boom");
+        assert!(m.status_is_error);
+        assert!(matches!(apply_msg(&mut m, leave_broadcast(third.clone(), None)).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert_eq!(m.await_filters.len(), 150);
+        assert_eq!(
+            m.status_msg,
+            "2/3 Leave messages broadcast (frame 9). Awaiting inclusion for 150 filter(s); 1/3 messages failed (100 filter(s)): boom"
+        );
+        assert!(m.status_is_error);
+        apply_msg(&mut m, Msg::AwaitResult { action: "Leave".into(), frame: 10, err: Some("rpc".into()), per_filter: Vec::new() });
+        assert_eq!(m.status_msg, "Leave check transient error (1/3): rpc; 1/3 messages failed (100 filter(s)): boom");
+        assert!(m.status_is_error);
+        let per_filter = first.iter().chain(&third).map(|f| FilterOutcome { filter: f.clone(), outcome: "left".into(), settled: true }).collect();
+        apply_msg(&mut m, Msg::AwaitResult { action: "Leave".into(), frame: 12, err: None, per_filter });
+        assert_eq!(m.status_msg, "Leave confirmed at frame 12 (150 filter(s)); 1/3 messages failed (100 filter(s)): boom");
+        assert!(m.status_is_error && !m.action_in_flight);
+        assert_eq!((m.broadcasted_filters.len(), m.action_total), (0, 0), "nothing carries over");
+    }
+
+    /// When the last message fails, the filters of the earlier ones are
+    /// still awaited; when every message fails, none is.
+    #[test]
+    fn a_failed_last_message_still_awaits_the_sent_filters() {
+        let mut m = Model::new();
+        let first = leaving_250(&mut m);
+        let second = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(first, None)));
+        let third = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(second, None)));
+        assert!(matches!(apply_msg(&mut m, leave_broadcast(third, Some("boom"))).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert!(m.action_in_flight);
+        assert_eq!(m.await_filters.len(), 200);
+        assert_eq!(
+            m.status_msg,
+            "2/3 Leave messages broadcast (frame 9). Awaiting inclusion for 200 filter(s); 1/3 messages failed (50 filter(s)): boom"
+        );
+
+        let mut m = Model::new();
+        let mut filters = leaving_250(&mut m);
+        for _ in 0..2 {
+            filters = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(filters, Some("boom"))));
+        }
+        assert!(matches!(apply_msg(&mut m, leave_broadcast(filters, Some("late"))).as_slice(), [Cmd::Fetch]));
+        assert_eq!(m.status_msg, "0/3 Leave messages broadcast; 3/3 messages failed (250 filter(s)): boom");
+        assert!(m.status_is_error && !m.action_in_flight && m.await_filters.is_empty());
+    }
+
+    /// A new action starts from clean counts: nothing a previous action
+    /// broadcast, queued or failed leaks into its messages or its await.
+    #[test]
+    fn a_new_action_does_not_inherit_the_previous_actions_counts() {
+        let mut m = Model::new();
+        let filter = |n: u8| vec![n; 32];
+        m.process_refresh_data(Some(NodeInfoResponse {
+            shard_allocations: (0..2).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
+            ..Default::default()
+        }), None, None);
+        m.action_total = 3;
+        m.action_index = 3;
+        m.broadcasted_filters = vec![filter(7); 100];
+        m.broadcasted_statuses = vec![2; 100];
+        let rows = m.allocations.clone();
+        let filters = lifecycle_filters(&start_multi_filter_action(&mut m, "Leave", rows, |s| s == 2));
+        assert_eq!(m.status_msg, "Creating Leave message for 2 allocation(s)...");
+        apply_msg(&mut m, leave_broadcast(filters, None));
+        assert_eq!(m.await_filters.len(), 2);
+        assert_eq!(m.status_msg, "Leave broadcast (frame 9). Awaiting inclusion for 2 filter(s)...");
+        assert!(!m.status_is_error);
     }
 
     #[test]

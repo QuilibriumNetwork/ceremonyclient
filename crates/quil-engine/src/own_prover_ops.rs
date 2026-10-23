@@ -16,8 +16,11 @@ use quil_execution::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROV
 use quil_execution::global_intrinsic::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
 use quil_execution::global_intrinsic::prover_ops::{
     ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_SENIORITY_MERGE,
+    TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
+use quil_execution::canonical_cursor::{read_lp, read_u32, read_u64};
 use quil_execution::message_envelope::CanonicalMessageBundle;
+use quil_types::error::Result;
 use tracing::info;
 
 /// GLOBAL frames after its submission frame by which an operation not yet
@@ -52,22 +55,54 @@ pub fn tracker() -> &'static OwnProverOps {
 
 const PRESENCE_REPORT: &str = "presence_report";
 
-fn describe(inner: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
+/// An op's kind and the filters it names. An op that does not decode has its
+/// filters read without the decoders' limits, as far as its bytes go, so the
+/// line refusing to publish it (`prover_pipeline::refuse_undecodable`) still
+/// counts its seats. No such op is tracked: the pipeline refuses it before
+/// publication, and the requests workers send through the master are frame
+/// headers, handoffs and presence reports.
+pub(crate) fn describe(inner: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
     let Some(prefix) = inner.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])) else {
         return ("unknown", Vec::new());
     };
+    let or_lenient = |kind, decoded: Result<Vec<Vec<u8>>>| match decoded {
+        Ok(filters) => (kind, filters),
+        Err(_) => (kind, lenient_filters(prefix, inner)),
+    };
     match prefix {
-        TYPE_PROVER_JOIN => ("join", ProverJoin::from_canonical_bytes(inner).map(|op| op.filters).unwrap_or_default()),
-        TYPE_PROVER_CONFIRM => ("confirm", ProverConfirm::from_canonical_bytes(inner)
-            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters }).unwrap_or_default()),
-        TYPE_PROVER_REJECT => ("reject", ProverReject::from_canonical_bytes(inner)
-            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters }).unwrap_or_default()),
-        TYPE_PROVER_LEAVE => ("leave", ProverLeave::from_canonical_bytes(inner).map(|op| op.filters).unwrap_or_default()),
+        TYPE_PROVER_JOIN => or_lenient("join", ProverJoin::from_canonical_bytes(inner).map(|op| op.filters)),
+        TYPE_PROVER_CONFIRM => or_lenient("confirm", ProverConfirm::from_canonical_bytes(inner)
+            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters })),
+        TYPE_PROVER_REJECT => or_lenient("reject", ProverReject::from_canonical_bytes(inner)
+            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters })),
+        TYPE_PROVER_LEAVE => or_lenient("leave", ProverLeave::from_canonical_bytes(inner).map(|op| op.filters)),
         TYPE_PRESENCE_REPORT => (PRESENCE_REPORT,
             PresenceReport::from_canonical_bytes(inner).map(|report| vec![report.filter]).unwrap_or_default()),
         TYPE_PROVER_SENIORITY_MERGE => ("seniority_merge", Vec::new()),
+        TYPE_SHARD_SPLIT => ("shard_split", Vec::new()),
+        TYPE_SHARD_MERGE => ("shard_merge", Vec::new()),
         _ => ("other", Vec::new()),
     }
+}
+
+/// The filters a join, leave, confirm or reject names, read without the
+/// decoders' limits: as many as its bytes hold.
+fn lenient_filters(prefix: u32, inner: &[u8]) -> Vec<Vec<u8>> {
+    let mut filters = Vec::new();
+    let mut cursor = 4;
+    let _ = (|| -> Result<()> {
+        if matches!(prefix, TYPE_PROVER_CONFIRM | TYPE_PROVER_REJECT) {
+            // The deprecated single filter, the frame number, the signature.
+            read_lp(inner, &mut cursor)?;
+            read_u64(inner, &mut cursor)?;
+            read_lp(inner, &mut cursor)?;
+        }
+        for _ in 0..read_u32(inner, &mut cursor)? {
+            filters.push(read_lp(inner, &mut cursor)?);
+        }
+        Ok(())
+    })();
+    filters
 }
 
 fn filter_list(filters: &[Vec<u8>]) -> String {
@@ -157,6 +192,18 @@ impl OwnProverOps {
 mod tests {
     use super::*;
 
+    /// Each op kind has its own name, so the per-kind refusal warning of one
+    /// does not hide another's.
+    #[test]
+    fn shard_splits_and_merges_are_named_apart() {
+        use quil_execution::global_intrinsic::prover_ops::{ShardMerge, ShardSplit};
+        let split = ShardSplit::default().to_canonical_bytes().unwrap();
+        let merge = ShardMerge::default().to_canonical_bytes().unwrap();
+        assert_eq!(describe(&split).0, "shard_split");
+        assert_eq!(describe(&merge).0, "shard_merge");
+        assert_eq!(describe(b"\xff\xff\xff\xff").0, "other");
+    }
+
     #[test]
     fn an_included_operation_stops_being_tracked() {
         let ops = OwnProverOps::default();
@@ -237,6 +284,35 @@ mod tests {
             ops.submitted(&i.to_be_bytes(), i);
         }
         assert_eq!(ops.tracked(), MAX_TRACKED);
+    }
+
+    /// An op over the decoders' limits (a renewal of 103 seats in one
+    /// confirm) is still described by the filters it names, which the line
+    /// refusing to publish it counts.
+    #[test]
+    fn an_undecodable_op_is_described_by_the_filters_it_names() {
+        use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+        let filters: Vec<Vec<u8>> = (0..103u8).map(|i| vec![i; 32]).collect();
+        let confirm = ProverConfirm {
+            frame_number: 9,
+            public_key_signature_bls48581: Some(AddressedSignature { signature: vec![1; 666], address: vec![2; 32] }),
+            filters: filters.clone(),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        assert!(ProverConfirm::from_canonical_bytes(&confirm).is_err(), "over the decoder's limit");
+        assert_eq!(describe(&confirm), ("confirm", filters.clone()));
+        let reject = ProverReject { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        assert_eq!(describe(&reject), ("reject", filters.clone()));
+        let leave = ProverLeave { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        assert_eq!(describe(&leave), ("leave", filters.clone()));
+        let join = ProverJoin { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        assert_eq!(describe(&join), ("join", filters));
+        let mut truncated = TYPE_PROVER_LEAVE.to_be_bytes().to_vec();
+        truncated.extend_from_slice(&u32::MAX.to_be_bytes());
+        truncated.extend_from_slice(&[0, 0, 0, 1, 7, 0, 0]);
+        assert_eq!(describe(&truncated), ("leave", vec![vec![7]]), "as far as its bytes go");
     }
 
     #[test]

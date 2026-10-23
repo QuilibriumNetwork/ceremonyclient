@@ -523,6 +523,8 @@ impl WorkerAllocator {
     /// running or awaiting its retry. A renewal stuck in preparation past the
     /// recovery epoch would otherwise lose its worker, and the orphan sweep
     /// then proposes leaving a registration the protocol still accepts.
+    /// Only a confirm counts: a seat whose leave is in flight is not being
+    /// renewed, and a confirm naming it once it is Leaving is refused.
     pub(crate) fn renewal_recovering(
         &self,
         allocation: &quil_types::consensus::ProverAllocationInfo,
@@ -530,7 +532,7 @@ impl WorkerAllocator {
     ) -> bool {
         epoch_renewal_recovery_pending(allocation, frame)
             || (allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                && self.submission_attempts.owned(&allocation.confirmation_filter, frame))
+                && self.submission_attempts.confirming(&allocation.confirmation_filter, frame))
     }
 
     /// Whether a lapsed seat keeps its worker until the lifecycle first
@@ -2534,7 +2536,8 @@ mod tests {
             renewing.epoch = 0;
             let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![renewing.clone()])));
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-            let renewal = allocator.submission_attempts.begin(std::slice::from_ref(&filter), 1400).unwrap();
+            let renewal = allocator.submission_attempts
+                .begin(std::slice::from_ref(&filter), 1400, crate::submission_attempts::OpKind::Confirm).unwrap();
             for frame in [1440, 2160, 2900] {
                 allocator.on_new_frame(frame).unwrap();
                 assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
@@ -2545,6 +2548,33 @@ mod tests {
             allocator.on_new_frame(2901).unwrap();
             assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
                 "a failed renewal no longer reserves the worker");
+        }
+    }
+
+    /// A seat lapsed past its recovery epoch whose leave is in flight is not
+    /// being renewed: its worker is released, and an idle one is not bound
+    /// to it, while a running confirm keeps or recovers it (2026-10-22: a
+    /// worker was rebound to a seat being left, and the renewal planned for
+    /// it was refused once the seat was Leaving).
+    #[test]
+    fn only_a_running_confirm_keeps_or_recovers_a_lapsed_seats_worker() {
+        use crate::submission_attempts::OpKind;
+        let filter = vec![0x01; 32];
+        for (kind, kept) in [(OpKind::Confirm, true), (OpKind::Leave, false)] {
+            for initially_bound in [false, true] {
+                let wm = Arc::new(MockWorkerManager::new());
+                wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+                let mut lapsed = make_alloc(filter.clone());
+                lapsed.epoch = 0;
+                let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
+                let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+                allocator.note_renewals_offered();
+                let running = allocator.submission_attempts.begin(std::slice::from_ref(&filter), 1440, kind).unwrap();
+                allocator.on_new_frame(1441).unwrap();
+                assert_eq!(wm.range_workers().unwrap()[0].filter == filter, kept,
+                    "{kind:?} in flight, initially_bound={initially_bound}");
+                drop(running);
+            }
         }
     }
 
@@ -2570,7 +2600,7 @@ mod tests {
                     "renewals not decided yet; renewing={renewing}");
             }
             let renewal = renewing.then(|| allocator.submission_attempts
-                .begin(std::slice::from_ref(&filter), 3 * e + 1).unwrap());
+                .begin(std::slice::from_ref(&filter), 3 * e + 1, crate::submission_attempts::OpKind::Confirm).unwrap());
             allocator.note_renewals_offered();
             allocator.on_new_frame(3 * e + 2).unwrap();
             assert_eq!(wm.range_workers().unwrap()[0].filter.is_empty(), !renewing,

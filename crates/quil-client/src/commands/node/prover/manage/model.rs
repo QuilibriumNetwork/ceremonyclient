@@ -254,7 +254,10 @@ impl ColumnFilter {
 #[derive(Debug, Clone)]
 pub struct PendingAction {
     pub action: String,
-    pub filter: Vec<u8>,
+    /// The filters one op of the queue carries: one per op for a batch of
+    /// single-filter actions, up to the decoders' limit for a split
+    /// multi-filter action.
+    pub filters: Vec<Vec<u8>>,
     pub status: u32,
 }
 
@@ -459,6 +462,11 @@ pub struct Model {
     // Broadcast accumulator for the await loop.
     pub broadcasted_filters: Vec<Vec<u8>>,
     pub broadcasted_statuses: Vec<u32>,
+    /// Messages of the current action that failed, the filters they
+    /// carried, and the first failure's error.
+    pub failed_messages: usize,
+    pub failed_filters: usize,
+    pub first_failure: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

@@ -1759,6 +1759,13 @@ pub(crate) fn spawn_all(
             Box::pin(async move {
                 if frame == 0 { return Err("no frames received yet".into()); }
                 if filters.is_empty() { return Err("filters must be non-empty".into()); }
+                // Every node refuses a join naming a filter longer than this,
+                // whatever else it carries. A request of more filters than one
+                // join carries goes out as several joins.
+                use quil_execution::global_intrinsic::prover_ops::MAX_FILTER_LEN;
+                if let Some(filter) = filters.iter().find(|filter| filter.len() > MAX_FILTER_LEN) {
+                    return Err(format!("filters: a filter of {} bytes; no node decodes one over {MAX_FILTER_LEN}", filter.len()));
+                }
                 if !worker_ids.is_empty() {
                     if worker_ids.len() != filters.len() {
                         return Err(format!("worker_ids length ({}) must match filters length ({})", worker_ids.len(), filters.len()));
@@ -1772,8 +1779,15 @@ pub(crate) fn spawn_all(
                 let filters_for_task = filters.clone();
                 let worker_ids_for_task = worker_ids.clone();
                 join_spawner.detach("request-join-submit", async move {
-                    if let Err(e) = pp.submit_join(filters_for_task, &worker_ids_for_task, frame).await {
-                        tracing::warn!(error = %e, "request_join detached submit_join failed");
+                    // Each join marks pending only the workers of its own filters.
+                    let chunks = quil_engine::prover_pipeline::join_chunks(&filters_for_task, &worker_ids_for_task);
+                    let chunk_count = chunks.len();
+                    for (chunk, (chunk_filters, chunk_workers)) in chunks.into_iter().enumerate() {
+                        let count = chunk_filters.len();
+                        if let Err(e) = pp.submit_join(chunk_filters, &chunk_workers, frame).await {
+                            tracing::warn!(error = %e, frame, chunk, chunk_count, filters = count,
+                                "request_join detached submit_join failed");
+                        }
                     }
                     Ok(())
                 });
