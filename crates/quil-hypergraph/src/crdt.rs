@@ -68,14 +68,21 @@ impl Drop for CommitGuard<'_> {
 impl CommitLock {
     /// Take the lock; its release counts as a commit.
     pub(crate) fn lock(&self) -> std::result::Result<CommitGuard<'_>, ()> {
-        let guard = self.inner.lock().map_err(|_| ())?;
+        let guard = self.wait()?;
         Ok(CommitGuard { _guard: guard, releases: Some(&self.releases) })
     }
 
     /// Take the lock to read only; its release is not counted.
     fn lock_to_read(&self) -> std::result::Result<CommitGuard<'_>, ()> {
-        let guard = self.inner.lock().map_err(|_| ())?;
+        let guard = self.wait()?;
         Ok(CommitGuard { _guard: guard, releases: None })
+    }
+
+    /// Take the lock, marking the wait on a worker thread's probe: a
+    /// commit holding it stalls every task of a worker that waits.
+    fn wait(&self) -> std::result::Result<std::sync::MutexGuard<'_, ()>, ()> {
+        let _probe = quil_types::thread_probe::section(quil_types::thread_probe::Section::CommitLockWait);
+        self.inner.lock().map_err(|_| ())
     }
 
     /// Counted releases so far.

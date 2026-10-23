@@ -22,6 +22,7 @@ use quil_types::consensus::{AppFrameValidator, ProverRegistry};
 use quil_types::crypto::FrameProver;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
+use quil_types::thread_probe as probe;
 
 use crate::app_types::AppShardState;
 use crate::bounded_warn::{self, Report};
@@ -2729,6 +2730,7 @@ impl AppConsensusEngine {
     /// repeats every [`FENCE_REANCHOR_RETRY`]; a marker whose rebase
     /// committed is cleared first.
     fn rewind_past_fence(&mut self) -> Result<bool> {
+        let _probe = probe::section(probe::Section::FenceRewind);
         let Some(shard) = self.execution_engine.as_ref().map(|m| m.crdt()) else {
             return Ok(false);
         };
@@ -3277,6 +3279,7 @@ impl AppConsensusEngine {
     /// has finalized nothing since, and this member's head has moved past it:
     /// the members did not share that head, and the ones behind caught up.
     fn adopted_genesis_superseded(&self) -> Option<u64> {
+        let _probe = probe::section(probe::Section::GenesisSupersededCheck);
         let handle = self.cw_handle.as_ref()?;
         let genesis = handle.adopted_genesis?;
         if handle.finalized.load(std::sync::atomic::Ordering::Acquire) {
@@ -3775,6 +3778,7 @@ impl AppConsensusEngine {
     /// sync's last anchor refusal, or, when `pending` is the wait for the
     /// predecessor's outgoing history, that wait.
     fn warn_predecessor_blocked(&mut self, now: std::time::Instant, pending: &QuilError) {
+        let _probe = probe::section(probe::Section::PredecessorBlockReport);
         // Its archive recoveries go first while it waits (recovery_turns),
         // unless it is leaving or not seated.
         let priority = self.successor_priority();
@@ -3865,6 +3869,7 @@ impl AppConsensusEngine {
     /// node: a worker whose allocation was leaving queued its checkpoint
     /// install as a blocked successor).
     fn successor_priority(&self) -> bool {
+        let _probe = probe::section(probe::Section::SuccessorPriority);
         if self.start_context.not_seated.is_some() {
             return false;
         }
@@ -3945,6 +3950,7 @@ impl AppConsensusEngine {
     /// for a worker whose key is not in the committee it would start
     /// (`session`, when one governs the shard).
     fn local_seat(&self, session: Option<&quil_cw_consensus::handoff::Session>) -> NotSeated {
+        let _probe = probe::section(probe::Section::SeatRead);
         let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
         let own: Vec<quil_types::consensus::ProverAllocationInfo> = self.prover_registry
@@ -4270,6 +4276,7 @@ impl AppConsensusEngine {
     /// with no proposer at all. `data_ready` is sticky and the worker keeps one
     /// sync in flight, so this is a no-op once the data lands.
     fn request_data_bootstrap_if_unstaged(&self) {
+        let _probe = probe::section(probe::Section::StagedDataCheck);
         // An owed re-anchor requests its own attempts.
         if self.data_ready.load(std::sync::atomic::Ordering::Relaxed) || self.fence_reanchor.owed().is_some() {
             return;
@@ -4488,6 +4495,7 @@ impl AppConsensusEngine {
 
                 // Inbound network messages
                 msg = msg_rx.recv() => {
+                    probe::step(message_step(&msg));
                     // Flip this worker's CRDT to unified (+ consolidate) once
                     // its anchored global frame reaches the cutover, BEFORE any
                     // produce/validate/materialize below computes a `state_root`.
@@ -4751,6 +4759,7 @@ impl AppConsensusEngine {
 
                 // Periodic cleanup
                 _ = cleanup_timer.tick() => {
+                    probe::step(probe::Section::EngineCleanupTimer);
                     self.retry_certified_parent_seals().await;
                     if self.pending_follower_clock.is_some() {
                         self.try_materialize_follower_frames().await;
@@ -4762,11 +4771,13 @@ impl AppConsensusEngine {
                 // committee is buildable (the shard's active provers are present
                 // in this node's registry). No-op once running.
                 _ = delivery_source_timer.tick() => {
+                    probe::step(probe::Section::EngineDeliveryTimer);
                     self.fetch_delivery_sources().await;
                     self.request_data_bootstrap_if_unstaged();
                 }
 
                 _ = cw_retry_timer.tick() => {
+                    probe::step(probe::Section::EngineRetryTimer);
                     // A held finalized frame (transient materialization fault)
                     // is retried here, not only when another frame arrives.
                     if self.received_full_frames.contains_key(&(self.last_materialized_frame + 1)) {
@@ -4886,6 +4897,7 @@ impl AppConsensusEngine {
                 }
             }
 
+            probe::step(probe::Section::EngineUpkeep);
             // Process any pending parent seal (queued by QC handler)
             if let Some(child_rank) = self.pending_seal_rank.take() {
                 self.try_seal_parent_with_child(child_rank).await;
@@ -4928,6 +4940,7 @@ impl AppConsensusEngine {
     /// epoch (`committee_anchor_gfn`), matching the leader provider + produced/
     /// verified frames. Empty when unresolved (drives the passive-mode retry).
     fn compute_committee_members(&self) -> Vec<Vec<u8>> {
+        let _probe = probe::section(probe::Section::CommitteeMembers);
         let (committee_anchor, _) = resolve_global_anchor(self.global_anchor_store.as_ref());
         let committee_frame = if committee_anchor > 0 {
             committee_anchor
@@ -5029,6 +5042,7 @@ impl AppConsensusEngine {
     /// they arrive from authors this node has no PeerInfo for, and are dropped;
     /// `blocked` counts messages consensus discarded as invalid.
     fn log_session_liveness(&mut self) {
+        let _probe = probe::section(probe::Section::SessionLiveness);
         let (Some(liveness), Some(session)) = (self.session_liveness.as_ref(), self.cw_session.as_ref()) else {
             return;
         };
@@ -5078,6 +5092,7 @@ impl AppConsensusEngine {
     /// warn while it sends none as the other members vote
     /// ([`crate::own_votes`]).
     fn track_own_votes(&mut self) {
+        let _probe = probe::section(probe::Section::OwnVotes);
         let now = std::time::Instant::now();
         let hosting = self.cw_session.is_some() && self.cw_handle.as_ref().is_some_and(|host| !host.is_dead());
         let log = if hosting { self.own_votes.check(now) } else { self.own_votes.stop("its consensus host stopped") };
@@ -5142,6 +5157,7 @@ impl AppConsensusEngine {
     /// refuse is not sent. Its inclusion is logged by the own-operation
     /// tracker of the master that publishes it.
     fn report_presence(&mut self) {
+        let _probe = probe::section(probe::Section::PresenceReport);
         use crate::presence_reports::{Hold, Look, Outcome, Pace};
         use quil_execution::global_intrinsic::handoff;
         // Unset (mainnet, and by default): nothing is read.
@@ -5554,6 +5570,7 @@ impl AppConsensusEngine {
     /// shard kept from a legacy instance (its own, or an earlier assignment's
     /// left beside it) are not replayed into a session.
     fn drop_discarded_finalized_records(&self) -> Result<()> {
+        let _probe = probe::section(probe::Section::FinalizedRecordsScan);
         let Some(policy) = quil_types::consensus::committee_handoff_policy() else { return Ok(()) };
         if policy.legacy_history != quil_types::consensus::LegacyHistory::Discard
             || self.clock_store.app_frame_history_discarded()?.is_none()
@@ -5595,6 +5612,7 @@ impl AppConsensusEngine {
     /// limited; the bootstrap re-gates proposing and voting until installed.
     /// At a session base the evidence is the seals instead (`seal_roots`).
     fn heal_disagreeing_pre_state(&mut self) {
+        let _probe = probe::section(probe::Section::PreStateHeal);
         use std::sync::atomic::Ordering;
         let (seen, last) = self.pre_state_heal;
         if self.last_materialized_frame != seen {
@@ -5642,6 +5660,7 @@ impl AppConsensusEngine {
     /// Refresh only from authenticated lifecycle state and local staging.
     /// Progress, quorum and peer traffic remain separate observations.
     fn observe_consensus_phase(&self) {
+        let _probe = probe::section(probe::Section::ConsensusPhase);
         use quil_execution::global_intrinsic::handoff::{schedule, CommittedView};
         let session_id = match self.cw_session.as_ref().map(|session| session.id()).transpose() {
             Ok(id) => id,
@@ -5747,7 +5766,11 @@ impl AppConsensusEngine {
             Some(global) => {
                 let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
                     .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-                match crate::app_handoff::resolve(global, &filter, global_frame)? {
+                let choice = {
+                    let _probe = probe::section(probe::Section::SessionResolve);
+                    crate::app_handoff::resolve(global, &filter, global_frame)?
+                };
+                match choice {
                     crate::app_handoff::SessionChoice::Legacy => None,
                     crate::app_handoff::SessionChoice::Pending(reason) => {
                         return Err(QuilError::Consensus(format!("app committee session unavailable: {reason}")));
@@ -5802,10 +5825,12 @@ impl AppConsensusEngine {
             // the successor check re-derives the sealed history instead of
             // accepting it on state-root equality.
             if let Some(manager) = self.execution_engine.clone() {
-                let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(global)?;
-                for (source, checkpoint) in crate::app_handoff::predecessor_history_sources(
-                    &view, session, self.last_materialized_frame,
-                )? {
+                let sources = {
+                    let _probe = probe::section(probe::Section::PredecessorHistorySources);
+                    let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(global)?;
+                    crate::app_handoff::predecessor_history_sources(&view, session, self.last_materialized_frame)?
+                };
+                for (source, checkpoint) in sources {
                     match crate::app_history_recovery::recover(
                         &source, manager.clone(), self.clock_store.clone(), self.frame_validator(),
                         Some(global), self.delivery_frame_source.as_ref(), checkpoint.frame,
@@ -5861,7 +5886,11 @@ impl AppConsensusEngine {
                     }
                 }
             }
-            if let Err(error) = crate::app_handoff::successor_state_matches_held(global, &shard, self.clock_store.as_ref(), session, &mut self.start_context.own_chain) {
+            let matched = {
+                let _probe = probe::section(probe::Section::SuccessorStateCheck);
+                crate::app_handoff::successor_state_matches_held(global, &shard, self.clock_store.as_ref(), session, &mut self.start_context.own_chain)
+            };
+            if let Err(error) = matched {
                 // A member that did not run (or did not finish) the predecessor
                 // recovers its sealed state through the shard sync: a replay of
                 // the missing frames from an archive when it has a lineage, the
@@ -5889,6 +5918,7 @@ impl AppConsensusEngine {
                     )));
                 }
             } else {
+                let _probe = probe::section(probe::Section::SessionGenesis);
                 let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(global)?;
                 session_genesis = Some(SessionGenesis {
                     base_frame: session.base_frame,
@@ -5931,9 +5961,12 @@ impl AppConsensusEngine {
                 return Err(QuilError::ExecutionUnavailable("awaiting allocation activation".into()));
             }
         }
-        let (scheme, peers) = match session.as_ref() {
-            Some(session) => crate::cw_app_seams::build_session_committee(session, &my_sk, &my_pk),
-            None => crate::cw_app_seams::build_app_committee(&member_pubkeys, &my_sk, &my_pk, &app_address),
+        let (scheme, peers) = {
+            let _probe = probe::section(probe::Section::CommitteeBuild);
+            match session.as_ref() {
+                Some(session) => crate::cw_app_seams::build_session_committee(session, &my_sk, &my_pk),
+                None => crate::cw_app_seams::build_app_committee(&member_pubkeys, &my_sk, &my_pk, &app_address),
+            }
         }
                 .ok_or_else(|| {
                     QuilError::Consensus(
@@ -7560,6 +7593,7 @@ impl AppConsensusEngine {
     // ---------------------------------------------------------------
 
     fn cleanup_frame_store(&mut self) {
+        let _probe = probe::section(probe::Section::FrameStoreCleanup);
         // Remove cached frames older than 10 minutes. In practice the
         // frame store grows slowly (one entry per received frame), but
         // we bound memory by evicting stale entries.
@@ -7580,6 +7614,22 @@ impl AppConsensusEngine {
 
 fn expected_admission_wait(error: &QuilError) -> bool {
     matches!(error, QuilError::ExecutionUnavailable(reason) if reason == "awaiting allocation activation")
+}
+
+/// The worker-thread probe's step for an inbound message
+/// ([`crate::worker_stall`]): the ones that can run long are named.
+fn message_step(message: &Option<AppEngineMessage>) -> probe::Section {
+    use probe::Section;
+    match message {
+        Some(AppEngineMessage::Frame(_)) => Section::EngineFrameMessage,
+        Some(AppEngineMessage::ReplayArchiveFrame { .. }) => Section::EngineReplayArchiveFrame,
+        Some(AppEngineMessage::ValidateShardSyncAnchor { .. }) => Section::EngineSyncAnchor,
+        Some(AppEngineMessage::ShardSyncCompleted { .. }) => Section::EngineSyncCompleted,
+        Some(AppEngineMessage::ShardBootstrapCompleted { .. }) => Section::EngineBootstrapCompleted,
+        Some(AppEngineMessage::CwFinalizedFrame { .. }) => Section::EngineFinalizedFrame,
+        Some(AppEngineMessage::CwTransportReady) => Section::EngineTransportReady,
+        _ => Section::EngineMessage,
+    }
 }
 
 /// Whether a refused start waits for this worker's allocation to activate:

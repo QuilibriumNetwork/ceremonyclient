@@ -813,6 +813,8 @@ pub(crate) fn init(
                 })
             });
 
+            // A blocked worker thread is reported in that worker's log.
+            quil_engine::worker_stall::route_logs_with(crate::logging::route_thread_to_core);
             thread_mgr.set_consensus_deps(quil_engine::thread_worker::WorkerConsensusDeps {
                 prover_registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
                 frame_prover: frame_prover.clone(),
