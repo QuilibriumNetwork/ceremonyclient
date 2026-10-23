@@ -12,7 +12,7 @@ use quil_types::proto::global::{AppShardFrame, GlobalFrame, GlobalFrameHeader};
 
 #[cfg(test)]
 #[path = "frame_validator_history_tests.rs"]
-mod history_tests;
+pub(crate) mod history_tests;
 
 /// Validates received global frames by verifying VDF proof and BLS signature.
 pub struct GlobalFrameVerifier {
@@ -77,6 +77,36 @@ pub(crate) fn validate_archive_replay_chain(
             .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child))
             || !linked(parent)? {
             return Err(QuilError::InvalidSignature("archive replay ancestor chain rejected".into()));
+        }
+        child = parent;
+    }
+    Ok(())
+}
+
+/// Fetch the GLOBAL anchors [`validate_archive_replay_chain`] checks the
+/// linked frames' outputs against, walking down from the certified
+/// `descendants` terminal, which the caller has authenticated, while each
+/// frame links to its child. Validation reads anchors from this node's clock
+/// only, so a frame anchored in a hole of its GLOBAL chain was refused on
+/// every retry. Anchors at or above the local GLOBAL head are left to
+/// validation, which names both frames. Stops at the first fetch failure.
+pub(crate) async fn prepare_archive_replay_anchors(
+    validator: &BlsAppFrameValidator,
+    frame: &AppShardFrame,
+    descendants: &[AppShardFrame],
+) -> Result<()> {
+    let Some((mut child, linked)) = descendants.split_last() else { return Ok(()) };
+    if descendants.len() > MAX_REPLAY_DESCENDANTS {
+        return Ok(());
+    }
+    for parent in linked.iter().rev().chain(std::iter::once(frame)) {
+        if !parent.header.as_ref().zip(child.header.as_ref())
+            .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child)) {
+            break;
+        }
+        if validator.missing_global_anchor(parent)
+            .is_some_and(|(wanted, latest)| latest.is_some_and(|latest| wanted < latest)) {
+            validator.prepare_global_anchor(parent).await?;
         }
         child = parent;
     }
@@ -896,11 +926,20 @@ impl BlsAppFrameValidator {
         self.prepare_storage_history_with(frame, false).await
     }
 
-    async fn prepare_storage_history_with(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
+    /// Fetch `frame`'s GLOBAL anchor from this node's own master when its
+    /// clock lacks it ([`crate::global_anchor::ensure_global_anchor`]); the
+    /// frame's output is checked against it. Without an anchor source the
+    /// clock is used as it is.
+    pub async fn prepare_global_anchor(&self, frame: &AppShardFrame) -> Result<()> {
         if let (Some(source), Some(header)) = (self.global_anchor_source.as_ref(), frame.header.as_ref()) {
             let store = self.clock_store.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("GLOBAL anchor has no clock store".into()))?;
             crate::global_anchor::ensure_global_anchor(store.as_ref(), source, header.global_frame_number).await?;
         }
+        Ok(())
+    }
+
+    async fn prepare_storage_history_with(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
+        self.prepare_global_anchor(frame).await?;
         let Some(source) = self.storage_history_source.as_ref() else { return Ok(()); };
         let (Some(header), Some(attestation)) = (frame.header.as_ref(), frame.storage_attestation.as_ref()) else { return Ok(()); };
         if attestation.openings.is_empty() { return Ok(()); }

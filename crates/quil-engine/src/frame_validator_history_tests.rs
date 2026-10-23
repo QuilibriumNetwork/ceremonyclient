@@ -11,7 +11,7 @@ use quil_types::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn certify(frame: &mut AppShardFrame, signer: &quil_crypto::FalconSigner, global_output: &[u8]) {
+pub(crate) fn certify(frame: &mut AppShardFrame, signer: &quil_crypto::FalconSigner, global_output: &[u8]) {
     use quil_cw_consensus::{
         _consensus::{
             simplex::{
