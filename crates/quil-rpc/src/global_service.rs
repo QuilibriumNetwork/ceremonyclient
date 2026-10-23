@@ -237,11 +237,15 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
     }
 
     /// Uncached: the inner lookup reads a header cheaply, and a header must
-    /// never stand in for a frame in the by-number cache.
+    /// never stand in for a frame in the by-number cache. The head's header
+    /// is read from the shared head, without copying its bundles.
     fn get_frame_header(
         &self,
         frame_number: u64,
     ) -> Result<global::GlobalFrameHeader, String> {
+        if frame_number == 0 {
+            return self.latest_shared()?.header.clone().ok_or_else(|| "the latest frame has no header".to_string());
+        }
         self.inner.get_frame_header(frame_number)
     }
 }
@@ -1149,6 +1153,20 @@ impl GlobalService for GlobalRpcServer {
                 .map_err(|e| Status::not_found(format!("frame {frame_number} header not found: {e}")))?;
             let frame = global::GlobalFrame { header: Some(header), requests: Vec::new() };
             return Ok(Response::new(global::GlobalFrameResponse { frame: Some(frame), proof: Vec::new() }));
+        }
+        // A poller asks for the head whole only if it is newer than its own.
+        // While it is not, the header tells the poller this archive's height
+        // without the request bundles it already holds.
+        if frame_number == 0 && req.if_newer_than > 0 {
+            let frames = self.frames.clone();
+            let header = tokio::task::spawn_blocking(move || frames.get_frame_header(0))
+                .await
+                .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+                .map_err(|e| Status::not_found(format!("no frames: {e}")))?;
+            if header.frame_number <= req.if_newer_than {
+                let frame = global::GlobalFrame { header: Some(header), requests: Vec::new() };
+                return Ok(Response::new(global::GlobalFrameResponse { frame: Some(frame), proof: Vec::new() }));
+            }
         }
 
         // Store read runs on the blocking pool, NOT inline on a peer-gRPC
@@ -2821,7 +2839,7 @@ mod global_anchor_tests {
             .with_self_peer_id(me.to_bytes())
             .with_global_anchor_source(Some(source));
         let request = |frame_number, historical_anchor, peer: Option<quil_p2p::PeerId>| {
-            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor, header_only: false });
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor, header_only: false, if_newer_than: 0 });
             if let Some(peer_id) = peer {
                 request.extensions_mut().insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
             }
@@ -2873,7 +2891,7 @@ mod global_anchor_tests {
         let lookup = CachingFrameLookup::new(BundledLookup(whole.clone()), 16, std::time::Duration::from_secs(1));
         let server = GlobalRpcServer::new(Arc::new(lookup));
         let ask = |frame_number, header_only| {
-            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only });
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only, if_newer_than: 0 });
             request.extensions_mut().insert(AuthenticatedPeer { peer_id: quil_p2p::PeerId::random(), falcon_public_key: Vec::new() });
             request
         };
@@ -2885,6 +2903,31 @@ mod global_anchor_tests {
         assert_eq!(full.requests.len(), 1);
         assert_eq!(full.header, frame(3).header);
         assert_eq!(whole.load(Ordering::SeqCst), 1);
+    }
+
+    /// A peer asking for the head whole only if it is newer than its own gets
+    /// the header alone while the head is not newer, taken from the shared
+    /// head without copying its bundles, and the whole head once it is newer.
+    /// A request without the field gets the whole head as before.
+    #[tokio::test]
+    async fn head_requests_get_the_whole_head_only_when_it_is_newer() {
+        let whole = Arc::new(AtomicUsize::new(0));
+        let lookup = CachingFrameLookup::new(BundledLookup(whole.clone()), 16, std::time::Duration::from_secs(60));
+        let server = GlobalRpcServer::new(Arc::new(lookup));
+        let ask = |if_newer_than| {
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number: 0, if_newer_than, ..Default::default() });
+            request.extensions_mut().insert(AuthenticatedPeer { peer_id: quil_p2p::PeerId::random(), falcon_public_key: Vec::new() });
+            request
+        };
+        for known in [3, 4] {
+            let head = server.get_global_frame(ask(known)).await.unwrap().into_inner().frame.unwrap();
+            assert_eq!(head, frame(3), "head 3 is not newer than {known}: the header alone");
+        }
+        for known in [0, 2] {
+            let head = server.get_global_frame(ask(known)).await.unwrap().into_inner().frame.unwrap();
+            assert_eq!((head.header, head.requests.len()), (frame(3).header, 1), "the whole head for {known}");
+        }
+        assert_eq!(whole.load(Ordering::SeqCst), 1, "the head is read once and shared");
     }
 }
 

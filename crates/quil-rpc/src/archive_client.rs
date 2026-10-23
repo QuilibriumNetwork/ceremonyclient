@@ -745,7 +745,7 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: false })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: false, if_newer_than: 0 })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
@@ -762,12 +762,29 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: true })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: true, if_newer_than: 0 })
             .await?
             .into_inner();
         let mut frame = resp.frame.ok_or(ArchiveClientError::MissingField("frame"))?;
         frame.requests.clear();
         Ok(frame)
+    }
+
+    /// The latest GLOBAL frame for a poller that holds frames up to
+    /// `newer_than`: whole when the archive's head is newer, else its header
+    /// alone, which gives the archive's height without the request bundles
+    /// the poller already holds. A server that predates `if_newer_than`
+    /// sends the whole head either way; `0` asks for it whole.
+    pub async fn get_global_head(
+        &mut self,
+        newer_than: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number: 0, if_newer_than: newer_than, ..Default::default() })
+            .await?
+            .into_inner();
+        resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
     }
 
     /// Historical GLOBAL frame `frame_number` from this worker's own master
@@ -781,7 +798,7 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true, header_only: false })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true, header_only: false, if_newer_than: 0 })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
