@@ -1685,6 +1685,9 @@ pub(crate) async fn start(
                 .with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
                 .with_request_retention(Arc::new(move || clock.global_requests_retained_from()))
         };
+        // Final production-history rows survive a restart: it then
+        // backfills only the rows after the last saved one.
+        let state = state.with_history_file(config_dir.join("explorer-history.json"), network);
         let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {
             Ok(listener) => {
@@ -1696,9 +1699,12 @@ pub(crate) async fn start(
                     .await
                     .map_err(anyhow::Error::from)
                 });
-                // App-shard production index for `/shards/production`.
-                sup.run_until_cancelled("explorer-production", move |_token| {
-                    quil_explorer::production::run_indexer(state)
+                // App-shard production index for `/shards/production`; it
+                // saves the history rows on cancellation.
+                sup.spawn("explorer-production", move |token| {
+                    quil_explorer::production::run_indexer(state, async move {
+                        token.cancelled().await;
+                    })
                 });
             }
             Err(e) => warn!(
