@@ -866,7 +866,8 @@ pub async fn handle_prover_shards(method: Method, State(state): State<ExplorerSt
 /// `fetchShardSizes` does, but in-process: enumerate the shards store and
 /// resolve each shard's `(size, data_shards)` via the same provider the
 /// gRPC `GetAppShards` uses. The filter key is `L2 (last 32 bytes of the
-/// shard key) ++ each prefix element as a byte`.
+/// shard key) ++ each prefix element as a byte`. Rows under GLOBAL's address
+/// are left out: they are no app shards (see `production::is_app_shard`).
 fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> {
     let mut result = HashMap::new();
     let shards = match state.shards_store.range_app_shards() {
@@ -877,6 +878,10 @@ fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> 
         if shard.shard_key.len() < 32 {
             continue;
         }
+        let l2 = &shard.shard_key[shard.shard_key.len() - 32..];
+        if !production::is_app_shard(l2) {
+            continue;
+        }
         let (size_be, data_shards) = match &state.app_shards_provider {
             Some(p) => match p(&shard.shard_key, &shard.prefix) {
                 Some((sz, ds, _)) => (sz, ds),
@@ -884,7 +889,6 @@ fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> 
             },
             None => (shard.size.clone(), shard.data_shards),
         };
-        let l2 = &shard.shard_key[shard.shard_key.len() - 32..];
         let filter = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
         let size = BigInt::from_bytes_be(Sign::Plus, &size_be);
         result.insert(hex::encode(&filter), (size, data_shards));
@@ -2920,8 +2924,20 @@ mod tests {
 
     /// An explorer over an empty in-memory store.
     fn empty_state() -> ExplorerState {
+        state_with_shards(&[], None)
+    }
+
+    /// An explorer over an in-memory store holding only the shard rows
+    /// `rows`, sized by `sizes` (an archive's provider).
+    fn state_with_shards(rows: &[quil_types::store::ShardInfo], sizes: Option<crate::AppShardsProvider>) -> ExplorerState {
+        use quil_types::store::{KvDb as _, ShardsStore as _};
         let db = quil_store::RocksDb::open_in_memory().expect("an in-memory store");
         let raw = db.inner();
+        let txn = db.new_batch(false).unwrap();
+        for row in rows {
+            quil_store::RocksShardsStore::new(raw.clone()).put_app_shard(txn.as_ref(), row).unwrap();
+        }
+        txn.commit().unwrap();
         let hg = Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             hg as Arc<dyn quil_types::store::HypergraphStore>,
@@ -2933,7 +2949,7 @@ mod tests {
             Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
             Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
             Arc::new(quil_store::RocksShardsStore::new(raw)),
-            None,
+            sizes,
             None,
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
             Arc::new(crate::RecentMessageRing::new(16)),
@@ -3408,6 +3424,32 @@ mod tests {
         *state.eviction.write() = Some(Arc::new(assess_eviction(frame, Instant::now(), None, &halts)));
         let unread = handle_eviction_risk(Method::GET, State(state.clone()), Query(HashMap::new())).await;
         assert_eq!(unread.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A root row under GLOBAL's address, as an archive's shards store holds
+    /// one, is no app shard: `/provers/shards` leaves it out, sized or not.
+    #[tokio::test]
+    async fn provers_shards_leave_out_a_global_row() {
+        let row = |l2: [u8; 32], prefix: Vec<u32>| {
+            let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(&l2, 256, 3).to_vec();
+            shard_key.extend_from_slice(&l2);
+            quil_types::store::ShardInfo { shard_key, prefix, size: vec![], data_shards: 0, commitment: vec![] }
+        };
+        let quil = quil_execution::domains::QUIL_TOKEN;
+        let (global, other) = (quil_execution::domains::GLOBAL, [0xaa; 32]);
+        let rows = [row(quil, vec![0]), row(global, vec![]), row(other, vec![])];
+        let sized: crate::AppShardsProvider = Arc::new(|_: &[u8], _: &[u32]| Some((vec![1], 1, Default::default())));
+        let state = state_with_shards(&rows, Some(sized));
+        let sizes = compute_shard_sizes(&state);
+        let app = |l2: [u8; 32], prefix: &[u32]| hex::encode(quil_forest::shard_prefix_to_filter(&l2, prefix));
+        let mut keys: Vec<&String> = sizes.keys().collect();
+        keys.sort();
+        let mut expected = vec![app(quil, &[0]), app(other, &[])];
+        expected.sort();
+        assert_eq!(keys, expected.iter().collect::<Vec<_>>(), "QUIL and another app; GLOBAL out");
+        let listed = body_json(handle_prover_shards(Method::GET, State(state)).await).await;
+        let filters: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|s| s["filter"].as_str()).collect();
+        assert_eq!(filters, expected.iter().map(String::as_str).collect::<Vec<_>>(), "every sized app shard, not GLOBAL");
     }
 
     #[test]

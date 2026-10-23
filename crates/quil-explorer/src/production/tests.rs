@@ -867,6 +867,49 @@ fn a_regular_node_takes_its_grid_from_the_archive_cache() {
     assert!(json.ends_with(r#""grid_source":"archive_cache","grid_shards":2,"grid_digest":"5936e534","grid_unavailable":null}"#), "{json}");
 }
 
+/// GLOBAL's address in the registry (a prover's allocation) and in the
+/// shard sizes (a root row an archive's shards store holds) makes no live
+/// app shard, from either grid source; the grid and its digest stay the
+/// QUIL rows'.
+#[test]
+fn global_is_never_a_live_app_shard() {
+    let global = quil_execution::domains::GLOBAL.to_vec();
+    let (staffed, empty) = (quil_filter(&[0, 7, 8]), quil_filter(&[0, 7, 9]));
+    let registry = vec![staffed.clone(), global.clone()];
+    let sizes = HashMap::from([
+        (hex::encode(&staffed), (num_bigint::BigInt::from(5), 1)),
+        (hex::encode(&empty), (num_bigint::BigInt::from(0), 0)),
+        (hex::encode(&global), (num_bigint::BigInt::from(0), 0)),
+    ]);
+    let row = |key: Vec<u8>, prefix: Vec<u32>| quil_types::store::ShardInfo {
+        shard_key: key,
+        prefix,
+        size: Vec::new(),
+        data_shards: 0,
+        commitment: Vec::new(),
+    };
+    let quil_rows = vec![
+        row([vec![1, 2, 3], quil_execution::domains::QUIL_TOKEN.to_vec()].concat(), vec![0]),
+        row([vec![1, 2, 3], quil_execution::domains::QUIL_TOKEN.to_vec()].concat(), vec![1]),
+    ];
+    let rows = [quil_rows.clone(), vec![row([vec![4, 5, 6], global.clone()].concat(), Vec::new())]].concat();
+    let store = grid_from_store(&registry, &sizes, &rows);
+    assert_eq!(store.live, BTreeSet::from([staffed.clone()]), "the staffed shard; GLOBAL out");
+    let cache = HashMap::from([(staffed.clone(), (5, 1)), (empty.clone(), (0, 0)), (global.clone(), (7, 1))]);
+    assert_eq!(grid_from_cache(&registry, Some(cache)).live, BTreeSet::from([staffed.clone()]), "a sized GLOBAL entry too");
+
+    let mut idx = index(1);
+    empty_through(&mut idx, 240);
+    assert!(idx.window_complete());
+    let w = World { grid: store, active: HashMap::from([(staffed.clone(), 4)]), halted: BTreeSet::new(), committed: HashMap::new() };
+    let r = report(&idx, &w);
+    let s = &r.summary;
+    assert_eq!((s.live_shards, s.classes.below_quorum, s.classes.staffed_not_producing), (1, 0, 1));
+    assert!(r.shards.iter().all(|shard| shard.filter != hex::encode(&global)), "no GLOBAL row");
+    let grid = grid_filters(&quil_rows);
+    assert_eq!((s.grid_shards, s.grid_digest.clone()), (Some(grid.len() as u64), Some(grid_digest(&grid))), "the QUIL grid's");
+}
+
 #[test]
 fn an_unavailable_grid_is_reported_never_off_grid() {
     let registry = vec![quil_filter(&[0, 6, 4])];
