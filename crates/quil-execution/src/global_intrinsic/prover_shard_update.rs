@@ -161,7 +161,7 @@ pub fn materialize_settlement_records(
     }
     if written > 0 {
         tracing::info!(
-            shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+            shard = %hex::encode(&frame_header.address),
             shard_frame = frame_header.frame_number,
             frame = current_frame_number,
             written,
@@ -233,7 +233,7 @@ pub fn verify_frame_header_session(
                 // materialization.
                 if info.public_key != *key || info.address != address {
                     tracing::warn!(
-                        shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+                        shard = %hex::encode(&frame_header.address),
                         member = %hex::encode(&address[..8]),
                         registry_key = %hex::encode(&info.public_key[..info.public_key.len().min(8)]),
                         registry_address = %hex::encode(&info.address[..info.address.len().min(8)]),

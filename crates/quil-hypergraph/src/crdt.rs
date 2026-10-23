@@ -3639,7 +3639,7 @@ impl HypergraphCrdt {
             Ok(Some(found)) if found == *root => Some((version, frame)),
             _ => {
                 tracing::debug!(
-                    shard = %hex::encode(&shard_id[..shard_id.len().min(8)]),
+                    shard = %hex::encode(shard_id),
                     phase = phase_idx,
                     version,
                     root = %hex::encode(root),

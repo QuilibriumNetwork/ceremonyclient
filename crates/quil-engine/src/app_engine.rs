@@ -2321,6 +2321,9 @@ pub struct AppConsensusEngine {
     /// logged ([`Self::log_session_liveness`]).
     session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
     session_liveness_logged: Option<std::time::Instant>,
+    /// When the materialized height was last logged at info
+    /// ([`MaterializedLog`]).
+    materialized_log: MaterializedLog,
     /// This node's presence reports of the running session
     /// ([`Self::report_presence`]).
     presence: crate::presence_reports::PresenceReporter,
@@ -2504,6 +2507,7 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
+            materialized_log: MaterializedLog::default(),
             presence: Default::default(),
             cw_inbound: [0; 4],
             cw_unresolved: 0,
@@ -3150,12 +3154,13 @@ impl AppConsensusEngine {
         // (app_engine.rs ~2326). If this line never logs a non-zero `now`, the
         // shard is wedged at genesis: every proposal is nullified, nothing
         // finalizes, and `mat` can never advance (self-sustaining deadlock).
-        info!(
-            filter = %hex::encode(&self.filter[..self.filter.len().min(8)]),
-            prev,
-            now = n,
-            "app-shard materialized height advanced"
-        );
+        // Leaving genesis always logs at info ([`MaterializedLog`]).
+        match self.materialized_log.due(prev, n, std::time::Instant::now()) {
+            Some((since_frame, since)) => info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                prev, now = n, since_frame, since_secs = since.as_secs(), "app-shard materialized height advanced"),
+            None => debug!(core_id = self.core_id, filter = hex::encode(&self.filter), prev, now = n,
+                "app-shard materialized height advanced"),
+        }
         if let Some((Report::Recovered { attempts, duration }, opened_at)) =
             self.frame_gap.materialized(n, std::time::Instant::now())
         {
@@ -3761,30 +3766,45 @@ impl AppConsensusEngine {
         let priority = self.successor_priority();
         self.execution.set_successor_blocked(priority);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
-        let predecessor = self.global_hypergraph.as_ref()
-            .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
-            .map_or_else(|| "unknown".to_string(), |seal| format!(
-                "generation {} {} at frame {}, successor generation {}",
-                seal.predecessor_generation, if seal.fenced { "fenced" } else { "sealed" },
-                seal.through, seal.session_generation,
-            ));
+        let seal = self.global_hypergraph.as_ref()
+            .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten());
+        let predecessor = seal.as_ref().map_or_else(|| "unknown".to_string(), |seal| format!(
+            "generation {} {} at frame {}, successor generation {}",
+            seal.predecessor_generation, if seal.fenced { "fenced" } else { "sealed" },
+            seal.through, seal.session_generation,
+        ));
+        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        // What the successor check reads: the stored cursor, which can trail
+        // this engine's materialized frame.
+        let committed_cursor = self.execution_engine.as_ref()
+            .and_then(|manager| manager.read_app_materialized_cursor(&self.filter).ok());
         if predecessor_history_pending(pending) {
+            let walk = crate::app_history_recovery::walk_progress(&self.filter).map_or_else(
+                || "no batch recovered in this process yet".to_string(),
+                |(done, next, target)| format!("{} frames left, from {next} down to {done} (target {target})",
+                    next.saturating_sub(done)));
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
-                local_frame = self.last_materialized_frame,
+                local_frame = self.last_materialized_frame, committed_cursor = %or_none(committed_cursor),
+                history_walk = %walk,
                 cause = "predecessor outgoing history recovery still in progress",
                 blocked_secs = blocked.as_secs(), recovery_priority = priority, scope = "this node",
                 action = "this worker cannot join the shard's consensus until it rebuilds the predecessor's \
                     outgoing history from certified headers or an archive; it retries; a 'predecessor outgoing \
                     history could not be recovered' warning names a failing source; report it with this line \
-                    if it persists",
+                    if it persists; ends when the walk reaches its target ('successor session no longer blocked \
+                    on predecessor state')",
                 "successor session blocked: predecessor outgoing history not recovered");
             return;
         }
-        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let missing_frames = match (seal.as_ref(), committed_cursor) {
+            (Some(seal), Some(cursor)) => seal.through.saturating_sub(cursor).to_string(),
+            _ => "unknown".to_string(),
+        };
         // A recovery that failed before reaching this engine (an archive
         // lacking the frame, a failed connection) is recorded only by the
         // worker's execution record.
-        let recorded = self.execution.snapshot().recovery
+        let record = self.execution.snapshot().recovery;
+        let recorded = record.as_ref()
             .filter(|r| r.consecutive_failures > 0 && !r.last_error.is_empty())
             .map(|r| AnchorRefusal {
                 frame: None, global_frame: None, at_unix_ms: r.last_error_unix_ms,
@@ -3797,13 +3817,22 @@ impl AppConsensusEngine {
         let action = if refusal.is_some_and(|r| r.global_frame.is_some()) {
             "this node's master could not supply the anchored GLOBAL frame from its store or an archive; \
                 this worker cannot join the shard's consensus until it is recovered; the shard sync retries it; \
-                report it with this line if it persists"
+                report it with this line if it persists; ends when the committed cursor reaches the predecessor's \
+                seal frame ('successor session no longer blocked on predecessor state')"
         } else {
             "this worker cannot join the shard's consensus until the shard sync recovers the predecessor's \
-                state from an archive; it retries; report it with this line if it persists"
+                state from an archive; it retries; report it with this line if it persists; ends when the \
+                committed cursor reaches the predecessor's seal frame ('successor session no longer blocked on \
+                predecessor state')"
         };
+        let recovery = record.as_ref().map_or_else(
+            || "no archive recovery attempt recorded on this worker".to_string(),
+            |r| format!("{} attempts, {} consecutive failures, phase {}, last outcome {}",
+                r.attempts, r.consecutive_failures, if r.phase.is_empty() { "idle" } else { r.phase.as_str() },
+                if r.last_outcome.is_empty() { "none" } else { r.last_outcome.as_str() }));
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), predecessor = %predecessor,
             local_frame = self.last_materialized_frame,
+            committed_cursor = %or_none(committed_cursor), missing_frames = %missing_frames, recovery = %recovery,
             anchor_frame = %or_none(refusal.and_then(|r| r.frame)),
             anchored_global_frame = %or_none(refusal.and_then(|r| r.global_frame)),
             cause = refusal.map_or("no recovery refusal recorded yet", |r| r.cause),
@@ -5000,8 +5029,17 @@ impl AppConsensusEngine {
         let outcome = |o: Option<quil_cw_consensus::adapters::Outcome>| o.map_or_else(String::new, |o| {
             format!("view {}: {} ({})", o.view, o.reason, o.detail)
         });
+        // At or below the quorum, one more absent member stops certificates:
+        // name the members missing from the best view, as the below-quorum
+        // warnings do.
+        let margin = seen.voters as i64 - quorum as i64;
+        let absent = if margin <= 0 {
+            list_missing(&session.members, &missing_from_view(best_signers.as_ref(), members), self.session_silent.me)
+        } else {
+            String::new()
+        };
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
-            base = session.base_frame, members, quorum,
+            base = session.base_frame, members, quorum, margin, absent = %absent,
             voters = seen.voters, view = seen.view, notarized = seen.notarized, nullified = seen.nullified,
             finalized = seen.finalized, notarize_votes = seen.notarize_votes, nullify_votes = seen.nullify_votes,
             finalize_votes = seen.finalize_votes, current_view = %tally(seen.current), best_view = %tally(seen.best),
@@ -5152,15 +5190,8 @@ impl AppConsensusEngine {
                 return;
             }
             SilentReport::NoQuorumView { stalled, never_voted } => {
-                let me = self.session_silent.me;
                 let missing = missing_from_view(best.as_ref(), session.members.len());
-                let listed = missing.iter().take(SILENT_LISTED).map(|&(member, voted)| {
-                    use quil_execution::global_intrinsic::materialize::prover_address_from_pubkey;
-                    let address = session.members.get(member)
-                        .and_then(|key| prover_address_from_pubkey(key).ok())
-                        .map_or_else(|| "unknown".to_string(), |address| hex::encode(&address[..8]));
-                    format!("{member} {address} {voted}{}", if Some(member) == me { ", this node" } else { "" })
-                }).collect::<Vec<_>>().join("; ");
+                let listed = list_missing(&session.members, &missing, self.session_silent.me);
                 let tally = best.as_ref().map_or((0, 0, 0), |b| (b.view, b.notarize.len(), b.nullify.len()));
                 warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
                     members = session.members.len(), quorum, voters, never_voted, stalled_secs = stalled.as_secs(),
@@ -6154,7 +6185,7 @@ impl AppConsensusEngine {
                 self.shard_mat_frame.clone(),
                 app_leader.clone(),
                 session.as_ref().filter(|_| !continues_legacy).map(|s| (s.base_frame, s.genesis)),
-            ))),
+            ).for_core(self.core_id))),
             _ => None,
         };
         self.session_closing.store(false, std::sync::atomic::Ordering::Release);
@@ -10235,6 +10266,19 @@ fn missing_from_view(
         .collect()
 }
 
+/// The first [`SILENT_LISTED`] of a session's `missing` members as
+/// `index address vote` entries (the prover address's first 8 bytes, as
+/// the below-quorum warnings name members), marking this node's index `me`.
+fn list_missing(members: &[Vec<u8>], missing: &[(usize, &'static str)], me: Option<usize>) -> String {
+    use quil_execution::global_intrinsic::materialize::prover_address_from_pubkey;
+    missing.iter().take(SILENT_LISTED).map(|&(member, voted)| {
+        let address = members.get(member)
+            .and_then(|key| prover_address_from_pubkey(key).ok())
+            .map_or_else(|| "unknown".to_string(), |address| hex::encode(&address[..8]));
+        format!("{member} {address} {voted}{}", if Some(member) == me { ", this node" } else { "" })
+    }).collect::<Vec<_>>().join("; ")
+}
+
 #[cfg(test)]
 mod silent_member_tests {
     use super::*;
@@ -10348,6 +10392,15 @@ mod silent_member_tests {
         };
         assert_eq!(missing_from_view(Some(&view), 5), vec![(2, "nullified"), (4, "no vote")]);
         assert_eq!(missing_from_view(None, 2), vec![(0, "no vote"), (1, "no vote")]);
+    }
+
+    /// Missing members are named by index, address prefix and vote, with
+    /// this node marked; a member without a key is named `unknown`.
+    #[test]
+    fn missing_members_are_listed_with_this_node_marked() {
+        let listed = list_missing(&[vec![1; 585], vec![2; 585]], &[(1, "no vote")], Some(1));
+        assert!(listed.starts_with("1 ") && listed.ends_with("no vote, this node"), "{listed}");
+        assert_eq!(list_missing(&[vec![1; 585]], &[(3, "nullified")], None), "3 unknown nullified");
     }
 }
 
@@ -11161,6 +11214,55 @@ mod session_view_lag_tests {
         assert!(!session_view_behind(1_000, 1_720, 720));
         assert!(session_view_behind(1_000, 1_721, 720));
         assert!(!session_view_behind(2_000, 1_000, 720));
+    }
+}
+
+/// How often a materialized height advancing one frame at a time is logged
+/// at info.
+const MATERIALIZED_LOG_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// When the materialized height was last logged at info, and at which frame.
+/// It advances with every finalized frame: logged each time, it was most of
+/// a worker's info lines.
+#[derive(Default)]
+struct MaterializedLog {
+    last: Option<(std::time::Instant, u64)>,
+}
+
+impl MaterializedLog {
+    /// Whether the height moving from `prev` to `n` at `now` is logged at
+    /// info: leaving genesis, a move other than one frame up (a sync, a
+    /// replay jump, a reset), the first move after a start, or the first
+    /// move [`MATERIALIZED_LOG_REPEAT`] after the last line. Returns the
+    /// frame of the last line and its age.
+    fn due(&mut self, prev: u64, n: u64, now: std::time::Instant) -> Option<(u64, Duration)> {
+        let jump = n != prev && n != prev.saturating_add(1);
+        let stale = self.last.is_none_or(|(at, _)| now.saturating_duration_since(at) >= MATERIALIZED_LOG_REPEAT);
+        if !((prev == 0 && n != 0) || jump || stale) {
+            return None;
+        }
+        let last = self.last.replace((now, n));
+        Some(last.map_or((prev, Duration::ZERO), |(at, frame)| (frame, now.saturating_duration_since(at))))
+    }
+}
+
+#[cfg(test)]
+mod materialized_log_tests {
+    use super::*;
+
+    /// Leaving genesis, a jump and the first advance an interval after the
+    /// last line log at info, each naming the frame and age of the last
+    /// line; single-frame advances between them do not.
+    #[test]
+    fn materialized_height_logs_genesis_exit_jumps_and_every_interval() {
+        let start = std::time::Instant::now();
+        let mut log = MaterializedLog::default();
+        assert_eq!(log.due(0, 1, start), Some((0, Duration::ZERO)));
+        assert_eq!(log.due(1, 2, start + Duration::from_secs(9)), None);
+        assert_eq!(log.due(2, 40, start + Duration::from_secs(18)), Some((1, Duration::from_secs(18))));
+        assert_eq!(log.due(40, 41, start + Duration::from_secs(60)), None);
+        assert_eq!(log.due(41, 42, start + Duration::from_secs(18) + MATERIALIZED_LOG_REPEAT),
+            Some((40, MATERIALIZED_LOG_REPEAT)));
     }
 }
 
@@ -12632,8 +12734,8 @@ mod tests {
         let (mut engine, _, _, _) = engine_with_session_based_at_seven(0x43);
         assert_eq!(warned(&mut engine, start), "");
         let line = warned(&mut engine, minutes(11));
-        assert!(line.contains("cause=\"no recovery refusal recorded yet\"") && line.contains("last_error=none"),
-            "{line}");
+        assert!(line.contains("cause=\"no recovery refusal recorded yet\"") && line.contains("last_error=none")
+            && line.contains("missing_frames=") && line.contains("recovery="), "{line}");
     }
 
     #[test]

@@ -37,7 +37,7 @@ async fn tree_sync_turn(
     match turn.clone().try_lock_owned() {
         Ok(guard) => guard,
         Err(_) => {
-            info!(shard = %hex::encode(&shard_id[..shard_id.len().min(8)]),
+            info!(shard = %hex::encode(shard_id),
                 "tree sync: another sync of this tree is running; waiting for it");
             turn.lock_owned().await
         }
@@ -235,6 +235,8 @@ async fn fetch_remote_blobs(
 const MAX_SYNC_REBASES: usize = 16;
 /// How long a chunk waits out local writes staged but not yet committed.
 const STAGED_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a long install logs its progress between doublings.
+const SYNC_PROGRESS_REPEAT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The tree head never advances without the data needed to read its new
 /// leaves. Each bounded transaction is a resumable intermediate tree; only
@@ -254,7 +256,8 @@ async fn sync_phase_data(
     bit_path: Vec<bool>,
     anchor: Option<quil_forest::SubtreeSyncAnchor>,
 ) -> Result<[u8; 32]> {
-    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
+    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase)
+        .labelled(filter.to_vec());
     let (client, store, shard) = (client.clone(), crdt.clone(), shard_id.to_vec());
     let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
         let (mut client, store, shard) = (client.clone(), store.clone(), shard.clone());
@@ -313,15 +316,24 @@ where
             "sync phase: installing changed leaves");
     }
     let mut next_report = 1024usize;
+    // When a progress line was last logged; an install that logged one
+    // also logs its end.
+    let mut reported: Option<std::time::Instant> = None;
     let mut rebases = 0usize;
     let mut staged_since: Option<std::time::Instant> = None;
     loop {
         while !plan.remaining().is_empty() {
             let installed = planned.saturating_sub(plan.remaining().len());
             progress(installed, planned);
-            if installed >= next_report {
-                info!(%filter, phase, installed, planned, "sync phase: installing");
-                next_report *= 2;
+            if installed >= next_report
+                || (installed > 0 && reported.unwrap_or(started).elapsed() >= SYNC_PROGRESS_REPEAT)
+            {
+                info!(%filter, phase, installed, planned, rebases,
+                    elapsed_secs = started.elapsed().as_secs(), "sync phase: installing");
+                while next_report <= installed {
+                    next_report *= 2;
+                }
+                reported = Some(std::time::Instant::now());
             }
             // Take leaves up to the chunk's leaf and byte limits; sizes are
             // authenticated in the leaves, so no blob is held beyond a chunk.
@@ -394,7 +406,15 @@ where
                 plan = rebase(crdt, plan).await?;
                 planned = plan.remaining().len();
             }
-            other => return other,
+            other => {
+                if reported.is_some() {
+                    info!(%filter, phase, leaves = planned, rebases,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        outcome = if other.is_ok() { "installed" } else { "failed" },
+                        "sync phase: installing changed leaves finished");
+                }
+                return other;
+            }
         }
     }
 }
@@ -538,7 +558,7 @@ pub(crate) async fn sync_shard_phases_on(
             continue;
         }
         let Some(source) = resolve_phase_source(&mut client, &crdt, shard_id, phase, exp).await? else {
-            warn!(phase, anchor = %hex::encode(exp),
+            warn!(phase, shard = %hex::encode(shard_id), anchor = %hex::encode(exp),
                 "phase cannot reach its anchor: source unavailable or empty source with stale local data");
             return Ok(None);
         };
@@ -553,6 +573,7 @@ pub(crate) async fn sync_shard_phases_on(
             if got.as_slice() != exp {
                 warn!(
                     phase,
+                    shard = %hex::encode(shard_id),
                     got = %hex::encode(got),
                     expected = %hex::encode(exp),
                     "phase root != anchor after root-addressed pull — not committing",

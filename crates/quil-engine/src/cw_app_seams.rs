@@ -1619,9 +1619,8 @@ impl AppSeamFinalizer {
             digest = %hex::encode(&head.digest.0[..4]),
             frame = %head.frame.map_or_else(|| "unknown".to_string(), |frame| frame.to_string()),
             reason = head.held.reason(), materialized = self.materialized_floor(),
-            stalled_secs = stuck.as_secs(), scope = "this node", action = head.held.action(),
-            "finalized app frames are not reaching this worker's engine: the oldest pending finalization cannot be delivered and holds back {} later finalizations",
-            head.behind);
+            stalled_secs = stuck.as_secs(), held_back = head.behind, scope = "this node", action = head.held.action(),
+            "finalized app frames are not reaching this worker's engine: the oldest pending finalization cannot be delivered and holds back later finalizations");
         Some(if first { HeadSignal::Stalled } else { HeadSignal::StillStalled })
     }
 

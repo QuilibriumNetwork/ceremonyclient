@@ -315,16 +315,25 @@ impl SharedWorkerExecution {
         let now = Instant::now();
         let source = if ended.source.is_empty() { "none" } else { ended.source.as_str() };
         let class = failure.as_deref().map(failure_class);
-        let (logged, classes) = {
+        let (logged, classes, failed_before, first_failure) = {
             let mut streaks = self.streaks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let streak = streaks.entry(filter.to_vec()).or_default();
+            // The failures a success ends, warned about or not: one or two
+            // failures between successes never reach the warning.
+            let failed_before = match streak.failures {
+                0 => (0, "none".to_string()),
+                failures => (failures, streak.classes()),
+            };
             // A node without any archive is one condition, summarized below
             // for all its workers.
             let logged = match class {
                 None => streak.succeeded(now),
                 Some(class) => streak.failed(class, now, if class == NO_ARCHIVE { u64::MAX } else { STREAK_WARN_AFTER }),
             };
-            (logged, streak.classes())
+            let first_failure = logged.is_none()
+                && class.is_some_and(|class| class != NO_ARCHIVE)
+                && streak.first_failure_due(now);
+            (logged, streak.classes(), failed_before, first_failure)
         };
         note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
         let filter = hex::encode(filter);
@@ -337,7 +346,8 @@ impl SharedWorkerExecution {
                 tracing::info!(%filter, outcome = %ended.last_outcome, source,
                     attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
                     installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
-                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, "archive recovery batch complete");
+                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, failed_attempts = failed_before.0,
+                    failed_classes = %failed_before.1, "archive recovery batch complete");
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
                         "archive recovery succeeded after a failure streak");
@@ -348,10 +358,19 @@ impl SharedWorkerExecution {
                     attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
                     installed_leaves = ended.attempt_installed_leaves, consecutive_failures = ended.consecutive_failures,
                     "archive recovery attempt failed");
+                if let (true, Some(class)) = (first_failure, class) {
+                    let (scope, _) = failure_guidance(class);
+                    tracing::info!(%filter, %error, class, source,
+                        attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                        installed_leaves = ended.attempt_installed_leaves, warn_after = STREAK_WARN_AFTER, scope,
+                        "archive recovery attempt failed; it retries (installed leaves are kept) and warns if it \
+                        keeps failing");
+                }
                 if let (Some(StreakLog::Failing { failures, duration }), Some(class)) = (logged, class) {
                     let (scope, action) = failure_guidance(class);
                     tracing::warn!(%filter, consecutive_failures = failures, failing_secs = duration.as_secs(),
                         classes = %classes, last_class = class, last_error = %error, last_source = source,
+                        longest_permit_wait_secs = ended.longest_permit_wait_ms / 1000,
                         scope, action, "archive recovery failing; it retries (installed leaves are kept)");
                 }
             }
@@ -382,6 +401,8 @@ pub(crate) struct FailureStreak {
     reported: bool,
     failures: u64,
     classes: BTreeMap<&'static str, u64>,
+    /// When a streak's first failure was last noted at info.
+    noted: Option<Instant>,
 }
 
 /// What a [`FailureStreak`] change logs.
@@ -396,7 +417,7 @@ pub(crate) enum StreakLog {
 
 impl FailureStreak {
     const fn new() -> Self {
-        Self { since: None, warned: None, reported: false, failures: 0, classes: BTreeMap::new() }
+        Self { since: None, warned: None, reported: false, failures: 0, classes: BTreeMap::new(), noted: None }
     }
 
     /// An attempt failed with `class` at `now`.
@@ -412,6 +433,17 @@ impl FailureStreak {
         self.warned = Some(now);
         self.reported = true;
         Some(StreakLog::Failing { failures: self.failures, duration: now.saturating_duration_since(since) })
+    }
+
+    /// Whether the failure just counted, a streak's first, is noted at info
+    /// at `now`: at most once per [`STREAK_REPEAT`], so a flapping recovery
+    /// stays bounded.
+    pub(crate) fn first_failure_due(&mut self, now: Instant) -> bool {
+        if self.failures != 1 || self.noted.is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT) {
+            return false;
+        }
+        self.noted = Some(now);
+        true
     }
 
     /// An attempt succeeded at `now`: the end of the streak, named if it
@@ -770,6 +802,24 @@ mod tests {
             assert_eq!(streak.failed("connect", at, 3), None);
             assert_eq!(streak.succeeded(at), None);
         }
+    }
+
+    /// A streak's first failure is noted at most once per repeat interval,
+    /// so failures between successes show without flooding.
+    #[test]
+    fn a_streaks_first_failure_is_noted_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut streak = FailureStreak::default();
+        streak.failed("connect", start, 3);
+        assert!(streak.first_failure_due(start));
+        streak.succeeded(start + MINUTE);
+        streak.failed("connect", start + MINUTE * 2, 3);
+        assert!(!streak.first_failure_due(start + MINUTE * 2), "within the interval");
+        streak.failed("connect", start + MINUTE * 3, 3);
+        assert!(!streak.first_failure_due(start + MINUTE * 3), "not a first failure");
+        streak.succeeded(start + MINUTE * 4);
+        streak.failed("connect", start + MINUTE * 12, 3);
+        assert!(streak.first_failure_due(start + MINUTE * 12));
     }
 
     /// Recoveries finding no archive warn once for the node, with the
