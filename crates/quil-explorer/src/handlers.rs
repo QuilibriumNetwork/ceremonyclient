@@ -48,14 +48,18 @@ const PROVER_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
 // Response helpers
 // ---------------------------------------------------------------------------
 
-fn build_response(status: StatusCode, body: Vec<u8>, cache: Option<&str>) -> Response {
+fn build_response(
+    status: StatusCode,
+    body: impl Into<axum::body::Body>,
+    cache: Option<&str>,
+) -> Response {
     let mut builder = Response::builder()
         .status(status)
         .header("Content-Type", "application/json");
     if let Some(c) = cache {
         builder = builder.header("Cache-Control", c);
     }
-    builder.body(axum::body::Body::from(body)).unwrap()
+    builder.body(body.into()).unwrap()
 }
 
 /// JSON body in Go `encoding/json` style: serialized value + trailing `\n`.
@@ -207,15 +211,61 @@ pub async fn handle_certified(
 // /messages
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct MessageJson {
-    timestamp: String,
-    from: String,
-    bitmask: String,
-    seqno: String,
-    signature: String,
-    key: String,
-    data: String,
+/// A `/messages` body younger than this is served again although messages
+/// arrived since (bounded staleness: under steady gossip every request
+/// would otherwise re-serialize megabytes of payloads).
+const MESSAGES_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Append `bytes` as lowercase hex.
+fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)]);
+        out.push(DIGITS[usize::from(b & 0xf)]);
+    }
+}
+
+/// The `/messages` JSON, written straight into one buffer: an array of
+/// objects with hex fields, then a newline (as `json_value` would produce).
+fn render_messages(records: &[crate::RecentMessage]) -> axum::body::Bytes {
+    let size: usize = records
+        .iter()
+        .map(|r| {
+            2 * (r.from.len() + r.bitmask.len() + r.seqno.len() + r.signature.len() + r.key.len() + r.data.len())
+                + 140
+        })
+        .sum();
+    let mut out = Vec::with_capacity(size + 3);
+    out.push(b'[');
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"{\"timestamp\":\"");
+        out.extend_from_slice(r.timestamp().as_bytes());
+        for (name, value) in [
+            ("from", &r.from),
+            ("bitmask", &r.bitmask),
+            ("seqno", &r.seqno),
+            ("signature", &r.signature),
+            ("key", &r.key),
+            ("data", &r.data),
+        ] {
+            out.extend_from_slice(b"\",\"");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b"\":\"");
+            push_hex(&mut out, value);
+        }
+        out.extend_from_slice(b"\"}");
+    }
+    out.extend_from_slice(b"]\n");
+    out.into()
+}
+
+/// The `/messages` body for `limit` at `now`, reusing the ring's cached one.
+fn messages_body(ring: &crate::RecentMessageRing, limit: usize, now: Instant) -> axum::body::Bytes {
+    ring.cached_body(limit, now, MESSAGES_CACHE_MAX_AGE, render_messages)
 }
 
 pub async fn handle_messages(
@@ -234,20 +284,7 @@ pub async fn handle_messages(
             }
         }
     }
-    let records = state.messages.snapshot(limit);
-    let response: Vec<MessageJson> = records
-        .into_iter()
-        .map(|r| MessageJson {
-            timestamp: r.timestamp,
-            from: hex::encode(&r.from),
-            bitmask: hex::encode(&r.bitmask),
-            seqno: hex::encode(&r.seqno),
-            signature: hex::encode(&r.signature),
-            key: hex::encode(&r.key),
-            data: hex::encode(&r.data),
-        })
-        .collect();
-    json_ok(&response, None)
+    build_response(StatusCode::OK, messages_body(&state.messages, limit, Instant::now()), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2772,6 +2809,59 @@ mod tests {
             Arc::new(crate::RecentMessageRing::new(16)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
+    }
+
+    fn recent(time: std::time::SystemTime, from: &[u8], data: &[u8]) -> crate::RecentMessage {
+        crate::RecentMessage {
+            time,
+            from: from.to_vec().into(),
+            bitmask: vec![0xBB].into(),
+            seqno: Default::default(),
+            signature: vec![0x51, 0x47].into(),
+            key: Default::default(),
+            data: data.to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn messages_json_keeps_its_shape() {
+        let at = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 5);
+        let ring = crate::RecentMessageRing::new(4);
+        ring.record(recent(at, &[0x01, 0xAB], &[0x00, 0xFF]));
+        ring.record(recent(at, &[0x02], &[]));
+        let body = messages_body(&ring, 50, Instant::now());
+        // Newest first; hex lowercase; every field present; trailing newline.
+        let expected = concat!(
+            r#"[{"timestamp":"2023-11-14T22:13:20.000000005Z","from":"02","bitmask":"bb","seqno":"","signature":"5147","key":"","data":""},"#,
+            r#"{"timestamp":"2023-11-14T22:13:20.000000005Z","from":"01ab","bitmask":"bb","seqno":"","signature":"5147","key":"","data":"00ff"}]"#,
+            "\n"
+        );
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+        // The same bytes serde would produce for the old shape.
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value[1]["data"], "00ff");
+        // Empty ring: an empty array, as before.
+        let empty = crate::RecentMessageRing::new(4);
+        assert_eq!(&messages_body(&empty, 50, Instant::now())[..], b"[]\n");
+    }
+
+    #[test]
+    fn messages_body_is_cached_per_version_and_limit() {
+        let ring = crate::RecentMessageRing::new(8);
+        ring.push_received(&[1], &[2], &[3]);
+        let t0 = Instant::now();
+        let first = messages_body(&ring, 50, t0);
+        assert_eq!(first.as_ptr(), messages_body(&ring, 50, t0 + Duration::from_secs(30)).as_ptr());
+        // A push within the window is not shown yet; beyond it, it is.
+        ring.push_received(&[4], &[2], &[3]);
+        let soon = messages_body(&ring, 50, t0 + MESSAGES_CACHE_MAX_AGE / 2);
+        assert_eq!(first.as_ptr(), soon.as_ptr());
+        let later = messages_body(&ring, 50, t0 + MESSAGES_CACHE_MAX_AGE * 2);
+        assert_ne!(first, later);
+        assert_eq!(later.iter().filter(|b| **b == b'{').count(), 2);
+        // Another limit is not served the cached body.
+        let one = messages_body(&ring, 1, t0 + MESSAGES_CACHE_MAX_AGE * 2);
+        assert_eq!(one.iter().filter(|b| **b == b'{').count(), 1);
     }
 
     #[test]
