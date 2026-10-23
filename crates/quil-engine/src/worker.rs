@@ -5,6 +5,13 @@ use quil_types::error::Result;
 /// Worker manager: coordinates data worker processes for parallel
 /// proof computation across shards.
 pub trait WorkerManager: Send + Sync {
+    /// How many allocations this node may hold: the configured worker count.
+    /// Persisted records from an earlier, larger configuration can make
+    /// `range_workers` longer, but they add no capacity.
+    fn allocation_capacity(&self) -> Result<usize> {
+        Ok(self.range_workers()?.len())
+    }
+
     /// Ask the worker to remove application payload outside `keep` from its
     /// own store. The worker revalidates its binding before any write;
     /// managers without worker-owned stores ignore the request.

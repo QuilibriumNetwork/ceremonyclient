@@ -23,6 +23,17 @@ fn restore_and_fill_worker_pool(
 ) -> quil_types::error::Result<(usize, usize)> {
     let mut restored = 0;
     for entry in persisted {
+        // An idle record above the configured count is left over from a larger
+        // configuration; restoring it would add a worker the operator removed.
+        // It stays in the store, manual flag included, and returns if the
+        // count is raised again. Records still holding a filter or an
+        // outstanding join keep serving.
+        if entry.core_id > expected_worker_count
+            && entry.filter.is_empty()
+            && entry.pending_filter_frame == 0
+        {
+            continue;
+        }
         // This deliberately also spawns records with an empty filter: they are
         // idle workers which must remain available for later allocations.
         worker_manager.set_worker_filter(entry.core_id, &entry.filter, false)?;
@@ -1224,15 +1235,8 @@ pub(crate) fn init(
                 thread_mgr.load_all_persisted()
             };
             if !archive_mode {
-                let worker_count = if config.engine.data_worker_count > 0 {
-                    config.engine.data_worker_count as u32
-                } else {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get() as u32)
-                        .unwrap_or(4)
-                        .saturating_sub(1)
-                        .max(1)
-                };
+                // The manager's count is also its allocation capacity.
+                let worker_count = thread_mgr.num_worker_cores();
                 match restore_and_fill_worker_pool(thread_mgr.as_ref(), &persisted, worker_count) {
                     Ok((restored, created)) => info!(
                         workers = worker_count,
@@ -1453,6 +1457,28 @@ mod tests {
         let workers = manager.range_workers().unwrap();
         assert_eq!(workers.iter().map(|w| w.core_id).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert!(workers.iter().find(|w| w.core_id == 3).unwrap().filter.is_empty());
+    }
+
+    /// After lowering the worker count, idle records above it are dropped;
+    /// those still serving a shard or holding a reserved join are kept.
+    #[test]
+    fn reduced_worker_count_keeps_obligations_but_drops_idle_records() {
+        let manager = TestWorkerManager::new();
+        let record = |core_id, filter: Vec<u8>, pending_filter_frame| quil_types::store::PersistedWorkerInfo {
+            core_id, filter, manually_managed: false, allocated: false, pending_filter_frame,
+        };
+        let persisted = vec![
+            record(1, vec![0xaa], 0),
+            record(2, Vec::new(), 0),
+            record(3, Vec::new(), 0),     // Dropped.
+            record(4, vec![0xbb], 0),     // Still serving.
+            record(5, vec![0xcc], 100),   // Join reserved.
+            record(6, Vec::new(), 0),     // Dropped.
+        ];
+        assert_eq!(restore_and_fill_worker_pool(&manager, &persisted, 2).unwrap(), (4, 0));
+        let workers = manager.range_workers().unwrap();
+        assert_eq!(workers.iter().map(|w| w.core_id).collect::<Vec<_>>(), vec![1, 2, 4, 5]);
+        assert_eq!(workers[3].pending_filter_frame, 100);
     }
 
     /// #595 regression: a fresh thread worker must install a PERSISTENT (Rocks)

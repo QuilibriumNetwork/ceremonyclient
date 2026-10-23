@@ -1111,7 +1111,7 @@ impl ProverLifecycle {
 
     /// Pick auto-managed Active filters to leave when the prover holds
     /// Returns lowest-scoring active filters when total active allocs
-    /// exceed total worker capacity. Manually-managed pins are
+    /// exceed `total_capacity` (the configured worker count). Manually-managed pins are
     /// protected — they're never picked as leave candidates — but
     /// they DO count toward capacity (an idle manual worker is still
     /// a worker, capable of hosting whichever filter the operator
@@ -1120,6 +1120,7 @@ impl ProverLifecycle {
         &self,
         active_filters: &[Vec<u8>],
         workers: &[crate::worker::WorkerInfo],
+        total_capacity: usize,
         allocated_descriptors: &[ShardDescriptor],
         difficulty: u64,
         world_bytes: &BigInt,
@@ -1139,8 +1140,6 @@ impl ProverLifecycle {
         // `mm_filters`) and the surplus calc subtracted them from
         // capacity while still counting all actives, falsely
         // concluding "too many allocs, propose leave."
-        let total_capacity = workers.len();
-
         let total_active_count = active_filters.len();
 
         if total_active_count <= total_capacity {
@@ -1335,6 +1334,10 @@ impl ProverLifecycle {
         let reward_rings = registry_view.reward_rings;
         let workers = worker_manager.range_workers()?;
         let worker_view = WorkerView::from_workers(workers.clone());
+        // Allocations the node may hold. Not `workers.len()`: records left
+        // from a larger configuration still finish their obligations but add
+        // no capacity.
+        let worker_capacity = worker_manager.allocation_capacity()?;
 
         // Discover shard filters from the local `ShardsStore`.
         // Mainnet seeds many shards at genesis (per
@@ -1694,10 +1697,28 @@ impl ProverLifecycle {
             .iter()
             .filter(|f| !worker_bound_filters.contains(*f))
             .count();
+        // Nor may joins take the node past its capacity: every filter held or
+        // bound occupies a slot, whichever worker record serves it. A join
+        // published but not yet in the registry is not counted: after the
+        // count is lowered, a record above it still awaiting its join can let
+        // one join too many through. The confirm cap normally rejects the
+        // excess, but it does not count confirmations still in flight, so a
+        // re-ranking between evaluations can confirm it too; the surplus leave
+        // path then sheds it unless the halt-risk shield protects that shard.
+        let occupied = all_our_filters
+            .iter()
+            .chain(&worker_bound_filters)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         let assignable_worker_ids: Vec<u32> = free_worker_ids
             .iter()
             .copied()
-            .take(free_worker_ids.len().saturating_sub(unbound_held_count))
+            .take(
+                free_worker_ids
+                    .len()
+                    .saturating_sub(unbound_held_count)
+                    .min(worker_capacity.saturating_sub(occupied)),
+            )
             .collect();
         let allow_proposals = !assignable_worker_ids.is_empty();
 
@@ -1902,7 +1923,7 @@ impl ProverLifecycle {
         //    after a shard freeze. Has its own cooldown separate from the
         //    join cooldown (4 frames between reject batches).
         let excess_rejects =
-            self.select_excess_pending_filters(&active_filters, &joining_filters, workers.len());
+            self.select_excess_pending_filters(&active_filters, &joining_filters, worker_capacity);
         if !excess_rejects.is_empty() {
             let last_reject = self.allocator.last_reject_attempt();
             let cooldown_ok = last_reject == 0
@@ -1917,12 +1938,12 @@ impl ProverLifecycle {
                     .iter()
                     .map(hex::encode)
                     .collect();
-                let allowed = workers.len().saturating_sub(active_filters.len());
+                let allowed = worker_capacity.saturating_sub(active_filters.len());
                 info!(
                     frame = frame_number,
                     active_count = active_filters.len(),
                     pending_count = joining_filters.len(),
-                    worker_capacity = workers.len(),
+                    worker_capacity,
                     allowed_pending = allowed,
                     rejections = filters.len(),
                     ?reject_summary,
@@ -1947,6 +1968,7 @@ impl ProverLifecycle {
             let surplus = self.select_excess_active_filters(
                 &active_filters,
                 &workers,
+                worker_capacity,
                 &allocated_descriptors,
                 difficulty,
                 &world_bytes,
@@ -1969,7 +1991,7 @@ impl ProverLifecycle {
                     info!(
                         frame = frame_number,
                         active_count = active_filters.len(),
-                        worker_capacity = workers.len(),
+                        worker_capacity,
                         manually_managed_pinned = mm_count,
                         surplus = surplus.len(),
                         ?leave_summary,
@@ -2199,17 +2221,24 @@ impl ProverLifecycle {
             // confirmed join stay or become committee members whatever a
             // pending join does, so a pending join must not take the worker
             // one of them needs. Pending joins are what this cap decides.
-            let owed_workers = prover_info.as_ref().map_or(0, |p| p.allocations.iter()
-                .filter(|a| !a.confirmation_filter.is_empty()
-                    && !worker_bound_filters.contains(&a.confirmation_filter))
+            //
+            // And never past capacity: those same held allocations, served or
+            // not, already occupy slots a confirmed join would need.
+            let held: Vec<&quil_types::consensus::ProverAllocationInfo> = prover_info.iter()
+                .flat_map(|p| &p.allocations)
+                .filter(|a| !a.confirmation_filter.is_empty())
                 .filter(|a| match a.phase(frame_number) {
                     Some(quil_types::consensus::AllocationPhase::Joining) => false,
                     Some(_) => true,
                     None => self.allocator.renewal_recovering(a, frame_number),
                 })
-                .count());
+                .collect();
+            let owed_workers = held.iter()
+                .filter(|a| !worker_bound_filters.contains(&a.confirmation_filter))
+                .count();
             let available_workers = workers.iter().filter(|w| !w.allocated).count()
-                .saturating_sub(owed_workers);
+                .saturating_sub(owed_workers)
+                .min(worker_capacity.saturating_sub(held.len()));
 
             // Manual bucket: confirm up to capacity, reject excess
             // (capacity-only, deterministic lexicographic order so
@@ -2425,8 +2454,8 @@ impl ProverLifecycle {
             // allocation to it first, so subtracting it found a surplus of
             // one per idle manual worker and left a holding it could serve.
             let auto_worker_capacity = workers.iter()
-                .filter(|w| !w.manually_managed || w.filter.is_empty())
-                .count();
+                .filter(|w| !w.manually_managed || w.filter.is_empty()).count()
+                .min(worker_capacity.saturating_sub(manually_managed_filters.len()));
             let overcapacity = sheddable_filters.len().saturating_sub(auto_worker_capacity);
             let overcapacity_filters: Vec<Vec<u8>> = if overcapacity == 0 {
                 Vec::new()
@@ -2828,6 +2857,38 @@ impl ProverLifecycle {
                 }
             }
 
+            // Serving more shards than the configured worker count (only after
+            // the count was lowered) must be able to shrink: the score rule
+            // below rejects a leave when no better shard is open, so the
+            // surplus leave would be proposed and rejected every epoch.
+            // Confirm, lowest score first, the leaves that bring the served
+            // holdings down to the count. Departures in notice no longer
+            // count, nor do bound leaves confirmed above; the score rule's
+            // halt-risk shield still applies.
+            let serving = prover_info.iter().flat_map(|p| &p.allocations)
+                .filter(|a| bound_filters.contains(&a.confirmation_filter))
+                .filter(|a| match a.phase(frame_number) {
+                    Some(quil_types::consensus::AllocationPhase::Joining
+                        | quil_types::consensus::AllocationPhase::Departing) => false,
+                    Some(_) => true,
+                    None => self.allocator.renewal_recovering(a, frame_number),
+                })
+                .count()
+                .saturating_sub(orphan_ready.iter().chain(&lapsed_ready).chain(&manual_ready)
+                    .filter(|f| bound_filters.contains(*f)).count());
+            let shielded: std::collections::HashSet<Vec<u8>> = held_descriptors.iter()
+                .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1)
+                .map(|d| d.filter.clone())
+                .collect();
+            let capacity_ready: Vec<Vec<u8>> = proposer::rank_allocated_by_score_ascending(
+                &held_descriptors, difficulty, &world_bytes, self.units, self.strategy, &shielded)
+                .into_iter()
+                .map(|(f, _)| f)
+                .filter(|f| auto_ready.contains(f))
+                .take(serving.saturating_sub(worker_capacity))
+                .collect();
+            auto_ready.retain(|f| !capacity_ready.contains(f));
+
             // Confirmed notice-period departures already provide future slots.
             // Count only workers actually serving them, once per worker; local
             // publication is not an authenticated confirmation.
@@ -2885,6 +2946,7 @@ impl ProverLifecycle {
 
             auto_reject.extend(retained_rejections);
             info!(frame = frame_number, score = auto_confirm.len(),
+                capacity = capacity_ready.len(),
                 halt_risk_swap = swap_confirm.len(), orphan = orphan_ready.len(),
                 lapsed = lapsed_ready.len(), manual = manual_ready.len(), reject = auto_reject.len(),
                 confirmed_departure_workers = confirmed_departure_workers.len(),
@@ -2896,10 +2958,11 @@ impl ProverLifecycle {
             }
 
             // Manual, orphan and lapsed: always confirm at window, no
-            // auto-reject. Order: auto confirms, then swaps, then orphans,
+            // auto-reject. Order: auto confirms, then capacity, then swaps, then orphans,
             // then lapsed, then manuals — stable per-frame ordering for the
             // log.
             let mut combined_confirm = auto_confirm;
+            combined_confirm.extend(capacity_ready);
             combined_confirm.extend(swap_confirm);
             combined_confirm.extend(orphan_ready);
             combined_confirm.extend(lapsed_ready);
@@ -7534,6 +7597,101 @@ mod proposal_loop_tests {
         assert_eq!(pending(timed_out + 1), proposed, "nor one still running");
         lifecycle.note_registry_synced(since);
         assert_eq!(pending(timed_out + 2), 0, "a registry synced since without the join frees the worker");
+    }
+
+    /// Worker records left from a larger configuration add no capacity:
+    /// with two workers configured and one shard held, a node with seven
+    /// records proposes one join, not six.
+    #[test]
+    fn joins_stay_within_the_configured_worker_count() {
+        let address = vec![0xCDu8; 32];
+        let held = filter_bytes(0xB0);
+        let crowded = |filter: Vec<u8>| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 1);
+            ProverShardSummary { filter, status_counts: counts, total_size: 10_000_000 }
+        };
+        let proposed = |capacity: Option<usize>| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            (2..=7).for_each(|core| wm.add(idle_worker(core)));
+            if let Some(capacity) = capacity {
+                wm.set_allocation_capacity(capacity);
+            }
+            let reg = Arc::new(ConfigurableRegistry::new());
+            reg.set_prover(prover(address.clone(), vec![alloc(held.clone(), ProverStatus::Active, 10)]));
+            reg.set_summaries((0xC0..0xC6).map(|b| crowded(filter_bytes(b))).collect());
+            let lifecycle = make_lifecycle(address.clone(), wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>);
+            lifecycle.set_prover_root_verified_frame(100);
+            count_proposed_joins(&lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        assert!(proposed(None) > 1, "the records alone would fund several joins");
+        assert_eq!(proposed(Some(2)), 1);
+    }
+
+    /// Confirmations count held allocations against the configured count,
+    /// not against however many idle worker records exist.
+    #[test]
+    fn confirms_stay_within_the_configured_worker_count() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let held = filter_bytes(0xB0);
+        wm.add(allocated_worker(1, held.clone()));
+        (2..=7).for_each(|core| wm.add(idle_worker(core)));
+        wm.set_allocation_capacity(2);
+        let joining: Vec<Vec<u8>> = (0xA1..=0xA3).map(filter_bytes).collect();
+        let mut allocs = vec![alloc(held.clone(), ProverStatus::Active, 10)];
+        allocs.extend(joining.iter().map(|f| alloc(f.clone(), ProverStatus::Joining, 50)));
+        reg.set_prover(prover(address.clone(), allocs));
+        let mut summaries = vec![shard_summary(held, 1)];
+        summaries.extend(joining.iter().map(|f| shard_summary(f.clone(), 1)));
+        reg.set_summaries(summaries);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(800);
+
+        // Epoch 1: the epoch-0 joins are in their confirm slot.
+        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_confirms(&actions).len(), 1, "{actions:?}");
+    }
+
+    /// After the worker count is lowered, the surplus leave the node proposes
+    /// is confirmed even with no better shard to go to. Without a reduction
+    /// the same leave still goes through the score rule and is rejected.
+    #[test]
+    fn a_surplus_leave_after_lowering_the_count_is_confirmed() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let decided = |capacity: usize| {
+            let address = vec![0xCDu8; 32];
+            let (a, b) = (filter_bytes(0xA1), filter_bytes(0xA2));
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, a.clone()));
+            wm.add(allocated_worker(2, b.clone()));
+            wm.set_allocation_capacity(capacity);
+            let reg = Arc::new(ConfigurableRegistry::new());
+            reg.set_summaries(vec![shard_summary(a.clone(), 8), shard_summary(b.clone(), 8)]);
+            let mut allocs = vec![alloc(a, ProverStatus::Active, 10), alloc(b, ProverStatus::Active, 10)];
+            reg.set_prover(prover(address.clone(), allocs.clone()));
+            let lifecycle = make_lifecycle(address.clone(), wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>);
+            lifecycle.set_prover_root_verified_frame(100);
+            let proposed = count_proposed_leaves(&lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            // Whatever was proposed, decide a pending leave of `b` in its confirm epoch.
+            allocs[1].status = ProverStatus::Leaving;
+            allocs[1].leave_frame_number = 100;
+            reg.set_prover(prover(address, allocs));
+            lifecycle.set_prover_root_verified_frame(800);
+            let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            let rejected: usize = actions.iter().map(|a| match a {
+                LifecycleAction::RejectLeaves { filters, .. } => filters.len(),
+                _ => 0,
+            }).sum();
+            (proposed, actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { .. })), rejected)
+        };
+        assert_eq!(decided(1), (1, true, 0), "reduced count: proposed and confirmed");
+        assert_eq!(decided(2), (0, false, 1), "no reduction: the score rule still decides");
     }
 
     #[test]

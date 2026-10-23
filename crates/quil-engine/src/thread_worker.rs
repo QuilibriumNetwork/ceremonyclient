@@ -259,7 +259,7 @@ pub struct ThreadWorkerManager {
     /// Channel for workers to send events back to master.
     master_rx: Mutex<Option<mpsc::Receiver<WorkerToMaster>>>,
     master_tx: mpsc::Sender<WorkerToMaster>,
-    /// Number of available CPU cores (excluding core 0 for master).
+    /// Configured worker count, or available CPUs less the master's (at least one).
     num_cores: u32,
     /// Shared consensus dependencies — set after construction.
     consensus_deps: Mutex<Option<Arc<WorkerConsensusDeps>>>,
@@ -283,15 +283,18 @@ impl ThreadWorkerManager {
     ///   * `> 0` → honor it exactly (the operator asked for N local workers);
     ///     this is what makes a `dataWorkerCount: 1` localnet run a single
     ///     worker instead of silently spinning up `cpu-1`.
-    ///   * `<= 0` (the default) → auto-size to `cpu_cores - 1` (the historical
-    ///     behavior; production configs that don't set the field are unchanged).
+    ///   * `<= 0` (the default) → auto-size to `available_parallelism - 1`,
+    ///     at least one. Unlike the core list used for pinning, this honors
+    ///     cgroup CPU quotas.
+    ///
+    /// This count is also the node's allocation capacity.
     pub fn new_with_count(configured: i32) -> Self {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let cpu_default = if core_ids.len() > 1 {
-            (core_ids.len() - 1) as u32
-        } else {
-            0
-        };
+        let cpu_default = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(4)
+            .saturating_sub(1)
+            .max(1);
         let num_cores = if configured > 0 {
             configured as u32
         } else {
@@ -994,6 +997,10 @@ impl ThreadWorkerManager {
 }
 
 impl WorkerManager for ThreadWorkerManager {
+    fn allocation_capacity(&self) -> Result<usize> {
+        Ok(self.num_cores as usize)
+    }
+
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
         let workers = self
             .workers
@@ -1223,6 +1230,16 @@ mod tests {
     fn worker_manager_construction() {
         let mgr = ThreadWorkerManager::new();
         assert!(mgr.num_worker_cores() > 0 || cfg!(target_os = "linux"));
+    }
+
+    /// The automatic count follows `available_parallelism`, which honors a
+    /// cgroup CPU quota; the affinity core list (used only for pinning) does not.
+    #[test]
+    fn automatic_worker_count_honors_cpu_quota() {
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get() as u32).unwrap_or(4).saturating_sub(1).max(1);
+        assert_eq!(ThreadWorkerManager::new_with_count(0).num_worker_cores(), expected);
+        assert_eq!(ThreadWorkerManager::new_with_count(3).num_worker_cores(), 3);
     }
 
     #[test]
