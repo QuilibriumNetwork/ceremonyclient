@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use quil_types::error::{QuilError, Result};
+use quil_types::thread_probe::{install as install_probe, probed, Section as ProbeSection, ThreadProbe};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
@@ -472,7 +473,16 @@ impl ThreadWorkerManager {
                     .build()
                     .expect("failed to create worker tokio runtime");
 
-                rt.block_on(async move {
+                // A watchdog on another thread names what blocks this one
+                // (worker_stall): the probe marks this thread's tasks and
+                // synchronous sections, and the heartbeat stops while one
+                // of them blocks it.
+                let probe = ThreadProbe::new();
+                let probe_installed = install_probe(probe.clone());
+                crate::worker_stall::watch(core_id, &probe);
+                rt.spawn(crate::worker_stall::heartbeat(Arc::downgrade(&probe), crate::worker_stall::HEARTBEAT));
+
+                rt.block_on(probed(ProbeSection::WorkerLoop, async move {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
                     // The last engine's mempool and its application. A split or
@@ -522,6 +532,7 @@ impl ThreadWorkerManager {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
                                         bound_since = std::time::Instant::now();
+                                        probe.set_filter(&filter);
                                         // Retire telemetry before replacing the engine generation.
                                         *execution_slot.lock().unwrap() = None;
                                         // Stop existing engine if any
@@ -710,7 +721,7 @@ impl ThreadWorkerManager {
                                                     let sync_in_progress = std::sync::Arc::new(
                                                         std::sync::atomic::AtomicBool::new(false),
                                                     );
-                                                    tokio::spawn(async move {
+                                                    tokio::spawn(probed(ProbeSection::EngineEvents, async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
                                                                 crate::app_engine::AppEngineEvent::FrameProduced { filter, frame_number, frame_data } => {
@@ -821,7 +832,7 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     }
                                                                     let release_sync = ReleaseSyncFlag(flag);
-                                                                    tokio::spawn(async move {
+                                                                    tokio::spawn(probed(ProbeSection::ArchiveRecovery, async move {
                                                                         let _release_sync = release_sync;
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
@@ -840,7 +851,7 @@ impl ThreadWorkerManager {
                                                                             &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,
                                                                             core_id, &lb, lb.execution_record(), lineage,
                                                                         ).await;
-                                                                    });
+                                                                    }));
                                                                 }
                                                                 _ => {
                                                                     // Equivocation/Halted/ParentSealed —
@@ -850,7 +861,7 @@ impl ThreadWorkerManager {
                                                                 }
                                                             }
                                                         }
-                                                    });
+                                                    }));
 
                                                     // Spawn the engine as its own task so it schedules
                                                     // independently of the cancellation watcher and any
@@ -858,9 +869,9 @@ impl ThreadWorkerManager {
                                                     // Sharing a task via `tokio::select!` here was making
                                                     // the engine's own select starve under load.
                                                     let signer_factory = deps.bls_signer_factory.clone();
-                                                    let mut engine_handle = tokio::spawn(async move {
+                                                    let mut engine_handle = tokio::spawn(probed(ProbeSection::AppEngine, async move {
                                                         engine.run(signer_factory).await;
-                                                    });
+                                                    }));
                                                     tokio::select! {
                                                         _ = ec.cancelled() => {
                                                             info!(core_id, "app engine cancelled");
@@ -923,10 +934,10 @@ impl ThreadWorkerManager {
                                             crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base,
                                                 move |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
                                                     crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey)))));
-                                        tokio::spawn(async move {
+                                        tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
                                             crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage).await;
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        });
+                                        }));
                                     }
                                     Some(MasterToWorker::CreateJoinProof {
                                         challenge,
@@ -959,7 +970,8 @@ impl ThreadWorkerManager {
                             }
                         }
                     }
-                });
+                }));
+                drop(probe_installed);
             })
             .map_err(|e| QuilError::Internal(format!("failed to spawn worker thread: {}", e)))?;
 

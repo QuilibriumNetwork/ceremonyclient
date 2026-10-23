@@ -254,6 +254,116 @@ struct CompositeScan {
 const COMPOSITE_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(900);
 const MAX_COMPOSITE_SCANS: usize = 64;
 
+/// The peer listener's deadline for a PQNoise handshake.
+const PQ_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// PQNoise handshakes the peer listener dropped at their deadline, logged
+/// at most once a minute with their count, and at most a minute after the
+/// first one not yet logged. The dialer is unknown until its handshake
+/// completes, so the line names none.
+#[derive(Default)]
+struct HandshakeTimeouts {
+    state: std::sync::Mutex<TimeoutCount>,
+}
+
+#[derive(Default)]
+struct TimeoutCount {
+    /// When the last line was logged.
+    logged_at: Option<std::time::Instant>,
+    /// Timeouts since.
+    pending: u64,
+    /// A flush of `pending` is scheduled.
+    flush_scheduled: bool,
+}
+
+/// What a counted timeout or a scheduled flush calls for.
+#[derive(Debug, PartialEq, Eq)]
+enum TimeoutsDue {
+    /// Log now: the timeouts since the previous line and how long ago that
+    /// line was.
+    Log(u64, Option<std::time::Duration>),
+    /// Flush the count after this long, when the next line is due.
+    FlushAfter(std::time::Duration),
+    /// Nothing to log: counted for a scheduled flush, or already logged.
+    Nothing,
+}
+
+impl HandshakeTimeouts {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Count a timeout at `now`.
+    fn record(&self, now: std::time::Instant) -> TimeoutsDue {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending += 1;
+        match state.logged_at.map(|at| now.saturating_duration_since(at)) {
+            Some(since) if since < Self::EVERY => {
+                if std::mem::replace(&mut state.flush_scheduled, true) {
+                    TimeoutsDue::Nothing
+                } else {
+                    TimeoutsDue::FlushAfter(Self::EVERY - since)
+                }
+            }
+            since => {
+                state.logged_at = Some(now);
+                TimeoutsDue::Log(std::mem::take(&mut state.pending), since)
+            }
+        }
+    }
+
+    /// The scheduled flush at `now`. A line logged since it was scheduled
+    /// defers the timeouts counted after it until the next line is due.
+    fn flush(&self, now: std::time::Instant) -> TimeoutsDue {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending == 0 {
+            state.flush_scheduled = false;
+            return TimeoutsDue::Nothing;
+        }
+        match state.logged_at.map(|at| now.saturating_duration_since(at)) {
+            Some(since) if since < Self::EVERY => TimeoutsDue::FlushAfter(Self::EVERY - since),
+            since => {
+                state.flush_scheduled = false;
+                state.logged_at = Some(now);
+                TimeoutsDue::Log(std::mem::take(&mut state.pending), since)
+            }
+        }
+    }
+}
+
+/// Count a handshake the peer listener dropped at its deadline. Called on
+/// the handshake runtime, which runs the scheduled flush.
+fn note_handshake_timeout() {
+    static TIMEOUTS: std::sync::OnceLock<HandshakeTimeouts> = std::sync::OnceLock::new();
+    let timeouts = TIMEOUTS.get_or_init(HandshakeTimeouts::default);
+    match timeouts.record(std::time::Instant::now()) {
+        TimeoutsDue::Log(count, since) => log_handshake_timeouts(count, since),
+        TimeoutsDue::FlushAfter(mut delay) => {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(delay).await;
+                    match timeouts.flush(std::time::Instant::now()) {
+                        TimeoutsDue::Log(count, since) => {
+                            log_handshake_timeouts(count, since);
+                            break;
+                        }
+                        TimeoutsDue::FlushAfter(again) => delay = again,
+                        TimeoutsDue::Nothing => break,
+                    }
+                }
+            });
+        }
+        TimeoutsDue::Nothing => {}
+    }
+}
+
+fn log_handshake_timeouts(timeouts: u64, since: Option<std::time::Duration>) {
+    info!(timeouts, since_previous_line_secs = %since.map_or_else(|| "none".to_string(), |d| d.as_secs().to_string()),
+        deadline_secs = PQ_HANDSHAKE_DEADLINE.as_secs(), scope = "inbound connections to this node's peer gRPC listener",
+        action = "connections that did not finish a PQNoise handshake in time were dropped; slow or stalled dialers \
+            and scanners that never speak both count, and the line names no dialer; a steady high count may mean \
+            this node's handshake runtime is overloaded: report it with this line",
+        "PQNoise handshakes timed out on the peer gRPC listener");
+}
+
 /// The shard path of a full filter, and the last address of its range.
 fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
     let (_, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)?;
@@ -2715,7 +2825,7 @@ pub(crate) fn spawn_all(
                     // only the task execution moves.
                     tls_handshake_rt.spawn(async move {
                         let pq = match tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
+                            PQ_HANDSHAKE_DEADLINE,
                             quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &pq_seed),
                         )
                         .await
@@ -2732,6 +2842,7 @@ pub(crate) fn spawn_all(
                             Err(_) => {
                                 crate::rpc_metrics::inc_tls_handshake("timeout");
                                 debug!("PQNoise handshake timed out");
+                                note_handshake_timeout();
                                 return;
                             }
                         };
@@ -2877,6 +2988,38 @@ fn committed_global_app_heads(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, filte
             generation: session.generation,
         }))
     }).collect()
+}
+
+#[cfg(test)]
+mod handshake_timeout_tests {
+    use super::HandshakeTimeouts;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn handshake_timeouts_log_at_most_once_a_minute_and_flush_within_one() {
+        use super::TimeoutsDue::{FlushAfter, Log, Nothing};
+        let timeouts = HandshakeTimeouts::default();
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let secs = Duration::from_secs;
+        assert_eq!(timeouts.record(at(0)), Log(1, None));
+        assert_eq!(timeouts.record(at(1)), FlushAfter(secs(59)));
+        assert_eq!(timeouts.record(at(59)), Nothing);
+        // The scheduled flush logs the trailing count without a further timeout.
+        assert_eq!(timeouts.flush(at(60)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.record(at(200)), Log(1, Some(secs(140))));
+        assert_eq!(timeouts.record(at(201)), FlushAfter(secs(59)));
+        // A timeout once the line is due logs at once; the flush finds nothing.
+        assert_eq!(timeouts.record(at(260)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.flush(at(260)), Nothing);
+        assert_eq!(timeouts.record(at(261)), FlushAfter(secs(59)));
+        // Timeouts counted after such a line wait until the next one is due.
+        assert_eq!(timeouts.record(at(320)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.record(at(330)), Nothing);
+        assert_eq!(timeouts.flush(at(320)), FlushAfter(secs(60)));
+        assert_eq!(timeouts.flush(at(380)), Log(1, Some(secs(60))));
+        assert_eq!(timeouts.record(at(381)), FlushAfter(secs(59)));
+    }
 }
 
 #[cfg(test)]

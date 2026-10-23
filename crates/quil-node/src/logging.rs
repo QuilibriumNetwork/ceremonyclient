@@ -35,6 +35,12 @@ pub fn set_worker_core_id(core_id: u32) {
     WORKER_CORE_ID.with(|cell| cell.set(Some(core_id)));
 }
 
+/// Tag this thread's next lines as `core_id`'s (`None`: the master's), so a
+/// watchdog thread can write a worker's lines to that worker's log.
+pub fn route_thread_to_core(core_id: Option<u32>) {
+    WORKER_CORE_ID.with(|cell| cell.set(core_id));
+}
+
 pub fn current_worker_core_id() -> Option<u32> {
     WORKER_CORE_ID.with(|cell| cell.get())
 }
