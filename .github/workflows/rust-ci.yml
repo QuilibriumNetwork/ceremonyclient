@@ -27,11 +27,47 @@ env:
 
 jobs:
   # -----------------------------------------------------------------
+  # scope — skip a pull request whose merge result push CI already
+  # tests: a branch of this repository that the push trigger covers,
+  # which contains its base (a release branch into develop). The merge
+  # is then the head's own tree, built and tested by its push.
+  # -----------------------------------------------------------------
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=true
+          # Keep in step with the push trigger's branch patterns above.
+          if [ "$EVENT" = pull_request ] && [ "$SAME_REPO" = true ] &&
+             [[ $HEAD_REF =~ ^(develop|develop-.+|v[0-9].*)$ ]]; then
+            # On an API error the jobs run: a skipped required check
+            # would count as passed.
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq .status) || status=unknown
+            case $status in ahead|identical) run=false ;; esac
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------
   # build — compile every workspace target early, including test-only code.
   # -----------------------------------------------------------------
   build:
     name: build (cargo check)
     runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +110,11 @@ jobs:
   test:
     name: test (cargo nextest)
     runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    permissions:
+      contents: read
+      checks: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,11 +143,32 @@ jobs:
         with:
           tool: nextest
 
+      # A merge queue merges the commit its group tested, so the push of
+      # that commit only builds the tests, which refreshes the base's
+      # cache. A push that skipped the queue still runs them.
+      - name: find this commit's passed test run
+        id: tested
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The check name is this job's name.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=test%20(cargo%20nextest)&status=completed" \
+            --jq '[.check_runs[] | select(.conclusion == "success")] | length') || n=0
+          echo "tested=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       # .nextest.toml gives the multi-node consensus e2e tests exclusive
       # scheduling slots so they aren't starved by parallel tests on the
       # 4-vCPU runner (it no longer skips any tests).
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml
+        env:
+          TESTED: ${{ steps.tested.outputs.tested }}
+        run: |
+          if [ "$TESTED" = true ]; then
+            cargo nextest run --workspace --locked --config-file .nextest.toml --no-run
+          else
+            cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml
+          fi
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
