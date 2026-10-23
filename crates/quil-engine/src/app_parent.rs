@@ -128,6 +128,9 @@ pub struct AppParentExecutor {
     /// The tip as last read by a proposal or vote; [`Self::extendable`] runs
     /// in the consensus loop and must not wait for the store's commit lock.
     tip_hint: std::sync::Mutex<Option<Tip>>,
+    /// The worker this executor serves, for its log lines: they run outside
+    /// the worker's span.
+    core_id: u32,
 }
 
 impl AppParentExecutor {
@@ -165,7 +168,14 @@ impl AppParentExecutor {
             prepared: std::sync::Mutex::new(None),
             verdicts: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tip_hint: std::sync::Mutex::new(None),
+            core_id: 0,
         }
+    }
+
+    /// Name the worker in this executor's lines ([`Self::core_id`]).
+    pub(super) fn for_core(mut self, core_id: u32) -> Self {
+        self.core_id = core_id;
+        self
     }
 
     /// The consensus host's body store, where selected parents' bytes arrive.
@@ -435,9 +445,11 @@ impl AppParentExecutor {
             None,
         );
         info!(
+            core_id = self.core_id,
             filter = %hex::encode(&self.filter),
             frame = number,
             view = parent_view,
+            base = tip.cursor,
             frames = chain.len(),
             processed,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -583,6 +595,7 @@ impl quil_cw_consensus::engine_host::ParentFallback for AppParentExecutor {
                 .and_then(|(_, verdict)| verdict.map(|refused| refused.depth))
         });
         info!(
+            core_id = self.core_id,
             filter = %hex::encode(&self.filter),
             view,
             parent_view = parent,

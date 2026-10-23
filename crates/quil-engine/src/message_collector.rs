@@ -673,7 +673,7 @@ impl MessageCollector {
                 // shard carries committed data, and the shard still progresses.
                 if c.global_frame_number > 0 && !c.has_attestation {
                     tracing::debug!(
-                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        address = %hex::encode(&c.address),
                         frame_number = c.frame_number,
                         global_frame_number = c.global_frame_number,
                         "message collector: storage frame carries no attestation — ACCEPTING (reward withheld by the intrinsic if data-bearing; frame not wedged)"

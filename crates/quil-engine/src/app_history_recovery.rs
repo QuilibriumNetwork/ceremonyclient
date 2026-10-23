@@ -47,6 +47,35 @@ fn unavailable(message: impl Into<String>) -> QuilError {
     QuilError::ExecutionUnavailable(format!("app history recovery: {}", message.into()))
 }
 
+/// How often a running outgoing-history walk logs a batch at info; its
+/// first batch in this process and its last always do.
+const WALK_PROGRESS_REPEAT: Duration = Duration::from_secs(5 * 60);
+
+/// Running walks by filter: when each last logged at info, and its
+/// `(done, next, target)` after its latest batch. An abandoned walk leaves
+/// one entry, bounded by the filters this process served.
+static WALKS: Mutex<BTreeMap<Vec<u8>, (Instant, (u64, u64, u64))>> = Mutex::new(BTreeMap::new());
+
+/// Record a committed batch of `filter`'s walk at `now`: whether it is
+/// logged at info. A finished walk is forgotten.
+fn walk_batch(filter: &[u8], progress: (u64, u64, u64), now: Instant) -> bool {
+    let mut walks = WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (done, _, target) = progress;
+    if done == target {
+        walks.remove(filter);
+        return true;
+    }
+    let last = walks.get(filter).map(|(at, _)| *at);
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= WALK_PROGRESS_REPEAT);
+    walks.insert(filter.to_vec(), (if due { now } else { last.unwrap_or(now) }, progress));
+    due
+}
+
+/// `filter`'s running walk in this process, `(done, next, target)`.
+pub(crate) fn walk_progress(filter: &[u8]) -> Option<(u64, u64, u64)> {
+    WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(filter).map(|(_, progress)| *progress)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Progress {
     version: u8,
@@ -917,14 +946,28 @@ async fn recover_with_headers(
         expected_cursor,
         &records,
     )?;
-    tracing::info!(
-        filter = hex::encode(&session.filter),
-        processed,
-        target = progress.target,
-        next = progress.next,
-        done = progress.done,
-        "recovered authenticated outgoing history batch"
-    );
+    if walk_batch(&session.filter, (progress.done, progress.next, progress.target), Instant::now()) {
+        tracing::info!(
+            filter = hex::encode(&session.filter),
+            generation = session.generation,
+            processed,
+            target = progress.target,
+            next = progress.next,
+            done = progress.done,
+            remaining = progress.next.saturating_sub(progress.done),
+            completed = progress.done == progress.target,
+            "recovered authenticated outgoing history batch"
+        );
+    } else {
+        tracing::debug!(
+            filter = hex::encode(&session.filter),
+            processed,
+            target = progress.target,
+            next = progress.next,
+            done = progress.done,
+            "recovered authenticated outgoing history batch"
+        );
+    }
     if let Some(error) = blocked {
         tracing::warn!(filter = hex::encode(&session.filter), %error, "outgoing history recovery remains incomplete");
     }
@@ -2397,5 +2440,19 @@ mod tests {
         assert_eq!(clock.get_shard_frame_accumulator(&filter, 95).unwrap(), Some(other_digest));
         assert!(clock.get_shard_frame_accumulator(&filter, 99).unwrap().is_none());
         assert_eq!(field(), None);
+    }
+
+    /// A walk logs its first batch, then at most one batch per interval,
+    /// and its last; it is forgotten once finished.
+    #[test]
+    fn a_walk_logs_its_first_batch_every_interval_and_its_end() {
+        let filter = [0x5a; 35];
+        let start = Instant::now();
+        assert!(walk_batch(&filter, (10, 95, 100), start));
+        assert!(!walk_batch(&filter, (10, 87, 100), start + Duration::from_secs(10)));
+        assert_eq!(walk_progress(&filter), Some((10, 87, 100)));
+        assert!(walk_batch(&filter, (10, 40, 100), start + WALK_PROGRESS_REPEAT));
+        assert!(walk_batch(&filter, (100, 100, 100), start + WALK_PROGRESS_REPEAT + Duration::from_secs(10)));
+        assert_eq!(walk_progress(&filter), None);
     }
 }

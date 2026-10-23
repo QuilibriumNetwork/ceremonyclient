@@ -264,7 +264,7 @@ impl ArchiveAppShardIngest {
         }
         self.awaiting_anchor.entry(address.to_vec()).or_default().insert(number, anchor);
         if self.anchors_noted.insert(anchor) {
-            info!(anchor, frame = number, address = %hex::encode(&address[..address.len().min(8)]),
+            info!(anchor, frame = number, address = %hex::encode(address),
                 "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
                  they are asked for again once it is");
         }
@@ -373,7 +373,7 @@ impl ArchiveAppShardIngest {
         debug!(
             frame = frame_number,
             held,
-            address = %hex::encode(&address[..address.len().min(8)]),
+            address = %hex::encode(&address),
             "archive ingest: received a full app-shard frame"
         );
         // Already materialized (or older) — ignore.
@@ -585,7 +585,7 @@ impl ArchiveAppShardIngest {
             });
         if let Err(error) = stored {
             warn!(frame = header.frame_number, %error,
-                address = %hex::encode(&header.address[..header.address.len().min(8)]),
+                address = %hex::encode(&header.address),
                 "archive ingest: storing a verified shard frame for serving failed");
         }
     }
@@ -903,7 +903,7 @@ impl ArchiveFrameVerifier {
             Ok(false) => {
                 warn!(
                     frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
+                    address = %hex::encode(address),
                     "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
                 );
                 return None;
@@ -916,7 +916,7 @@ impl ArchiveFrameVerifier {
                 // propagation gap.
                 warn!(
                     frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
+                    address = %hex::encode(address),
                     certified,
                     error = %e,
                     "archive ingest: shard frame validation FAILED — rejecting"
@@ -934,7 +934,7 @@ impl ArchiveFrameVerifier {
         if canonical.len() != frame.requests.len() {
             warn!(
                 frame = frame_number,
-                address = %hex::encode(&address[..address.len().min(8)]),
+                address = %hex::encode(address),
                 converted = canonical.len(),
                 total = frame.requests.len(),
                 "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
@@ -955,7 +955,7 @@ impl ArchiveFrameVerifier {
             Err(e) => {
                 warn!(
                     frame = frame_number,
-                    address = %hex::encode(&address[..address.len().min(8)]),
+                    address = %hex::encode(address),
                     error = %e,
                     "archive ingest: requests_root recompute errored — rejecting frame"
                 );
@@ -963,7 +963,7 @@ impl ArchiveFrameVerifier {
             }
         };
         if recomputed != *requests_root {
-            warn!(frame = frame_number, "archive ingest: requests_root mismatch — rejecting");
+            warn!(frame = frame_number, address = %hex::encode(address), "archive ingest: requests_root mismatch — rejecting");
             return None;
         }
 

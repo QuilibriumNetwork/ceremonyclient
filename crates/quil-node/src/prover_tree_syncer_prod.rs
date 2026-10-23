@@ -295,7 +295,7 @@ impl ProdProverTreeSyncer {
             if is_empty_phase_root(&expected) {
                 for (id, _) in &sub_shards {
                     if !is_empty_phase_root(&self.crdt.current_forest_phase_root(id, phase as usize)?) {
-                        warn!(phase, "committed empty split phase still has local data");
+                        warn!(phase, shard = %hex::encode(id), "committed empty split phase still has local data");
                         return Ok(false);
                     }
                 }
@@ -316,7 +316,7 @@ impl ProdProverTreeSyncer {
                 }).transpose()?;
                 if h32.is_none()
                     && !is_empty_phase_root(&self.crdt.current_forest_phase_root(shard_id, phase as usize)?) {
-                    warn!(phase, "absent split phase still has local data");
+                    warn!(phase, shard = %hex::encode(shard_id), "absent split phase still has local data");
                     return Ok(false);
                 }
                 heads.push((shard_id.clone(), bits.clone(), h32));
@@ -330,7 +330,7 @@ impl ProdProverTreeSyncer {
                     .map(|(_, bits, h)| (bits.clone(), h.map(|(_, r)| r).unwrap_or([0u8; 32])))
                     .collect();
                 if !self.crdt.app_root_matches(&sub_roots, &expected) {
-                    warn!(phase, "QUIL sub-shard roots do not aggregate to the header root — not syncing");
+                    warn!(phase, app = %hex::encode(app), "QUIL sub-shard roots do not aggregate to the header root — not syncing");
                     return Ok(false);
                 }
             }
@@ -342,7 +342,7 @@ impl ProdProverTreeSyncer {
                 )
                 .await?;
                 if got != root_s {
-                    warn!(phase, "QUIL sub-shard post-sync root mismatch — not syncing");
+                    warn!(phase, shard = %hex::encode(shard_id), "QUIL sub-shard post-sync root mismatch — not syncing");
                     return Ok(false);
                 }
             }
@@ -373,7 +373,7 @@ impl ProdProverTreeSyncer {
                 let (set, phase_name) = crate::forest_sync::phase_strs(phase);
                 let local = self.crdt.sub_shard_commitment_for_filter(set, phase_name, filter);
                 if !is_empty_phase_root(&local) {
-                    warn!(phase, "committed empty shard phase has stale or unreadable local state");
+                    warn!(phase, filter = %hex::encode(filter), "committed empty shard phase has stale or unreadable local state");
                     return Ok(false);
                 }
                 continue;
@@ -544,7 +544,7 @@ impl ProdProverTreeSyncer {
         if self.crdt.unified_tree() {
             let prefix_bytes: Vec<u8> = if filter.len() > 32 { filter[32..].to_vec() } else { Vec::new() };
             if prefix_bytes.is_empty() {
-                info!(%addr, filter = %hex::encode(&filter[..n]), "syncing app tree (unified, whole tree)");
+                info!(%addr, filter = %hex::encode(filter), "syncing app tree (unified, whole tree)");
                 return self.sync_single_shard(addr, l2.to_vec(), expected_roots).await;
             }
             info!(%addr, filter = %hex::encode(filter), "syncing shard subtree (unified, range diff — only this prefix)");
@@ -556,7 +556,7 @@ impl ProdProverTreeSyncer {
             info!(%addr, "syncing QUIL app (forest diff, 64 sub-shards)");
             return self.sync_split_shard(addr, l2, expected_roots).await;
         }
-        info!(%addr, filter = %hex::encode(&filter[..n]), "syncing app-shard tree (forest diff, single-shard)");
+        info!(%addr, filter = %hex::encode(filter), "syncing app-shard tree (forest diff, single-shard)");
         self.sync_single_shard(addr, l2.to_vec(), expected_roots).await
     }
 }

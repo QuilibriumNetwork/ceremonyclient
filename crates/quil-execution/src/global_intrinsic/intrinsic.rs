@@ -927,7 +927,7 @@ impl GlobalIntrinsic {
                             .map(|p| hex::encode(&p.address[..p.address.len().min(8)]))
                             .collect();
                         tracing::warn!(
-                            shard_address = %hex::encode(&op.address[..op.address.len().min(8)]),
+                            shard_address = %hex::encode(&op.address),
                             bitmask_hex = %hex::encode(&sig.bitmask),
                             participant_indices = ?participant_indices,
                             active_count = active.len(),
@@ -1571,7 +1571,7 @@ impl GlobalIntrinsic {
                         return Err(QuilError::InvalidArgument(format!(
                             "invoke_step join: shard {} is frozen by a pending split/merge \
                              (join blocked until it settles at E+2)",
-                            hex::encode(&filter[..filter.len().min(8)]),
+                            hex::encode(filter),
                         )));
                     }
                 }

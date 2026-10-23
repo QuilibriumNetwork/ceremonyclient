@@ -134,12 +134,21 @@ where
     Ok(answers.into_iter().flatten().collect())
 }
 
+/// A walk logs its progress only once it is long: past this many reads or
+/// [`WALK_LOG_AFTER`]. The GLOBAL prover tree's routine walks (about 10k
+/// reads in seconds) stay quiet.
+const WALK_LOG_READS: u64 = 1 << 16;
+const WALK_LOG_AFTER: Duration = Duration::from_secs(30);
+
 /// A remote view of ONE shard/phase tree on a peer archive, addressed by
 /// `(shard_id, phase)`. Clone-cheap (the client shares one h2 channel).
 pub struct RemoteTreeReader {
     client: ArchiveClient,
     handle: tokio::runtime::Handle,
     shard_id: Vec<u8>,
+    /// What progress lines name: the tree id, or the full shard filter
+    /// whose subtree this reader walks ([`Self::labelled`]).
+    label: Vec<u8>,
     phase: u32,
     /// Remote reads so far and when the walk started, for progress lines.
     reads: std::sync::atomic::AtomicU64,
@@ -164,6 +173,7 @@ impl RemoteTreeReader {
         Self {
             client,
             handle,
+            label: shard_id.clone(),
             shard_id,
             phase,
             reads: std::sync::atomic::AtomicU64::new(0),
@@ -173,15 +183,24 @@ impl RemoteTreeReader {
         }
     }
 
+    /// Name a full shard filter in progress lines instead of the tree id.
+    pub fn labelled(mut self, label: Vec<u8>) -> Self {
+        self.label = label;
+        self
+    }
+
     /// Count remote reads (nodes or values). Log each time the count passes a
-    /// power of two from 1,024, so a long walk shows progress in a few lines.
+    /// power of two from 1,024 once the walk is long ([`WALK_LOG_READS`]), so
+    /// a long walk shows progress in a few lines and a routine one none.
     fn counted(&self, n: usize) {
         let before = self.reads.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         let reads = before + n as u64;
         let crossed = reads >= 1024 && (64 - before.leading_zeros()) != (64 - reads.leading_zeros());
-        if crossed || (reads >= 1024 && reads.is_power_of_two()) {
+        if (crossed || (reads >= 1024 && reads.is_power_of_two()))
+            && (reads >= WALK_LOG_READS || self.started.elapsed() >= WALK_LOG_AFTER)
+        {
             tracing::info!(
-                shard = %hex::encode(&self.shard_id[..self.shard_id.len().min(8)]),
+                shard = %hex::encode(&self.label),
                 phase = self.phase,
                 reads,
                 elapsed_secs = self.started.elapsed().as_secs(),
