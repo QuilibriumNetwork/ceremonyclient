@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
-use tracing::debug;
+use tracing::{debug, info};
 
 use quil_types::proto::global;
 use quil_types::proto::global::global_service_server::GlobalService;
@@ -132,32 +132,37 @@ impl<F: FrameLookup> CachingFrameLookup<F> {
             w.remove(&lowest);
         }
     }
-}
 
-impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
-    fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+    /// The chain head under the TTL, shared rather than copied: a caller
+    /// that needs only its number does not copy a frame of several MB.
+    fn latest_shared(&self) -> Result<Arc<global::GlobalFrame>, String> {
         if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
             if at.elapsed() < self.latest_ttl {
-                return Ok((**frame).clone());
+                return Ok(frame.clone());
             }
         }
         let _load = self.latest_load.lock().unwrap();
         if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
             if at.elapsed() < self.latest_ttl {
-                return Ok((**frame).clone());
+                return Ok(frame.clone());
             }
         }
-        let frame = self.inner.get_latest_frame()?;
-        let arc = Arc::new(frame.clone());
+        let frame = Arc::new(self.inner.get_latest_frame()?);
         // Opportunistically populate the by-number cache too: the head is
         // the single most-requested frame.
         if let Some(n) = frame.header.as_ref().map(|h| h.frame_number) {
             if n != 0 {
-                self.insert_frame(n, arc.clone());
+                self.insert_frame(n, frame.clone());
             }
         }
-        *self.latest.write().unwrap() = Some((std::time::Instant::now(), arc));
+        *self.latest.write().unwrap() = Some((std::time::Instant::now(), frame.clone()));
         Ok(frame)
+    }
+}
+
+impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
+    fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+        self.latest_shared().map(|frame| (*frame).clone())
     }
 
     fn get_frame(&self, frame_number: u64) -> Result<global::GlobalFrame, String> {
@@ -199,8 +204,8 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
         const PROPOSAL_SETTLE_MARGIN: u64 = 4;
         // Proposal-only catchup must refresh the head itself; it cannot rely
         // on another RPC having populated (and kept refreshing) latest.
-        let head = self.get_latest_frame().ok()
-            .and_then(|f| f.header.map(|h| h.frame_number));
+        let head = self.latest_shared().ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.frame_number));
         if frame_number == 0
             || head.is_some_and(|h| h.saturating_sub(frame_number) >= PROPOSAL_SETTLE_MARGIN)
         {
@@ -216,6 +221,92 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
         frame_number: u64,
     ) -> Result<Option<global::GlobalFrame>, String> {
         self.inner.get_anchor_frame(frame_number)
+    }
+}
+
+/// Peer frame reads (`GetGlobalFrame`, `GetGlobalProposal`,
+/// `GetAppShardFrame`) running at once. Each holds a blocking thread and a
+/// copy of a frame of up to several MB; unbounded, a catch-up burst held
+/// hundreds of them at once on the few archives every node syncs from.
+const FRAME_READ_SLOTS: usize = 8;
+/// Frame reads waiting for a slot beyond which further reads are refused at
+/// once.
+const MAX_FRAME_READ_WAITERS: usize = 64;
+/// How long a frame read waits for a slot before the server answers busy. A
+/// catching-up poller pauses and asks another archive, without passing over
+/// this one.
+const FRAME_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often refused frame reads are summarized in the log.
+const FRAME_READ_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The bound on peer frame reads, shared by every peer-facing service.
+pub(crate) static FRAME_READS: FrameReadBound =
+    FrameReadBound::new(FRAME_READ_SLOTS, MAX_FRAME_READ_WAITERS, FRAME_READ_WAIT);
+
+/// Slots for blocking frame reads and a bounded queue for them. A read keeps
+/// its slot until its storage work and copy finish, even when its caller has
+/// gone.
+pub(crate) struct FrameReadBound {
+    slots: usize,
+    workers: tokio::sync::Semaphore,
+    /// Reads running or waiting for a slot.
+    admitted: tokio::sync::Semaphore,
+    wait: std::time::Duration,
+    refused: std::sync::atomic::AtomicU64,
+    /// When refusals were last logged, and the count then.
+    reported: std::sync::Mutex<(Option<std::time::Instant>, u64)>,
+}
+
+impl FrameReadBound {
+    pub(crate) const fn new(slots: usize, waiters: usize, wait: std::time::Duration) -> Self {
+        Self {
+            slots,
+            workers: tokio::sync::Semaphore::const_new(slots),
+            admitted: tokio::sync::Semaphore::const_new(slots + waiters),
+            wait,
+            refused: std::sync::atomic::AtomicU64::new(0),
+            reported: std::sync::Mutex::new((None, 0)),
+        }
+    }
+
+    /// Start `read` on the blocking pool once a slot is free. Past the wait,
+    /// or with the queue full, answer busy: the caller retries later or asks
+    /// another archive.
+    pub(crate) async fn spawn<T: Send + 'static>(
+        &'static self,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<T>, Status> {
+        let Ok(admitted) = self.admitted.try_acquire() else { return Err(self.busy()) };
+        let slot = match self.workers.try_acquire() {
+            Ok(slot) => slot,
+            Err(_) => match tokio::time::timeout(self.wait, self.workers.acquire()).await {
+                Ok(Ok(slot)) => slot,
+                _ => return Err(self.busy()),
+            },
+        };
+        Ok(tokio::task::spawn_blocking(move || {
+            let _held = (admitted, slot);
+            read()
+        }))
+    }
+
+    /// Count a refusal, and log the refusals at most once per interval, so
+    /// an operator sees how often peers were turned away.
+    fn busy(&self) -> Status {
+        use std::sync::atomic::Ordering;
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+        if reported.0.is_none_or(|at| at.elapsed() >= FRAME_READ_REPORT_INTERVAL) {
+            let refused = self.refused.load(Ordering::Relaxed);
+            info!(
+                refused = refused - reported.1,
+                refused_total = refused,
+                slots = self.slots,
+                "frame reads for peers refused: all frame read slots busy; peers retry later or ask another archive"
+            );
+            *reported = (Some(std::time::Instant::now()), refused);
+        }
+        Status::resource_exhausted("frame reads busy; retry later")
     }
 }
 
@@ -428,6 +519,8 @@ pub struct GlobalRpcServer {
     app_shard_topologies: Arc<tokio::sync::Mutex<AppShardTopologies>>,
     app_shards_version: Option<AppShardsVersion>,
     frames: Arc<dyn FrameLookup>,
+    /// Bounds peers' frame and proposal reads ([`FRAME_READS`]).
+    frame_reads: &'static FrameReadBound,
     submit_handler: Option<SubmitHandler>,
     consensus_delivery: Option<ConsensusDeliveryHandler>,
     shards_store: Option<Arc<dyn ShardsStore>>,
@@ -654,6 +747,7 @@ impl GlobalRpcServer {
             app_shard_topologies: Arc::new(tokio::sync::Mutex::new(AppShardTopologies::new())),
             app_shards_version: None,
             frames,
+            frame_reads: &FRAME_READS,
             submit_handler: None,
             consensus_delivery: None,
             shards_store: None,
@@ -801,6 +895,12 @@ impl GlobalRpcServer {
         self
     }
 
+    #[cfg(test)]
+    fn with_frame_reads(mut self, reads: &'static FrameReadBound) -> Self {
+        self.frame_reads = reads;
+        self
+    }
+
     pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
         self.app_shards = Some(p);
         self
@@ -893,9 +993,10 @@ impl GlobalService for GlobalRpcServer {
     ) -> Result<Response<global::GlobalFrameResponse>, Status> {
         // Only this node's own worker may ask for an anchor; from anyone else
         // the flag is ignored. The latest-frame alias is never an anchor.
+        let own = self.is_own_identity(request.extensions());
         let anchor = request.get_ref().historical_anchor
             && request.get_ref().frame_number != 0
-            && self.is_own_identity(request.extensions());
+            && own;
         let req = request.into_inner();
         let frame_number = req.frame_number;
         if anchor {
@@ -911,7 +1012,7 @@ impl GlobalService for GlobalRpcServer {
         // starves the latency-critical consensus delivery (votes/proposals)
         // sharing them. Same treatment as `get_app_shards` below.
         let frames = self.frames.clone();
-        let frame = tokio::task::spawn_blocking(move || {
+        let read = move || {
             if frame_number == 0 {
                 frames
                     .get_latest_frame()
@@ -921,10 +1022,20 @@ impl GlobalService for GlobalRpcServer {
                     .get_frame(frame_number)
                     .map_err(|e| format!("frame {} not found: {}", frame_number, e))
             }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
-        .map_err(Status::not_found)?;
+        };
+        // A peer's numbered frame takes a frame read slot. The head does not:
+        // it is one cached frame, and a poller whose head read fails passes
+        // over the archive for a minute. Nor do this node's own workers,
+        // which must not wait behind peers.
+        let task = if frame_number != 0 && !own {
+            self.frame_reads.spawn(read).await?
+        } else {
+            tokio::task::spawn_blocking(read)
+        };
+        let frame = task
+            .await
+            .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+            .map_err(Status::not_found)?;
 
         Ok(Response::new(global::GlobalFrameResponse {
             frame: Some(frame),
@@ -940,6 +1051,7 @@ impl GlobalService for GlobalRpcServer {
         // global proposal is served only to this node's own identity or an ACTIVE
         // prover.
         self.require_prover(request.extensions())?;
+        let own = self.is_own_identity(request.extensions());
         let req = request.into_inner();
         // Assemble state + parent QC + prior TC + vote from the clock store
         // (see `FrameLookup::get_global_proposal`). Mirrors Go
@@ -951,9 +1063,12 @@ impl GlobalService for GlobalRpcServer {
         // `get_global_frame`: multiple synchronous store reads (frame,
         // parent frame, QC, TC, vote) that must not hold a peer-gRPC
         // runtime worker while catch-up peers hammer this in a loop.
+        // A peer's read takes a frame read slot, as in `get_global_frame`.
         let frames = self.frames.clone();
         let frame_number = req.frame_number;
-        let result = tokio::task::spawn_blocking(move || frames.get_global_proposal(frame_number))
+        let read = move || frames.get_global_proposal(frame_number);
+        let task = if own { tokio::task::spawn_blocking(read) } else { self.frame_reads.spawn(read).await? };
+        let result = task
             .await
             .map_err(|e| Status::internal(format!("get_global_proposal task panicked: {e}")))?;
         match result {
@@ -2334,5 +2449,102 @@ mod global_anchor_tests {
         }
         assert_eq!(served(server.get_global_frame(request(0, true, Some(me))).await), Ok(9));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod frame_read_bound_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+    use std::time::Duration;
+
+    fn frame(number: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader { frame_number: number, ..Default::default() }),
+            requests: vec![],
+        }
+    }
+
+    struct Frames;
+    impl FrameLookup for Frames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Ok(frame(9)) }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> { Ok(frame(n)) }
+        fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+            Ok(global::GlobalProposal { state: Some(frame(n)), ..Default::default() })
+        }
+    }
+
+    /// A read waits in the queue while the slots are taken, a read past a
+    /// full queue is refused at once, and a queued read runs once a slot
+    /// frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_reads_past_the_bound_are_refused_until_a_slot_frees() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 1, Duration::from_secs(5));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let running = READS.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        let queued = tokio::spawn(READS.spawn(|| 7));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while READS.admitted.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the second read queues for the slot");
+        let started = std::time::Instant::now();
+        assert_eq!(READS.spawn(|| 0).await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert!(started.elapsed() < Duration::from_secs(1), "a full queue refuses at once");
+        release_tx.send(()).unwrap();
+        running.await.unwrap();
+        assert_eq!(queued.await.unwrap().unwrap().await.unwrap(), 7, "a queued read runs once the slot frees");
+        assert_eq!(READS.spawn(|| 8).await.unwrap().await.unwrap(), 8);
+
+        static SHORT: FrameReadBound = FrameReadBound::new(1, 1, Duration::from_millis(20));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let running = SHORT.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        assert_eq!(SHORT.spawn(|| 0).await.unwrap_err().code(), tonic::Code::ResourceExhausted, "the wait is bounded");
+        release_tx.send(()).unwrap();
+        running.await.unwrap();
+        assert_eq!(SHORT.spawn(|| 1).await.unwrap().await.unwrap(), 1);
+    }
+
+    /// While every frame read slot is busy, a peer asking for a numbered
+    /// GLOBAL frame or proposal is answered busy. The head, which every
+    /// poller reads and whose failure makes it pass over the archive, and
+    /// the node's own workers are still served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_frame_reads_refuse_only_peers_numbered_frames() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 0, Duration::from_millis(20));
+        let me = quil_p2p::PeerId::random();
+        let peer = quil_p2p::PeerId::random();
+        let server = GlobalRpcServer::new(Arc::new(Frames))
+            .with_self_peer_id(me.to_bytes())
+            .with_frame_reads(&READS);
+        fn request_from<T>(message: T, peer_id: quil_p2p::PeerId) -> Request<T> {
+            let mut request = Request::new(message);
+            request.extensions_mut().insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
+            request
+        }
+        let frame_from = |frame_number, peer_id| {
+            request_from(global::GetGlobalFrameRequest { frame_number, historical_anchor: false, ..Default::default() }, peer_id)
+        };
+        let proposal_from = |frame_number, peer_id| request_from(global::GetGlobalProposalRequest { frame_number }, peer_id);
+        let frame_served = |result: Result<Response<global::GlobalFrameResponse>, Status>| {
+            result
+                .map(|response| response.into_inner().frame.and_then(|f| f.header).map_or(u64::MAX, |h| h.frame_number))
+                .map_err(|status| status.code())
+        };
+        let proposal_served = |result: Result<Response<global::GlobalProposalResponse>, Status>| {
+            result.map(|response| response.into_inner().proposal.is_some()).map_err(|status| status.code())
+        };
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = READS.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        assert_eq!(frame_served(server.get_global_frame(frame_from(5, peer)).await), Err(tonic::Code::ResourceExhausted));
+        assert_eq!(proposal_served(server.get_global_proposal(proposal_from(5, peer)).await), Err(tonic::Code::ResourceExhausted));
+        assert_eq!(frame_served(server.get_global_frame(frame_from(0, peer)).await), Ok(9), "the head is never refused");
+        assert_eq!(frame_served(server.get_global_frame(frame_from(5, me)).await), Ok(5), "own workers take no slot");
+        assert_eq!(proposal_served(server.get_global_proposal(proposal_from(5, me)).await), Ok(true));
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        assert_eq!(frame_served(server.get_global_frame(frame_from(5, peer)).await), Ok(5));
+        assert_eq!(proposal_served(server.get_global_proposal(proposal_from(5, peer)).await), Ok(true));
     }
 }

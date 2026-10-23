@@ -102,6 +102,8 @@ fn frame_outgoing(
 /// finalized frame), so no worker routing is needed.
 struct ClockStoreAppShardFrameProvider {
     clock_store: Arc<dyn ClockStore>,
+    /// Bounds peers' frame reads, shared with `GlobalService`.
+    reads: &'static crate::global_service::FrameReadBound,
 }
 
 #[tonic::async_trait]
@@ -112,7 +114,7 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
         frame_number: u64,
     ) -> Result<Option<global::AppShardFrame>, Status> {
         let clock_store = self.clock_store.clone();
-        tokio::task::spawn_blocking(move || {
+        let read = move || {
             let result = if frame_number == 0 {
                 clock_store.get_latest_shard_clock_frame(&filter)
             } else {
@@ -125,7 +127,16 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
                     "app-shard frame store read failed: {e}"
                 ))),
             }
-        })
+        };
+        // A numbered frame takes a frame read slot. The latest does not: a
+        // node that cannot read it starts an app's state sync without the
+        // roots to check it against.
+        let task = if frame_number == 0 {
+            tokio::task::spawn_blocking(read)
+        } else {
+            self.reads.spawn(read).await?
+        };
+        task
         .await
         .map_err(|e| Status::internal(format!("app-shard frame read task failed: {e}")))?
     }
@@ -171,7 +182,10 @@ pub struct AppShardRpcServer {
 impl AppShardRpcServer {
     /// Construct the archive/store-backed variant (reads the local clock store).
     pub fn new(clock_store: Arc<dyn ClockStore>) -> Self {
-        Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider { clock_store }))
+        Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider {
+            clock_store,
+            reads: &crate::global_service::FRAME_READS,
+        }))
     }
 
     /// Construct with an explicit provider — the worker-routing
@@ -552,5 +566,45 @@ mod outgoing_history_tests {
         assert!(server.get_shard_outgoing_history(request(4, 9)).await.unwrap().into_inner().frames.is_empty());
         assert!(server.get_shard_outgoing_history(request(0, 3)).await.is_err());
         assert!(server.get_shard_outgoing_history(request(3, 2)).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod frame_read_tests {
+    use super::*;
+    use crate::global_service::FrameReadBound;
+
+    /// While every frame read slot is busy, a numbered app-shard frame is
+    /// answered busy and served once a slot frees; the latest frame is never
+    /// refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn numbered_app_shard_frames_wait_for_a_frame_read_slot() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 1, std::time::Duration::from_millis(20));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let filter = vec![0x21; 32];
+        let frame = global::AppShardFrame {
+            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 3, ..Default::default() }),
+            ..Default::default()
+        };
+        let selector = [3u8; 32];
+        let txn = clock.new_transaction(false).unwrap();
+        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = clock.new_transaction(false).unwrap();
+        clock.commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        let provider = ClockStoreAppShardFrameProvider { clock_store: clock, reads: &READS };
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = READS.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        assert_eq!(
+            provider.get_app_shard_frame(filter.clone(), 3).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted,
+        );
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 0).await.unwrap(), Some(frame.clone()));
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        assert_eq!(provider.get_app_shard_frame(filter, 3).await.unwrap(), Some(frame));
     }
 }
