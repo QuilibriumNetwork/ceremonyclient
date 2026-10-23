@@ -1118,6 +1118,9 @@ pub struct BuildTimings {
     pub shard_sets: Duration,
     /// Registry provers and the effectively active census.
     pub census: Duration,
+    /// Coverage halts, with the eviction assessment they come in (see
+    /// `handlers::eviction_at`); zero when one was made at this head
+    /// already.
     pub halts: Duration,
     /// Committed snapshot capture and the head session reads.
     pub committed: Duration,
@@ -1308,6 +1311,9 @@ impl Indexer {
             self.last_build = Some(Instant::now());
             build = Some((timings, live));
         }
+        // `/stats` and `/provers/eviction-risk` serve the eviction assessment
+        // at this head: made by the build above when it was due, else here.
+        crate::handlers::eviction_at(state, head, Instant::now());
         if let Some(row) = row {
             state.production_history.write().insert(row);
         }
@@ -1622,8 +1628,10 @@ fn log_tick(
 }
 
 /// Index new GLOBAL frames every [`TICK`] after rebuilding from
-/// [`history::live_start`], rebuild the snapshot the handlers serve, record
-/// history rows and backfill older ones (see [`history`]). Store
+/// [`history::live_start`], rebuild the snapshot the handlers serve, assess
+/// eviction risk at each new head for `/stats` and `/provers/eviction-risk`
+/// (see `handlers::eviction_at`), record history rows and backfill older
+/// ones (see [`history`]). Store
 /// reads and the snapshot build run on blocking workers, so a failed read or
 /// a panic there is logged and retried. Never returns: the caller drops it
 /// on shutdown.
