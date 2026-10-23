@@ -523,6 +523,43 @@ fn memory_state(stored: u64, head: u64, grid: Arc<parking_lot::Mutex<Option<Hash
     .with_archive_grid(Arc::new(move || grid.lock().clone()))
 }
 
+#[test]
+fn an_indexer_restarted_with_its_history_file_reads_no_row_it_saved() {
+    let tmp = history::persist::TempPath::new("indexer");
+    let grid = Arc::new(parking_lot::Mutex::new(Some(cache_with_two_shards())));
+    let run = |indexer: &mut Indexer, state: &crate::ExplorerState| {
+        for _ in 0..200 {
+            indexer.tick(state, 3_000);
+            if indexer.backfill.as_ref().is_some_and(|plan| plan.is_done()) {
+                return;
+            }
+        }
+        panic!("the backfill did not complete");
+    };
+    // Rows 960 through 2940 backfilled, 3000 live.
+    let state = memory_state(3_000, 3_000, grid.clone()).with_history_file(tmp.0.clone(), 0);
+    let mut first = Indexer::default();
+    run(&mut first, &state);
+    assert_eq!((first.backfill.as_ref().unwrap().frames, state.production_history.read().len()), (2_941, 35));
+    assert!(tmp.0.exists(), "saved once the live row is recorded");
+    first.saver.save_at_shutdown(state.history_file.as_ref().unwrap(), &state.production_history);
+
+    // A restart over the same frames.
+    let restarted = memory_state(3_000, 3_000, grid).with_history_file(tmp.0.clone(), 0);
+    let source = StoreSource(restarted.clock_store.as_ref());
+    history::persist::restore(restarted.history_file.as_ref().unwrap(), &source, &restarted.production_history);
+    assert_eq!(restarted.production_history.read().len(), 35);
+    let mut second = Indexer::default();
+    run(&mut second, &restarted);
+    let plan = second.backfill.as_ref().unwrap();
+    assert_eq!((plan.frames, plan.rows), (0, 0), "every row below the live one restored");
+    let (before, after) = (state.production_history.read(), restarted.production_history.read());
+    assert_eq!(
+        before.final_rows().map(|r| r.frame).collect::<Vec<_>>(),
+        after.final_rows().map(|r| r.frame).collect::<Vec<_>>()
+    );
+}
+
 fn served(state: &crate::ExplorerState) -> Arc<Snapshot> {
     state.production_snapshot.read().clone().expect("a snapshot")
 }

@@ -105,6 +105,10 @@ pub struct ExplorerState {
     /// production snapshot's grid then comes from it, not from the shards
     /// store (see [`production::GridSource`]). `None` on archives.
     pub archive_grid: Option<production::ArchiveGridProvider>,
+    /// Where [`production::run_indexer`] saves the final history rows and
+    /// restores them at start, so a restart backfills only the rows after
+    /// them. `None`: they are held in memory only.
+    pub history_file: Option<production::history::persist::HistoryFile>,
 }
 
 impl ExplorerState {
@@ -141,6 +145,7 @@ impl ExplorerState {
             production_history: Arc::new(RwLock::new(production::history::Rows::default())),
             requests_retained_from: None,
             archive_grid: None,
+            history_file: None,
         }
     }
 
@@ -156,6 +161,14 @@ impl ExplorerState {
     /// store keeps the genesis grid.
     pub fn with_archive_grid(mut self, provider: production::ArchiveGridProvider) -> Self {
         self.archive_grid = Some(provider);
+        self
+    }
+
+    /// Save the final production-history rows to `path`, and restore them
+    /// at start, if they were computed on `network` with this build's
+    /// parameters (see [`production::history::persist`]).
+    pub fn with_history_file(mut self, path: std::path::PathBuf, network: u8) -> Self {
+        self.history_file = Some(production::history::persist::HistoryFile::new(path, network));
         self
     }
 }
