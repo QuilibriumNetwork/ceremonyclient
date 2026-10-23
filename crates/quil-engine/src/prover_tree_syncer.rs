@@ -51,6 +51,24 @@ pub trait ProverTreeSyncer: Send + Sync {
     }
 }
 
+/// A random delay of at most `max`. Every node receives a GLOBAL frame, and
+/// passes an epoch boundary, within moments of the others, and they all sync
+/// the prover tree from the same few archives: a delay drawn for each sync
+/// spreads those syncs out instead of starting them together.
+pub fn sync_jitter(max: std::time::Duration) -> std::time::Duration {
+    use rand::Rng;
+    let nanos = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    std::time::Duration::from_nanos(rand::thread_rng().gen_range(0..=nanos))
+}
+
+/// A random index below `len` (0 when `len` is 0): the archive a pass over
+/// all of them starts at, so nodes that pass together start at different
+/// archives.
+pub fn random_index(len: usize) -> usize {
+    use rand::Rng;
+    if len == 0 { 0 } else { rand::thread_rng().gen_range(0..len) }
+}
+
 pub(crate) enum ShardSyncResult {
     Anchored { anchor: AppShardFrame, predecessor: Option<AppShardFrame> },
     /// `pinned`: the origins' sealed state, verified against their roots;

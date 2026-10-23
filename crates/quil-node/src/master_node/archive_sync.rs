@@ -2171,7 +2171,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                                 }
                             }
-                            for addr in sync_pool.get_all().await.iter() {
+                            let order = crate::prover_tree_syncer_prod::archive_pull_order(sync_pool.get_all().await);
+                            for addr in order.iter() {
                                 if sync_token.is_cancelled() { break 'rounds; }
                                 match crate::forest_sync::sync_single_shard_verified(
                                     addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
@@ -2184,6 +2185,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     Err(e) => warn!(peer = %addr, round, error = %e,
                                         "initial prover tree sync failed; trying the next archive"),
                                 }
+                                crate::prover_tree_syncer_prod::source_failed(addr);
                             }
                         }
                         warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
@@ -3786,7 +3788,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     "prover registry reconcile pinned snapshot");
                             }
                             let expected_root = anchor.root.clone();
-                            let reconcile_peers = sync_pool.get_all().await;
+                            // From a random archive, recently failed ones
+                            // last: regular nodes pull together at an epoch
+                            // boundary, and in the pool's order they would all
+                            // ask the first archive, then all the next.
+                            let reconcile_peers = crate::prover_tree_syncer_prod::archive_pull_order(
+                                sync_pool.get_all().await,
+                            );
                             let mut reconcile_converged = false;
                             for addr in reconcile_peers.iter() {
                                 // Snapshot the local reward balance before the
@@ -3806,6 +3814,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     Ok(conv) => {
                                         if conv.is_none() {
                                             debug!(peer = %addr, "reconcile: peer not on finalized lineage — trying next");
+                                            crate::prover_tree_syncer_prod::source_failed(addr);
                                             continue;
                                         }
                                         info!(peer = %addr, match_ok = conv.is_some(), "incremental prover tree sync complete");
@@ -3983,6 +3992,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     }
                                     Err(e) => {
                                         warn!(peer = %addr, error = %e, "incremental prover tree sync failed — trying next peer");
+                                        crate::prover_tree_syncer_prod::source_failed(addr);
                                     }
                                 }
                             }
