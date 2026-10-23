@@ -948,9 +948,18 @@ impl ProductionReport {
     }
 }
 
+/// Whether `filter` can be an application shard's: a filter under GLOBAL's
+/// address ([`quil_execution::domains::GLOBAL`]) names the GLOBAL
+/// intrinsic, never an app shard, although a prover's allocation and a
+/// shards-store row can carry it.
+pub fn is_app_shard(filter: &[u8]) -> bool {
+    !filter.starts_with(&quil_execution::domains::GLOBAL)
+}
+
 /// The live (`/provers/shards`) set: registry filters on the current grid,
-/// plus grid shards holding data without provers. `sizes` is keyed by
-/// lowercase hex filter, as `compute_shard_sizes` builds it.
+/// plus grid shards holding data without provers; app shards only (see
+/// [`is_app_shard`]). `sizes` is keyed by lowercase hex filter, as
+/// `compute_shard_sizes` builds it.
 pub fn live_filters<'a>(
     registry: impl IntoIterator<Item = &'a [u8]>,
     sizes: &HashMap<String, (num_bigint::BigInt, u64)>,
@@ -967,6 +976,7 @@ pub fn live_filters<'a>(
             }
         }
     }
+    live.retain(|f| is_app_shard(f));
     live
 }
 
