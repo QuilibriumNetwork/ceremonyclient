@@ -1818,6 +1818,12 @@ struct EngineCwTransport {
     /// lagging the session (a regular node's, after a split or reassignment)
     /// silently dropped a real committee's messages (2026-10-13).
     alone: bool,
+    /// The votes this host hands to the node to publish
+    /// ([`crate::own_votes`]). Counted here, before the master publishes
+    /// them: the publish reports no outcome back to the engine (for a
+    /// standalone worker it runs on another machine), so a vote the network
+    /// never carries still counts.
+    sent: crate::own_votes::SentVotes,
 }
 impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     fn deliver(
@@ -1828,6 +1834,9 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     ) {
         if self.alone {
             return;
+        }
+        if channel == crate::own_votes::VOTE_CHANNEL {
+            self.sent.note();
         }
         let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
             crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
@@ -2339,6 +2348,9 @@ pub struct AppConsensusEngine {
     /// Which members of the running session were heard, to name those that
     /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
     session_silent: SilentMembers,
+    /// This member's own votes in the running session host against the
+    /// other members' ([`Self::track_own_votes`]).
+    own_votes: crate::own_votes::OwnVotes,
     /// Executes an unfinalized selected parent for the running consensus host.
     private_parents: Option<Arc<AppParentExecutor>>,
     /// A finalized terminal seal: `(session id, canonical CommitteeHandoff)`.
@@ -2408,6 +2420,7 @@ impl AppConsensusEngine {
         let shard_mat_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cancel = CancellationToken::new();
         let execution = crate::worker_execution::SharedWorkerExecution::default();
+        execution.engine_started();
         execution.state("starting", "waiting for transport");
         let handle = AppEngineHandle {
             execution: execution.clone(),
@@ -2510,6 +2523,7 @@ impl AppConsensusEngine {
             cw_nonmember: 0,
             ancestor_sync: AncestorSyncPacing::default(),
             session_silent: SilentMembers::default(),
+            own_votes: Default::default(),
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
@@ -4617,7 +4631,11 @@ impl AppConsensusEngine {
                                 self.cw_unresolved += 1;
                             } else {
                                 match self.cw_session.as_ref().map(|session| session.members.binary_search(&from)) {
-                                    Some(Ok(member)) => self.session_silent.record(member, channel),
+                                    Some(Ok(member)) => {
+                                        self.session_silent.record(member, channel);
+                                        self.own_votes.received(member, channel, std::time::Instant::now(),
+                                            crate::worker_execution::now_ms());
+                                    }
                                     Some(Err(_)) => self.cw_nonmember += 1,
                                     None => {}
                                 }
@@ -4737,6 +4755,7 @@ impl AppConsensusEngine {
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
                     self.report_presence();
+                    self.track_own_votes();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
                         self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -5016,6 +5035,65 @@ impl AppConsensusEngine {
         self.log_silent_members(&seen, best_signers, quorum);
     }
 
+    /// Report this member's votes in its running session host
+    /// (`WorkerExecution.own_votes`), for the node's renewal of its seat, and
+    /// warn while it sends none as the other members vote
+    /// ([`crate::own_votes`]).
+    fn track_own_votes(&mut self) {
+        let now = std::time::Instant::now();
+        let hosting = self.cw_session.is_some() && self.cw_handle.as_ref().is_some_and(|host| !host.is_dead());
+        let log = if hosting { self.own_votes.check(now) } else { self.own_votes.stop("its consensus host stopped") };
+        self.execution.votes(self.own_votes.report());
+        self.log_own_votes(log);
+    }
+
+    /// Log what [`crate::own_votes::OwnVotes`] reports for the running
+    /// session host, with what this engine knows it waits on.
+    fn log_own_votes(&self, log: Option<crate::own_votes::OwnVotesLog>) {
+        use crate::own_votes::OwnVotesLog;
+        let Some(log) = log else { return };
+        let filter = hex::encode(&self.filter);
+        let generation = self.cw_session.as_ref().map_or(0, |session| session.generation);
+        let members = self.cw_session.as_ref().map_or(0, |session| session.members.len());
+        let index = |member: Option<usize>| member.map_or_else(|| "none".to_string(), |member| member.to_string());
+        match log {
+            OwnVotesLog::Ended { silent, how, member } => info!(core_id = self.core_id, %filter, generation, members,
+                member = %index(member), silent_secs = silent.as_secs(), how, scope = "local",
+                "this member's silence in its committee session ended"),
+            OwnVotesLog::Silent { silent, repeat } => {
+                let execution = self.execution.snapshot();
+                let data_ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire);
+                let recovery = execution.recovery.as_ref()
+                    .map_or("idle", |recovery| if recovery.phase.is_empty() { "idle" } else { recovery.phase.as_str() });
+                let waiting_on = if !data_ready {
+                    "shard data staging (data_ready=false)".to_string()
+                } else if recovery != "idle" {
+                    format!("archive recovery ({recovery})")
+                } else if !execution.blocker.is_empty() {
+                    execution.blocker.clone()
+                } else {
+                    "nothing this engine knows of".to_string()
+                };
+                let (view, voters) = self.session_liveness.as_ref()
+                    .map_or((0, 0), |liveness| { let seen = liveness.snapshot(); (seen.view, seen.voters) });
+                let decided = self.session_liveness.as_ref().map(|liveness| liveness.decisions()).unwrap_or_default();
+                let outcome = |o: Option<quil_cw_consensus::adapters::Outcome>| o.map_or_else(String::new, |o| {
+                    format!("view {}: {} ({})", o.view, o.reason, o.detail)
+                });
+                let peer_votes = self.own_votes.report().peer;
+                warn!(core_id = self.core_id, %filter, generation, members, member = %index(self.own_votes.member()),
+                    silent_secs = silent.as_secs(), repeat, peer_votes, phase = %execution.state,
+                    %waiting_on, data_ready, recovery, view, voters,
+                    last_declined = %outcome(decided.last_declined), last_refused = %outcome(decided.last_refused),
+                    scope = "local", action = "check",
+                    "this member has sent no consensus vote in its committee session while the other members vote: \
+                     the committee counts it as absent, and its seat is not renewed once this lasts an epoch. Check \
+                     this worker's log since the session host started for consensus host, journal or transport \
+                     errors, and its disk and clock; restarting the worker starts a new host");
+            }
+        }
+    }
+
     /// While the running session's committed tip stands still, carry the
     /// notarize votes this node received to GLOBAL as evidence of which
     /// members are present ([`crate::presence_reports`]). Nothing is read
@@ -5278,6 +5356,8 @@ impl AppConsensusEngine {
                         warn!(core_id = self.core_id, error = %e, "retired app consensus host stopped with an error");
                     }
                 }
+                let ended = self.own_votes.stop("its committee session retired");
+                self.log_own_votes(ended);
                 self.cw_session = None;
                 self.session_liveness = None;
                 self.execution.state("handoff", "awaiting successor");
@@ -5964,11 +6044,13 @@ impl AppConsensusEngine {
         // notarize-candidate write is needed (unlike global).
         let on_notarized: crate::cw_app_seams::AppFrameSink = Arc::new(|_frame| {});
 
+        let sent_votes = crate::own_votes::SentVotes::default();
         let transport: Arc<dyn crate::cw_app_seams::AppConsensusTransport> =
             Arc::new(EngineCwTransport {
                 filter: filter.clone(),
                 event_tx: self.event_tx.clone(),
                 alone: member_pubkeys.len() == 1,
+                sent: sent_votes.clone(),
             });
 
         let partition = format!("app-{}", hex::encode(&app_address));
@@ -6282,6 +6364,12 @@ impl AppConsensusEngine {
                 base_frame = session.base_frame, members = session.members.len(),
                 session = %hex::encode(session.id()?), "app committee session host started");
         }
+        let ended = match session.as_ref() {
+            Some(session) => self.own_votes.restart(sent_votes, session.members.binary_search(&my_pk).ok(),
+                std::time::Instant::now(), crate::worker_execution::now_ms()),
+            None => self.own_votes.stop("its consensus host restarted"),
+        };
+        self.log_own_votes(ended);
         self.cw_session = session;
         Ok(handle)
     }
@@ -10070,9 +10158,7 @@ fn session_view_behind(committed_frame: u64, latest_global_frame: u64, epoch_fra
     latest_global_frame.saturating_sub(committed_frame) > epoch_frames
 }
 
-/// Simplex's vote channel (`cw_app_seams` routes channels 0/1/2 as
-/// vote/certificate/resolver).
-const VOTE_CHANNEL: u64 = 0;
+use crate::own_votes::VOTE_CHANNEL;
 
 /// How long a session is observed before members are named as never voting.
 const SILENT_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -11561,7 +11647,7 @@ mod tests {
     fn only_resolver_messages_carry_their_recipients() {
         use crate::cw_app_seams::AppConsensusTransport as _;
         let (event_tx, mut events) = mpsc::unbounded_channel();
-        let transport = EngineCwTransport { filter: vec![1; 32], event_tx, alone: false };
+        let transport = EngineCwTransport { filter: vec![1; 32], event_tx, alone: false, sent: Default::default() };
         let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
         for (channel, expected) in [
             (crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, vec![vec![5u8; 897]]),
@@ -11577,6 +11663,7 @@ mod tests {
                 _ => panic!("expected a CwOut"),
             }
         }
+        assert_eq!(transport.sent.get(), 1, "only the vote sent counts as this member's vote");
     }
 
     /// Only a host whose own committee is this node alone stays silent; the
@@ -11585,12 +11672,13 @@ mod tests {
     fn a_committee_of_this_node_alone_sends_nothing() {
         use crate::cw_app_seams::AppConsensusTransport as _;
         let (event_tx, mut events) = mpsc::unbounded_channel();
-        let alone = EngineCwTransport { filter: vec![1; 32], event_tx, alone: true };
+        let alone = EngineCwTransport { filter: vec![1; 32], event_tx, alone: true, sent: Default::default() };
         let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
         for channel in [0, 1, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL] {
             alone.deliver(channel, vec![member.clone()], vec![channel as u8]);
         }
         assert!(events.try_recv().is_err());
+        assert_eq!(alone.sent.get(), 0, "nothing sent, no vote counted");
     }
 
     /// Each confidential bundle is proposed by exactly one live shard, the

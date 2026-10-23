@@ -1294,6 +1294,10 @@ fn on_local_clock(
     let rebase = |at: u64| if at == 0 { 0 } else { local_now_ms.saturating_sub(worker_now_ms.saturating_sub(at)) };
     execution.observed_unix_ms = rebase(execution.observed_unix_ms);
     execution.last_advance_unix_ms = rebase(execution.last_advance_unix_ms);
+    execution.last_peer_vote_unix_ms = rebase(execution.last_peer_vote_unix_ms);
+    // `host_started_unix_ms` and `engine_started_unix_ms` name the host and
+    // engine; moved, they would differ between reports by the request's
+    // latency, so they stay on the worker's clock.
     execution
 }
 
@@ -1595,6 +1599,23 @@ mod fee_relay_tests {
                 now_unix_ms: now,
             }))
         }
+    }
+
+    /// Every time of a worker's report, the last vote it received from
+    /// another member included, is read on this node's clock; none stays
+    /// none, and the start times naming its host and engine stay as the
+    /// worker reported them.
+    #[test]
+    fn a_report_is_moved_onto_the_local_clock() {
+        let report = node::WorkerExecution { observed_unix_ms: 9_000, last_advance_unix_ms: 8_000,
+            last_peer_vote_unix_ms: 7_000, own_votes: Some(0), host_started_unix_ms: 6_000,
+            engine_started_unix_ms: 5_000, silent_ms: 4_000, ..Default::default() };
+        let moved = on_local_clock(report, 10_000, 50_000);
+        assert_eq!((moved.observed_unix_ms, moved.last_advance_unix_ms, moved.last_peer_vote_unix_ms),
+            (49_000, 48_000, 47_000));
+        assert_eq!((moved.own_votes, moved.host_started_unix_ms, moved.engine_started_unix_ms, moved.silent_ms),
+            (Some(0), 6_000, 5_000, 4_000));
+        assert_eq!(on_local_clock(node::WorkerExecution::default(), 10_000, 50_000).last_peer_vote_unix_ms, 0);
     }
 
     /// A standalone worker's execution report reaches the master on the

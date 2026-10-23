@@ -813,6 +813,7 @@ mod tests {
             }),
             seal: Some(SessionSeal { generation: 6, drain: "partial via 192.0.2.10".into(), recorded_unix_ms: 1_700, ..Default::default() }),
             awaited_frame: None,
+            ..Default::default()
         }
     }
 
