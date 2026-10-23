@@ -565,6 +565,25 @@ fn an_indexer_tick_behind_the_head_keeps_classifying_flagged_stale() {
 }
 
 #[test]
+fn an_indexer_tick_assesses_eviction_at_its_head() {
+    let grid = Arc::new(parking_lot::Mutex::new(Some(cache_with_two_shards())));
+    let state = memory_state(300, 300, grid);
+    let mut indexer = Indexer::default();
+    // The first tick builds the snapshot, which makes the assessment.
+    indexer.tick(&state, 300);
+    let first = state.eviction.read().clone().expect("an assessment");
+    assert_eq!(first.frame, 300);
+    // A tick at the same head keeps it.
+    indexer.tick(&state, 300);
+    assert!(Arc::ptr_eq(&first, state.eviction.read().as_ref().unwrap()));
+    // A new head, not stored yet: no snapshot build is due, and the tick
+    // still assesses it, so requests need not.
+    let tick = indexer.tick(&state, 301);
+    assert!(tick.build.is_none());
+    assert_eq!(state.eviction.read().as_ref().map(|e| e.frame), Some(301));
+}
+
+#[test]
 fn an_applied_app_frame_is_producing_in_a_short_window() {
     let mut idx = index(1);
     empty_through(&mut idx, 9);

@@ -91,6 +91,13 @@ pub struct ExplorerState {
     /// `handlers::all_provers`). Holds at most one snapshot.
     pub(crate) provers_snapshot:
         Arc<Mutex<Option<(u64, Instant, Arc<Vec<quil_types::consensus::ProverInfo>>)>>>,
+    /// `/stats` and `/provers/eviction-risk` as [`production::run_indexer`]
+    /// last assessed them at its head (see `handlers::eviction_at`); a
+    /// request assesses only while none is recent. Holds at most one.
+    pub(crate) eviction: Arc<RwLock<Option<Arc<handlers::Eviction>>>>,
+    /// Held while an eviction assessment is made, so callers needing one
+    /// at once make it once.
+    pub(crate) eviction_making: Arc<Mutex<()>>,
     /// `/shards/production` and `/stats` `app_shards` as
     /// [`production::run_indexer`] last built them; `None` until its first
     /// build. Handlers only read it.
@@ -137,6 +144,8 @@ impl ExplorerState {
             cache: Arc::new(RwLock::new(HashMap::new())),
             token_scan: Arc::new(tokio::sync::Semaphore::new(1)),
             provers_snapshot: Arc::new(Mutex::new(None)),
+            eviction: Arc::new(RwLock::new(None)),
+            eviction_making: Arc::new(Mutex::new(())),
             production_snapshot: Arc::new(RwLock::new(None)),
             production_history: Arc::new(RwLock::new(production::history::Rows::default())),
             requests_retained_from: None,
