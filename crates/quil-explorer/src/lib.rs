@@ -79,8 +79,13 @@ pub struct ExplorerState {
     pub current_frame: Arc<AtomicU64>,
     /// Short-lived response cache (3-min TTL), mirroring the Go explorer's
     /// per-request `proverCache`/`proverShardCache` maps. Keyed by an
-    /// endpoint-specific string; stores the already-serialized body.
+    /// endpoint-specific string; stores the already-serialized body. Holds
+    /// at most `handlers::CACHE_MAX_ENTRIES` bodies.
     pub(crate) cache: Arc<RwLock<HashMap<String, (Instant, Vec<u8>)>>>,
+    /// One permit: full token scans (`/token/supply?scan=1`, each
+    /// `/token/coins/:owner`) read every coin of the domain, so they run one
+    /// at a time and a request arriving during one is answered 503.
+    pub(crate) token_scan: Arc<tokio::sync::Semaphore>,
     /// Every prover known to the registry at one frame, with its build
     /// time, shared by requests within that frame and a few seconds (see
     /// `handlers::all_provers`). Holds at most one snapshot.
@@ -130,6 +135,7 @@ impl ExplorerState {
             messages,
             current_frame,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            token_scan: Arc::new(tokio::sync::Semaphore::new(1)),
             provers_snapshot: Arc::new(Mutex::new(None)),
             production_snapshot: Arc::new(RwLock::new(None)),
             production_history: Arc::new(RwLock::new(production::history::Rows::default())),
@@ -153,6 +159,15 @@ impl ExplorerState {
         self
     }
 }
+
+/// Requests the explorer serves at once; a request beyond them is answered
+/// 503 at once instead of waiting behind slow store reads.
+pub const MAX_IN_FLIGHT: usize = 64;
+
+/// Worker threads of the explorer's own runtime ([`serve`]). Its handlers
+/// read the stores synchronously: on these threads a slow or heavy request
+/// delays other explorer requests, not the node's consensus and sync.
+pub const HTTP_WORKERS: usize = 2;
 
 /// Build the explorer router with all 11 endpoints. Every route accepts
 /// any method (handlers themselves return 405 for non-GET, matching Go's
@@ -182,21 +197,55 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/token/reward/:prover", any(handlers::handle_token_reward))
         .route("/keys/identity/:addr", any(handlers::handle_key_identity))
         .route("/keys/prover/:addr", any(handlers::handle_key_prover))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+            limit_in_flight,
+        ))
         .layer(axum::middleware::from_fn(cors_layer))
         .with_state(state)
 }
 
+/// Answer 503 while `permits` requests are already being served.
+async fn limit_in_flight(
+    axum::extract::State(permits): axum::extract::State<Arc<tokio::sync::Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match permits.try_acquire() {
+        Ok(_serving) => next.run(req).await,
+        Err(_) => handlers::busy("the explorer is serving its maximum of requests; retry shortly", 1),
+    }
+}
+
 /// Run the explorer HTTP server on `listener` until `shutdown` resolves.
 /// The caller wires `shutdown` to the lifecycle supervisor's cancellation
-/// token (graceful shutdown, like the gRPC servers).
+/// token (graceful shutdown, like the gRPC servers). The server runs on its
+/// own runtime of [`HTTP_WORKERS`] threads, so requests never occupy the
+/// node's runtime workers.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     router: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
+    let listener = listener.into_std()?;
+    let (done, served) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new().name("explorer-http".into()).spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(HTTP_WORKERS)
+            .thread_name("explorer-http")
+            .enable_all()
+            .build()
+            .and_then(|runtime| {
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)?;
+                    axum::serve(listener, router).with_graceful_shutdown(shutdown).await
+                })
+            });
+        let _ = done.send(result);
+    })?;
+    served
         .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("the explorer HTTP thread ended without a result")))
 }
 
 /// CORS + OPTIONS middleware, mirroring Go's `withCORS`: every response
@@ -266,6 +315,50 @@ mod tests {
         assert_eq!(resp.headers()["Access-Control-Allow-Methods"], "GET, OPTIONS");
         assert_eq!(resp.headers()["Access-Control-Allow-Headers"], "Content-Type");
         assert_eq!(resp.headers()["Access-Control-Expose-Headers"], "X-Total-Count");
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_limit_are_answered_busy() {
+        let limited = |permits: Arc<tokio::sync::Semaphore>| {
+            Router::new()
+                .route("/x", any(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(permits, limit_in_flight))
+        };
+        let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
+        // Every permit taken: the request is answered at once, not queued.
+        let full = limited(Arc::new(tokio::sync::Semaphore::new(0))).oneshot(get()).await.unwrap();
+        assert_eq!(full.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(full.headers()["Retry-After"], "1");
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let served = limited(permits.clone()).oneshot(get()).await.unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(permits.available_permits(), 1, "a served request returns its permit");
+    }
+
+    #[tokio::test]
+    async fn requests_are_served_on_the_explorer_runtime() {
+        let router = Router::new().route(
+            "/thread",
+            any(|| async { std::thread::current().name().unwrap_or("").to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, router, async move {
+            let _ = stopped.await;
+        }));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"GET /thread HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("explorer-http"), "served off the caller's runtime: {answer}");
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
