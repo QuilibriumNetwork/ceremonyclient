@@ -5010,15 +5010,16 @@ impl AppConsensusEngine {
                     if let Err(error) = self.discard_legacy_history_if_due().await {
                         warn!(core_id = self.core_id, %error, "legacy app history could not be discarded; will retry");
                     }
-                    // Before consensus starts the engine materializes nothing,
-                    // so a joiner's first registration is sealed from here
+                    // The epoch proof job also runs from here, not only when a
+                    // frame materializes: a joiner materializes nothing before
+                    // consensus starts, and a stalled committee nothing at all,
+                    // yet a seal or a settlement left undone kicks the member
                     // (an in-process engine receives no GLOBAL frame messages).
-                    if self.cw_handle.is_none() {
-                        if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
-                            .and_then(|frame| frame.header).map(|header| header.frame_number)
-                        {
-                            self.prove_storage_epoch_if_due(head);
-                        }
+                    // `claim_epoch_proof` paces the attempts.
+                    if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                        .and_then(|frame| frame.header).map(|header| header.frame_number)
+                    {
+                        self.prove_storage_epoch_if_due(head);
                     }
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
@@ -7275,15 +7276,13 @@ impl AppConsensusEngine {
             self.shard_frame_number = expected_shard_frame;
         }
 
-        // A seat whose consensus has not started (a joiner before the epoch
-        // it activates in) materializes no frames, where the epoch proof job
-        // otherwise runs. Its first registration lands the epoch before that
-        // one and must be sealed before it begins, so run the job from GLOBAL
-        // frames until consensus starts (and from the retry timer, for an
-        // in-process engine, which receives no GLOBAL frame messages).
-        if self.cw_handle.is_none() {
-            self.prove_storage_epoch_if_due(global_frame_number);
-        }
+        // Run the epoch proof job from GLOBAL frames too (and from the retry
+        // timer, for an in-process engine, which receives no GLOBAL frame
+        // messages), not only when a frame materializes: a joiner's first
+        // registration must be sealed before consensus starts, and a member
+        // whose committee stalls in the settlement window must still settle
+        // what it committed, or it is kicked.
+        self.prove_storage_epoch_if_due(global_frame_number);
 
         // Update difficulty from global frame header
         self.current_difficulty.store(
@@ -11812,6 +11811,37 @@ mod tests {
         };
         let (engine, handle) = AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
         (engine, handle, received)
+    }
+
+    /// A member whose committee runs consensus but materializes nothing (a
+    /// stalled committee) still settles its storage epoch, from GLOBAL frames:
+    /// GLOBAL kicks a member that committed roots and never proved them.
+    #[tokio::test]
+    async fn a_stalled_member_settles_its_storage_epoch_from_global_frames() {
+        use crate::storage_epoch_batch::SeatMessage;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
+        let epoch = 5;
+        let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        registry.set_storage_seat_slot(&[1; 32], &engine.filter, quil_types::consensus::StorageSeatSlot {
+            epoch, leaves: vec![vec![0]], registered_at: 1, sealed_at: Some(2), frames: 1,
+            accumulator: [0; 32], chained: Vec::new(), open: true,
+        });
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: until - 1, ..Default::default() }),
+            ..Default::default()
+        };
+        engine.handle_global_frame_message(&crate::consensus_wire::encode_global_frame(&frame).unwrap());
+        let announced = published.lock().unwrap().iter()
+            .any(|bytes| matches!(SeatMessage::from_bytes(bytes), Ok(SeatMessage::Announce(..))));
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(announced, "a settlement due on a running, stalled committee is prepared from a GLOBAL frame");
     }
 
     /// This node's prover (`test_engine`'s), allocated to the engine's shard

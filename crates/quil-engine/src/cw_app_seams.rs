@@ -1813,6 +1813,23 @@ impl Drop for StopOnDrop {
 }
 
 impl AppConsensusCwHandle {
+    /// A handle whose host has already returned: an engine with it counts as
+    /// running consensus, and materializes nothing.
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
+            inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
+            ingest_block: Arc::new(|_| {}),
+            shutdown,
+            adopted_genesis: None,
+            finalized: Default::default(),
+            thread: std::thread::spawn(|| {}),
+            outbound_task: tokio::spawn(std::future::pending()),
+        }
+    }
+
     /// The host thread has returned without being asked: its engine stopped
     /// (an actor panicked, for instance) and this shard is taking no part in
     /// consensus until the owner rebuilds the host.
