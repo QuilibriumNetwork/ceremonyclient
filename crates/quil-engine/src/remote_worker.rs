@@ -1243,9 +1243,24 @@ impl WorkerManager for RemoteWorkerManager {
     }
 
     fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<()> {
-        let mut workers = self.workers.lock().unwrap();
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.manually_managed = manually_managed;
+        let changed = {
+            let mut workers = self.workers.lock().unwrap();
+            workers.get_mut(&core_id).is_some_and(|w| {
+                let changed = w.manually_managed != manually_managed;
+                w.manually_managed = manually_managed;
+                changed
+            })
+        };
+        // As the local manager logs it. This manager keeps no worker store,
+        // so the mode lasts until the node restarts; `data_worker_filters`
+        // is what pins a remote worker across restarts.
+        if changed {
+            info!(
+                core_id,
+                mode = if manually_managed { "manual" } else { "auto" },
+                persisted = false,
+                "worker management mode changed"
+            );
         }
         Ok(())
     }
@@ -1446,6 +1461,33 @@ mod tests {
         assert!(workers[0].filter.is_empty());
         mgr.set_worker_filter(1, &[0xBB; 32], false).unwrap();
         assert!(!mgr.range_workers().unwrap()[0].allocated);
+    }
+
+    /// A mode toggle on a remote worker is logged on change, as the local
+    /// manager logs it, and says it is not persisted.
+    #[test]
+    fn a_mode_toggle_is_logged_on_change_only() {
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mgr = RemoteWorkerManager::new(vec![(1, "http://10.0.0.1:32501".into())], String::new(), None);
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            mgr.set_manually_managed(1, true).unwrap();
+            mgr.set_manually_managed(1, true).unwrap();
+            mgr.set_manually_managed(1, false).unwrap();
+            mgr.set_manually_managed(99, true).unwrap();
+        });
+        let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.matches("worker management mode changed").count(), 2, "{logged}");
+        assert!(logged.contains("mode=\"manual\"") || logged.contains("mode=manual"), "{logged}");
+        assert!(logged.contains("persisted=false"), "{logged}");
+        assert!(!mgr.range_workers().unwrap()[0].manually_managed);
     }
 }
 

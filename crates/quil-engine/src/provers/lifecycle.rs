@@ -2419,8 +2419,14 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
             // Capacity for auto-managed allocations is the worker count
-            // less the operator's pins, matching the set above.
-            let auto_worker_capacity = workers.iter().filter(|w| !w.manually_managed).count();
+            // less the workers bound to the operator's pins, matching the
+            // set above. An idle manual worker still counts, as in
+            // `select_excess_active_filters`: the allocator binds an unbound
+            // allocation to it first, so subtracting it found a surplus of
+            // one per idle manual worker and left a holding it could serve.
+            let auto_worker_capacity = workers.iter()
+                .filter(|w| !w.manually_managed || w.filter.is_empty())
+                .count();
             let overcapacity = sheddable_filters.len().saturating_sub(auto_worker_capacity);
             let overcapacity_filters: Vec<Vec<u8>> = if overcapacity == 0 {
                 Vec::new()
@@ -2473,9 +2479,15 @@ impl ProverLifecycle {
             // (canonical, persists). Detected purely from the shard-filter set, so
             // it does not depend on the reassignment landing. A leaf has no
             // descendants → not flagged → stable, no churn.
+            //
+            // Operator pins are included here and below: the seat they
+            // protect no longer exists, so no worker can serve it, and a
+            // prover kept on a split-away parent is counted by the split
+            // proposer as if it still ran there. The manual decide bucket
+            // confirms the leave at maturity, and the operator is told
+            // below that the worker idles once it departs.
             let split_parent_filters: Vec<Vec<u8>> = active_filters
                 .iter()
-                .filter(|f| !manually_managed_filters.contains(*f))
                 .filter(|f| !pending_leave_filters.contains(*f))
                 .filter(|f| settled_split_away(f))
                 .cloned()
@@ -2484,7 +2496,6 @@ impl ProverLifecycle {
             // of its frames, and the worker can cover a real shard.
             let retired_filters: Vec<Vec<u8>> = active_filters
                 .iter()
-                .filter(|f| !manually_managed_filters.contains(*f))
                 .filter(|f| !pending_leave_filters.contains(*f))
                 .filter(|f| retired.contains(*f))
                 .cloned()
@@ -2648,6 +2659,22 @@ impl ProverLifecycle {
 
             if leave_candidates.len() > MAX_PROPOSALS_PER_CYCLE {
                 leave_candidates.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+
+            // Only a gone shard can put an operator pin here; the per-filter
+            // cooldown above bounds this to one line per proposal.
+            for f in leave_candidates.iter().filter(|f| manually_managed_filters.contains(*f)) {
+                let reason = if split_parent_filters.contains(f) { "split_parent" } else { "retired" };
+                for w in workers.iter().filter(|w| w.manually_managed && &w.filter == f) {
+                    tracing::warn!(
+                        core_id = w.core_id,
+                        filter = %hex::encode(f),
+                        frame = frame_number,
+                        reason,
+                        "lifecycle: proposing leave off a manual worker's shard, which no longer exists; \
+                         the worker idles once the leave departs: join it to a live shard or switch it to auto"
+                    );
+                }
             }
 
             if !leave_candidates.is_empty() {
@@ -6798,6 +6825,52 @@ mod proposal_loop_tests {
         );
     }
 
+    /// The leave sweep's over-capacity rule had the same phantom surplus:
+    /// it subtracted every manual worker from the capacity for auto
+    /// holdings, though an idle one holds no pin and the allocator binds an
+    /// unbound allocation to it first. With six auto workers serving six
+    /// holdings, an idle manual worker and a seventh holding not yet bound
+    /// (the operator's join just landed), it proposed leaving one.
+    #[test]
+    fn an_idle_manual_worker_counts_as_capacity_in_the_leave_sweep() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        for i in 1..=6u32 {
+            wm.add(allocated_worker(i, filter_bytes(0xA0 + i as u8)));
+        }
+        let mut manual = idle_worker(7);
+        manual.manually_managed = true;
+        wm.add(manual);
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=7u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary { filter: f, status_counts: counts, total_size: 1_000_000 });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "seven workers can serve seven holdings; got {:?}",
+            actions
+        );
+    }
+
     #[test]
     fn unsynced_tree_emits_nothing() {
         let address = vec![0xCDu8; 32];
@@ -7636,6 +7709,65 @@ mod proposal_loop_tests {
         assert!(!leaves(merged.clone()).contains(&retired), "an archive listed it within the hour (the seeded sizes)");
         lifecycle.remote_reported_at.lock().unwrap().clear();
         assert!(leaves(merged).contains(&retired), "no view lists it");
+    }
+
+    /// An operator pin on a gone shard was never shed: the manual worker
+    /// stayed on a shard no worker can serve until the operator noticed.
+    /// The leave is proposed as for an auto holding, retired or split away.
+    #[test]
+    fn a_manual_pin_on_a_gone_shard_is_left() {
+        let address = vec![0xCDu8; 32];
+        let app = [0x1Du8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let retired = quil_forest::encode_shard_bit_path(&app, &[true, false]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut pinned = allocated_worker(1, retired.clone());
+        pinned.manually_managed = true;
+        wm.add(pinned);
+        reg.set_prover(prover(address.clone(), vec![alloc(retired.clone(), ProverStatus::Active, 4)]));
+        reg.set_summaries(vec![shard_summary(parent.clone(), 3), shard_summary(retired.clone(), 2)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(900);
+        lifecycle.set_shards_store(put_grid(&app, &[&[true]], None));
+        let sizes: HashMap<Vec<u8>, u64> = [(parent.clone(), 1_000_000u64)].into_iter().collect();
+        let leaves = || {
+            lifecycle.set_remote_shard_sizes(sizes.clone());
+            let actions = lifecycle.evaluate(900, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.iter().filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+        assert!(!leaves().contains(&retired), "the refresh it asked for is pending");
+        lifecycle.remote_reported_at.lock().unwrap().clear();
+        assert!(leaves().contains(&retired), "a manual pin on a retired shard is left");
+
+        let app = [0x1Eu8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let children = [false, true].map(|bit| quil_forest::encode_shard_bit_path(&app, &[false, bit])).to_vec();
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut pinned = allocated_worker(1, parent.clone());
+        pinned.manually_managed = true;
+        wm.add(pinned);
+        let address = vec![0xCDu8; 32];
+        reg.set_prover(prover(address.clone(), vec![alloc(parent.clone(), ProverStatus::Active, 4)]));
+        reg.set_summaries(vec![shard_summary(parent.clone(), 8)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(242);
+        lifecycle.set_shards_store(put_grid(&app, &[&[false, false], &[false, true]], None));
+        let sizes: HashMap<Vec<u8>, u64> = children.iter().map(|c| (c.clone(), 734u64)).collect();
+        let leaves = || {
+            lifecycle.set_remote_shard_sizes(sizes.clone());
+            let actions = lifecycle.evaluate(242, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.iter().filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+        assert!(!leaves().contains(&parent), "the refresh it asked for is pending");
+        assert!(leaves().contains(&parent), "a manual pin on a split-away parent is left");
     }
 
     /// Manual-bucket confirm: when a Joining alloc reaches confirm
