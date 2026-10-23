@@ -720,6 +720,15 @@ impl quil_rpc::FrameLookup for ClockStoreFrameLookup {
             Err(e) => Err(e.to_string()),
         }
     }
+    /// Read without the request bundles; pruning keeps every header, so any
+    /// stored frame has one to give.
+    fn get_frame_header(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrameHeader, String> {
+        if n == 0 {
+            let latest = self.0.get_latest_global_frame().map_err(|e| e.to_string())?;
+            return latest.header.ok_or_else(|| "the latest frame has no header".to_string());
+        }
+        self.0.get_global_frame_header(n).map_err(|e| e.to_string())
+    }
 }
 // A frame whose request bodies were pruned is only a header here; never
 // hand it to a peer as if it were complete.
@@ -3340,7 +3349,8 @@ mod anchor_lookup_tests {
 
     /// A frame whose request bodies were pruned is the node's own worker's
     /// anchor as its header while a peer is still refused it; a retained
-    /// frame is whole either way, and one never held is no anchor here.
+    /// frame is whole either way, and one never held is no anchor here. A
+    /// peer asking for headers alone gets the header of either.
     #[test]
     fn own_workers_read_pruned_headers_that_peers_are_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -3362,6 +3372,9 @@ mod anchor_lookup_tests {
         assert_eq!(lookup.get_frame(8).unwrap(), frame(8));
         assert_eq!(lookup.get_anchor_frame(8).unwrap(), Some(frame(8)));
         assert_eq!(lookup.get_anchor_frame(4).unwrap(), None);
+        assert_eq!(lookup.get_frame_header(5).unwrap(), frame(5).header.unwrap(), "a peer asking for headers alone");
+        assert_eq!(lookup.get_frame_header(8).unwrap(), frame(8).header.unwrap());
+        assert!(lookup.get_frame_header(4).is_err());
     }
 }
 

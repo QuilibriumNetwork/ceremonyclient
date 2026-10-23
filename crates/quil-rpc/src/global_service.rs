@@ -45,6 +45,19 @@ pub trait FrameLookup: Send + Sync {
     ) -> Result<Option<global::GlobalFrame>, String> {
         Ok(None)
     }
+
+    /// The header of frame `frame_number` (`0`: the latest), for a peer that
+    /// asks for headers alone (`GetGlobalFrame` with `header_only`). The
+    /// default takes it from [`Self::get_frame`]; the clock-store lookup
+    /// reads the header alone, never the request bundles, and has one even
+    /// for a frame whose bundles were pruned.
+    fn get_frame_header(
+        &self,
+        frame_number: u64,
+    ) -> Result<global::GlobalFrameHeader, String> {
+        let frame = if frame_number == 0 { self.get_latest_frame()? } else { self.get_frame(frame_number)? };
+        frame.header.ok_or_else(|| format!("frame {frame_number} has no header"))
+    }
 }
 
 /// Read-through, bounded in-memory cache in front of a [`FrameLookup`].
@@ -216,6 +229,15 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
         frame_number: u64,
     ) -> Result<Option<global::GlobalFrame>, String> {
         self.inner.get_anchor_frame(frame_number)
+    }
+
+    /// Uncached: the inner lookup reads a header cheaply, and a header must
+    /// never stand in for a frame in the by-number cache.
+    fn get_frame_header(
+        &self,
+        frame_number: u64,
+    ) -> Result<global::GlobalFrameHeader, String> {
+        self.inner.get_frame_header(frame_number)
     }
 }
 
@@ -985,6 +1007,19 @@ impl GlobalService for GlobalRpcServer {
         let frame_number = req.frame_number;
         if anchor {
             let frame = self.own_worker_anchor(frame_number).await?;
+            return Ok(Response::new(global::GlobalFrameResponse { frame: Some(frame), proof: Vec::new() }));
+        }
+        // A peer that checks only headers and their links (a historical
+        // anchor and the frames certifying it) asks for the header alone:
+        // the bundles are never read or sent, which keeps the answer small
+        // enough for its short deadline.
+        if req.header_only {
+            let frames = self.frames.clone();
+            let header = tokio::task::spawn_blocking(move || frames.get_frame_header(frame_number))
+                .await
+                .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+                .map_err(|e| Status::not_found(format!("frame {frame_number} header not found: {e}")))?;
+            let frame = global::GlobalFrame { header: Some(header), requests: Vec::new() };
             return Ok(Response::new(global::GlobalFrameResponse { frame: Some(frame), proof: Vec::new() }));
         }
 
@@ -2587,7 +2622,7 @@ mod global_anchor_tests {
             .with_self_peer_id(me.to_bytes())
             .with_global_anchor_source(Some(source));
         let request = |frame_number, historical_anchor, peer: Option<quil_p2p::PeerId>| {
-            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor });
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor, header_only: false });
             if let Some(peer_id) = peer {
                 request.extensions_mut().insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
             }
@@ -2609,5 +2644,47 @@ mod global_anchor_tests {
         }
         assert_eq!(served(server.get_global_frame(request(0, true, Some(me))).await), Ok(9));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Holds frame 3 with a request bundle, counting the frames read whole;
+    /// its header is read alone, as the clock store does.
+    struct BundledLookup(Arc<AtomicUsize>);
+    impl FrameLookup for BundledLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { self.get_frame(3) }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if n != 3 {
+                return Err(format!("frame {n} not held"));
+            }
+            let mut whole = frame(3);
+            whole.requests.push(global::MessageBundle { timestamp: 3, ..Default::default() });
+            Ok(whole)
+        }
+        fn get_frame_header(&self, n: u64) -> Result<global::GlobalFrameHeader, String> {
+            frame(n).header.filter(|_| n == 3).ok_or_else(|| format!("frame {n} not held"))
+        }
+    }
+
+    /// Any peer asking for a frame's header alone gets it without the
+    /// request bundles, which are not even read; asked without the flag, it
+    /// gets the whole frame as before.
+    #[tokio::test]
+    async fn header_only_requests_are_answered_without_request_bundles() {
+        let whole = Arc::new(AtomicUsize::new(0));
+        let lookup = CachingFrameLookup::new(BundledLookup(whole.clone()), 16, std::time::Duration::from_secs(1));
+        let server = GlobalRpcServer::new(Arc::new(lookup));
+        let ask = |frame_number, header_only| {
+            let mut request = Request::new(global::GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only });
+            request.extensions_mut().insert(AuthenticatedPeer { peer_id: quil_p2p::PeerId::random(), falcon_public_key: Vec::new() });
+            request
+        };
+        let header = server.get_global_frame(ask(3, true)).await.unwrap().into_inner().frame.unwrap();
+        assert_eq!(header, frame(3), "the header, without the bundle");
+        assert_eq!(whole.load(Ordering::SeqCst), 0, "no bundle is read");
+        assert_eq!(server.get_global_frame(ask(4, true)).await.unwrap_err().code(), tonic::Code::NotFound);
+        let full = server.get_global_frame(ask(3, false)).await.unwrap().into_inner().frame.unwrap();
+        assert_eq!(full.requests.len(), 1);
+        assert_eq!(full.header, frame(3).header);
+        assert_eq!(whole.load(Ordering::SeqCst), 1);
     }
 }

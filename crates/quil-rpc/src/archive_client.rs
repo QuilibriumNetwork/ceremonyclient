@@ -683,10 +683,29 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: false })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// GLOBAL frame `frame_number` as its header alone, for a caller that
+    /// checks headers and their links and never reads the request bundles,
+    /// which can make a frame megabytes long. A server that predates the
+    /// `header_only` flag sends the whole frame; its bundles are dropped
+    /// here, so the answer is the same either way.
+    pub async fn get_global_frame_header_only(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: true })
+            .await?
+            .into_inner();
+        let mut frame = resp.frame.ok_or(ArchiveClientError::MissingField("frame"))?;
+        frame.requests.clear();
+        Ok(frame)
     }
 
     /// Historical GLOBAL frame `frame_number` from this worker's own master
@@ -700,7 +719,7 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true, header_only: false })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
