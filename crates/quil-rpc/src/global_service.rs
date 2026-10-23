@@ -468,11 +468,12 @@ pub struct GlobalRpcServer {
 }
 
 // Shared across peer-facing server instances. A cancelled RPC keeps its
-// permit inside the blocking closure until storage work actually finishes.
+// permit inside the blocking closure until the storage read in progress
+// finishes; a batch then stops (`BatchDeadline`).
 // `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default
 // `default_forest_read_slots`); a batched request reads up to
-// `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached nodes and values
-// (`forest_read_cache`) take no slot at all.
+// `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached nodes, values and
+// prover-tree blobs (`forest_read_cache`) take no slot at all.
 static FOREST_READ_WORKERS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
     let slots = std::env::var("QUIL_FOREST_READ_SLOTS").ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -625,11 +626,53 @@ async fn bounded_forest_read<T: Send + 'static>(
     }).await.map_err(|e| Status::internal(format!("forest read task failed: {e}")))
 }
 
+/// How long a batched read may go on reading storage from its arrival, slot
+/// wait included, before it answers the keys read so far. A syncing client
+/// gives up after 15 s and sends the whole batch again, so storage reads past
+/// that served no one: at an epoch boundary every regular node syncs the
+/// prover tree, and timed-out batches kept the slots of the 4 archives busy
+/// for over an hour (GLOBAL 925,920). The client asks again for the rest of
+/// a prefix answer.
+const FOREST_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// When a batched read stops reading storage: past its budget, or once its
+/// caller has gone (the RPC was cancelled or timed out, and its handler
+/// dropped).
+struct BatchDeadline {
+    ends: std::time::Instant,
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Held by a request handler; dropping it marks its batch abandoned.
+struct BatchCaller(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BatchCaller {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl BatchDeadline {
+    /// A deadline `budget` from now, and the guard its handler holds.
+    fn start(budget: std::time::Duration) -> (Self, BatchCaller) {
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ends = std::time::Instant::now() + budget;
+        (Self { ends, abandoned: abandoned.clone() }, BatchCaller(abandoned))
+    }
+
+    fn passed(&self) -> bool {
+        self.abandoned.load(std::sync::atomic::Ordering::Relaxed) || std::time::Instant::now() >= self.ends
+    }
+}
+
 /// Answer a batched read: each key from `hits` when cached, else through
-/// `read` (which may cache it), stopping after `MAX_FOREST_BATCH_BYTES`.
+/// `read` (which may cache it), stopping after `MAX_FOREST_BATCH_BYTES`, or
+/// at the first key to read from storage once `deadline` has passed. The
+/// first key is always answered.
 fn answer_batch<K>(
     keys: Vec<K>,
     hits: Vec<Option<Arc<Vec<u8>>>>,
+    deadline: &BatchDeadline,
     mut read: impl FnMut(&K) -> Option<Vec<u8>>,
 ) -> Vec<global::ForestReadResult> {
     let mut out = Vec::with_capacity(keys.len());
@@ -640,12 +683,54 @@ fn answer_batch<K>(
         }
         let data = match hit {
             Some(data) => Some(data.as_ref().clone()),
+            None if !out.is_empty() && deadline.passed() => break,
             None => read(key),
         };
         bytes += data.as_ref().map_or(0, Vec::len);
         out.push(global::ForestReadResult { found: data.is_some(), data: data.unwrap_or_default() });
     }
     out
+}
+
+/// The leading cached entries of a batch.
+fn cached_prefix(hits: &[Option<Arc<Vec<u8>>>]) -> Vec<Arc<Vec<u8>>> {
+    hits.iter().map_while(Option::clone).collect()
+}
+
+/// A batched read's answer; when no storage slot was free, its leading
+/// cached keys (`prefix`) if there are any, within `MAX_FOREST_BATCH_BYTES`,
+/// and the client asks again for the rest.
+fn or_cached_prefix(
+    read: Result<Option<Vec<global::ForestReadResult>>, Status>,
+    prefix: Vec<Arc<Vec<u8>>>,
+    unserved: usize,
+) -> Result<Vec<global::ForestReadResult>, Status> {
+    match read {
+        Ok(answered) => Ok(answered.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])),
+        Err(busy) if busy.code() == tonic::Code::ResourceExhausted && !prefix.is_empty() => {
+            let mut bytes = 0usize;
+            Ok(prefix.into_iter()
+                .take_while(|data| {
+                    let room = bytes < MAX_FOREST_BATCH_BYTES;
+                    bytes += data.len();
+                    room
+                })
+                .map(|data| global::ForestReadResult { found: true, data: data.as_ref().clone() })
+                .collect())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// The GLOBAL prover tree's id, also the app part of its blobs' ShardKey.
+const PROVER_TREE: [u8; 32] = [0xff; 32];
+
+/// Whether `shard_key` keys the GLOBAL prover tree's blobs. That tree is
+/// never split, so a blob version names one tree's version, whose head says
+/// whether a read is final; a split app's blobs carry its sub-shards'
+/// versions instead.
+fn prover_blobs(shard_key: &[u8]) -> bool {
+    shard_key.len() == 35 && shard_key[3..] == PROVER_TREE
 }
 
 impl GlobalRpcServer {
@@ -1405,20 +1490,25 @@ impl GlobalService for GlobalRpcServer {
         let hits: Vec<_> = req.node_keys.iter()
             .map(|key| cache.get(&CacheKey::node(origin, &req.shard_id, req.phase, key)))
             .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
         let (shard_id, phase, keys) = (req.shard_id, req.phase, req.node_keys);
         let nodes = if hits.iter().all(Option::is_some) {
-            answer_batch(keys, hits, |_| None)
+            answer_batch(keys, hits, &deadline, |_| None)
         } else {
-            let unserved = keys.len();
-            forest_read(self.forest_server.clone(), peer, move |s| {
-                Some(answer_batch(keys, hits, |key| {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(forest_read(self.forest_server.clone(), peer, move |s| {
+                Some(answer_batch(keys, hits, &deadline, |key| {
+                    let cached = CacheKey::node(origin, &shard_id, phase, key);
+                    if let Some(node) = cache.recheck(&cached) {
+                        return Some(node.as_ref().clone());
+                    }
                     let node = s.serve_node(&shard_id, phase, key);
                     if let Some(node) = &node {
-                        cache.put(CacheKey::node(origin, &shard_id, phase, key), node.clone());
+                        cache.put(cached, node.clone());
                     }
                     node
                 }))
-            }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])
+            }).await, prefix, unserved)?
         };
         Ok(Response::new(global::GetForestNodesResponse { nodes }))
     }
@@ -1448,23 +1538,28 @@ impl GlobalService for GlobalRpcServer {
         let hits: Vec<_> = keys.iter()
             .map(|(version, hash)| cache.get(&CacheKey::value(origin, &req.shard_id, req.phase, *version, hash)))
             .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
         let (shard_id, phase) = (req.shard_id, req.phase);
         let values = if hits.iter().all(Option::is_some) {
-            answer_batch(keys, hits, |_| None)
+            answer_batch(keys, hits, &deadline, |_| None)
         } else {
-            let unserved = keys.len();
-            forest_read(self.forest_server.clone(), peer, move |s| {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(forest_read(self.forest_server.clone(), peer, move |s| {
                 // A value read above the tree's head could change when that
                 // version commits, so only reads at or below it are kept.
                 let head = s.serve_head(&shard_id, phase).map(|(version, _)| version);
-                Some(answer_batch(keys, hits, |(version, hash)| {
+                Some(answer_batch(keys, hits, &deadline, |(version, hash)| {
+                    let cached = CacheKey::value(origin, &shard_id, phase, *version, hash);
+                    if let Some(value) = cache.recheck(&cached) {
+                        return Some(value.as_ref().clone());
+                    }
                     let value = s.serve_value(&shard_id, phase, *version, *hash);
                     if let Some(value) = value.as_ref().filter(|_| head.is_some_and(|head| *version <= head)) {
-                        cache.put(CacheKey::value(origin, &shard_id, phase, *version, hash), value.clone());
+                        cache.put(cached, value.clone());
                     }
                     value
                 }))
-            }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])
+            }).await, prefix, unserved)?
         };
         Ok(Response::new(global::GetForestValuesResponse { values }))
     }
@@ -1500,17 +1595,44 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetVertexBlobsRequest>,
     ) -> Result<Response<global::GetVertexBlobsResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
         let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         if req.blobs.len() > MAX_FOREST_BATCH_KEYS {
             return Err(Status::invalid_argument(format!("at most {MAX_FOREST_BATCH_KEYS} keys per request")));
         }
-        let unserved = req.blobs.len();
-        let hits = vec![None; req.blobs.len()];
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let blobs = vec![global::ForestReadResult::default(); req.blobs.len()];
+            return Ok(Response::new(global::GetVertexBlobsResponse { blobs }));
+        };
+        let cache = ForestReadCache::process();
+        let cached = prover_blobs(&req.shard_key);
+        let hits: Vec<_> = req.blobs.iter()
+            .map(|key| cached.then(|| cache.get(&CacheKey::blob(origin, &req.shard_key, req.phase, key.version, &key.id))).flatten())
+            .collect();
+        let (deadline, _caller) = BatchDeadline::start(FOREST_BATCH_BUDGET);
         let (shard_key, phase, keys) = (req.shard_key, req.phase, req.blobs);
-        let blobs = forest_read(self.forest_server.clone(), peer, move |s| {
-            Some(answer_batch(keys, hits, |key| s.serve_vertex_blob(&shard_key, phase, &key.id, Some(key.version))))
-        }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved]);
+        let blobs = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, &deadline, |_| None)
+        } else {
+            let (unserved, prefix) = (keys.len(), cached_prefix(&hits));
+            or_cached_prefix(forest_read(self.forest_server.clone(), peer, move |s| {
+                // As for values: only reads at or below the tree's head are
+                // kept.
+                let head = cached.then(|| s.serve_head(&PROVER_TREE, phase).map(|(version, _)| version)).flatten();
+                Some(answer_batch(keys, hits, &deadline, |key| {
+                    let entry = CacheKey::blob(origin, &shard_key, phase, key.version, &key.id);
+                    if let Some(blob) = cached.then(|| cache.recheck(&entry)).flatten() {
+                        return Some(blob.as_ref().clone());
+                    }
+                    let blob = s.serve_vertex_blob(&shard_key, phase, &key.id, Some(key.version));
+                    if let Some(blob) = blob.as_ref().filter(|_| head.is_some_and(|head| key.version <= head)) {
+                        cache.put(entry, blob.clone());
+                    }
+                    blob
+                }))
+            }).await, prefix, unserved)?
+        };
         Ok(Response::new(global::GetVertexBlobsResponse { blobs }))
     }
 
@@ -2188,15 +2310,168 @@ mod forest_read_tests {
     fn a_batch_answers_a_prefix_within_its_byte_budget() {
         let keys: Vec<u32> = (0..5).collect();
         let hits = vec![None, Some(Arc::new(vec![1u8; 3])), None, None, None];
-        let out = answer_batch(keys, hits, |key| match key {
+        let (deadline, _caller) = BatchDeadline::start(std::time::Duration::from_secs(600));
+        let out = answer_batch(keys, hits, &deadline, |key| match key {
             2 => None,
             _ => Some(vec![0u8; MAX_FOREST_BATCH_BYTES / 2]),
         });
         assert_eq!(out.len(), 4, "the fifth key is past the budget");
         assert!(out[0].found && out[1].found && !out[2].found && out[3].found);
         assert_eq!(out[1].data, vec![1u8; 3]);
-        let one = answer_batch(vec![0u32], vec![None], |_| Some(vec![0u8; MAX_FOREST_BATCH_BYTES * 2]));
+        let one = answer_batch(vec![0u32], vec![None], &deadline, |_| Some(vec![0u8; MAX_FOREST_BATCH_BYTES * 2]));
         assert_eq!(one.len(), 1, "a single oversized entry is still answered");
+    }
+
+    /// Past its deadline, or once its caller has gone, a batch reads no
+    /// further key from storage: it answers what it has, cached keys
+    /// included, and always at least its first key.
+    #[test]
+    fn a_batch_stops_reading_storage_past_its_deadline_or_once_its_caller_has_gone() {
+        let reads = std::cell::Cell::new(0);
+        let read = |_: &u32| {
+            reads.set(reads.get() + 1);
+            Some(vec![1u8])
+        };
+        let (passed, _caller) = BatchDeadline::start(std::time::Duration::ZERO);
+        let out = answer_batch(vec![0, 1, 2], vec![None, Some(Arc::new(vec![2u8])), None], &passed, read);
+        assert_eq!((out.len(), reads.get()), (2, 1), "the first key and the cached one");
+        assert_eq!(out[1].data, vec![2u8]);
+
+        let (deadline, caller) = BatchDeadline::start(std::time::Duration::from_secs(600));
+        let out = answer_batch(vec![0, 1, 2], vec![None; 3], &deadline, read);
+        assert_eq!((out.len(), reads.get()), (3, 4), "a live caller within budget gets every key");
+        drop(caller);
+        let out = answer_batch(vec![0, 1, 2], vec![None; 3], &deadline, read);
+        assert_eq!((out.len(), reads.get()), (1, 5), "an abandoned batch stops after its first key");
+    }
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Err("n/a".into()) }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> { Err("n/a".into()) }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> { Err("n/a".into()) }
+    }
+
+    type ReadHook = Box<dyn Fn(&[u8]) + Send>;
+
+    /// Serves every node and blob it is asked for, counting storage reads;
+    /// each tree's head is `head`.
+    struct CountingForest {
+        reads: std::sync::atomic::AtomicUsize,
+        head: u64,
+        /// Runs on each node read, as a concurrent request's read would.
+        on_node_read: std::sync::Mutex<Option<ReadHook>>,
+    }
+
+    impl CountingForest {
+        fn new(head: u64) -> Arc<Self> {
+            Arc::new(Self { reads: Default::default(), head, on_node_read: Default::default() })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ForestServer for CountingForest {
+        fn serve_node(&self, _: &[u8], _: u32, node_key: &[u8]) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(hook) = self.on_node_read.lock().unwrap().as_ref() {
+                hook(node_key);
+            }
+            Some(node_key.to_vec())
+        }
+        fn serve_value(&self, _: &[u8], _: u32, _: u64, _: [u8; 32]) -> Option<Vec<u8>> { None }
+        fn serve_head(&self, _: &[u8], _: u32) -> Option<(u64, [u8; 32])> { Some((self.head, [0; 32])) }
+        fn serve_preimage(&self, _: &[u8], _: u32, _: [u8; 32]) -> Option<Vec<u8>> { None }
+        fn serve_vertex_blob(&self, _: &[u8], _: u32, id: &[u8], version: Option<u64>) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some([id, &version.unwrap_or(0).to_be_bytes()].concat())
+        }
+        fn resolve_root(&self, _: &[u8], _: u32, _: [u8; 32]) -> Option<(u64, u64)> { None }
+        fn serve_app_manifest(&self, _: &[u8], _: u32, _: [u8; 32]) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>> { None }
+    }
+
+    fn blob_request(shard_key: Vec<u8>, keys: &[(&[u8], u64)]) -> Request<global::GetVertexBlobsRequest> {
+        let blobs = keys.iter()
+            .map(|(id, version)| global::VertexBlobKey { id: id.to_vec(), version: *version })
+            .collect();
+        Request::new(global::GetVertexBlobsRequest { shard_key, phase: 0, blobs })
+    }
+
+    /// Every node syncing the prover tree after an epoch asks for the same
+    /// blobs: one read at or below the tree's head is final and served to
+    /// the next asker from memory. Reads above the head, and blobs of other
+    /// shards (whose versions may be a split app's sub-shards'), are read
+    /// from storage each time.
+    #[tokio::test]
+    async fn prover_tree_blobs_at_or_below_its_head_are_read_from_storage_once() {
+        let forest = CountingForest::new(7);
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let prover: Vec<u8> = [0x51, 0x52, 0x53].into_iter().chain(PROVER_TREE).collect();
+        let keys: [(&[u8], u64); 2] = [(b"blob kept a", 5), (b"blob kept b", 9)];
+        let first = server.get_vertex_blobs(blob_request(prover.clone(), &keys)).await.unwrap().into_inner().blobs;
+        assert_eq!(forest.reads(), 2);
+        let again = server.get_vertex_blobs(blob_request(prover, &keys)).await.unwrap().into_inner().blobs;
+        assert_eq!(again, first, "the same answer");
+        assert_eq!(forest.reads(), 3, "only the read above the head is repeated");
+
+        let app: Vec<u8> = [0x51, 0x52, 0x53].into_iter().chain([7u8; 32]).collect();
+        for _ in 0..2 {
+            server.get_vertex_blobs(blob_request(app.clone(), &[(b"blob of an app", 5)])).await.unwrap();
+        }
+        assert_eq!(forest.reads(), 5, "another shard's blobs are not kept");
+    }
+
+    /// A key cached by another peer's read while this batch waited is
+    /// served from memory when the batch reaches it.
+    #[tokio::test]
+    async fn a_node_cached_while_its_batch_waited_takes_no_storage_read() {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let forest = CountingForest::new(7);
+        let origin = Origin::of(&forest);
+        let shard: Vec<u8> = vec![0x61; 32];
+        let late: &[u8] = b"node cached late";
+        let shard_for_hook = shard.clone();
+        *forest.on_node_read.lock().unwrap() = Some(Box::new(move |_| {
+            ForestReadCache::process().put(CacheKey::node(origin, &shard_for_hook, 0, late), b"from memory".to_vec());
+        }));
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let request = Request::new(global::GetForestNodesRequest {
+            shard_id: shard, phase: 0, node_keys: vec![b"node read first".to_vec(), late.to_vec()],
+        });
+        let nodes = server.get_forest_nodes(request).await.unwrap().into_inner().nodes;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].data, b"from memory".to_vec());
+        assert_eq!(forest.reads(), 1);
+    }
+
+    /// A peer refused a storage slot still gets the leading keys of its
+    /// batch that are cached; with none cached it is told to retry.
+    #[tokio::test]
+    async fn a_busy_archive_answers_the_cached_leading_keys() {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        use crate::peer_auth_middleware::AuthenticatedPeer;
+        let forest = CountingForest::new(7);
+        let shard: Vec<u8> = vec![0x71; 32];
+        let warm: &[u8] = b"node already cached";
+        ForestReadCache::process().put(CacheKey::node(Origin::of(&forest), &shard, 0, warm), warm.to_vec());
+        let server = GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(forest.clone());
+        let peer = quil_p2p::PeerId::random();
+        let _held: Vec<_> = (0..FOREST_READ_SLOTS_PER_PEER)
+            .map(|_| PeerSlot::take(Some(peer.to_bytes()), FOREST_READ_SLOTS_PER_PEER).unwrap())
+            .collect();
+        let request = |node_keys: Vec<Vec<u8>>| {
+            let mut request = Request::new(global::GetForestNodesRequest { shard_id: shard.clone(), phase: 0, node_keys });
+            request.extensions_mut().insert(AuthenticatedPeer { peer_id: peer, falcon_public_key: Vec::new() });
+            request
+        };
+        let nodes = server.get_forest_nodes(request(vec![warm.to_vec(), b"node not cached".to_vec()]))
+            .await.unwrap().into_inner().nodes;
+        assert_eq!(nodes.len(), 1, "the cached prefix");
+        assert_eq!(nodes[0].data, warm.to_vec());
+        let refused = server.get_forest_nodes(request(vec![b"node not cached".to_vec(), warm.to_vec()])).await;
+        assert_eq!(refused.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(forest.reads(), 0);
     }
 }
 
