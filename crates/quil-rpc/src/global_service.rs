@@ -501,13 +501,16 @@ pub type AppShardsVersion = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 /// Distinct requests whose shard rows are kept; prefixes are caller-chosen.
 const APP_SHARD_TOPOLOGY_ENTRIES: usize = 256;
 
-/// Callers waiting for the one shard-row read in progress.
+/// Callers waiting for a shard-row read of their request in progress.
 static APP_SHARDS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One request's shard rows and whether a pending split or merge freezes each.
 type ShardTopology = Vec<(quil_types::store::ShardInfo, bool)>;
-type AppShardTopologies =
-    std::collections::HashMap<(Vec<u8>, Vec<u32>), (u64, Arc<ShardTopology>)>;
+/// A request's rows and the committed frame they were read at. Each request
+/// has its own lock: callers of one request share its read, and never wait
+/// for another request's.
+type KeptTopology = Arc<tokio::sync::Mutex<Option<(u64, Arc<ShardTopology>)>>>;
+type AppShardTopologies = std::collections::HashMap<(Vec<u8>, Vec<u32>), KeptTopology>;
 
 /// The shard rows a `GetAppShards` request names: one application's when
 /// `shard_key` is a full 35-byte key, otherwise every application's.
@@ -533,12 +536,36 @@ fn read_shard_topology(
         .collect())
 }
 
+/// The rows kept for request `key`, added if new. A full table first drops
+/// the requests no caller is reading whose rows are not from `version`, then
+/// every request no caller is reading.
+fn kept_topology(
+    topologies: &parking_lot::Mutex<AppShardTopologies>,
+    key: &(Vec<u8>, Vec<u32>),
+    version: Option<u64>,
+) -> KeptTopology {
+    let mut kept = topologies.lock();
+    if let Some(slot) = kept.get(key) {
+        return slot.clone();
+    }
+    if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+        kept.retain(|_, slot| match slot.try_lock() {
+            Ok(rows) => version.is_some() && rows.as_ref().map(|(at, _)| *at) == version,
+            Err(_) => true,
+        });
+        if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+            kept.retain(|_, slot| slot.try_lock().is_err());
+        }
+    }
+    kept.entry(key.clone()).or_default().clone()
+}
+
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
     /// `GetAppShards` shard rows, read once per committed GLOBAL frame (see
     /// [`AppShardsVersion`]): every prover polls them.
-    app_shard_topologies: Arc<tokio::sync::Mutex<AppShardTopologies>>,
+    app_shard_topologies: Arc<parking_lot::Mutex<AppShardTopologies>>,
     app_shards_version: Option<AppShardsVersion>,
     frames: Arc<dyn FrameLookup>,
     /// Bounds peers' frame and proposal reads ([`FRAME_READS`]).
@@ -851,7 +878,7 @@ fn prover_blobs(shard_key: &[u8]) -> bool {
 impl GlobalRpcServer {
     pub fn new(frames: Arc<dyn FrameLookup>) -> Self {
         Self {
-            app_shard_topologies: Arc::new(tokio::sync::Mutex::new(AppShardTopologies::new())),
+            app_shard_topologies: Arc::new(parking_lot::Mutex::new(AppShardTopologies::new())),
             app_shards_version: None,
             frames,
             frame_reads: &FRAME_READS,
@@ -1230,14 +1257,16 @@ impl GlobalService for GlobalRpcServer {
             let lock_wait;
             let mut rows_read = None;
             // Rows change only with a committed GLOBAL frame: one caller reads
-            // them per frame, and callers arriving meanwhile wait and share it.
+            // them per frame, and callers of the same request arriving
+            // meanwhile wait and share it.
             let topology = {
+                let version = version.as_ref().and_then(|version| version());
+                let slot = kept_topology(&topologies, &key, version);
                 APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut kept = topologies.lock_owned().await;
+                let mut kept = slot.lock_owned().await;
                 APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 lock_wait = started.elapsed();
-                let version = version.as_ref().and_then(|version| version());
-                match (version, kept.get(&key)) {
+                match (version, kept.as_ref()) {
                     (Some(version), Some((at, rows))) if *at == version => rows.clone(),
                     _ => {
                         let read_started = std::time::Instant::now();
@@ -1250,13 +1279,7 @@ impl GlobalService for GlobalRpcServer {
                         );
                         rows_read = Some(read_started.elapsed());
                         if let Some(version) = version {
-                            if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
-                                kept.retain(|_, (at, _)| *at == version);
-                                if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
-                                    kept.clear();
-                                }
-                            }
-                            kept.insert(key, (version, rows.clone()));
+                            *kept = Some((version, rows.clone()));
                         }
                         rows
                     }
@@ -2378,6 +2401,67 @@ mod app_shards_cache_tests {
             assert_eq!(info[0].size, 7u64.to_be_bytes().to_vec());
         }
         assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two applications' shards; a read of the first is held until released.
+    struct TwoApps {
+        held: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        reads: AtomicUsize,
+    }
+    impl ShardsStore for TwoApps {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<ShardInfo>> { Ok(Vec::new()) }
+        fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if shard_key[0] == 0 {
+                let _ = self.held.lock().unwrap().recv();
+            }
+            Ok(vec![ShardInfo { shard_key: shard_key.to_vec(), prefix: prefix.to_vec(), size: Vec::new(), data_shards: 0, commitment: Vec::new() }])
+        }
+        fn put_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &ShardInfo) -> quil_types::error::Result<()> { Ok(()) }
+        fn delete_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: &[u32]) -> quil_types::error::Result<()> { Ok(()) }
+    }
+
+    // Every prover polls its own applications' shards. A slow read of one
+    // application's rows held every other application's callers too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_read_of_one_application_holds_up_no_other() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(TwoApps { held: std::sync::Mutex::new(release_rx), reads: AtomicUsize::new(0) });
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(store.clone())
+            .with_app_shards_version(Arc::new(|| Some(9))));
+        let ask_app = |first: u8| {
+            let server = server.clone();
+            async move {
+                server.get_app_shards(Request::new(global::GetAppShardsRequest { shard_key: vec![first; 35], prefix: vec![1] }))
+                    .await.map(|r| r.into_inner().info)
+            }
+        };
+        let slow = tokio::spawn(ask_app(0));
+        while store.reads.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        let other = tokio::time::timeout(std::time::Duration::from_secs(5), ask_app(1)).await
+            .expect("another application's rows are not held up").unwrap();
+        assert_eq!(other[0].prefix, vec![1]);
+        release_tx.send(()).unwrap();
+        assert_eq!(slow.await.unwrap().unwrap().len(), 1);
+    }
+
+    /// A full table keeps the rows read at the current frame and those being
+    /// read, and makes room by dropping the rest.
+    #[test]
+    fn a_full_table_drops_rows_of_older_frames_first() {
+        let topologies = parking_lot::Mutex::new(AppShardTopologies::new());
+        let key = |n: usize| (vec![0; 35], vec![n as u32]);
+        for n in 0..APP_SHARD_TOPOLOGY_ENTRIES {
+            let slot = kept_topology(&topologies, &key(n), Some(1));
+            *slot.try_lock().unwrap() = Some((if n == 0 { 2 } else { 1 }, Arc::new(Vec::new())));
+        }
+        let reading = kept_topology(&topologies, &key(1), Some(1));
+        let _held = reading.try_lock().unwrap();
+        kept_topology(&topologies, &key(APP_SHARD_TOPOLOGY_ENTRIES), Some(2));
+        let kept = topologies.lock();
+        assert_eq!(kept.len(), 3, "the current frame's rows, the read in progress and the new request");
+        assert!(kept.contains_key(&key(0)) && kept.contains_key(&key(1)));
     }
 }
 
