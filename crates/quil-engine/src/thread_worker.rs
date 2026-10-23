@@ -425,8 +425,11 @@ impl ThreadWorkerManager {
             .spawn(move || {
                 // Pin to the requested core
                 let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+                let mut cpu = None;
                 if (core_id as usize) < core_ids.len() {
-                    if !core_affinity::set_for_current(core_ids[core_id as usize]) {
+                    if core_affinity::set_for_current(core_ids[core_id as usize]) {
+                        cpu = Some(core_ids[core_id as usize].id);
+                    } else {
                         warn!(core_id, "failed to pin thread to core");
                     }
                 }
@@ -436,6 +439,9 @@ impl ThreadWorkerManager {
                         init(core_id);
                     }
                 }
+
+                // After `worker_init`, so a failure lands in this worker's log.
+                run_falcon_self_test(core_id, cpu);
 
                 // Confirms per-worker log routing is wired: this line
                 // emits from the worker's OS thread and must land in
@@ -1173,6 +1179,54 @@ fn join_within(mut handles: Vec<(u32, JoinHandle<()>)>, deadline: std::time::Dur
     }
 }
 
+/// Messages the worker's startup Falcon self-test signs.
+const FALCON_SELF_TEST_MESSAGES: u32 = 8;
+/// FN-DSA context of the self-test signatures, apart from every consensus domain.
+const FALCON_SELF_TEST_DOMAIN: &[u8] = b"quil-worker-self-test";
+
+/// Sign the self-test messages and count the signatures that fail to verify
+/// (or that `sign` fails to produce).
+fn falcon_self_test_failures(
+    mut sign: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+    verify: impl Fn(&[u8], &[u8]) -> bool,
+) -> u32 {
+    (0..FALCON_SELF_TEST_MESSAGES)
+        .filter(|i| {
+            let msg = format!("quilibrium worker falcon self-test {i}");
+            !sign(msg.as_bytes()).is_some_and(|sig| verify(msg.as_bytes(), &sig))
+        })
+        .count() as u32
+}
+
+/// Check that this worker's core signs valid Falcon signatures. Falcon signing
+/// runs on floating point while verification is integer-only, so a core that
+/// miscomputes floating point signs invalid signatures it can still detect;
+/// such a worker fails every archive handshake and casts votes nobody counts.
+/// Key generation is fixed-point integer code, so the shared test key is valid
+/// whichever thread generates it.
+fn run_falcon_self_test(core_id: u32, cpu: Option<usize>) {
+    use quil_types::crypto::Signer as _;
+    static KEY: std::sync::OnceLock<quil_crypto::FalconSigner> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(quil_crypto::FalconSigner::generate);
+    let failures = falcon_self_test_failures(
+        |m| key.sign_with_domain(m, FALCON_SELF_TEST_DOMAIN).ok(),
+        |m, sig| quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN),
+    );
+    if failures > 0 {
+        tracing::error!(
+            core_id,
+            cpu,
+            failures,
+            attempts = FALCON_SELF_TEST_MESSAGES,
+            "CPU core {} signs invalid Falcon signatures: this worker cannot connect to \
+             archives or cast valid votes. The cause is the CPU core (hardware fault or \
+             unstable overclock/undervolt): test that core, e.g. with a per-core stress \
+             test, or exclude it from the node's workers",
+            cpu.unwrap_or(core_id as usize),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1378,5 +1432,44 @@ mod tests {
         assert!(workers[0].allocated, "a worker running consensus is allocated");
         mgr.set_worker_filter(1, b"joining-filter", false).unwrap();
         assert!(!mgr.range_workers().unwrap()[0].allocated);
+    }
+
+    fn self_test_key() -> quil_crypto::FalconSigner {
+        quil_crypto::FalconSigner::generate()
+    }
+
+    fn self_test_with(key: &quil_crypto::FalconSigner, corrupt: impl Fn(u32) -> bool) -> u32 {
+        use quil_types::crypto::Signer as _;
+        let mut calls = 0;
+        falcon_self_test_failures(
+            |m| {
+                calls += 1;
+                let mut sig = key.sign_with_domain(m, FALCON_SELF_TEST_DOMAIN).ok()?;
+                if corrupt(calls) {
+                    sig[100] ^= 0x01;
+                }
+                Some(sig)
+            },
+            |m, sig| quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN),
+        )
+    }
+
+    #[test]
+    fn falcon_self_test_passes_a_good_signer_quickly() {
+        let started = std::time::Instant::now();
+        let key = self_test_key();
+        let keygen = started.elapsed();
+        let started = std::time::Instant::now();
+        assert_eq!(self_test_with(&key, |_| false), 0);
+        let test = started.elapsed();
+        eprintln!("falcon self-test: keygen {keygen:?}, {FALCON_SELF_TEST_MESSAGES} sign+verify {test:?}");
+        assert!(test < std::time::Duration::from_millis(100), "self-test took {test:?}");
+    }
+
+    #[test]
+    fn falcon_self_test_counts_every_corrupt_signature() {
+        let key = self_test_key();
+        assert_eq!(self_test_with(&key, |_| true), FALCON_SELF_TEST_MESSAGES);
+        assert_eq!(self_test_with(&key, |n| n % 4 == 0), FALCON_SELF_TEST_MESSAGES / 4);
     }
 }
