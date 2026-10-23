@@ -4275,7 +4275,7 @@ mod successor_tests {
             zero.clone(), global.clone(), shard.clone(), clock.clone() as Arc<dyn ClockStore>, closing.clone(),
         ).unwrap();
         let context = |view: u64, parent_view: u64, parent: [u8; 32]| ProposalContext {
-            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent),
+            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent), leader: None,
         };
         // A member that has not staged the shard's data reads no parent, so it
         // can neither propose nor verify a seal of its partial roots.

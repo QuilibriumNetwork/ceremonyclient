@@ -1460,6 +1460,7 @@ fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
             Some(R::ShardMerge(_)) => "ShardMerge",
             Some(R::CommitteeHandoff(_)) => "CommitteeHandoff",
             Some(R::PresenceReport(_)) => "PresenceReport",
+            Some(R::StorageEpochProof(_)) => "StorageEpochProof",
         });
     }
     tags.join(",")

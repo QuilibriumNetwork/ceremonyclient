@@ -251,10 +251,18 @@ where
     // opening is its own pairing check, independent of the others, so they run
     // in parallel: one after another they were most of a shard header's GLOBAL
     // execution time. The result is the same as checking them in turn.
+    // The scheme is the audited epoch's, decided here rather than per opening
+    // on the pool's threads (the registry check pins every opening to it).
+    let hash = quil_types::consensus::hash_storage_proofs_at(active_epoch);
     let verified: Vec<bool> = audited
         .par_iter()
         .map(|(o, registry_ok)| {
-            *registry_ok && verify_storage_attestation(std::slice::from_ref(*o), 0, rho_n, &[], poly_size)
+            *registry_ok
+                && if hash {
+                    crate::storage_proof::verify_opening(o, rho_n)
+                } else {
+                    verify_storage_attestation(std::slice::from_ref(*o), 0, rho_n, &[], poly_size)
+                }
         })
         .collect();
     // Failed members in opening order, as before: every node kicks the same
@@ -698,6 +706,13 @@ fn update_frame_transcript(
     }
 }
 
+/// Whether an opening set is hash-based ([`crate::storage_proof`]): its epoch
+/// is at or after `quil_types::consensus::hash_storage_proof_epoch()`. A set
+/// mixing schemes fails verification either way.
+fn uses_hash_proofs(openings: &[StorageOpening]) -> bool {
+    openings.first().is_some_and(|o| quil_types::consensus::hash_storage_proofs_at(o.epoch))
+}
+
 /// The committee's `storage_attestation_root` for the FrameHeader: the 74-byte
 /// **aggregate proof point** `A = Σ_k γ^k · π_k` over the canonical opening set
 /// (a compressed BLS48-581 G1 element), where `γ` is the Fiat-Shamir challenge
@@ -715,6 +730,9 @@ pub fn compute_storage_attestation_root(
     bitmask: &[u8],
     poly_size: u64,
 ) -> Vec<u8> {
+    if uses_hash_proofs(openings) {
+        return crate::storage_proof::attestation_root(openings, frame_number, rho_n, bitmask);
+    }
     let idx = canonical_indexed(openings, rho_n, poly_size);
     if idx.is_empty() {
         return Vec::new();
@@ -746,6 +764,11 @@ pub fn verify_storage_attestation(
         // No openings to satisfy this frame; the caller enforces the
         // participation quorum separately.
         return true;
+    }
+    if uses_hash_proofs(openings) {
+        return openings.iter().all(|o| {
+            quil_types::consensus::hash_storage_proofs_at(o.epoch) && crate::storage_proof::verify_opening(o, rho_n)
+        });
     }
     if poly_size == 0 {
         return false;
@@ -1515,6 +1538,41 @@ mod tests {
         let parallel = audit_frame_storage_attestations(&mixed, &rho_n, poly_size, epoch, u64::MAX, &good_no_m1);
         assert_eq!(parallel, sequential(&mixed, &good_no_m1));
         assert_eq!(parallel.len(), 2, "m1 unregistered and m2 tampered: {parallel:?}");
+    }
+
+    /// A registered member's opening with a field too short to decode is
+    /// rejected and its member kicked, as any bad opening is: the KZG decoder
+    /// indexed past such bytes and panicked GLOBAL execution on every archive
+    /// that sampled it (found 2026-10-20).
+    #[test]
+    fn a_truncated_kzg_opening_is_rejected_not_a_panic() {
+        use std::collections::HashMap;
+        bls48581::init();
+        let poly_size = 16u64;
+        let rho_n = [0xA1u8; 32];
+        let openings = build_attestation(&rho_n, poly_size);
+        let epoch = openings[0].epoch;
+        let reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = openings
+            .iter()
+            .map(|o| ((o.member_id.clone(), o.shard_id.clone()), (o.leaf_root.clone(), o.num_blocks, epoch)))
+            .collect();
+        let lookup = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let truncations: [fn(&mut StorageOpening); 6] = [
+            |o| o.commitment.clear(),
+            |o| o.proof.truncate(10),
+            |o| o.value.clear(),
+            |o| o.commitment = [&[0x04u8][..], &o.commitment[1..]].concat(),
+            |o| if let Some(c) = o.path_commits.first_mut() { c.truncate(1) } else { o.proof.clear() },
+            |o| if let Some(p) = o.path_proofs.first_mut() { p.clear() } else { o.commitment.truncate(73) },
+        ];
+        for (case, truncate) in truncations.iter().enumerate() {
+            let mut bad = openings.clone();
+            truncate(&mut bad[0]);
+            let failed = audit_frame_storage_attestations(&bad, &rho_n, poly_size, epoch, u64::MAX, &lookup);
+            assert_eq!(failed.first(), Some(&bad[0].member_id), "case {case}");
+            let root = compute_storage_attestation_root(&bad, 1, &rho_n, &[], poly_size);
+            assert!(!verify_frame_storage_attestation(&root, &bad, 1, &rho_n, &[], poly_size), "case {case}");
+        }
     }
 
     #[test]
