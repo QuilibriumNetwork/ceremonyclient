@@ -106,6 +106,10 @@ pub struct SessionHost {
     /// Told whether each seal this member verifies shares its state roots
     /// (`HandoffProposer::with_checkpoint_votes`).
     pub checkpoint_votes: Option<quil_cw_consensus::handoff::automaton::CheckpointVotes>,
+    /// Says why no closing request authorizes a seal, and whether a refresh
+    /// of the committed GLOBAL view is on its way
+    /// (`HandoffProposer::with_closing_probe`).
+    pub closing_probe: Option<quil_cw_consensus::handoff::automaton::ClosingProbe>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -2037,6 +2041,7 @@ pub fn activate_app_consensus_cw(
                 .with_private_checkpoint_reader(host.read_private_checkpoint)
                 .with_seal_parents(store.clone(), host.read_tip)
                 .with_checkpoint_votes(host.checkpoint_votes)
+                .with_closing_probe(host.closing_probe)
                 .with_liveness(Some(host.liveness)),
                 bodies: sealed_bodies.clone(),
             }),

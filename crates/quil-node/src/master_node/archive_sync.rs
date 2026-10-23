@@ -48,6 +48,43 @@ fn reconcile_workers_after_registry_sync(
     Ok(Some(frame))
 }
 
+/// The next prover-tree pull: `None` for the periodic one, else the early pull
+/// `refresh` decided on, after which the period restarts. Only a node whose
+/// `refresh` is enabled checks for early pulls. `clock` holds the received
+/// GLOBAL headers and, on a regular node, the cursor of the committed view the
+/// last verified pull recorded.
+async fn next_prover_tree_pull(
+    periodic: &mut tokio::time::Interval,
+    check: &mut tokio::time::Interval,
+    refresh: &quil_engine::global_view_refresh::ViewRefresh,
+    clock: &quil_store::RocksClockStore,
+) -> Option<quil_engine::global_view_refresh::EarlyPull> {
+    use quil_engine::global_view_refresh::Decision;
+    let enabled = refresh.enabled();
+    loop {
+        tokio::select! {
+            _ = periodic.tick() => return None,
+            _ = check.tick(), if enabled => {
+                let head = clock.get_latest_global_frame().ok()
+                    .and_then(|frame| frame.header).map(|header| header.frame_number);
+                let view = clock.get_global_materialized_cursor();
+                match refresh.decide(view, head, std::time::Instant::now()) {
+                    Decision::Idle => {}
+                    Decision::Pull(pull) => {
+                        info!(reason = pull.reason.as_str(), through = pull.through, committed_view = ?view,
+                            head = ?head, "early prover tree sync started");
+                        periodic.reset();
+                        return Some(pull);
+                    }
+                    Decision::Exhausted { epoch, wanted, max } => info!(epoch, reason = wanted.reason.as_str(),
+                        through = wanted.through, max,
+                        "early prover tree syncs used up for this epoch; the periodic sync continues"),
+                }
+            }
+        }
+    }
+}
+
 /// Reuse an authenticated startup jump before considering the fallback pull.
 /// A dropped sender means the jump task failed; it must not enable lifecycle.
 async fn bootstrap_prover_sync<F, Fut>(
@@ -3643,9 +3680,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
 
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(sync_interval_secs));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // A regular node's app sessions read committee handoff state
+                // from this pull: run it early when GLOBAL passes an epoch
+                // boundary and when a local session asks for a fresher view.
+                // Its in-process workers share `early_refresh`.
+                let early_refresh = quil_engine::global_view_refresh::shared();
+                if !sync_archive_mode && quil_types::consensus::committee_handoff_policy().is_some() {
+                    early_refresh.enable(quil_types::consensus::epoch_length_frames());
+                }
+                let mut early_check = tokio::time::interval(quil_engine::global_view_refresh::CHECK_INTERVAL);
+                early_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
-                        _ = interval.tick() => {
+                        early = next_prover_tree_pull(
+                            &mut interval, &mut early_check, &early_refresh, sync_cs.as_ref(),
+                        ) => {
+                            let pull_started = std::time::Instant::now();
                             // Archives have full history locally — a HEALTHY
                             // archive doesn't need to incremental-sync the prover
                             // tree from peers (and on a fresh post-migration
@@ -3727,6 +3777,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 sync_cs.as_ref(),
                                 sync_mat.as_ref().and_then(|m| m.fork_target_root()),
                             );
+                            // Running until this pass ends: sessions asking for a
+                            // later frame are told the next pull starts after it.
+                            let _pull = early_refresh.pull(anchor.cursor.unwrap_or(0));
                             if let Some(frame) = anchor.cursor {
                                 info!(registry_sync, frame = frame.saturating_add(1),
                                     root = hex::encode(&anchor.root),
@@ -3938,6 +3991,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     peers = reconcile_peers.len(),
                                     "reconcile: no reachable peer holds the finalized prover root this round — will retry next cycle"
                                 );
+                            }
+                            let committed_view = sync_cs.get_global_materialized_cursor();
+                            if let Some(view) = committed_view {
+                                early_refresh.settle(view);
+                            }
+                            if let Some(early) = early {
+                                info!(reason = early.reason.as_str(), through = early.through, committed_view = ?committed_view,
+                                    converged = reconcile_converged, duration_ms = pull_started.elapsed().as_millis() as u64,
+                                    "early prover tree sync finished");
                             }
                         }
                         _ = sync_token.cancelled() => break,
@@ -4355,6 +4417,76 @@ mod validation_tests {
         reconcile_workers_after_registry_sync(&allocator,
             &RegistrySyncAnchor { root: vec![9; 32], cursor: Some(4) }, false).unwrap();
         assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
+    }
+
+    fn early_pull_clock(head: u64, view: u64) -> quil_store::RocksClockStore {
+        use quil_types::store::ClockStore;
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: head, ..Default::default() }),
+            ..Default::default()
+        }, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        clock.put_global_materialized_cursor(view).unwrap();
+        clock
+    }
+
+    fn early_refresh(enabled: bool) -> quil_engine::global_view_refresh::ViewRefresh {
+        let refresh = quil_engine::global_view_refresh::ViewRefresh::default();
+        if enabled {
+            refresh.enable(quil_types::consensus::epoch_length_frames());
+        }
+        refresh
+    }
+
+    /// The pull runs early once the GLOBAL head binds an epoch boundary the
+    /// committed view lacks; a view holding it, or a node that does not pull
+    /// early (an archive), waits for the period.
+    #[tokio::test(start_paused = true)]
+    async fn the_prover_tree_pull_runs_early_past_an_epoch_boundary() {
+        use quil_engine::global_view_refresh::{EarlyPull, Reason, ViewRefresh};
+        let boundary = 1281 * quil_types::consensus::epoch_length_frames();
+        let pull = |clock: quil_store::RocksClockStore, refresh: ViewRefresh| async move {
+            let mut periodic = tokio::time::interval(std::time::Duration::from_secs(300));
+            periodic.tick().await;
+            let mut check = tokio::time::interval(std::time::Duration::from_millis(20));
+            tokio::time::timeout(std::time::Duration::from_millis(500),
+                next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock)).await
+        };
+        assert_eq!(pull(early_pull_clock(boundary + 1, boundary - 5), early_refresh(true)).await,
+            Ok(Some(EarlyPull { reason: Reason::EpochBoundary, through: boundary })));
+        assert!(pull(early_pull_clock(boundary + 1, boundary), early_refresh(true)).await.is_err(),
+            "nothing newer to pull");
+        assert!(pull(early_pull_clock(boundary, boundary - 5), early_refresh(true)).await.is_err(),
+            "the boundary is not bindable yet");
+        assert!(pull(early_pull_clock(boundary + 1, boundary - 5), early_refresh(false)).await.is_err(),
+            "an archive pulls only periodically");
+    }
+
+    /// An early pull restarts the period, and the periodic pull still follows.
+    #[tokio::test(start_paused = true)]
+    async fn the_periodic_pull_follows_an_early_one_a_full_period_later() {
+        let boundary = 1281 * quil_types::consensus::epoch_length_frames();
+        let refresh = early_refresh(true);
+        let clock = early_pull_clock(boundary + 1, boundary - 5);
+        let period = std::time::Duration::from_millis(300);
+        let mut periodic = tokio::time::interval(period);
+        periodic.tick().await;
+        tokio::time::sleep(period * 2 / 3).await;
+        let mut check = tokio::time::interval(std::time::Duration::from_millis(20));
+        let early = tokio::time::timeout(period, next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock))
+            .await.unwrap();
+        assert!(early.is_some(), "the boundary is pulled before the period ends");
+        let restarted = tokio::time::Instant::now();
+        // It did not converge: the gap holds the next early pull, the period's comes.
+        refresh.end(std::time::Instant::now());
+        let periodic_pull = tokio::time::timeout(period * 3, next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock))
+            .await.unwrap();
+        assert_eq!(periodic_pull, None);
+        assert!(restarted.elapsed() >= period, "the period restarted at the early pull: {:?}", restarted.elapsed());
     }
 
     #[test]

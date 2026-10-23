@@ -27,7 +27,7 @@ use quil_cw_consensus::{
     falcon_base::{FalconPrivateKey, FalconPublicKey},
     falcon_simplex::SimplexFalconScheme,
     handoff::{
-        automaton::{AuthorizedParent, HandoffProposer, ParentReader},
+        automaton::{AuthorizedParent, ClosingAbsence, ClosingProbe, HandoffProposer, ParentReader, CLOSING_REQUEST_WAIT},
         verify_seal, Checkpoint, Seal, Session,
     },
 };
@@ -173,6 +173,117 @@ fn session_refusals_are_named_and_data_proposals_wait_for_their_anchor() {
     assert_eq!(proposer.verify_or_defer(fourth, Digest(seal.digest()), Some(seal.encode())), Ok(false));
     liveness.settle(Step::Verify, 4, false);
     assert_eq!(liveness.decisions().refused.get("seal while no closing request"), Some(&1));
+}
+
+/// A seal of this session whose closing request this member's committed
+/// GLOBAL view lacks waits while that view is being refreshed and is accepted
+/// once the request arrives; with a current view, or for another session, it
+/// is refused at once, naming what this member's view lacked.
+#[test]
+fn a_seal_waits_for_a_refreshing_view_to_bring_its_closing_request() {
+    let (session, _) = session();
+    let mut parent = genesis(&session);
+    parent.checkpoint.frame += 1;
+    parent.checkpoint.view = 11;
+    parent.checkpoint.digest = [9; 32];
+    let state = Arc::new(Mutex::new(Some(parent.clone())));
+    let liveness = Arc::new(Liveness::default());
+    let absence = Arc::new(Mutex::new(ClosingAbsence {
+        detail: "no closing request in the committed GLOBAL view at frame 40, GLOBAL head 45".into(),
+        refreshing: true,
+    }));
+    let (probe, asked) = (absence.clone(), Arc::new(AtomicUsize::new(0)));
+    let probe_asked = asked.clone();
+    let proposer = HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state.clone()))
+        .unwrap()
+        .with_liveness(Some(liveness.clone()))
+        .with_closing_probe(Some(Arc::new(move || {
+            probe_asked.fetch_add(1, Ordering::SeqCst);
+            probe.lock().unwrap().clone()
+        })));
+    let ctx = context(&session, &parent, 18);
+    let seal = Seal { request: [8; 32], session: session.id().unwrap(), view: 18, checkpoint: parent.checkpoint.clone() };
+    let (digest, bytes) = (Digest(seal.digest()), seal.encode());
+
+    // Behind and refreshing: checked again later, not refused.
+    assert_eq!(proposer.verify_or_defer(ctx, digest, Some(bytes.clone())), Err(CLOSING_REQUEST_WAIT));
+    // Another session's seal is not waited for, and asks nothing of the view.
+    let foreign = Seal { session: [0; 32], ..seal.clone() };
+    let before = asked.load(Ordering::SeqCst);
+    assert_eq!(proposer.verify_or_defer(ctx, Digest(foreign.digest()), Some(foreign.encode())), Ok(false));
+    assert_eq!(asked.load(Ordering::SeqCst), before);
+    // The refresh brings the request: the same seal is accepted.
+    state.lock().unwrap().as_mut().unwrap().closing_request = Some([8; 32]);
+    assert_eq!(proposer.verify_or_defer(ctx, digest, Some(bytes)), Ok(true));
+    liveness.settle(Step::Verify, 18, true);
+
+    // A current view refuses at once and names the input it lacked.
+    state.lock().unwrap().as_mut().unwrap().closing_request = None;
+    absence.lock().unwrap().refreshing = false;
+    let next = context(&session, &parent, 19);
+    let current = Seal { view: 19, ..seal };
+    assert_eq!(proposer.verify_or_defer(next, Digest(current.digest()), Some(current.encode())), Ok(false));
+    liveness.settle(Step::Verify, 19, false);
+    let decided = liveness.decisions();
+    assert_eq!(decided.accepted, 1);
+    assert_eq!(decided.refused.get("seal while no closing request"), Some(&1));
+    let last = decided.last_refused.unwrap();
+    assert_eq!((last.view, last.detail.as_str()),
+        (19, "no closing request in the committed GLOBAL view at frame 40, GLOBAL head 45"));
+}
+
+/// One vote through the adapter's verify loop on a seal whose closing request
+/// this member's refreshing view lacks; the request arrives with the probe's
+/// `lands_at` check, if ever. Returns the verdict, whether it took the voter's
+/// whole patience, and the refusals noted under the missing request.
+fn vote_on_waiting_seal(lands_at: Option<usize>) -> (Option<bool>, bool, Option<u64>) {
+    use commonware_consensus::{simplex::types::Context, types::{Epoch, Round, View}, Automaton as _};
+    let (session, _) = session();
+    let mut parent = genesis(&session);
+    parent.checkpoint.frame += 1;
+    parent.checkpoint.view = 11;
+    parent.checkpoint.digest = [9; 32];
+    let state = Arc::new(Mutex::new(Some(parent.clone())));
+    let (landing, checks) = (state.clone(), Arc::new(AtomicUsize::new(0)));
+    let probe: ClosingProbe = Arc::new(move || {
+        if lands_at.is_some_and(|at| checks.fetch_add(1, Ordering::SeqCst) + 1 >= at) {
+            landing.lock().unwrap().as_mut().unwrap().closing_request = Some([8; 32]);
+        }
+        ClosingAbsence { detail: "no closing request in the committed GLOBAL view at frame 40, GLOBAL head 45".into(), refreshing: true }
+    });
+    let liveness = Arc::new(Liveness::default());
+    let proposer = Arc::new(
+        HandoffProposer::new(Arc::new(DataProposer), session.clone(), reader(state)).unwrap()
+            .with_liveness(Some(liveness.clone()))
+            .with_closing_probe(Some(probe)),
+    );
+    let seal = Seal { request: [8; 32], session: session.id().unwrap(), view: 18, checkpoint: parent.checkpoint.clone() };
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    let generation = session.generation;
+    let counted = liveness.clone();
+    let (verdict, whole_patience) = deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+        let store = BlockStore::new();
+        let payload = Digest(seal.digest());
+        store.put(payload, seal.encode());
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(context.child("automaton"), proposer, store)
+            .with_liveness(Some(counted));
+        let started = context.current();
+        let round = Round::new(Epoch::new(generation), View::new(18));
+        let pending = automaton
+            .verify(Context { round, leader, parent: (View::new(11), Digest([9; 32])) }, payload)
+            .await;
+        let verdict = pending.await.ok();
+        (verdict, context.current().duration_since(started).unwrap() >= Duration::from_secs(20))
+    });
+    (verdict, whole_patience, liveness.decisions().refused.get("seal while no closing request").copied())
+}
+
+/// A waiting seal is accepted once the refresh brings its closing request,
+/// and refused, never accepted, when its patience runs out without it.
+#[test]
+fn a_waiting_seal_is_refused_when_its_closing_request_never_arrives() {
+    assert_eq!(vote_on_waiting_seal(Some(3)), (Some(true), false, None));
+    assert_eq!(vote_on_waiting_seal(None), (Some(false), true, Some(1)));
 }
 
 #[test]
