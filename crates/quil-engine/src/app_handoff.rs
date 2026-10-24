@@ -2409,6 +2409,55 @@ mod successor_tests {
         assert!(error.to_string().contains("sealed checkpoint"), "other state is still refused: {error}");
     }
 
+    /// A session that ran and sealed at frame 3, then sessions based at the
+    /// seal that each sealed at their base: the sealed frame's digest, which
+    /// the head's direct origin does not name, still authenticates the
+    /// headers an outgoing-history or carry-window read starts from, and
+    /// only that frame's (…091f80: generation 12 sealed at frame 4693,
+    /// generations 13 to 23 sealed or fenced there, 2026-10-23).
+    #[test]
+    fn history_reads_take_a_sealed_frame_under_sessions_sealed_at_its_seal() {
+        let (global, state) = global_state();
+        let filter = vec![0x0a; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        let sealed = [0x3a; 32];
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: sealed, state_roots: [[4; 32]; 4], history_root: [5; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 4);
+        let mut head = handoff::head(&state, &filter).unwrap().unwrap();
+        let committed = |number| crate::app_history_recovery::committed_digest(Some(&global), &filter, number).unwrap();
+        assert_eq!(committed(3), Some(sealed), "the sealed checkpoint, a direct origin");
+        for frame in [5, 7] {
+            let close = handoff::schedule(&state, frame, vec![filter.clone()], vec![DesiredCommittee {
+                filter: filter.clone(), members: head.members.clone(),
+            }]).unwrap();
+            commit(&global, &state, frame);
+            let seal = Seal {
+                request: close.id().unwrap(), session: head.id().unwrap(), view: 9,
+                checkpoint: Checkpoint {
+                    frame: head.base_frame, view: 0, digest: head.genesis,
+                    state_roots: [[4; 32]; 4], history_root: [0xb1; 32],
+                },
+            };
+            let certificate = crate::test_support::certify_seal(&head, &signers, &seal);
+            assert!(handoff::apply_submission(&state, frame + 1, &CertificateSubmission { seal, certificate }).unwrap());
+            commit(&global, &state, frame + 1);
+            head = handoff::head(&state, &filter).unwrap().unwrap();
+        }
+        assert_eq!((head.generation, head.base_frame), (4, 3));
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), None, "direct origins name only a base");
+        assert_eq!(committed(3), Some(sealed), "looked through to the seal");
+        for number in [2, 4] {
+            assert_eq!(committed(number), None);
+        }
+        assert_eq!(crate::app_history_recovery::committed_digest(None, &filter, 3).unwrap(), None, "no GLOBAL state");
+    }
+
     /// Committees that cannot produce keep sealing at their base, one session
     /// after another. However long that run grows, a successor still looks
     /// through it to the last certified checkpoint, rather than refusing to
