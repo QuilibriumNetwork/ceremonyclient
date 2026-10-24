@@ -71,6 +71,12 @@ pub struct SharedWorkerExecution {
     reanchor_yield: Arc<AtomicBool>,
     /// The archive recovery turn this worker's recovery holds.
     turn: Arc<Mutex<TurnHold>>,
+    /// This worker is a voting member of its shard's running committee
+    /// session whose materialized frame trails the session's committed tip.
+    lagging_voter: Arc<AtomicBool>,
+    /// The queue place of this worker's last replay, kept while it ended
+    /// behind its target: `(filter, ticket)`.
+    replay_ticket: Arc<Mutex<Option<(Vec<u8>, u64)>>>,
 }
 
 /// An archive recovery turn as its holder's recovery sees it
@@ -142,6 +148,31 @@ impl SharedWorkerExecution {
     /// not looked since.
     pub(crate) fn reanchor_yield_pending(&self) -> bool {
         self.reanchor_yield.load(Ordering::Relaxed)
+    }
+
+    /// Whether this worker votes in its shard's running committee session
+    /// while its materialized frame trails the session's committed tip. Its
+    /// replays take the next recovery turn before others, and keep it for
+    /// further batches, as a blocked successor's do.
+    pub fn set_lagging_voter(&self, lagging: bool) {
+        self.lagging_voter.store(lagging, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_lagging_voter`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> { self.lagging_voter.clone() }
+
+    /// A replay of `filter` ended its turn behind its target: its next
+    /// recovery of the shard queues again at `ticket`, its place, rather
+    /// than behind every waiter.
+    pub(crate) fn keep_replay_ticket(&self, filter: &[u8], ticket: u64) {
+        *self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((filter.to_vec(), ticket));
+    }
+
+    /// The place [`Self::keep_replay_ticket`] kept for `filter`; clears it.
+    pub(crate) fn take_replay_ticket(&self, filter: &[u8]) -> Option<u64> {
+        self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            .filter(|(kept, _)| kept == filter).map(|(_, ticket)| ticket)
     }
 
     /// This worker's recovery holds a turn from `since`, to do `kind`.
