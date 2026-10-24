@@ -473,8 +473,9 @@ fn refusal_text(refusal: LogRequestRefusal) -> &'static str {
         LogRequestRefusal::QueueFull => "its queue is full (diagnostics.logRequests.maxPending); ask again later",
         LogRequestRefusal::FilterLength => "a filter is not a full shard filter of 32 to 64 bytes",
         LogRequestRefusal::TooManyPending => {
-            "this requester's earlier requests hold its share of the queue (half of diagnostics.logRequests.maxPending); \
-             fetch them or let them expire first"
+            "this requester's requests awaiting a decision or a fetch hold its share of the queue (half of \
+             diagnostics.logRequests.maxPending); fetch the approved ones, or wait for the others to be decided; a node \
+             of an earlier release frees a place only when its request expires"
         }
     }
 }
