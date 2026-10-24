@@ -48,13 +48,14 @@ pub struct ProdProverTreeSyncer {
 
 use crate::forest_sync::{is_empty_phase_root, phase_anchor};
 
-/// How long an archive that failed a shard read is passed over while another
-/// is known. Process-wide: every worker of this node reads the same archives.
+/// How long an archive that failed a shard read or a GLOBAL prover-tree
+/// sync is passed over while another is known. Process-wide: the master and
+/// every worker of this node read the same archives.
 const SOURCE_AVOID: std::time::Duration = std::time::Duration::from_secs(120);
 static SOURCE_FAILURES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn source_failed(addr: &str) {
+pub(crate) fn source_failed(addr: &str) {
     SOURCE_FAILURES.lock().unwrap().insert(addr.to_string(), std::time::Instant::now());
 }
 
@@ -62,6 +63,24 @@ fn recently_failed(addr: &str) -> bool {
     let mut failures = SOURCE_FAILURES.lock().unwrap();
     failures.retain(|_, at| at.elapsed() < SOURCE_AVOID);
     failures.contains_key(addr)
+}
+
+/// The order a pass that pulls the GLOBAL prover tree tries `archives` in:
+/// from a random one, so regular nodes passing together at an epoch boundary
+/// spread over the archives instead of all asking the first configured one,
+/// and with those that failed recently last.
+pub(crate) fn archive_pull_order(archives: Vec<String>) -> Vec<String> {
+    let start = quil_engine::prover_tree_syncer::random_index(archives.len());
+    archive_pull_order_from(archives, start)
+}
+
+fn archive_pull_order_from(mut archives: Vec<String>, start: usize) -> Vec<String> {
+    if !archives.is_empty() {
+        let len = archives.len();
+        archives.rotate_left(start % len);
+    }
+    let (fresh, failed): (Vec<_>, Vec<_>) = archives.into_iter().partition(|addr| !recently_failed(addr));
+    fresh.into_iter().chain(failed).collect()
 }
 
 /// How long an unused archive connection for shard frame reads is kept.
@@ -471,8 +490,16 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         if self.caught_up_to_anchor(&[0xffu8; 32], expected_roots) {
             return Ok(true);
         }
-        info!(addr = %self.master_stream_addr, "syncing global prover tree (forest diff)");
-        self.sync_single_shard(&self.resolve_addr().await?, vec![0xffu8; 32], expected_roots).await
+        let addr = self.resolve_addr().await?;
+        info!(archive = %addr, "syncing global prover tree from archive (forest diff)");
+        let synced = self.sync_single_shard(&addr, vec![0xffu8; 32], expected_roots).await;
+        // As for a shard tree: the next attempt starts at another archive.
+        if !matches!(synced, Ok(true))
+            && !synced.as_ref().is_err_and(quil_engine::worker_execution::turn_spent)
+        {
+            source_failed(&addr);
+        }
+        synced
     }
 
     async fn sync_shard_tree(&self, filter: &[u8], expected_roots: &[Vec<u8>]) -> Result<bool> {
@@ -701,6 +728,60 @@ mod archive_routing_tests {
         assert!(read.await.is_err(), "the silent archive must not answer");
         assert!(recently_failed(&addr));
         silent.abort();
+    }
+
+    /// A failed GLOBAL prover-tree sync passes its archive over, as a failed
+    /// shard read does, so the next attempt asks another archive.
+    #[tokio::test]
+    async fn a_failed_global_prover_tree_sync_passes_its_archive_over() {
+        // Nothing listens on a port just released: the dial is refused.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+        let other = "192.0.2.31:8340";
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        pool.add(dead.clone()).await;
+        pool.add(other.into()).await;
+        let syncer = ProdProverTreeSyncer {
+            master_stream_addr: String::new(), hg_store, crdt,
+            falcon_signing_key: quil_p2p::generate_falcon_signing_key(), archive_pool: Some(pool),
+            discover_archives_from_master: false,
+        };
+        assert!(syncer.sync_prover_tree(&[]).await.is_err(), "the refused archive must fail the sync");
+        assert!(recently_failed(&dead));
+        for _ in 0..3 {
+            assert_eq!(syncer.resolve_addr().await.unwrap(), other);
+        }
+    }
+
+    /// Passes over the archives for the GLOBAL prover tree start at a random
+    /// archive, not all at the first configured one.
+    #[test]
+    fn prover_tree_pulls_start_at_a_random_archive() {
+        let archives: Vec<String> = (41..45).map(|host| format!("192.0.2.{host}:8340")).collect();
+        let firsts: std::collections::HashSet<String> = (0..64)
+            .map(|_| archive_pull_order(archives.clone()).remove(0))
+            .collect();
+        assert!(firsts.len() > 1, "every pass started at {firsts:?}");
+        let mut order = archive_pull_order(archives.clone());
+        order.sort();
+        assert_eq!(order, archives, "a pass tries every archive once");
+    }
+
+    /// A pass for the GLOBAL prover tree tries the archives that failed
+    /// recently last, in rotation order otherwise.
+    #[test]
+    fn prover_tree_pulls_try_recently_failed_archives_last() {
+        let archives: Vec<String> = (51..55).map(|host| format!("192.0.2.{host}:8340")).collect();
+        source_failed(&archives[2]);
+        assert_eq!(archive_pull_order_from(archives.clone(), 1),
+            [&archives[1], &archives[3], &archives[0], &archives[2]].map(String::clone));
+        source_failed(&archives[3]);
+        assert_eq!(archive_pull_order_from(archives.clone(), 3),
+            [&archives[0], &archives[1], &archives[3], &archives[2]].map(String::clone));
     }
 
     /// Idle connections are dropped on any lookup; a connection belongs to
