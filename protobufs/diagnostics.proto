@@ -232,7 +232,8 @@ enum LogRequestRefusal {
   LOG_REQUEST_REFUSAL_QUEUE_FULL = 8;
   // A filter is not a full shard filter (32 to 64 bytes).
   LOG_REQUEST_REFUSAL_FILTER_LENGTH = 9;
-  // This requester's requests hold half of `maxPending` already.
+  // This requester's requests awaiting a decision or a fetch hold half of
+  // `maxPending` already.
   LOG_REQUEST_REFUSAL_TOO_MANY_PENDING = 10;
 }
 

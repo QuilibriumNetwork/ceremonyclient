@@ -20,7 +20,9 @@
 //! reaches: whoever holds this node's network key acts as its operator
 //! there; it also lists requests and denies them, withdrawing an approved
 //! bundle. The node keeps the sealed bundle in its diagnostics spool until
-//! the request expires and serves it only to the requester.
+//! the request expires and serves it only to the requester. A request
+//! whose bundle the requester fetched holds no place in the queue: its
+//! bundle stays fetchable until it expires or a new request needs the place.
 //!
 //! A caller without a handshake identity, one not allowlisted, a node that
 //! has not enabled requests, a request whose key is not the caller's or whose
@@ -469,6 +471,33 @@ impl LogRequests {
         (self.limits.max_pending as usize / 2).max(1)
     }
 
+    /// Whether `entry` holds a place in the queue: it waits for a decision
+    /// or a fetch. A fetched (served) bundle holds none.
+    fn holds_place(entry: &Entry) -> bool {
+        entry.status != LogRequestStatus::Served
+    }
+
+    /// Make room for a new request: while the queue keeps `maxPending`
+    /// requests, end the oldest fetched one and delete its bundle, so the
+    /// queue and the spool stay within `maxPending` requests. Its requester
+    /// sees it expired.
+    fn make_room(&self, state: &mut State) {
+        while state.entries.len() >= self.limits.max_pending as usize {
+            let Some((id, requester, bytes)) = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| !Self::holds_place(entry))
+                .min_by_key(|(_, entry)| entry.received_ms)
+                .map(|(id, entry)| (*id, peer_tail(&entry.requester), entry.bundle_bytes))
+            else {
+                return;
+            };
+            self.finish(state, id, LogRequestStatus::Expired, LogRequestDenial::Operator);
+            info!(request = %short_id(&id), %requester, bytes,
+                "diagnostics log bundle deleted: its requester fetched it and a new request needs its place");
+        }
+    }
+
     /// Admit a requester: a handshake identity, requests enabled, and this
     /// node or an allowlisted peer.
     fn requester(&self, state: &mut State, caller: Option<&PeerId>, now_ms: u64) -> Result<PeerId, Status> {
@@ -623,7 +652,9 @@ impl LogRequests {
             || request.recipient_kem_public_key.len() != quil_crypto::SNTRUP761_PUBLIC_KEY_LEN
             || request.since_unix >= request.until_unix
             || i64::try_from(request.until_unix).is_err();
-        let pending_here = state.entries.values().filter(|entry| entry.requester == caller).count();
+        let pending_here =
+            state.entries.values().filter(|entry| entry.requester == caller && Self::holds_place(entry)).count();
+        let pending = state.entries.values().filter(|entry| Self::holds_place(entry)).count();
         let refusal = if malformed {
             LogRequestRefusal::Malformed
         } else if request.target_peer_id != self.own.to_bytes() {
@@ -644,7 +675,7 @@ impl LogRequests {
             LogRequestRefusal::OverBudget
         } else if pending_here >= self.per_requester() {
             LogRequestRefusal::TooManyPending
-        } else if state.entries.len() >= self.limits.max_pending as usize || state.nonces.len() >= NONCE_CACHE {
+        } else if pending >= self.limits.max_pending as usize || state.nonces.len() >= NONCE_CACHE {
             LogRequestRefusal::QueueFull
         } else {
             LogRequestRefusal::None
@@ -652,6 +683,7 @@ impl LogRequests {
         if refusal != LogRequestRefusal::None {
             return refuse(&mut state, refusal);
         }
+        self.make_room(&mut state);
         state.nonces.insert((caller, request.nonce.clone()), (id, now_ms));
         state.queued.entry(caller).or_default().push_back(now_ms);
         let entry = Entry {
@@ -1548,6 +1580,39 @@ mod tests {
         assert_eq!(small.per_requester(), 1, "at least one");
     }
 
+    /// A request whose bundle its requester fetched holds no place in the
+    /// queue: a pending or an approved, unfetched one still does. The
+    /// fetched bundle stays fetchable until a new request needs its place.
+    #[test]
+    fn a_fetched_request_frees_its_place_in_the_queue() {
+        let (own, a, b, c) = (key(), key(), key(), key());
+        let mut limits = config(true, &[&a, &b, &c]);
+        (limits.requests_per_day, limits.max_pending) = (8, 4);
+        let (queue, dir) = queue(&limits, &own);
+        let submit = |from: &Key, nonce: u8| queue.submit(Some(&from.peer), &signed(from, &request(from, &own.peer, nonce)), NOW);
+        let id = |from: &Key, nonce: u8| -> [u8; ID_LEN] { request_id(&signed(from, &request(from, &own.peer, nonce)).request) };
+        for nonce in 1..=2 {
+            assert_eq!(submit(&a, nonce).unwrap().status(), LogRequestStatus::Pending);
+        }
+        let fetched = id(&a, 2);
+        let (_, token) = queue.begin_upload(&fetched, 5, NOW).unwrap();
+        queue.finish_upload(&fetched, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW, None).unwrap();
+        assert_eq!(refusal(submit(&a, 3)), LogRequestRefusal::TooManyPending, "a pending and an approved request hold the share");
+        queue.served(&fetched);
+        assert_eq!(submit(&a, 3).unwrap().status(), LogRequestStatus::Pending, "the fetched one no longer does");
+        assert!(queue.bundle(Some(&a.peer), &fetched, NOW).is_ok(), "it stays fetchable");
+        assert_eq!(refusal(submit(&a, 4)), LogRequestRefusal::TooManyPending, "the two pending ones hold the share");
+        assert_eq!(submit(&b, 1).unwrap().status(), LogRequestStatus::Pending);
+        let path = dir.path().join("log-bundles").join(format!("{}.sealed", hex::encode(fetched)));
+        assert!(path.exists());
+        assert_eq!(submit(&b, 2).unwrap().status(), LogRequestStatus::Pending, "a fetched request gives up its place");
+        assert!(!path.exists(), "its bundle is deleted");
+        assert_eq!(queue.status(Some(&a.peer), &fetched, NOW).unwrap().status(), LogRequestStatus::Expired);
+        assert_eq!(queue.bundle(Some(&a.peer), &fetched, NOW).unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert_eq!(refusal(submit(&c, 1)), LogRequestRefusal::QueueFull, "unfetched requests hold every place");
+        assert_eq!(queue.list(Some(&own.peer), NOW).unwrap().requests.len(), limits.max_pending as usize);
+    }
+
     /// Only full shard filters (32 to 64 bytes) are taken: a shorter one
     /// would match unredacted text, since selection runs before redaction.
     #[test]
@@ -1755,11 +1820,11 @@ mod tests {
             .unwrap().request_id.try_into().unwrap();
         let (_, token) = queue.begin_upload(&id, 5, NOW).unwrap();
         queue.finish_upload(&id, token, Ok((b"seal!".to_vec(), vec![9; 32])), NOW, None).unwrap();
-        queue.served(&id);
         let path = dir.path().join("log-bundles").join(format!("{}.sealed", hex::encode(id)));
         assert!(path.exists());
         assert_eq!(refusal(queue.submit(Some(&listed.peer), &signed(&listed, &request(&listed, &own.peer, 2)), NOW)),
             LogRequestRefusal::TooManyPending);
+        queue.served(&id);
         assert_eq!(queue.deny(Some(&own.peer), &id, NOW).unwrap().status(), LogRequestStatus::Denied);
         assert!(!path.exists(), "the withdrawn bundle is deleted");
         assert_eq!(queue.status(Some(&listed.peer), &id, NOW).unwrap().status(), LogRequestStatus::Denied);
@@ -2003,8 +2068,8 @@ mod tests {
     }
 
     /// The daily budget and the queue's places still bound automatically
-    /// approved requests: a ready bundle holds its place until fetched and
-    /// expired, or withdrawn.
+    /// approved requests: a ready bundle holds its place until it is
+    /// fetched, expires or is withdrawn.
     #[tokio::test]
     async fn the_limits_bound_automatic_approval() {
         let (own, listed) = (key(), key());
