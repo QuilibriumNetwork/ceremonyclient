@@ -508,6 +508,71 @@ async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child
     assert_eq!(frames, vec![child]);
 }
 
+/// The header a GLOBAL frame carries for an app frame holds its committee's
+/// storage attestation (`app_handoff::canonical_header`). An archive that
+/// materializes an empty frame from that header, its body unserved, rebuilds
+/// the body its members stored: it passes full validation, possession
+/// included, and is served. Rebuilt from a header without the attestation,
+/// the frame is materialized on its certificate and output, not served, and
+/// its body is owed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_serves_an_empty_frame_it_rebuilt_whole_from_its_carried_header() {
+    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    use quil_types::store::ClockStore as _;
+    let aged = aged_out_registration_attested(vec![0; 32], &[]);
+    // As a member stores a commonware-finalized frame.
+    let mut body = aged.frame.clone();
+    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    signature.bitmask = Vec::new();
+    let carried = frame_header_to_proto(
+        &CarriedHeader::from_canonical_bytes(&crate::app_handoff::canonical_header(&body).unwrap()).unwrap(),
+    );
+    assert!(!carried.storage_attestation.is_empty(), "GLOBAL carries the attestation");
+    let filter = [8; 32];
+    for attested in [true, false] {
+        let mut header = carried.clone();
+        if !attested {
+            header.storage_attestation.clear();
+        }
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        clock.seed_frame(aged.clock.get_global_clock_frame(aged.global_frame).unwrap());
+        let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+        let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+            inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
+            crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+        ));
+        let mut ingest = crate::archive_ingest::ArchiveAppShardIngest::new(
+            aged.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            manager,
+            inclusion,
+            crdt,
+            clock.clone(),
+        )
+        .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), Arc::default()))
+        .sequenced()
+        .rebuilding_at_once_from(&filter, 94);
+        ingest.validator().prepare_storage_history(&body).await.unwrap();
+        let vouched = std::collections::HashMap::from([(95, header)]);
+        assert!(!ingest.materialize_through_vouched(&filter, 95, &vouched).unwrap(), "the body is sought first");
+        assert!(ingest.materialize_through_vouched(&filter, 95, &vouched).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 95);
+        let served = clock.get_shard_clock_frame(&filter, 95, false).ok();
+        if attested {
+            assert_eq!(served, Some(body.clone()), "the rebuilt body is the stored one");
+            assert!(!ingest.owes_body(&filter, 95));
+        } else {
+            assert_eq!(served, None);
+            assert!(ingest.owes_body(&filter, 95));
+        }
+    }
+}
+
 /// A legacy certificate signed by a committee today's registry no longer
 /// reproduces is rejected, and accepted once the committee rebuilt from
 /// GLOBAL history is prepared; a rebuilt committee that did not sign it does

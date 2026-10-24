@@ -1268,6 +1268,9 @@ pub(crate) async fn start(
     // frames need are fetched only while none of those wait.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
     let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
+    // Frames peers ask this archive for and its store lacks: a hole below the
+    // ingest's cursor gets its body recovered (`with_missing_frame_reports`).
+    let (frame_miss_tx, frame_miss_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(256);
     // The archive ingest's validator, once built below.
     let gap_validator: Arc<std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>> =
         Default::default();
@@ -1388,97 +1391,113 @@ pub(crate) async fn start(
                             endpoints.push(addr);
                         }
                     }
+                    // A frame that fails verification (a copy without its
+                    // storage attestation, say) does not end the round: the
+                    // next endpoint is asked, as when one lacks the frame,
+                    // unless the frame's registrations were unavailable.
                     let mut failures = Vec::new();
                     let mut recovered = None;
                     let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
                         let attempt = fetch_from(addr.clone(), frame_number);
                         async move { (addr, attempt.await) }
                     })).buffer_unordered(CONCURRENT);
-                    while let Some((addr, attempt)) = attempts.next().await {
-                        match attempt {
+                    while let Some((source, attempt)) = attempts.next().await {
+                        let frame = match attempt {
                             Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
-                                h.address == filter && h.frame_number == frame_number) => {
-                                recovered = Some((addr, frame));
-                                break;
+                                h.address == filter && h.frame_number == frame_number) => frame,
+                            Ok(Ok(Some(_))) => { failures.push(format!("{source}: served another frame")); continue; }
+                            Ok(Ok(None)) => { failures.push(format!("{source}: does not have the frame")); continue; }
+                            Ok(Err(error)) => { failures.push(format!("{source}: {error}")); continue; }
+                            Err(_) => { failures.push(format!("{source}: timed out")); continue; }
+                        };
+                        // A frame anchored to a GLOBAL frame this archive has
+                        // not stored cannot validate: it is parked below,
+                        // unprepared, until that GLOBAL frame is stored.
+                        let anchored = ingest.as_ref()
+                            .is_none_or(|(_, verifier)| verifier.missing_anchor(&frame).is_none());
+                        // Validation needs the storage registrations the
+                        // frames' GLOBAL anchors name; an archive whose
+                        // execution is behind those anchors fetches them
+                        // here, off the ingest lock. A frame without a
+                        // certificate comes with the run up to its
+                        // certified descendant, the source asked first.
+                        let mut prepared_ok = true;
+                        let frames = match validator.as_ref() {
+                            Some(validator) if anchored => {
+                                let fetch = |number: u64| {
+                                    let order: Vec<String> = std::iter::once(source.clone())
+                                        .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
+                                        .collect();
+                                    let filter = filter.clone();
+                                    let fetch_from = &fetch_from;
+                                    async move {
+                                        for addr in order {
+                                            if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
+                                                if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
+                                                    return Some(frame);
+                                                }
+                                            }
+                                        }
+                                        None
+                                    }
+                                };
+                                let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
+                                if let Err(error) = prepared {
+                                    prepared_ok = false;
+                                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                        "app-shard gap fetch: historical storage registrations unavailable");
+                                }
+                                frames
                             }
-                            Ok(Ok(Some(_))) => failures.push(format!("{addr}: served another frame")),
-                            Ok(Ok(None)) => failures.push(format!("{addr}: does not have the frame")),
-                            Ok(Err(error)) => failures.push(format!("{addr}: {error}")),
-                            Err(_) => failures.push(format!("{addr}: timed out")),
+                            _ => vec![frame],
+                        };
+                        let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
+                        match ingest.clone() {
+                            // Checked on the blocking pool, concurrently with
+                            // other fetches; the ingest is held only to admit.
+                            Some((ingest, verifier)) => {
+                                let address = filter.clone();
+                                let admitted = tokio::task::spawn_blocking(move || {
+                                    for (index, frame) in frames.into_iter().enumerate() {
+                                        if let Some(anchor) = verifier.missing_anchor(&frame) {
+                                            let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+                                            ingest.lock().unwrap_or_else(|p| p.into_inner())
+                                                .await_anchor(&address, number, anchor);
+                                        } else if let Some(certified) = verifier.verify(&frame) {
+                                            ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
+                                        } else if index == 0 {
+                                            // The frame asked for failed verification.
+                                            return false;
+                                        }
+                                    }
+                                    true
+                                }).await;
+                                match admitted {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        failures.push(format!("{source}: served a frame that failed verification"));
+                                        if prepared_ok {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    Err(error) => tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                        "app-shard gap fetch: admitting the recovered frames failed"),
+                                }
+                            }
+                            None => for frame in frames {
+                                let data = prost::Message::encode_to_vec(&frame);
+                                let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                            },
                         }
+                        recovered = Some((source, through));
+                        break;
                     }
                     drop(attempts);
                     match recovered {
-                        Some((source, frame)) => {
-                            // A frame anchored to a GLOBAL frame this archive has
-                            // not stored cannot validate: it is parked below,
-                            // unprepared, until that GLOBAL frame is stored.
-                            let anchored = ingest.as_ref()
-                                .is_none_or(|(_, verifier)| verifier.missing_anchor(&frame).is_none());
-                            // Validation needs the storage registrations the
-                            // frames' GLOBAL anchors name; an archive whose
-                            // execution is behind those anchors fetches them
-                            // here, off the ingest lock. A frame without a
-                            // certificate comes with the run up to its
-                            // certified descendant, the source asked first.
-                            let frames = match validator.as_ref() {
-                                Some(validator) if anchored => {
-                                    let fetch = |number: u64| {
-                                        let order: Vec<String> = std::iter::once(source.clone())
-                                            .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
-                                            .collect();
-                                        let filter = filter.clone();
-                                        let fetch_from = &fetch_from;
-                                        async move {
-                                            for addr in order {
-                                                if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
-                                                    if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
-                                                        return Some(frame);
-                                                    }
-                                                }
-                                            }
-                                            None
-                                        }
-                                    };
-                                    let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
-                                    if let Err(error) = prepared {
-                                        tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
-                                            "app-shard gap fetch: historical storage registrations unavailable");
-                                    }
-                                    frames
-                                }
-                                _ => vec![frame],
-                            };
-                            let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
-                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, through, %source,
-                                "app-shard gap fetch recovered a missing frame");
-                            match ingest {
-                                // Checked on the blocking pool, concurrently with
-                                // other fetches; the ingest is held only to admit.
-                                Some((ingest, verifier)) => {
-                                    let address = filter.clone();
-                                    let admitted = tokio::task::spawn_blocking(move || {
-                                        for frame in frames {
-                                            if let Some(anchor) = verifier.missing_anchor(&frame) {
-                                                let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
-                                                ingest.lock().unwrap_or_else(|p| p.into_inner())
-                                                    .await_anchor(&address, number, anchor);
-                                            } else if let Some(certified) = verifier.verify(&frame) {
-                                                ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
-                                            }
-                                        }
-                                    }).await;
-                                    if let Err(error) = admitted {
-                                        tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
-                                            "app-shard gap fetch: admitting the recovered frames failed");
-                                    }
-                                }
-                                None => for frame in frames {
-                                    let data = prost::Message::encode_to_vec(&frame);
-                                    let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
-                                },
-                            }
-                        }
+                        Some((source, through)) => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            through, %source, endpoints_failed = failures.len(),
+                            "app-shard gap fetch recovered a missing frame"),
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             tried = endpoints.len(), ?failures,
                             "app-shard gap fetch found no endpoint with the frame; ingest will retry"),
@@ -1502,7 +1521,7 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).sequenced();
+        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).with_missing_frame_reports(frame_miss_rx).sequenced();
         let ingest = match mtls_seed.map(|_| falcon_signing_key.clone()) {
             Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(archive_pool.clone(), key)),
             None => ingest,
@@ -1623,6 +1642,7 @@ pub(crate) async fn start(
         metrics_handle: metrics_handle.clone(),
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
+        app_frame_misses: archive_mode.then_some(frame_miss_tx),
         spawner: detached_spawner.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
     })?;
