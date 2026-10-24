@@ -2127,6 +2127,8 @@ pub struct AppConsensusEngine {
     /// Fetches certified frames of shards this node does not hold, so their
     /// committed outputs can be delivered here.
     delivery_frame_source: Option<DeliveryFrameSource>,
+    /// Those fetches, run off the select loop ([`crate::delivery_sources`]).
+    delivery_sources: crate::delivery_sources::DeliverySources,
     // NOTE: `global_anchor_store` (added below near `clock_store`) resolves the
     // GLOBAL frame anchor; `clock_store` serves this shard's own chain.
     /// CPU core this engine runs on.
@@ -2480,6 +2482,7 @@ impl AppConsensusEngine {
             storage_source_hypergraph: deps.storage_source_hypergraph,
             shard_drain: deps.topology.map(|topology| Arc::new(crate::shard_drain::ShardDrain::new(filter.clone(), topology))),
             delivery_frame_source: deps.delivery_frame_source,
+            delivery_sources: Default::default(),
             unified_cutover_hook: deps.unified_cutover_hook,
             execution_engine: deps.execution_engine,
             inclusion_prover: deps.inclusion_prover,
@@ -4314,8 +4317,11 @@ impl AppConsensusEngine {
         });
     }
 
-    async fn fetch_delivery_sources(&self) {
-        let (Some(manager), Some(fetch)) = (self.execution_engine.as_ref(), self.delivery_frame_source.as_ref()) else {
+    /// Start fetching the frames this shard's pending deliveries read their
+    /// bytes from and this node lacks. Never waits for the network: the
+    /// fetches run beside the select loop ([`crate::delivery_sources`]).
+    async fn fetch_delivery_sources(&mut self) {
+        let (Some(manager), Some(fetch)) = (self.execution_engine.as_ref(), self.delivery_frame_source.clone()) else {
             return;
         };
         let global = match self.storage_source_hypergraph.as_ref().or(self.hypergraph.as_ref()) {
@@ -4329,37 +4335,13 @@ impl AppConsensusEngine {
                 return;
             }
         };
-        for (filter, frame_number) in sources {
-            // Already here: this shard's own frames, and anything fetched
-            // earlier. Nothing is refetched.
-            if self.clock_store.get_shard_clock_frame(&filter, frame_number, false).is_ok() {
-                continue;
-            }
-            let Some(frame) = fetch(filter.clone(), frame_number).await else {
-                debug!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame not available yet");
-                continue;
-            };
-            let Some(header) = frame.header.as_ref() else { continue };
-            if header.address != filter || header.frame_number != frame_number {
-                warn!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame is not the one requested");
-                continue;
-            }
-            let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                .map(|hash| hash.to_vec())
-                .unwrap_or_default();
-            let stored = self.clock_store.new_transaction(false).ok().and_then(|txn| {
-                self.clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).ok()?;
-                txn.commit().ok()?;
-                let txn = self.clock_store.new_transaction(false).ok()?;
-                self.clock_store.commit_shard_clock_frame(&filter, frame_number, &selector, txn.as_ref(), true).ok()?;
-                txn.commit().ok()
-            });
-            if stored.is_some() {
-                info!(filter = hex::encode(&filter), frame = frame_number, "fetched a delivery's source frame");
-            } else {
-                warn!(filter = hex::encode(&filter), frame = frame_number, "storing a delivery's source frame failed");
-            }
-        }
+        // Already here: this shard's own frames, and anything fetched
+        // earlier. Nothing is refetched.
+        let missing: Vec<(Vec<u8>, u64)> = sources
+            .into_iter()
+            .filter(|(filter, frame_number)| self.clock_store.get_shard_clock_frame(filter, *frame_number, false).is_err())
+            .collect();
+        self.delivery_sources.sweep(&self.filter, missing, fetch, self.clock_store.clone()).await;
     }
 
     pub async fn run(
