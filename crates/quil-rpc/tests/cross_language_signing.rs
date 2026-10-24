@@ -63,16 +63,24 @@ fn build_leave() -> pb::MessageBundle {
     bundle_with(pb::message_request::Request::Leave(leave))
 }
 
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire: peers that predate the change send it, and
+// dropping it here would change the encoded bytes. Carried through verbatim
+// until the field is retired from the proto.
+#[allow(deprecated)]
 fn build_confirm() -> pb::MessageBundle {
     let confirm = pb::ProverConfirm {
         filter: vec![],
         frame_number: FRAME_NUMBER,
         public_key_signature_bls48581: Some(addr_sig()),
         filters: vec![fixture_filter_a()],
+        leaf_roots: vec![],
+        release: None,
     };
     bundle_with(pb::message_request::Request::Confirm(confirm))
 }
 
+#[allow(deprecated)] // see `build_confirm`
 fn build_reject() -> pb::MessageBundle {
     let reject = pb::ProverReject {
         filter: vec![],

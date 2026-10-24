@@ -73,6 +73,9 @@ pub struct CompressedCiphertext {
     pub aux: Vec<Vec<u8>>,
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
         return VerencProofAndBlindingKey{
@@ -120,6 +123,9 @@ pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     };
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn new_verenc_proof_encrypt_only(data: Vec<u8>, encryption_key_bytes: Vec<u8>) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
         return VerencProofAndBlindingKey{
@@ -207,6 +213,9 @@ fn point_from_bytes(bytes: Vec<u8>) -> Option<EdwardsPoint> {
     return Some(key.unwrap());
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_verify(proof: VerencProof) -> bool {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
@@ -281,6 +290,9 @@ pub fn verenc_verify(proof: VerencProof) -> bool {
 }
 
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
@@ -385,6 +397,9 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     };
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let blinding_key = point_from_bytes(recovery.blinding_pubkey);
     if blinding_key.is_none() {
@@ -435,7 +450,7 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
     let vparams = RDkgithParams{ N, t, n };
-    let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
+    let ve = RDkgith::setup(&params, &vparams, pke.clone());
     let wit_recover = ve.recover(&statement.unwrap(), &decryption_key, &ve_ct);
     return wit_recover.to_bytes().to_vec();
 }
@@ -497,7 +512,7 @@ mod tests {
         OsRng::fill_bytes(&mut OsRng, &mut roundcheck);
         let rndch = chunk_data_for_verenc(roundcheck.to_vec());
         assert!(rndch.len() == 24);
-        for i in 0..1000 {
+        for _i in 0..1000 {
             let mut data: [u8; 1265] = [0u8;1265];
             OsRng::fill_bytes(&mut OsRng, &mut data);
             let chunks = chunk_data_for_verenc(data.to_vec());

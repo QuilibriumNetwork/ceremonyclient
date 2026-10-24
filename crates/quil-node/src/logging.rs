@@ -1,7 +1,7 @@
 //! Tab-separated log lines with a JSON tail; `coreId` always present.
 //!
 //! ```text
-//! 2026-04-22T01:00:00Z  info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
+//! 2026-04-22T01:00:00Z info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
 //! ```
 //!
 //! Per-core file separation (`master.log` / `worker-N.log`) plus
@@ -20,6 +20,7 @@ use tracing_subscriber::fmt::{
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use tracing_subscriber::EnvFilter;
 
 // Worker threads are pinned to one OS thread; a thread-local
@@ -32,6 +33,12 @@ std::thread_local! {
 
 pub fn set_worker_core_id(core_id: u32) {
     WORKER_CORE_ID.with(|cell| cell.set(Some(core_id)));
+}
+
+/// Tag this thread's next lines as `core_id`'s (`None`: the master's), so a
+/// watchdog thread can write a worker's lines to that worker's log.
+pub fn route_thread_to_core(core_id: Option<u32>) {
+    WORKER_CORE_ID.with(|cell| cell.set(core_id));
 }
 
 pub fn current_worker_core_id() -> Option<u32> {
@@ -334,6 +341,24 @@ pub fn build_env_filter(
     directives.push("libp2p_quic=warn".to_string());
     directives.push("libp2p_tcp=warn".to_string());
     directives.push("libp2p_swarm=warn".to_string());
+    // Stock gossipsub emits "Send Queue full" (per-peer outbound backpressure)
+    // at WARN. Under load that is routine and NOT operator-actionable, but the
+    // message lives in the dependency so we can't relabel that one line without
+    // vendoring the crate. Treat it as debug-level instead: cap gossipsub's WARN
+    // floor at `error` in normal (info) runs so it's hidden, but leave it (and
+    // the rest of gossipsub) visible under `--debug` for diagnosis. Overridable
+    // via config `logFilters` / `--log-filter` (appended after this).
+    if !debug {
+        directives.push("libp2p_gossipsub=error".to_string());
+    }
+    // The HTTP/2 + gRPC stack (h2 codec frame send/received, hyper, tonic
+    // service, and tower buffer/ready) logs thousands of per-frame debug lines
+    // that bury the node's own output under `--debug`. Cap at warn unless opted
+    // back in.
+    directives.push("h2=warn".to_string());
+    directives.push("hyper=warn".to_string());
+    directives.push("tonic=warn".to_string());
+    directives.push("tower=warn".to_string());
 
     for (component, level) in config_filters {
         directives.push(format!("{}={}", component, level));
@@ -358,16 +383,20 @@ pub fn log_filename_for_core(core_id: u32) -> String {
     }
 }
 
-/// `cfg.path` empty → stderr only. Otherwise opens a rotating file
-/// at `<cfg.path>/<core>.log` and keeps stderr as a mirror.
+/// Writes rotating files to `cfg.log_dir(config_dir)` (by default
+/// `<config dir>/.log`) as `<core>.log`, and mirrors to stderr the lines at
+/// or above `cfg.stderr_level` (default `warn`); `path: none` logs every
+/// level to stderr only.
 ///
-/// Rotation:
-///   * `max_size` MB — rotation trigger (0 → daily).
-///   * `max_backups` — rotated files retained (0 → 1024 cap).
-///   * `max_age` days — reaper deletes older rotations.
-///   * `compress` — gzip on rotation.
+/// Rotation (`cfg.rotation()`; the default directory gets 50 MB, 10, 14 days,
+/// compressed):
+/// * `max_size` MB — rotation trigger (0 → daily).
+/// * `max_backups` — rotated files retained (0 → 1024 cap).
+/// * `max_age` days — reaper deletes older rotations.
+/// * `compress` — gzip on rotation.
 pub fn init_logging(
     cfg: &quil_config::LogConfig,
+    config_dir: &Path,
     core_id: u32,
     debug: bool,
     cli_filter: Option<&str>,
@@ -379,24 +408,24 @@ pub fn init_logging(
         .with_writer(std::io::stderr)
         .with_ansi(false);
 
-    if cfg.path.is_empty() {
+    let Some(dir) = cfg.log_dir(config_dir) else {
         tracing_subscriber::registry()
             .with(filter)
             .with(stderr_layer)
             .init();
         return None;
-    }
-
-    let dir = Path::new(&cfg.path);
+    };
+    let dir = dir.as_path();
+    let (max_size, max_backups, max_age, compress) = cfg.rotation();
     let _ = std::fs::create_dir_all(dir);
     let filename = log_filename_for_core(core_id);
     let log_path = dir.join(&filename);
 
     let rotate = build_rotating(
         log_path.as_path(),
-        cfg.max_size,
-        cfg.max_backups,
-        cfg.compress,
+        max_size,
+        max_backups,
+        compress,
     );
 
     let (non_blocking, guard) = tracing_appender::non_blocking(rotate);
@@ -406,10 +435,10 @@ pub fn init_logging(
         master: non_blocking.clone(),
         workers: RwLock::new(HashMap::new()),
         dir: Some(dir.to_path_buf()),
-        max_size: cfg.max_size,
-        max_backups: cfg.max_backups,
-        max_age: cfg.max_age,
-        compress: cfg.compress,
+        max_size,
+        max_backups,
+        max_age,
+        compress,
     }));
     let files = PER_CORE_FILES.get().expect("PerCoreFiles just set").clone();
 
@@ -418,11 +447,13 @@ pub fn init_logging(
         .with_writer(PerCoreFileWriter { files })
         .with_ansi(false);
 
-    spawn_log_reaper(dir.to_path_buf(), &filename, cfg.max_age, 0);
+    spawn_log_reaper(dir.to_path_buf(), &filename, max_age, 0);
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer)
+        .with(stderr_layer.with_filter(
+            cfg.stderr_level().parse().unwrap_or(tracing_subscriber::filter::LevelFilter::WARN),
+        ))
         .with(file_layer)
         .init();
     // Master appender is held by `PER_CORE_FILES`; its guard lives in

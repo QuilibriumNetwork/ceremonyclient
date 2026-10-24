@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ed448_goldilocks_plus::elliptic_curve::group::GroupEncoding;
 use ed448_goldilocks_plus::elliptic_curve::Group;
 use rand::rngs::OsRng;
-use rand::{CryptoRng, RngCore};
+use rand::RngCore;
 use sha2::{Sha512, Digest};
 use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -14,13 +14,16 @@ use thiserror::Error;
 use subtle::ConstantTimeEq;
 use super::doubleratchet::{MAX_SKIP, MAX_SKIPPED_KEYS};
 
-use super::doubleratchet::{DoubleRatchetParticipant, DoubleRatchetParticipantJson, MessageCiphertext, P2PChannelEnvelope};
-use super::feldman::{Feldman, vec_to_array, FeldmanReveal};
+use super::doubleratchet::{DoubleRatchetParticipant, MessageCiphertext, P2PChannelEnvelope};
+use super::feldman::{Feldman, vec_to_array, FeldmanReveal, FeldmanFrag};
 use super::x3dh::{receiver_x3dh, sender_x3dh};
 
 const TRIPLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
 const TRIPLE_RATCHET_PROTOCOL: u16 = 2 << 8 + TRIPLE_RATCHET_PROTOCOL_VERSION;
 
+// Round tracking is carried by the embedded Feldman state machine
+// (`FeldmanRound`); this mirror of it is not consulted.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 enum TripleRatchetRound {
     Uninitialized,
@@ -427,6 +430,8 @@ impl TripleRatchetParticipant {
         })
     }
 
+    // Accessor for embedders that need the peer ordering used by the DKG.
+    #[allow(dead_code)]
     pub fn get_peer_id_map(&self) -> HashMap<Vec<u8>, usize> {
         return self.peer_id_map.clone();
     }
@@ -452,17 +457,25 @@ impl TripleRatchetParticipant {
           return Err(TripleRatchetError::InvalidData(maybeerr.err().unwrap().to_string().into()))
         }
 
-        let result = self.dkg_ratchet.get_poly_frags().unwrap();
+        let result = self.dkg_ratchet.get_poly_frags().unwrap().clone();
+        // Our Feldman coefficient commitments, broadcast with every fragment so
+        // each receiver can verify its share lies on our committed polynomial.
+        let commitments = self.dkg_ratchet.get_commitments()
+            .map_err(|e| TripleRatchetError::CryptoError(e.to_string()))?;
 
         let mut result_map = HashMap::new();
-        for (k, v) in result {
-            let test: bool = self.id_peer_map[&k].public_key.ct_eq(&(self.peer_key * EdwardsPoint::generator()).compress().to_bytes()).into();
+        for (k, v) in &result {
+            let test: bool = self.id_peer_map[k].public_key.ct_eq(&(self.peer_key * EdwardsPoint::generator()).compress().to_bytes()).into();
             if !test {
+                let payload = serde_json::to_vec(&FeldmanFrag {
+                    frag: v.clone(),
+                    commitments: commitments.clone(),
+                }).map_err(|e| TripleRatchetError::CryptoError(e.to_string()))?;
                 let envelope = self.peer_channels
-                    .get_mut(&self.id_peer_map[&k].public_key)
+                    .get_mut(&self.id_peer_map[k].public_key)
                     .unwrap()
-                    .ratchet_encrypt(&v);
-                result_map.insert(self.id_peer_map[&k].public_key.clone(), envelope.unwrap());
+                    .ratchet_encrypt(&payload);
+                result_map.insert(self.id_peer_map[k].public_key.clone(), envelope.unwrap());
             }
         }
 
@@ -480,10 +493,16 @@ impl TripleRatchetParticipant {
           return Err(TripleRatchetError::CryptoError(b.err().unwrap().to_string()))
         }
 
+        let payload: FeldmanFrag = serde_json::from_slice(&b.unwrap())
+            .map_err(|e| TripleRatchetError::CryptoError(e.to_string()))?;
+
+        // Rejects (returns Err) when the share is inconsistent with the dealer's
+        // commitments — the Feldman VSS check.
         let result = self.dkg_ratchet.set_poly_frag_for_party(
             *self.peer_id_map.get(peer_id).unwrap(),
-            &b.unwrap(),
-        ).unwrap();
+            &payload.frag,
+            &payload.commitments,
+        ).map_err(|e| TripleRatchetError::CryptoError(e.to_string()))?;
 
         if result.is_some() {
             let mut envelopes = HashMap::new();
@@ -942,7 +961,12 @@ impl TripleRatchetParticipant {
           },
           Err(_) if receiving_header_key == self.current_header_key => {
               if self.async_dkg_ratchet && self.async_dkg_pubkey.is_some() {
-                  let receiving_group_key = Some(self.dkg_ratchet.public_key().to_bytes().to_vec());
+                  // This only derives the header key to *try* the decrypt; the
+                  // matching state update (`receiving_group_key`, `root_key`,
+                  // `current_header_key`, `next_header_key`) is performed by
+                  // `advance_and_decrypt` when we return
+                  // `should_advance_dkg_ratchet = true` below. Do not assign
+                  // `self.receiving_group_key` here as well.
                   let sess = Sha512::digest(&self.dkg_ratchet.public_key_bytes());
                   let hkdf = Hkdf::<Sha512>::new(
                       Some(&sess),

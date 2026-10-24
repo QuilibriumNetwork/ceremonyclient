@@ -306,7 +306,12 @@ pub fn verify_ed448(public_key: String, message: String, signature: String) -> S
     }
 
     let pub_arr: [u8; 57] = key_bytes.try_into().unwrap();
-    let pub_key = ed448_rust::PublicKey::from(pub_arr);
+    // `PublicKey::from` panics on a non-point key; this verifies untrusted input,
+    // so fail with an error string instead of crashing.
+    let pub_key = match ed448_rust::PublicKey::try_from(&pub_arr[..]) {
+        Ok(k) => k,
+        Err(_) => return "invalid public key".to_string(),
+    };
     let result = pub_key.verify(&maybe_message.unwrap(), &maybe_signature.unwrap(), None);
 
     match result {
@@ -679,7 +684,7 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     };
 }
 
-fn metadata_to_json(ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
+fn metadata_to_json(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
     let mut metadata_json = HashMap::<String, String>::new();
     for (k,v) in metadata {
         let env = v.to_json();
@@ -695,7 +700,10 @@ fn metadata_to_json(ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChanne
     Ok(metadata_json)
 }
 
-fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
+// Inverse of `metadata_to_json`, kept so the JSON state format stays
+// round-trippable; only the serializing half has a caller today.
+#[allow(dead_code)]
+fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, _ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
   let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
   for (k,v) in ratchet_state_and_metadata.metadata {
       let env = P2PChannelEnvelope::from_json(v);

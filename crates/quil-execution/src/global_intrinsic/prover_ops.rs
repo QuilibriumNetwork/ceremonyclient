@@ -8,7 +8,11 @@ use super::addressed_signature::AddressedSignature;
 use super::seniority_merge::SeniorityMerge;
 fn read_opt_addr_sig(buf: &[u8], c: &mut usize) -> Result<Option<AddressedSignature>> {
     let l = read_u32(buf, c)? as usize;
-    if l > 118 { return Err(QuilError::InvalidArgument(format!("sig too long: {}", l))); }
+    // Falcon-512 addressed-sig envelope: 710 (single) / 1226 (aggregate-1).
+    // See `MAX_ADDRESSED_SIG_LEN`.
+    if l > super::addressed_signature::MAX_ADDRESSED_SIG_LEN {
+        return Err(QuilError::InvalidArgument(format!("sig too long: {}", l)));
+    }
     if l == 0 { return Ok(None); }
     let b = read_bytes(buf, c, l)?;
     Ok(Some(AddressedSignature::from_canonical_bytes(&b)?))
@@ -17,11 +21,33 @@ fn write_opt_addr_sig(out: &mut Vec<u8>, sig: Option<&AddressedSignature>) -> Re
     match sig { Some(s) => { let b = s.to_canonical_bytes()?; put_u32(out, b.len() as u32); out.extend_from_slice(&b); } None => put_u32(out, 0), }
     Ok(())
 }
+/// The most filters one prover op carries: every node refuses to decode a
+/// join, leave, confirm or reject naming more, so a sender splits a longer
+/// list into several ops. Consensus-affecting: every node must agree on
+/// what decodes.
+pub const MAX_FILTERS_PER_OP: usize = 100;
+/// The longest filter a prover op carries; a longer one does not decode.
+pub const MAX_FILTER_LEN: usize = 64;
+
+/// Whether `filters` fit one prover op: the decoders' filter count and
+/// filter length limits, as an error naming the one exceeded.
+pub fn check_filters(filters: &[Vec<u8>]) -> Result<()> {
+    if filters.len() > MAX_FILTERS_PER_OP {
+        return Err(QuilError::InvalidArgument(format!(
+            "too many filters: {} (at most {} per op)", filters.len(), MAX_FILTERS_PER_OP)));
+    }
+    if let Some(filter) = filters.iter().find(|f| f.len() > MAX_FILTER_LEN) {
+        return Err(QuilError::InvalidArgument(format!(
+            "filter too long: {} bytes (at most {})", filter.len(), MAX_FILTER_LEN)));
+    }
+    Ok(())
+}
+
 fn read_filters(buf: &[u8], c: &mut usize) -> Result<Vec<Vec<u8>>> {
     let n = read_u32(buf, c)?;
-    if n > 100 { return Err(QuilError::InvalidArgument(format!("too many filters: {}", n))); }
+    if n > MAX_FILTERS_PER_OP as u32 { return Err(QuilError::InvalidArgument(format!("too many filters: {}", n))); }
     let mut out = Vec::with_capacity(n as usize);
-    for _ in 0..n { let l = read_u32(buf, c)?; if l > 64 { return Err(QuilError::InvalidArgument(format!("filter too long: {}", l))); } out.push(read_bytes(buf, c, l as usize)?); }
+    for _ in 0..n { let l = read_u32(buf, c)?; if l > MAX_FILTER_LEN as u32 { return Err(QuilError::InvalidArgument(format!("filter too long: {}", l))); } out.push(read_bytes(buf, c, l as usize)?); }
     Ok(out)
 }
 fn write_filters(out: &mut Vec<u8>, filters: &[Vec<u8>]) {
@@ -40,6 +66,18 @@ pub struct ProverConfirm {
     pub frame_number: u64,
     pub public_key_signature_bls48581: Option<AddressedSignature>,
     pub filters: Vec<Vec<u8>>,
+    /// Per-shard storage leaf roots registered as part of this confirm (folded
+    /// in: a confirm is the prover's per-epoch re-registration). Appended after
+    /// the legacy fields and bound into the signing message; an empty set
+    /// serializes + signs byte-identically to the pre-storage-attestation
+    /// format. See [`super::leaf_root_registration::ConfirmLeafRoots`].
+    pub leaf_roots: Vec<super::leaf_root_registration::ConfirmLeafRoots>,
+    /// The sender's release, appended after the leaf roots (an empty set
+    /// is then written as an explicit zero group count). Decoded, signed and
+    /// recorded only for a confirm signed from the release frame
+    /// ([`super::prover_release`]); `None` serializes byte-identically to the
+    /// legacy format, and a decoder that predates it ignores the bytes.
+    pub release: Option<super::prover_release::Release>,
 }
 
 impl ProverConfirm {
@@ -53,6 +91,13 @@ impl ProverConfirm {
         put_u64(&mut out, self.frame_number);
         write_opt_addr_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
         write_filters(&mut out, &self.filters);
+        super::leaf_root_registration::append_confirm_leaf_roots(&mut out, &self.leaf_roots);
+        if let Some(release) = self.release.as_ref() {
+            if self.leaf_roots.is_empty() {
+                put_u32(&mut out, 0);
+            }
+            out.extend_from_slice(&release.to_bytes());
+        }
         Ok(out)
     }
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
@@ -65,7 +110,17 @@ impl ProverConfirm {
         let frame_number = read_u64(data, &mut c)?;
         let sig = read_opt_addr_sig(data, &mut c)?;
         let filters = read_filters(data, &mut c)?;
-        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters })
+        let leaf_roots = super::leaf_root_registration::read_confirm_leaf_roots(data, &mut c)?;
+        // Like a decoder that predates it, never refuse a confirm for its
+        // tail: a short tail carries no release, and bytes after it are
+        // ignored. Before the release frame the tail is ignored entirely, so a
+        // confirm re-encodes as an older build re-encodes it.
+        let release = (frame_number >= super::prover_release::confirm_release_frame())
+            .then(|| data.get(c..))
+            .flatten()
+            .and_then(|tail| tail.get(..super::prover_release::Release::ENCODED_LEN))
+            .and_then(super::prover_release::Release::from_bytes);
+        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters, leaf_roots, release })
     }
 }
 
@@ -141,7 +196,7 @@ impl ProverKick {
         let tp = read_u32(data, &mut c)?;
         if tp != TYPE_PROVER_KICK { return Err(QuilError::InvalidArgument(format!("ProverKick: bad type 0x{:08x}", tp))); }
         let frame_number = read_u64(data, &mut c)?;
-        let kl = read_u32(data, &mut c)?; if kl > 585 { return Err(QuilError::InvalidArgument("ProverKick: key too long".into())); }
+        let kl = read_u32(data, &mut c)?; if kl > 897 { return Err(QuilError::InvalidArgument("ProverKick: key too long".into())); }
         let kicked = read_bytes(data, &mut c, kl as usize)?;
         let cf1l = read_u32(data, &mut c)?; if cf1l > 34825 { return Err(QuilError::InvalidArgument("ProverKick: cf1 too long".into())); }
         let cf1 = read_bytes(data, &mut c, cf1l as usize)?;
@@ -316,17 +371,45 @@ mod tests {
     use super::*;
 
     fn addr_sig() -> AddressedSignature {
-        AddressedSignature { signature: vec![0xAAu8; 74], address: vec![0xBBu8; 32] }
+        AddressedSignature { signature: vec![0xAAu8; 666], address: vec![0xBBu8; 32] }
     }
 
     fn merge_target() -> SeniorityMerge {
         SeniorityMerge { signature: vec![0x11u8; 74], key_type: 2, prover_public_key: vec![0x22u8; 57] }
     }
 
+    /// `check_filters` admits exactly the filter lists every filter op
+    /// decodes: senders split by these limits, so they must not drift apart.
+    #[test]
+    fn every_filter_op_decodes_exactly_what_check_filters_admits() {
+        use super::super::{prover_filter_ops::ProverLeave, prover_join::ProverJoin};
+        let decodes = |filters: Vec<Vec<u8>>| -> [bool; 4] {
+            [
+                ProverConfirm::from_canonical_bytes(&ProverConfirm { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverReject::from_canonical_bytes(&ProverReject { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverLeave::from_canonical_bytes(&ProverLeave { filters: filters.clone(), ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+                ProverJoin::from_canonical_bytes(&ProverJoin { filters, ..Default::default() }
+                    .to_canonical_bytes().unwrap()).is_ok(),
+            ]
+        };
+        let at_limit = vec![vec![7u8; MAX_FILTER_LEN]; MAX_FILTERS_PER_OP];
+        assert!(check_filters(&at_limit).is_ok());
+        assert_eq!(decodes(at_limit), [true; 4]);
+        let too_many = vec![vec![7u8; 32]; MAX_FILTERS_PER_OP + 1];
+        assert!(check_filters(&too_many).is_err());
+        assert_eq!(decodes(too_many), [false; 4]);
+        let too_long = vec![vec![7u8; MAX_FILTER_LEN + 1]];
+        assert!(check_filters(&too_long).is_err());
+        assert_eq!(decodes(too_long), [false; 4]);
+    }
+
     // -- ProverConfirm --
     #[test]
     fn confirm_round_trip() {
-        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]] };
+        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]], leaf_roots: Vec::new(), release: None };
         let b = c.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_PROVER_CONFIRM.to_be_bytes());
         let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
@@ -343,6 +426,188 @@ mod tests {
         assert_eq!(decoded.filter, b"reservedreservedreservedreserved".to_vec());
         assert_eq!(decoded.frame_number, 0);
         assert!(decoded.filters.is_empty());
+        assert!(decoded.leaf_roots.is_empty());
+    }
+
+    #[test]
+    fn confirm_empty_leaf_roots_is_byte_identical_to_legacy() {
+        use super::super::leaf_root_registration::ConfirmLeafRoots;
+        // A confirm with no leaf roots must serialize EXACTLY as before the
+        // storage-attestation fold (append nothing) — so existing signatures
+        // and on-wire bytes are unchanged.
+        let mut c = ProverConfirm {
+            filter: vec![], frame_number: 42,
+            public_key_signature_bls48581: Some(addr_sig()),
+            filters: vec![vec![1u8; 8], vec![2u8; 16]],
+            leaf_roots: Vec::new(),
+            release: None,
+        };
+        let legacy = c.to_canonical_bytes().unwrap();
+        c.leaf_roots = Vec::<ConfirmLeafRoots>::new();
+        assert_eq!(c.to_canonical_bytes().unwrap(), legacy);
+    }
+
+    #[test]
+    fn confirm_with_leaf_roots_round_trips() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let groups = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![
+                LeafRootEntry { prefix: vec![42, 7], leaf_root: vec![0x11; 74], num_blocks: 1234 },
+                LeafRootEntry { prefix: vec![], leaf_root: vec![0x22; 74], num_blocks: 1 },
+            ],
+        }];
+        let c = ProverConfirm {
+            filter: vec![], frame_number: 9,
+            public_key_signature_bls48581: Some(addr_sig()),
+            filters: vec![vec![0xAB; 32]],
+            leaf_roots: groups.clone(),
+            release: None,
+        };
+        let b = c.to_canonical_bytes().unwrap();
+        let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
+        assert_eq!(decoded.leaf_roots, groups);
+        // The leaf roots extend the bytes beyond the legacy tail.
+        let legacy = ProverConfirm { leaf_roots: Vec::new(), ..c.clone() };
+        assert!(b.len() > legacy.to_canonical_bytes().unwrap().len());
+    }
+
+    /// The confirm encoding of the base release, written out field by field.
+    fn legacy_confirm_bytes(c: &ProverConfirm) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0305u32.to_be_bytes());
+        out.extend_from_slice(&32u32.to_be_bytes());
+        out.extend_from_slice(b"reservedreservedreservedreserved");
+        out.extend_from_slice(&c.frame_number.to_be_bytes());
+        match c.public_key_signature_bls48581.as_ref() {
+            Some(sig) => {
+                let b = sig.to_canonical_bytes().unwrap();
+                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.extend_from_slice(&0u32.to_be_bytes()),
+        }
+        out.extend_from_slice(&(c.filters.len() as u32).to_be_bytes());
+        for f in &c.filters {
+            out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            out.extend_from_slice(f);
+        }
+        super::super::leaf_root_registration::append_confirm_leaf_roots(&mut out, &c.leaf_roots);
+        out
+    }
+
+    /// The base release's decoder: the legacy fields, then leaf roots if
+    /// bytes remain; anything after them is ignored.
+    fn legacy_decode(data: &[u8]) -> (u64, Option<AddressedSignature>, Vec<Vec<u8>>, Vec<super::super::leaf_root_registration::ConfirmLeafRoots>) {
+        let mut c = 0;
+        assert_eq!(read_u32(data, &mut c).unwrap(), TYPE_PROVER_CONFIRM);
+        let fl = read_u32(data, &mut c).unwrap();
+        read_bytes(data, &mut c, fl as usize).unwrap();
+        let frame_number = read_u64(data, &mut c).unwrap();
+        let sig = read_opt_addr_sig(data, &mut c).unwrap();
+        let filters = read_filters(data, &mut c).unwrap();
+        let leaf_roots = super::super::leaf_root_registration::read_confirm_leaf_roots(data, &mut c).unwrap();
+        (frame_number, sig, filters, leaf_roots)
+    }
+
+    fn release() -> super::super::prover_release::Release {
+        super::super::prover_release::Release { version: [2, 1, 0], patch: 25, subpatch: 92 }
+    }
+
+    #[test]
+    fn confirm_without_release_is_byte_identical_to_legacy() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for leaf_roots in [Vec::new(), roots] {
+            let c = ProverConfirm {
+                filter: vec![], frame_number: 42,
+                public_key_signature_bls48581: Some(addr_sig()),
+                filters: vec![vec![1u8; 8], vec![2u8; 16]],
+                leaf_roots,
+                release: None,
+            };
+            let bytes = c.to_canonical_bytes().unwrap();
+            assert_eq!(bytes, legacy_confirm_bytes(&c));
+            assert_eq!(ProverConfirm::from_canonical_bytes(&bytes).unwrap().release, None);
+        }
+    }
+
+    #[test]
+    fn confirm_with_release_round_trips_and_a_legacy_decoder_ignores_it() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        super::super::prover_release::set_confirm_release_frame_for_thread(Some(42));
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for leaf_roots in [Vec::new(), roots] {
+            let c = ProverConfirm {
+                filter: vec![], frame_number: 42,
+                public_key_signature_bls48581: Some(addr_sig()),
+                filters: vec![vec![1u8; 8]],
+                leaf_roots: leaf_roots.clone(),
+                release: Some(release()),
+            };
+            let bytes = c.to_canonical_bytes().unwrap();
+            let legacy = legacy_confirm_bytes(&c);
+            // The legacy bytes, an explicit empty leaf-root set, the release.
+            let mut expected = legacy.clone();
+            if leaf_roots.is_empty() {
+                expected.extend_from_slice(&0u32.to_be_bytes());
+            }
+            expected.extend_from_slice(&[2, 1, 0, 25, 0, 92]);
+            assert_eq!(bytes, expected);
+            let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+            assert_eq!(decoded.release, Some(release()));
+            assert_eq!(decoded.leaf_roots, leaf_roots);
+            let (frame, sig, filters, roots) = legacy_decode(&bytes);
+            assert_eq!((frame, sig, filters, roots), (42, Some(addr_sig()), vec![vec![1u8; 8]], leaf_roots));
+        }
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
+    }
+
+    #[test]
+    fn before_the_release_frame_a_confirm_re_encodes_as_a_legacy_decoder_reads_it() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let roots = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![LeafRootEntry { prefix: vec![3], leaf_root: vec![0x11; 74], num_blocks: 5 }],
+        }];
+        for frame in [None, Some(43)] {
+            super::super::prover_release::set_confirm_release_frame_for_thread(frame);
+            for leaf_roots in [Vec::new(), roots.clone()] {
+                let early = ProverConfirm {
+                    filter: vec![], frame_number: 42,
+                    public_key_signature_bls48581: Some(addr_sig()),
+                    filters: vec![vec![1u8; 8]],
+                    leaf_roots,
+                    release: Some(release()),
+                };
+                let legacy = legacy_confirm_bytes(&early);
+                let decoded = ProverConfirm::from_canonical_bytes(&early.to_canonical_bytes().unwrap()).unwrap();
+                assert_eq!(decoded.release, None, "release frame {frame:?}");
+                assert_eq!(decoded.to_canonical_bytes().unwrap(), legacy, "release frame {frame:?}");
+            }
+        }
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
+    }
+
+    #[test]
+    fn a_confirm_tail_without_a_whole_release_decodes_without_one() {
+        super::super::prover_release::set_confirm_release_frame_for_thread(Some(0));
+        let c = ProverConfirm { filters: vec![vec![1u8; 8]], ..Default::default() };
+        let mut bytes = c.to_canonical_bytes().unwrap();
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&[2, 1, 0]);
+        let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded.release, None);
+        bytes.extend_from_slice(&[25, 0, 92, 0xEE]);
+        let decoded = ProverConfirm::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded.release, Some(release()));
+        super::super::prover_release::set_confirm_release_frame_for_thread(None);
     }
 
     // -- ProverReject --

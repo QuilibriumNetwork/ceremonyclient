@@ -2,16 +2,16 @@
 //! signatures. Mirrors the Go path at `node/main.go:309-378`.
 //!
 //! On startup the node:
-//!   1. Computes SHA3-256 of its own executable.
-//!   2. Reads `<exe>.dgst` (an `sha3sum`-style line of the form
-//!      `SHA3-256(<filename>)= <hex>`) and checks that the parsed
-//!      hex digest equals the computed checksum.
-//!   3. For each present `<exe>.dgst.sig.N` (N=1..len(SIGNATORIES)),
-//!      verifies the Ed448 signature over the **full bytes of the
-//!      `.dgst` file** (not the parsed digest) against the (N-1)th
-//!      hardcoded signatory public key.
-//!   4. Refuses to start if fewer than `quorum_required(N_TOTAL)`
-//!      signatures verified.
+//! 1. Computes SHA3-256 of its own executable.
+//! 2. Reads `<exe>.dgst` (an `sha3sum`-style line of the form
+//! `SHA3-256(<filename>)= <hex>`) and checks that the parsed
+//! hex digest equals the computed checksum.
+//! 3. For each present `<exe>.dgst.sig.N` (N=1..len(SIGNATORIES)),
+//! verifies the Ed448 signature over the **full bytes of the
+//! `.dgst` file** (not the parsed digest) against the (N-1)th
+//! hardcoded signatory public key.
+//! 4. Refuses to start if fewer than `quorum_required(N_TOTAL)`
+//! signatures verified.
 //!
 //! Quorum follows the Go formula `((N-4)/2) + ((N-4) % 2)`. With
 //! N=17, that's `(13/2)+(13%2) = 6 + 1 = 7`.
@@ -188,6 +188,9 @@ fn append_suffix(p: &Path, suffix: &str) -> PathBuf {
 /// Default value for the signature-check flag, matching Go's
 /// `signatureCheckDefault()` at `node/main.go:195`. Honors
 /// `QUILIBRIUM_SIGNATURE_CHECK=true|false`; otherwise true.
+// Ported for parity with the Go node; the Rust CLI resolves the flag through
+// its own clap default today.
+#[allow(dead_code)]
 pub fn signature_check_default() -> bool {
     match std::env::var("QUILIBRIUM_SIGNATURE_CHECK") {
         Ok(v) => match v.parse::<bool>() {
@@ -385,8 +388,8 @@ mod tests {
     /// Network-gated test against an actual published release.
     /// Downloads only `.dgst` and `.dgst.sig.N` (small files), then:
     /// - Asserts every present signature validates against the
-    ///   production [`SIGNATORIES`] using the same Ed448 verify call
-    ///   the live `verify_release_signatures` path uses.
+    /// production [`SIGNATORIES`] using the same Ed448 verify call
+    /// the live `verify_release_signatures` path uses.
     /// - Asserts quorum is met by the present signatures.
     ///
     /// We deliberately do **not** download the binary itself (hundreds
@@ -396,8 +399,8 @@ mod tests {
     /// Ed448 verify implementation against published wire data.
     ///
     /// **Run manually**: `cargo test -p quil-node \
-    ///   release_check::tests::production_release_signatures \
-    ///   -- --ignored --nocapture`
+    /// release_check::tests::production_release_signatures \
+    /// -- --ignored --nocapture`
     #[test]
     #[ignore = "fetches files from releases.quilibrium.com — run on demand"]
     fn production_release_signatures() {

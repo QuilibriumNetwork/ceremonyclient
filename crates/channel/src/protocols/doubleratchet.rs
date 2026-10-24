@@ -9,7 +9,6 @@ use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
 use std::collections::HashMap;
-use std::error;
 use subtle::ConstantTimeEq;
 use serde::{Serialize, Deserialize};
 
@@ -377,7 +376,10 @@ impl DoubleRatchetParticipant {
         let dh_output = new_receiving_ephemeral_key * self.sending_ephemeral_private_key;
         let hkdf = Hkdf::<Sha512>::new(Some(&self.root_key), &dh_output.compress().to_bytes());
         let mut rkck = [0u8; 96];
-        hkdf.expand(b"quilibrium-double-ratchet", &mut rkck);
+        // Only fails when the output length exceeds 255*HashLen (16320 for
+        // SHA-512); 96 is a compile-time constant well under that.
+        hkdf.expand(b"quilibrium-double-ratchet", &mut rkck)
+            .map_err(|e| format!("HKDF expand failed: {}", e))?;
     
         self.root_key = rkck[..32].to_vec();
         self.receiving_chain_key = rkck[32..64].to_vec();
@@ -390,7 +392,10 @@ impl DoubleRatchetParticipant {
         let dh_output = new_receiving_ephemeral_key * self.sending_ephemeral_private_key;
         let hkdf = Hkdf::<Sha512>::new(Some(&self.root_key), &dh_output.compress().to_bytes());
         let mut rkck2 = [0u8; 96];
-        hkdf.expand(b"quilibrium-double-ratchet", &mut rkck2);
+        // Only fails when the output length exceeds 255*HashLen (16320 for
+        // SHA-512); 96 is a compile-time constant well under that.
+        hkdf.expand(b"quilibrium-double-ratchet", &mut rkck2)
+            .map_err(|e| format!("HKDF expand failed: {}", e))?;
     
         self.root_key = rkck2[..32].to_vec();
         self.sending_chain_key = rkck2[32..64].to_vec();
@@ -551,11 +556,15 @@ impl DoubleRatchetParticipant {
         }).map_err(|e| format!("Decryption failed: {}", e).into())
     }
 
+    // Ratchet control surface used by embedders of this crate rather than
+    // by the node itself.
+    #[allow(dead_code)]
     pub fn rotate_sending_key(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.sending_ephemeral_private_key = Scalar::random(&mut OsRng);
         self.ratchet_ephemeral_keys(&self.receiving_ephemeral_key.clone())
     }
 
+    #[allow(dead_code)] // see `rotate_sending_key`
     pub fn get_public_key(&self) -> EdwardsPoint {
         EdwardsPoint::mul_by_generator(&self.sending_ephemeral_private_key)
     }
@@ -618,6 +627,9 @@ impl Default for MessageCiphertext {
 
 // Implementation for P2PChannelEnvelope
 impl P2PChannelEnvelope {
+  // Envelopes are built field-wise by the ratchets; this constructor is part
+  // of the crate's public surface.
+  #[allow(dead_code)]
   pub fn new(protocol_identifier: u16) -> Self {
       P2PChannelEnvelope {
           protocol_identifier,
