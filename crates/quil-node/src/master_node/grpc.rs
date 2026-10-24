@@ -128,6 +128,9 @@ pub(crate) struct GrpcArgs {
         quil_types::proto::global::StreamGlobalMessagesResponse,
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    /// Archives: where the app-shard frame service reports each numbered
+    /// frame a peer asks for and the store lacks, for the ingest to recover.
+    pub app_frame_misses: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// Receive side of the direct global-consensus transport: peers'
     /// `SubmitGlobalConsensus` RPCs inject `(bitmask, data)` here, the
@@ -889,6 +892,7 @@ pub(crate) fn spawn_all(
         metrics_handle,
         global_msg_tx,
         archive_pool,
+        app_frame_misses,
         spawner,
         consensus_loopback_tx,
     } = args;
@@ -2362,9 +2366,11 @@ pub(crate) fn spawn_all(
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new({
-                let server = quil_rpc::stub_services::AppShardRpcServer::new(
-                    clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-                );
+                let store = clock_store.clone() as Arc<dyn quil_types::store::ClockStore>;
+                let server = match app_frame_misses {
+                    Some(missing) => quil_rpc::stub_services::AppShardRpcServer::reporting_missing_frames(store, missing),
+                    None => quil_rpc::stub_services::AppShardRpcServer::new(store),
+                };
                 // Answer peers asking about applications this node holds, so a
                 // node without coverage can serve its own wallet by asking one
                 // that has it.
