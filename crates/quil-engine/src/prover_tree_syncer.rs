@@ -120,6 +120,15 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     fn running(&self) -> bool {
         true
     }
+    /// The worker's committed cursor is at its same-filter predecessor's
+    /// sealed checkpoint with other state there
+    /// (`app_handoff::sealed_state_mismatch`).
+    async fn sealed_state_mismatch(&self) -> Option<crate::app_handoff::SealedStateMismatch> {
+        None
+    }
+    /// A sync installed the predecessor's sealed state at the checkpoint
+    /// `frame`, where the worker's cursor is.
+    fn sealed_state_installed(&self, _frame: u64) {}
 }
 
 #[async_trait]
@@ -156,6 +165,12 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
         self.execution_record().reanchor_yielded();
     }
     fn running(&self) -> bool { self.is_running() }
+    async fn sealed_state_mismatch(&self) -> Option<crate::app_handoff::SealedStateMismatch> {
+        crate::app_engine::AppEngineHandle::sealed_state_mismatch(self).await
+    }
+    fn sealed_state_installed(&self, frame: u64) {
+        self.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame: frame });
+    }
 }
 
 /// What a shard sync starting now does about a re-anchor at the fence.
@@ -189,6 +204,9 @@ pub(crate) enum ShardRecoveryProgress {
     Replayed { materialized: u64, archive_tip: Option<u64>, committed_tip: Option<u64>, turn: ReplayTurn },
     Anchored { frame: u64 },
     Inherited { pinned: bool },
+    /// The predecessor's sealed state replaced other state at its
+    /// checkpoint `frame`, where the worker's cursor is.
+    SealedStateInstalled { frame: u64 },
     NotReady(&'static str),
     /// Nothing was attempted, for a reason that is no failure of the
     /// recovery (a re-anchor at the fence has its own attempt): no counter,
@@ -209,6 +227,7 @@ impl std::fmt::Display for ShardRecoveryProgress {
             Self::Anchored { frame } => write!(f, "installed the archive checkpoint at frame {frame}"),
             Self::Inherited { pinned: true } => f.write_str("inherited the origins' sealed state"),
             Self::Inherited { pinned: false } => f.write_str("inherited the covered archive subtree, unpinned"),
+            Self::SealedStateInstalled { frame } => write!(f, "installed the predecessor's sealed state at frame {frame}"),
             Self::NotReady(reason) | Self::Deferred(reason) => f.write_str(reason),
             Self::Yielded => f.write_str(crate::worker_execution::RECOVERY_TURN_SPENT),
         }
@@ -250,6 +269,13 @@ pub(crate) async fn recover_shard_from_latest(
         }
         ReanchorAttempt::Elsewhere => return Ok(ShardRecoveryProgress::Deferred(REANCHOR_ELSEWHERE)),
         ReanchorAttempt::NotOwed => {}
+    }
+    // A worker at its predecessor's sealed checkpoint holding other state
+    // there has no frame to replay: its replay reported success while the
+    // successor's start refused the state, every 10 s for good (…091f80 at
+    // frame 4693, 2026-10-23).
+    if let Some(mismatch) = target.sealed_state_mismatch().await {
+        return yielded(install_sealed_state(syncer, filter, mismatch, target).await);
     }
     if let Some(local) = local {
         recovery_phase("replaying_frames");
@@ -308,6 +334,41 @@ pub(crate) async fn recover_shard_from_latest(
         Ok(ShardSyncResult::Inherited { pinned }) => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
         Ok(ShardSyncResult::NotReady(reason)) => Ok(ShardRecoveryProgress::NotReady(reason)),
     }
+}
+
+/// Why an install of a predecessor's sealed state over other local state
+/// failed ([`install_sealed_state`]).
+pub(crate) const SEALED_STATE_UNAVAILABLE: &str =
+    "the archive does not hold the predecessor's sealed state, or its roots differ";
+pub(crate) const SEALED_STATE_NOT_INSTALLED: &str =
+    "a shard sync pinned to the predecessor's sealed roots left other committed roots on this worker";
+
+/// Install a same-filter predecessor's sealed state over the other state
+/// this worker holds at its checkpoint (`mismatch`): its trees are synced
+/// pinned to the sealed roots, which the sync verifies, and the actor is
+/// told once its committed roots are the sealed ones. The cursor stays at
+/// the checkpoint, and the successor's start compares the state again.
+async fn install_sealed_state(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    mismatch: crate::app_handoff::SealedStateMismatch,
+    target: &dyn ShardRecoveryTarget,
+) -> Result<ShardRecoveryProgress> {
+    use crate::app_handoff::SealedStateMismatch;
+    crate::worker_execution::recovery_phase("installing_leaves");
+    let pinned: Vec<Vec<u8>> = mismatch.sealed_roots.iter().map(|root| root.to_vec()).collect();
+    if !syncer.sync_shard_tree(filter, &pinned).await? {
+        return Ok(ShardRecoveryProgress::NotReady(SEALED_STATE_UNAVAILABLE));
+    }
+    if target.sealed_state_mismatch().await.is_some() {
+        return Ok(ShardRecoveryProgress::NotReady(SEALED_STATE_NOT_INSTALLED));
+    }
+    target.sealed_state_installed(mismatch.frame);
+    tracing::info!(filter = %hex::encode(filter), generation = mismatch.generation, frame = mismatch.frame,
+        replaced_roots = %SealedStateMismatch::prefixes(&mismatch.local_roots),
+        sealed_roots = %SealedStateMismatch::prefixes(&mismatch.sealed_roots), scope = "this worker",
+        "installed the predecessor's sealed state from an archive over other local state at its checkpoint");
+    Ok(ShardRecoveryProgress::SealedStateInstalled { frame: mismatch.frame })
 }
 
 /// A tree sync that handed its turn back ([`crate::worker_execution::turn_spent`])
@@ -1714,6 +1775,94 @@ mod tests {
         }
         let done = finished.into_iter().max().unwrap();
         assert!(short_starts.iter().all(|&at| at < done), "short installs started {short_starts:?}, long ones done {done:?}");
+    }
+
+    /// A worker at its predecessor's sealed checkpoint frame 4693 whose
+    /// committed GLOBAL tip is that frame; `mismatches` answers its sealed
+    /// state checks in turn: other state there, or the sealed state.
+    struct AtSealedCheckpoint {
+        calls: Arc<Mutex<Vec<String>>>,
+        mismatches: Mutex<std::collections::VecDeque<bool>>,
+    }
+
+    impl AtSealedCheckpoint {
+        fn new(calls: &Arc<Mutex<Vec<String>>>, mismatches: &[bool]) -> Self {
+            Self { calls: calls.clone(), mismatches: Mutex::new(mismatches.iter().copied().collect()) }
+        }
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for AtSealedCheckpoint {
+        fn materialized(&self) -> u64 { 4693 }
+        async fn replay(&self, frame: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+            let number = frame.header.unwrap().frame_number;
+            self.calls.lock().unwrap().push(format!("replay {number}"));
+            Ok(number)
+        }
+        async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> {
+            unreachable!("a worker with a lineage is not anchored")
+        }
+        async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+            unreachable!("a worker with a lineage is not anchored")
+        }
+        fn inherited(&self) { panic!("the sealed state is installed pinned") }
+        async fn committed_tip(&self) -> Option<u64> { Some(4693) }
+        async fn sealed_state_mismatch(&self) -> Option<crate::app_handoff::SealedStateMismatch> {
+            self.calls.lock().unwrap().push("check".into());
+            self.mismatches.lock().unwrap().pop_front().unwrap_or(false).then(|| crate::app_handoff::SealedStateMismatch {
+                generation: 12, frame: 4693,
+                local_roots: [[0x11; 32], [0; 32], [0; 32], [0; 32]],
+                sealed_roots: [[0xa6; 32], [0; 32], [0; 32], [0; 32]],
+            })
+        }
+        fn sealed_state_installed(&self, frame: u64) {
+            self.calls.lock().unwrap().push(format!("installed {frame}"));
+        }
+    }
+
+    /// Recover a worker at its predecessor's sealed checkpoint frame 4693
+    /// from the archive `archive` makes, `mismatches` answering its sealed
+    /// state checks; the outcome, and the worker's and archive's calls.
+    async fn recover_at_sealed_checkpoint(
+        archive: impl FnOnce(Arc<Mutex<Vec<String>>>) -> Box<dyn ProverTreeSyncer>,
+        mismatches: &[bool],
+    ) -> (ShardRecoveryProgress, Vec<String>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = archive(calls.clone());
+        let target = AtSealedCheckpoint::new(&calls, mismatches);
+        let result = recover_shard_from_latest(archive.as_ref(), &[5; 32], Some(frame(4693)), &target, None, None).await;
+        let calls = calls.lock().unwrap().clone();
+        (result.unwrap(), calls)
+    }
+
+    /// A worker at its predecessor's sealed checkpoint holding other state
+    /// there has no frame to replay: recovery reported "replayed to frame
+    /// 4693" while the successor's start refused the state, every 10 s for
+    /// good (…091f80, 2026-10-23). It syncs the shard pinned to the sealed
+    /// roots and tells the actor once its state is the sealed one. An
+    /// archive that cannot supply that state, or a sync that leaves other
+    /// roots, fails the attempt; a worker holding the sealed state replays.
+    #[tokio::test]
+    async fn a_worker_at_its_sealed_checkpoint_with_other_state_installs_the_sealed_state() {
+        let archive = |calls| -> Box<dyn ProverTreeSyncer> { Box::new(Archive { latest: Some(frame(4693)), calls }) };
+        let (result, calls) = recover_at_sealed_checkpoint(archive, &[true, false]).await;
+        assert_eq!(result, ShardRecoveryProgress::SealedStateInstalled { frame: 4693 });
+        assert_eq!(calls, ["check", "sync 166", "check", "installed 4693"]);
+        assert_eq!(result.to_string(), "installed the predecessor's sealed state at frame 4693");
+
+        let (result, calls) = recover_at_sealed_checkpoint(|calls| Box::new(StatelessArchive { calls }), &[true]).await;
+        assert_eq!(result, ShardRecoveryProgress::NotReady(SEALED_STATE_UNAVAILABLE));
+        assert_eq!(calls, ["check", "sync 166"]);
+        assert_eq!(crate::worker_execution::failure_class(SEALED_STATE_UNAVAILABLE), "archive_state");
+
+        let (result, calls) = recover_at_sealed_checkpoint(archive, &[true, true]).await;
+        assert_eq!(result, ShardRecoveryProgress::NotReady(SEALED_STATE_NOT_INSTALLED));
+        assert_eq!(calls, ["check", "sync 166", "check"]);
+
+        let (result, calls) = recover_at_sealed_checkpoint(archive, &[false]).await;
+        let ShardRecoveryProgress::Replayed { materialized, turn, .. } = result else { panic!("expected a replay: {result:?}") };
+        assert_eq!((materialized, turn.frames), (4693, 0));
+        assert_eq!(calls, ["check", "fetch 0"]);
     }
 
     /// Never answers an installation: an engine busy or wedged.
