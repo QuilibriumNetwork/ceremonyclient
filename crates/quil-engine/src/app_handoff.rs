@@ -1427,9 +1427,13 @@ fn committed_frame_digest_in(
 /// recorded tip, else its base (nothing executed yet). `None` without a
 /// session.
 pub fn committed_tip(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Option<u64>> {
-    let view = CommittedView::capture(global)?;
-    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
-    Ok(Some(handoff::session_tip(&view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
+    committed_tip_in(&CommittedView::capture(global)?, filter)
+}
+
+/// [`committed_tip`] read from a captured `view`.
+pub fn committed_tip_in(view: &CommittedView, filter: &[u8]) -> Result<Option<u64>> {
+    let Some(session) = handoff::head(view, filter)? else { return Ok(None) };
+    Ok(Some(handoff::session_tip(view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
 }
 
 /// [`committed_tip`] of each of `filters` that has a session, read from one

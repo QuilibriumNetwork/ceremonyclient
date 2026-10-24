@@ -2364,6 +2364,9 @@ pub struct AppConsensusEngine {
     cw_nonmember: u64,
     /// Paces archive requests for a frame received blocks show missing.
     ancestor_sync: AncestorSyncPacing,
+    /// This voting member's lag behind its session's committed tip
+    /// ([`Self::publish_lagging_voter`]).
+    lagging_voter: LaggingVoter,
     /// Which members of the running session were heard, to name those that
     /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
     session_silent: SilentMembers,
@@ -2542,6 +2545,7 @@ impl AppConsensusEngine {
             cw_unresolved: 0,
             cw_nonmember: 0,
             ancestor_sync: AncestorSyncPacing::default(),
+            lagging_voter: LaggingVoter::default(),
             session_silent: SilentMembers::default(),
             own_votes: Default::default(),
             private_parents: None,
@@ -4733,7 +4737,7 @@ impl AppConsensusEngine {
                                                 AncestorSync::Hold { first: true, retry_in } => info!(
                                                     filter = %hex::encode(&self.filter), missing, materialized = cursor,
                                                     retry_in_secs = retry_in.as_secs(),
-                                                    reason = "requested recently; an archive serves a frame only once it finalizes",
+                                                    reason = ancestor_hold_reason(missing, self.lagging_voter.known_tip),
                                                     "holding back archive requests for a missing app frame",
                                                 ),
                                                 AncestorSync::Hold { .. } => {}
@@ -4828,6 +4832,7 @@ impl AppConsensusEngine {
                     self.log_session_liveness();
                     self.report_presence();
                     self.track_own_votes();
+                    self.publish_lagging_voter(std::time::Instant::now());
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
                         self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -4947,6 +4952,7 @@ impl AppConsensusEngine {
                 warn!(core_id = self.core_id, error = %e, "app consensus host stopped with an error");
             }
         }
+        self.execution.set_lagging_voter(false);
         self.execution.state("stopped", "engine exited");
     }
 
@@ -5117,6 +5123,49 @@ impl AppConsensusEngine {
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
         self.log_silent_members(&seen, best_signers, quorum);
+    }
+
+    /// Publish whether this worker is a lagging voter ([`LaggingVoter`]): a
+    /// member seated in its running session host whose materialized frame
+    /// trailed the session's committed tip ([`lagging_tip`]) by at least
+    /// [`LAGGING_VOTER_MIN_GAP`] frames for [`LAGGING_VOTER_AFTER`], until it
+    /// catches up. The bodies of frames it missed come only from archive
+    /// replay, so its replays take recovery turns first and keep them while
+    /// it trails (`recovery_turns`). On an operator's node such a member of
+    /// an 11-seat committee waited up to 5 hours per turn for 32 to 64
+    /// frames, and abstained for 12 hours while its committee stood one
+    /// vote short of its quorum.
+    fn publish_lagging_voter(&mut self, now: std::time::Instant) {
+        let seated = self.cw_session.is_some() && self.own_votes.member().is_some()
+            && self.cw_handle.as_ref().is_some_and(|host| !host.is_dead());
+        let materialized = self.last_materialized_frame;
+        let committed = self.lagging_voter.global_tip.filter(|_| self.cw_session.is_some());
+        let certified = self.received_full_frames.iter()
+            .filter(|(number, frame)| **number > materialized && frame.header.as_ref()
+                .and_then(|header| header.public_key_signature_bls48581.as_ref())
+                .is_some_and(|signature| !signature.signature.is_empty()))
+            .map(|(number, _)| *number)
+            .max();
+        self.lagging_voter.known_tip = committed.max(certified);
+        let gap = lagging_tip(seated, materialized, committed, certified).map_or(0, |tip| tip - materialized);
+        let logged = self.lagging_voter.observe(gap, now);
+        self.execution.set_lagging_voter(self.lagging_voter.lagging());
+        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        match logged {
+            Some(LaggingVoterLog::Gained { trailed }) => info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                materialized, committed_tip = %or_none(committed), certified_tip = %or_none(certified),
+                gap, trailed_secs = trailed.as_secs(), scope = "this node",
+                action = "none: the missing frames come from archive replay; it ends when this member catches up \
+                    ('voting member no longer trails its committee')",
+                "voting member trails its committee's committed tip: its archive replays take recovery turns \
+                 first and keep them while it trails"),
+            Some(LaggingVoterLog::Lost { duration }) => info!(core_id = self.core_id,
+                filter = hex::encode(&self.filter), materialized, committed_tip = %or_none(committed),
+                certified_tip = %or_none(certified), lagging_secs = duration.as_secs(),
+                outcome = if seated { "caught up" } else { "no longer votes in a running session" },
+                "voting member no longer trails its committee: its archive replays queue as others do"),
+            None => {}
+        }
     }
 
     /// Report this member's votes in its running session host
@@ -5368,6 +5417,9 @@ impl AppConsensusEngine {
     /// and stop a host whose session was retired or superseded so the retry
     /// path resolves the successor.
     async fn maintain_committee_session(&mut self) {
+        // Read again below, from the view the session's GLOBAL lag check
+        // captures, while the session is current.
+        self.lagging_voter.global_tip = None;
         let Some(global) = self.global_hypergraph.clone() else {
             return;
         };
@@ -5459,9 +5511,13 @@ impl AppConsensusEngine {
         filter: &str,
     ) {
         use quil_execution::global_intrinsic::handoff::CommittedView;
-        let Ok(committed_frame) = CommittedView::capture(global).map(|view| view.frame()) else {
+        let Ok(view) = CommittedView::capture(global) else {
             return;
         };
+        // The lagging-voter check reads the session's committed tip from
+        // this view rather than capturing another (`publish_lagging_voter`).
+        self.lagging_voter.global_tip = crate::app_handoff::committed_tip_in(&view, &self.filter).ok().flatten();
+        let committed_frame = view.frame();
         let Some(latest_global_frame) = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.as_ref().map(|h| h.frame_number)) else {
             return;
@@ -8604,6 +8660,111 @@ fn block_sync_from(bytes: &[u8], cursor: u64, session: impl FnOnce() -> Option<[
     }
     let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes).ok()?;
     (frame.header?.frame_number > next).then_some(next)
+}
+
+/// Why a repeated archive request for frame `missing` is held back, given
+/// the committed tip this worker knows (`known_tip`): a frame not yet
+/// committed may be only notarized, which no archive serves, while a
+/// committed one is served and its repeats only bound archive reads.
+fn ancestor_hold_reason(missing: u64, known_tip: Option<u64>) -> &'static str {
+    if known_tip.is_some_and(|tip| missing <= tip) {
+        "requested recently; the frame is committed and archives serve it: repeats are paced while a recovery \
+         for it is queued, running or failing"
+    } else {
+        "requested recently; an archive serves a frame only once it finalizes"
+    }
+}
+
+/// The tip a member at `materialized` trails as a lagging voter: the higher
+/// of GLOBAL's committed tip of its session (`committed`) and the highest
+/// certified frame it holds above its own (`certified`), when above
+/// `materialized` and the member votes in its running session (`seated`).
+fn lagging_tip(seated: bool, materialized: u64, committed: Option<u64>, certified: Option<u64>) -> Option<u64> {
+    committed.max(certified).filter(|&tip| seated && tip > materialized)
+}
+
+/// The fewest frames a voting member trails its committed tip by to count
+/// as lagging: certified frames wait briefly to materialize, so a healthy
+/// member trails by one now and then.
+const LAGGING_VOTER_MIN_GAP: u64 = 2;
+
+/// How long a voting member trails by [`LAGGING_VOTER_MIN_GAP`] or more,
+/// at every check, before it counts as lagging. Trails of a frame or two
+/// that end within seconds are routine (a 15-worker node: 'parent
+/// unavailable' 2 to 17 times per shard an hour, 1 to 2 frames behind).
+const LAGGING_VOTER_AFTER: Duration = Duration::from_secs(60);
+
+/// How often a worker's start of a lag as a voting member is logged at most.
+const LAGGING_VOTER_LOG_REPEAT: Duration = Duration::from_secs(10 * 60);
+
+/// What a [`LaggingVoter`] change logs.
+#[derive(Debug, PartialEq, Eq)]
+enum LaggingVoterLog {
+    /// It counts as lagging, having trailed for `trailed`.
+    Gained { trailed: Duration },
+    /// It caught up, or no longer votes, after lagging for `duration`.
+    Lost { duration: Duration },
+}
+
+/// A voting member's lag behind its session's committed tip
+/// ([`lagging_tip`]): set once it trailed by at least
+/// [`LAGGING_VOTER_MIN_GAP`] frames at every check for
+/// [`LAGGING_VOTER_AFTER`], cleared once it trails by none. Its start is
+/// logged at most every [`LAGGING_VOTER_LOG_REPEAT`], late if it still
+/// lasts then, and its end only after a logged start.
+#[derive(Debug, Default)]
+struct LaggingVoter {
+    /// Since when it has trailed by [`LAGGING_VOTER_MIN_GAP`] or more.
+    trailing: Option<std::time::Instant>,
+    /// Since when it counts as lagging: the start of its trail.
+    since: Option<std::time::Instant>,
+    /// Its start was logged.
+    logged: bool,
+    last_logged: Option<std::time::Instant>,
+    /// GLOBAL's committed tip of the running session, read by this check's
+    /// tick (`maintain_committee_session`).
+    global_tip: Option<u64>,
+    /// The committed tip last known: GLOBAL's of the running session, or a
+    /// higher certified frame held.
+    known_tip: Option<u64>,
+}
+
+impl LaggingVoter {
+    /// Whether it counts as lagging.
+    fn lagging(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// A check at `now` found it `gap` frames behind its committed tip (0:
+    /// caught up, or not voting).
+    fn observe(&mut self, gap: u64, now: std::time::Instant) -> Option<LaggingVoterLog> {
+        if gap < LAGGING_VOTER_MIN_GAP {
+            self.trailing = None;
+        } else {
+            self.trailing.get_or_insert(now);
+        }
+        let since = match self.since {
+            Some(since) if gap == 0 => {
+                self.since = None;
+                return std::mem::take(&mut self.logged)
+                    .then(|| LaggingVoterLog::Lost { duration: now.saturating_duration_since(since) });
+            }
+            Some(since) => since,
+            None => {
+                let trailing = self.trailing?;
+                if now.saturating_duration_since(trailing) < LAGGING_VOTER_AFTER {
+                    return None;
+                }
+                *self.since.insert(trailing)
+            }
+        };
+        if self.logged || self.last_logged.is_some_and(|at| now.saturating_duration_since(at) < LAGGING_VOTER_LOG_REPEAT) {
+            return None;
+        }
+        self.logged = true;
+        self.last_logged = Some(now);
+        Some(LaggingVoterLog::Gained { trailed: now.saturating_duration_since(since) })
+    }
 }
 
 /// The first repeat of an archive request for the same missing frame; each
@@ -11823,6 +11984,82 @@ mod tests {
         // So does another missing frame, and a return to the first.
         assert_eq!(pacing.admit(19647, 19650, at(2103)), AncestorSync::Request);
         assert_eq!(pacing.admit(19647, 19648, at(2104)), AncestorSync::Request);
+    }
+
+    /// A held-back request names a committed frame as one archives serve.
+    #[test]
+    fn a_held_back_committed_frame_is_not_called_unfinalized() {
+        assert!(ancestor_hold_reason(19647, Some(19700)).contains("committed"));
+        assert!(ancestor_hold_reason(19647, Some(19647)).contains("committed"));
+        assert!(ancestor_hold_reason(19647, Some(19646)).contains("only once it finalizes"));
+        assert!(ancestor_hold_reason(19647, None).contains("only once it finalizes"));
+    }
+
+    /// A voting member trails the higher of GLOBAL's committed tip and the
+    /// certified frames it holds; an unseated worker never counts.
+    #[test]
+    fn a_seated_member_below_its_committed_tip_is_a_lagging_voter() {
+        assert_eq!(lagging_tip(true, 100, Some(140), None), Some(140));
+        assert_eq!(lagging_tip(true, 100, Some(90), Some(160)), Some(160));
+        assert_eq!(lagging_tip(true, 100, None, Some(101)), Some(101));
+        assert_eq!(lagging_tip(true, 140, Some(140), None), None, "caught up");
+        assert_eq!(lagging_tip(true, 100, None, None), None, "no tip known");
+        assert_eq!(lagging_tip(false, 100, Some(140), Some(160)), None, "not seated");
+    }
+
+    /// A trail of a frame or two that ends within a minute, as certified
+    /// frames wait to materialize, sets no flag and logs nothing; one of two
+    /// frames or more at every check for a minute does, until the member
+    /// trails by none.
+    #[test]
+    fn only_a_sustained_trail_makes_a_lagging_voter() {
+        let t0 = std::time::Instant::now();
+        let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        let mut lag = LaggingVoter::default();
+        // Transient trails: under a minute, or by one frame however long.
+        for (second, gap) in [(0, 2), (10, 1), (20, 2), (30, 2), (40, 2), (50, 2), (60, 2), (70, 0), (80, 1)] {
+            assert_eq!(lag.observe(gap, at(second)), None, "second {second}");
+            assert!(!lag.lagging(), "second {second}");
+        }
+        for second in (90..=600).step_by(10) {
+            assert_eq!(lag.observe(1, at(second)), None);
+        }
+        assert!(!lag.lagging(), "a one-frame trail is routine");
+        // Two frames or more at every check for a minute.
+        for second in (610..670).step_by(10) {
+            assert_eq!(lag.observe(2 + second % 3, at(second)), None, "second {second}");
+            assert!(!lag.lagging());
+        }
+        assert_eq!(lag.observe(5, at(670)), Some(LaggingVoterLog::Gained { trailed: Duration::from_secs(60) }));
+        assert!(lag.lagging());
+        // It stays lagging, unlogged, until it trails by none.
+        assert_eq!(lag.observe(1, at(680)), None);
+        assert!(lag.lagging(), "cleared only once caught up");
+        assert_eq!(lag.observe(0, at(700)), Some(LaggingVoterLog::Lost { duration: Duration::from_secs(90) }));
+        assert!(!lag.lagging());
+    }
+
+    /// A member that keeps falling behind is logged at most every repeat
+    /// interval; a start not logged then is logged late, and only a logged
+    /// start has its end logged.
+    #[test]
+    fn lagging_voter_transitions_are_logged_at_a_bounded_rate() {
+        let t0 = std::time::Instant::now();
+        let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        let mut lag = LaggingVoter::default();
+        assert_eq!(lag.observe(3, t0), None);
+        assert_eq!(lag.observe(3, at(60)), Some(LaggingVoterLog::Gained { trailed: Duration::from_secs(60) }));
+        assert_eq!(lag.observe(0, at(70)), Some(LaggingVoterLog::Lost { duration: Duration::from_secs(70) }));
+        // Lagging again within the interval: flagged, not logged.
+        assert_eq!(lag.observe(3, at(80)), None);
+        assert_eq!(lag.observe(3, at(140)), None);
+        assert!(lag.lagging());
+        assert_eq!(lag.observe(0, at(150)), None, "its unlogged start has no logged end");
+        assert_eq!(lag.observe(3, at(160)), None);
+        assert_eq!(lag.observe(3, at(220)), None);
+        // Still lagging once the interval passed: logged late.
+        assert_eq!(lag.observe(2, at(660)), Some(LaggingVoterLog::Gained { trailed: Duration::from_secs(500) }));
+        assert_eq!(lag.observe(0, at(700)), Some(LaggingVoterLog::Lost { duration: Duration::from_secs(540) }));
     }
 
     /// Resolver messages carry the members they are addressed to; votes,
